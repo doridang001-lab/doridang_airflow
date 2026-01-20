@@ -107,6 +107,10 @@ keys/
 # Notebook checkpoints
 .ipynb_checkpoints/
 
+# Notebooks (exclude from backups)
+notebooks/
+*.ipynb
+
 # Data files (if you don't want to track them)
 *.csv
 *.parquet
