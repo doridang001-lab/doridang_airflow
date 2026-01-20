@@ -1,0 +1,62 @@
+import pandas as pd
+from pathlib import Path
+from modules.transform.utility.paths import ONEDRIVE_DB, LOCAL_DB
+
+# 전체 CSV 읽기
+local_csv_path = LOCAL_DB / "영업관리부_DB" / "sales_daily_orders.csv"
+print(f"CSV 읽는 중...")
+
+df = pd.read_csv(local_csv_path, encoding='utf-8-sig', low_memory=False)
+print(f"데이터 로드 완료: {len(df):,}행")
+
+# Parquet 저장용 DataFrame 복사 및 타입 정리
+df_for_parquet = df.copy()
+
+print("\n데이터 타입 정리 중...")
+# 혼합 타입(mixed types) 컬럼을 문자열로 통일
+for col in df_for_parquet.columns:
+    if df_for_parquet[col].dtype == 'object':
+        # NaN이 아닌 값들의 타입 확인
+        non_null_values = df_for_parquet[col].dropna()
+        if len(non_null_values) > 0:
+            # 타입이 혼합되어 있는지 확인
+            types = set(type(x) for x in non_null_values.head(100))
+            if len(types) > 1:
+                # 혼합 타입이면 모두 문자열로 변환
+                print(f"  - {col}: 혼합 타입 감지 ({len(types)}개 타입) -> 문자열로 변환")
+                df_for_parquet[col] = df_for_parquet[col].astype(str)
+            else:
+                # datetime 변환 시도
+                try:
+                    converted = pd.to_datetime(df_for_parquet[col], errors='coerce')
+                    # 변환된 값 중 NaT가 아닌 것이 일정 비율 이상이면 datetime으로 변환
+                    if converted.notna().sum() > len(non_null_values) * 0.9:
+                        df_for_parquet[col] = converted
+                        print(f"  - {col}: datetime으로 변환")
+                except:
+                    pass
+
+# OneDrive Parquet으로 저장
+onedrive_parquet_path = ONEDRIVE_DB / "영업관리부_DB" / "sales_daily_orders.parquet"
+onedrive_parquet_path.parent.mkdir(parents=True, exist_ok=True)
+
+print(f"\nParquet 저장 중: {onedrive_parquet_path}")
+try:
+    df_for_parquet.to_parquet(
+        onedrive_parquet_path,
+        index=False,
+        engine='pyarrow',
+        compression='snappy'
+    )
+    print("✅ Parquet 저장 성공!")
+    
+    # 파일 크기 확인
+    csv_size = local_csv_path.stat().st_size / (1024 * 1024)
+    parquet_size = onedrive_parquet_path.stat().st_size / (1024 * 1024)
+    compression_ratio = (1 - parquet_size / csv_size) * 100 if csv_size > 0 else 0
+    print(f"CSV: {csv_size:.2f} MB → Parquet: {parquet_size:.2f} MB ({compression_ratio:.1f}% 압축)")
+    
+except Exception as e:
+    print(f"❌ Parquet 저장 실패: {e}")
+    import traceback
+    traceback.print_exc()

@@ -1,0 +1,73 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Airflow
+logs/
+airflow.db
+airflow.cfg
+unittests.cfg
+airflow-webserver.pid
+standalone_admin_password.txt
+
+# Python
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sensitive data
+*.json
+!requirements.json
+config/*.json
+
+# Downloaded/temporary files
+download/
+temp/
+*.tmp
+*.log
+
+# Keys
+keys/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Data files (if you don't want to track them)
+*.csv
+*.parquet
+*.xlsx
+*.xls
+
+# Collected data
+Collect_Data/

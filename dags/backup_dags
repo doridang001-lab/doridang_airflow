@@ -1,0 +1,138 @@
+"""
+DB 파일 병합 파이프라인 DAG
+
+📋 목적:
+  - 토더 리뷰 데이터를 다양한 소스에서 로드하여 병합
+  - CSV/엑셀 파일을 자동으로 탐지하고 중복 제거
+  - 전처리 후 로컬 DB에 CSV로 저장
+
+🔄 처리 단계:
+  1. 데이터 로드: CSV 우선, 없으면 엑셀 로드
+  2. 전처리: 그룹화, 집계, 매장명 정리, ID 생성
+  3. CSV 저장: 로컬 DB에 최종 결과 저장
+
+📂 데이터 소스:
+  - /opt/airflow/download/업로드_temp/toorder_review_*.csv
+  - 원드라이브/영업관리부_수집/toorder_review_*.csv
+  - /opt/airflow/download/toorder_review_doridang1_*.xlsx
+
+⏰ 스케줄: 매주 월, 수 11시 실행
+"""
+import pendulum
+import os
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from modules.transform.utility.io2 import load_and_concat_csv
+# 함수 import
+# ============================================================
+# 📦 사용 가능한 함수들:
+# 
+# 1. load_reupload_toorder_review(**context)
+#    - 토더 리뷰 데이터를 자동으로 로드 (CSV 우선, 엑셀 대체)
+#    - XCom으로 'toorder_review_path' 반환
+# 
+# 2. preprocess_toorder_review_df(input_task_id, input_xcom_key, output_xcom_key, **context)
+#    - 토더 리뷰 데이터를 전처리 (그룹화, 집계, ID 생성)
+#    - XCom으로 처리된 파일 경로 반환
+# 
+# 3. fin_save_to_csv(input_task_id, input_xcom_key, output_filename, **context)
+#    - Parquet 데이터를 로컬 DB에 CSV로 저장
+#    - 중복 제거 및 백업 자동 처리
+# ============================================================
+from modules.transform.pipelines.db_file_merge_pipeline import (
+    load_df as load_reupload_toorder_review,
+    preprocess_toorder_review_df,
+    fin_save_to_csv,
+    load_baemin_ad_change_history_df,
+    preprocess_baemin_ad_change_history_df,
+    baemin_ad_change_history_save_to_csv
+)
+
+# ==================================================
+# DAG 정의
+# ==================================================
+filename = os.path.basename(__file__)
+
+with DAG(
+    dag_id=filename.replace('.py', ''),
+    schedule="0 11 * * 1,3",  # 매주 월, 수 11시 00분 실행
+    start_date=pendulum.datetime(2023, 1, 1, tz="Asia/Seoul"),
+    catchup=False,
+    tags=['02_sales', 'crawling', 'coupang'],
+) as dag:
+    # ============================================================
+    # Task 1: 토더 리뷰 데이터 로드
+    # ============================================================
+    # 📥 여러 경로에서 자동으로 파일 탐색 및 로드
+    # - CSV 파일 우선 검색 (빠름)
+    # - CSV 없으면 엑셀 파일 검색
+    # - 중복 파일명은 최신 파일만 사용
+    # 
+    # 출력: XCom['toorder_review_path'] = parquet 파일 경로
+    task_load_reupload = PythonOperator(
+        task_id='load_reupload_toorder_review',
+        python_callable=load_reupload_toorder_review,
+    )
+    
+    # ============================================================
+    # Task 2: 토더 리뷰 데이터 전처리
+    # ============================================================
+    # 🔄 처리 내용:
+    # - 컬럼 선택 (date, 매장명.1, 채널, 주문 수, 리뷰 수 등)
+    # - 결측치 제거 (채널이 null인 행)
+    # - 날짜/매장별 그룹화 및 집계 (sum, 평균)
+    # - Surrogate Key 생성 (date + stores_name)
+    # - 매장명 표준화 ("도리당" 접두사, 별칭 통일)
+    # 
+    # 입력: XCom['toorder_review_path'] (이전 Task에서)
+    # 출력: XCom['processed_toorder_review_path'] = 전처리된 parquet 경로
+    task_preprocess = PythonOperator(
+        task_id='preprocess_toorder_review',
+        python_callable=preprocess_toorder_review_df,
+        op_kwargs={
+            'input_task_id': 'load_reupload_toorder_review',  # 이전 Task ID
+            'input_xcom_key': 'toorder_review_path',          # 읽을 XCom 키
+            'output_xcom_key': 'processed_toorder_review_path',  # 저장할 XCom 키
+        }
+    )
+    
+    # 토더리뷰 csv저장   
+    task_save_csv = PythonOperator(
+        task_id='save_toorder_review_csv',
+        python_callable=fin_save_to_csv,
+        op_kwargs={
+            'input_task_id': 'preprocess_toorder_review',
+            'input_xcom_key': 'processed_toorder_review_path',
+            'output_filename': 'toorder_review_doridang.csv',
+        }
+    )
+    
+    # 배민 광고 변경이력 로드
+    task_load_baemin_ad_change_history = PythonOperator(
+        task_id='load_baemin_ad_change_history',
+        python_callable=load_baemin_ad_change_history_df,
+    )
+    # 배민 광고 변경이력 전처리
+    task_preprocess_baemin_ad_change_history = PythonOperator(
+        task_id='preprocess_baemin_ad_change_history',
+        python_callable=preprocess_baemin_ad_change_history_df,
+        op_kwargs={
+            'input_task_id': 'load_baemin_ad_change_history',
+            'input_xcom_key': 'baemin_ad_change_history_path',
+            'output_xcom_key': 'processed_baemin_ad_change_history_path',
+        }
+    )
+    # 배민 광고 변경이력 csv저장
+    task_baemin_ad_change_history_save_csv = PythonOperator(
+        task_id='baemin_ad_change_history_save_to_csv',
+        python_callable=baemin_ad_change_history_save_to_csv,
+        op_kwargs={
+            'input_task_id': 'preprocess_baemin_ad_change_history',
+            'input_xcom_key': 'processed_baemin_ad_change_history_path',
+        }
+    )
+        
+
+ # Task 의존성 설정
+task_load_reupload >> task_preprocess >> task_save_csv
+task_load_baemin_ad_change_history >> task_preprocess_baemin_ad_change_history >> task_baemin_ad_change_history_save_csv
