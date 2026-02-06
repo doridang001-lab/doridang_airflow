@@ -58,19 +58,14 @@ def load_baemin_data(**context):
     3. 주문수량 포함 → 수량이 다르면 다른 행으로 인식
     4. 전체 행 해시 → 같은 메뉴 2개 주문(2행)도 보존
     """
-    baemin_dir = COLLECT_DB / '영업관리부_수집'
-    file_pattern = f"{baemin_dir}/baemin_orders*.csv"
+    baemin_dir = LOCAL_DB / '영업관리부_DB'
+    file_pattern = f"{baemin_dir}/sales_daily_orders.csv"
     
     return load_data(
         file_path=file_pattern,
-        xcom_key='baemin_parquet_path',
-        use_glob=True,
-        # ✅ 수정: collected_at 제외, 실제 주문 데이터 기준 중복 제거
-        # - 같은 파일 다른 시점 업로드 → 중복 제거됨
-        # - 같은 주문 같은 메뉴 2개(2행) → row_hash로 구분
-        dedup_key=['store_name', '주문번호', '주문시각', '주문내역', 
-                   '주문옵션상세', '주문수량'],
-        add_row_hash=True,  # ⭐ 새 옵션: 행 해시 추가
+        xcom_key='sales_orders_daily_processed_path', # XCom 키
+        use_glob=False,
+        add_row_hash=False, 
         **context
     )
 
@@ -95,9 +90,7 @@ def load_coupang_data(**context):
         file_path=file_pattern,
         xcom_key='coupang_parquet_path',
         use_glob=True,
-        # ✅ 수정: collected_at 제외, 실제 주문 데이터 기준 중복 제거
-        dedup_key=['store_name', 'order_id', 'order_date', 'menu_name', 
-                   'menu_options', 'menu_qty'],
+        dedup_key=['store_name', 'order_id', 'order_date', 'menu_name', 'menu_options'],
         add_row_hash=True,  # ⭐ 새 옵션: 행 해시 추가
         **context
     )
@@ -232,18 +225,20 @@ def preprocess_load_baemin_data(
     # 날짜 변환 적용
     baemin_orders['order_date'] = baemin_orders['order_date'].apply(parse_baemin_date)
     
-    # 변환 결과 확인
-    nat_count = baemin_orders['order_date'].isna().sum()
-    if nat_count > 0:
+    # 변환 결과 확인 (안전 처리)
+    nat_count = baemin_orders['order_date'].isna().sum() if 'order_date' in baemin_orders.columns else 0
+    if len(baemin_orders) == 0:
+        print("[경고] 배민 데이터 없음: 필터/변환 후 0건")
+    elif nat_count > 0:
         print(f"[경고] 배민 order_date 변환 실패: {nat_count}건")
-        # 실패한 원본 출력
         failed_dates = baemin_orders[baemin_orders['order_date'].isna()]['order_date'].head(3)
         print(f"[경고] 실패한 샘플: {failed_dates.tolist()}")
     else:
-        print(f"[DEBUG] order_date 변환 성공: {baemin_orders['order_date'].iloc[0]}")
-    
-    # collected_at 변환
-    baemin_orders['collected_at'] = pd.to_datetime(baemin_orders['collected_at'])
+        print(f"[DEBUG] order_date 변환 성공 샘플: {baemin_orders['order_date'].head(3).tolist()}")
+
+    # collected_at 변환 (안전 처리)
+    if 'collected_at' in baemin_orders.columns:
+        baemin_orders['collected_at'] = pd.to_datetime(baemin_orders['collected_at'], errors='coerce')
     
     print(f"배민 전처리 완료: {len(baemin_orders)}건")
     
@@ -286,8 +281,9 @@ def preprocess_load_coupang_data(
     
     coupang_df = coupang_orders.copy()
 
-    # 취소되지 않은 주문만
-    coupang_df = coupang_df[coupang_df["order_status"].isin(["정산예정", "정산완료"])]
+    # order_status 필터 제거 - 모든 데이터 포함
+    print(f"[INFO] 모든 주문 데이터 포함: {len(coupang_df)}건")
+
 
     # 주요 금액 컬럼 결측치 0 처리
     cols_to_zero = [
@@ -319,6 +315,16 @@ def preprocess_load_coupang_data(
     # 광고 관련 컬럼
     coupang_df['ad_id'] = np.nan
     coupang_df['ad_product'] = np.nan
+
+    # order_date 대체 컬럼 매핑
+    if 'order_date' not in coupang_df.columns:
+        for cand in ['주문일시', '주문일자', 'order_datetime', 'order_time']:
+            if cand in coupang_df.columns:
+                coupang_df['order_date'] = coupang_df[cand]
+                print(f"[INFO] order_date 대체: {cand} 사용")
+                break
+        if 'order_date' not in coupang_df.columns:
+            print("[경고] order_date 컬럼 없음")
 
     # 컬럼 선택
     select_cols = ['platform', 'order_date', 'store_id', 'store_name', 'ad_id', 'ad_product',
@@ -358,17 +364,20 @@ def preprocess_load_coupang_data(
     coupang_dfs['menu_amount'] = coupang_dfs['total_amount']
     coupang_dfs['menu_option_price'] = np.nan
     
-    # 쿠폰 사용 여부
-    coupang_dfs['instant_discount_amount_YN'] = np.where(
-        coupang_dfs.groupby('order_id')["instant_discount_coupon"].transform('sum') > 0, 
-        'Y', 'N'
-    )
+    # 쿠폰 사용 여부 (통일된 컬럼명: instant_discount_coupon_YN)
+    if 'instant_discount_coupon' in coupang_dfs.columns and 'order_id' in coupang_dfs.columns and len(coupang_dfs) > 0:
+        coupang_dfs['instant_discount_coupon_YN'] = np.where(
+            coupang_dfs.groupby('order_id')["instant_discount_coupon"].transform('sum') > 0,
+            'Y', 'N'
+        )
+    else:
+        coupang_dfs['instant_discount_coupon_YN'] = 'N'
 
     # 최종 컬럼
     final_cols = ['platform', 'order_date', 'store_id', 'store_name', 'ad_id',
         'ad_product', 'order_id', 'order_summary', 'menu_option_name',
         'option_qty', 'delivery_type', 'total_amount', 'menu_amount',
-        'menu_option_price', 'instant_discount_coupon',
+        'menu_option_price', 'instant_discount_coupon', 'instant_discount_coupon_YN',
         'fee_ad', 'settlement_amount',
         'collected_at']
     
@@ -380,7 +389,11 @@ def preprocess_load_coupang_data(
     # ============================================================
     # ⭐ 날짜 형식 변환 (쿠팡 형식 지원 추가)
     # ============================================================
-    print(f"[DEBUG] order_date 원본 샘플: {coupang_dfs['order_date'].iloc[0] if len(coupang_dfs) > 0 else 'N/A'}")
+    # 원본 날짜 샘플 안전 출력
+    if 'order_date' in coupang_dfs.columns and len(coupang_dfs) > 0:
+        print(f"[DEBUG] order_date 원본 샘플: {coupang_dfs['order_date'].head(3).tolist()}")
+    else:
+        print("[DEBUG] order_date 원본 샘플: N/A (데이터 없음 또는 컬럼 누락)")
     
     def parse_coupang_date(date_str):
         """쿠팡 날짜 파싱: 2026.01.11 23:06"""
@@ -403,13 +416,18 @@ def preprocess_load_coupang_data(
     coupang_dfs['order_date'] = coupang_dfs['order_date'].apply(parse_coupang_date)
     
     # 변환 결과 확인
-    nat_count = coupang_dfs['order_date'].isna().sum()
-    if nat_count > 0:
+    nat_count = coupang_dfs['order_date'].isna().sum() if 'order_date' in coupang_dfs.columns else 0
+    if len(coupang_dfs) == 0:
+        print("[경고] 쿠팡 데이터 없음: 필터 후 0건")
+    elif nat_count > 0:
         print(f"[경고] 쿠팡 order_date 변환 실패: {nat_count}건")
     else:
-        print(f"[DEBUG] order_date 변환 성공: {coupang_dfs['order_date'].iloc[0]}")
-    
-    coupang_dfs["collected_at"] = pd.to_datetime(coupang_dfs["collected_at"])
+        # 성공 샘플을 안전하게 출력
+        print(f"[DEBUG] order_date 변환 성공 샘플: {coupang_dfs['order_date'].head(3).tolist()}")
+
+    # collected_at 변환 안전 처리
+    if 'collected_at' in coupang_dfs.columns:
+        coupang_dfs["collected_at"] = pd.to_datetime(coupang_dfs["collected_at"], errors='coerce')
         
     print(f"쿠팡이츠 전처리 완료: {len(coupang_dfs)}건")
     
@@ -445,14 +463,37 @@ def preprocess_merged_daily_orders(
     df = pd.read_parquet(parquet_path)
     print(f"전처리 시작: {len(df):,}행")
     
-    # 매장명 추출
-    df["stores"] = df["store_name"].str.split(" ").str[-2:].str.join(" ")
+    # ⭐ 디버깅: 실제 컬럼 확인
+    print(f"[DEBUG] 현재 컬럼 목록: {list(df.columns)}")
     
-    # ⭐ sub_order_id 생성 (행 해시 포함 버전)
+    # ⭐ 실오픈일 확인
+    if '실오픈일' in df.columns:
+        print(f"[DEBUG] ✅ 실오픈일 존재 - 샘플: {df['실오픈일'].dropna().head(3).tolist()}")
+    else:
+        print(f"[경고] ❌ 실오픈일 없음 - NaN 추가")
+        df['실오픈일'] = np.nan
+    
+    # ⭐⭐⭐ 매장명 추출 로직 수정 ⭐⭐⭐
+    if 'stores' not in df.columns:
+        if 'store_names' in df.columns:
+            print(f"[매장명] store_names 컬럼 사용")
+            df["stores"] = df["store_names"]
+        elif 'store_name' in df.columns:
+            print(f"[매장명] store_name 컬럼에서 추출")
+            df["stores"] = df["store_name"].str.split(" ").str[-2:].str.join(" ")
+        elif '매장명' in df.columns:
+            print(f"[매장명] 매장명 컬럼에서 추출")
+            df["stores"] = df["매장명"].str.split(" ").str[-2:].str.join(" ")
+        else:
+            print("[경고] 매장명 관련 컬럼을 찾을 수 없습니다 - Unknown으로 설정")
+            df["stores"] = "Unknown"
+    else:
+        print(f"[매장명] stores 컬럼 이미 존재")
+    
+    # ⭐ sub_order_id 생성
     print("\n[sub_order_id] 생성 중...")
     
     if '_row_hash' in df.columns and df['_row_hash'].notna().any():
-        # _row_hash가 있으면 order_id + 행 내 순번 + 해시 일부
         df = create_sub_order_id_with_hash(
             df,
             order_col='order_id',
@@ -460,7 +501,6 @@ def preprocess_merged_daily_orders(
             output_col='sub_order_id'
         )
     else:
-        # 기존 방식: order_id + 순번
         df = create_sub_order_id_simple(
             df,
             order_col='order_id',
@@ -469,21 +509,54 @@ def preprocess_merged_daily_orders(
     
     print(f"[INFO] 중복 제거는 save_to_csv 단계에서 실행됩니다.")
     
-    # 컬럼 선택
+    # ⭐ 컬럼 선택 (담당자/email/실오픈일 포함)
     df_col_candidates = [
-        'platform', 'order_date', 'store_id', 'store_name', 'stores',
+        'platform', 'order_date', 'store_id', 'store_names', 'stores',
         'ad_id', 'ad_product', 'order_id', 'sub_order_id', 'order_summary',
         'menu_option_name', 'delivery_type', 'total_amount', 'menu_amount',
         'menu_option_price', 'instant_discount_coupon',
         'instant_discount_coupon_YN', 'collected_at', 'option_qty', 'fee_ad',
-        'settlement_amount', '_row_hash'
+        'settlement_amount', '_row_hash',
+        '담당자', 'email', '상세주소', '광역', '시군구', '읍면동',  # ⭐ 직원정보 추가
+        '실오픈일'  # ⭐ 실오픈일
     ]
+    # ⭐ 디버깅: 담당자/email 확인
+    print(f"\n[직원정보 확인]")
+    print(f"  - 담당자 컬럼: {'담당자' in df.columns} (값 {(df['담당자'].astype(str).str.strip() != '').sum() if '담당자' in df.columns else 'N/A'}건)")
+    print(f"  - email 컬럼: {'email' in df.columns} (값 {(df['email'].astype(str).str.strip() != '').sum() if 'email' in df.columns else 'N/A'}건)")
     
     df_col = [col for col in df_col_candidates if col in df.columns]
     if len(df_col) == 0:
         df_col = list(df.columns)
     
+    print(f"\n[컬럼 선택] {len(df_col)}개 선택")
+    print(f"  선택: {df_col}")
+
+    
+    
     df = df[df_col]
+    df['menu_option_name'] = df['menu_option_name'].fillna(df['order_summary'])
+    
+    
+    # ⭐ 최종 확인
+    print(f"\n[최종 확인]")
+    if '실오픈일' in df.columns:
+        print(f"  ✅ 실오픈일 포함됨")
+    else:
+        print(f"  ❌ 실오픈일 누락!")
+    
+    if '담당자' in df.columns:
+        mgr_count = (df['담당자'].astype(str).str.strip() != '').sum()
+        print(f"  담당자: {mgr_count}건 입력됨")
+    else:
+        print(f"  ❌ 담당자 누락!")
+    
+    if 'email' in df.columns:
+        email_count = (df['email'].astype(str).str.strip() != '').sum()
+        print(f"  email: {email_count}건 입력됨")
+    else:
+        print(f"  ❌ email 누락!")
+    
     print(f"전처리 완료: {len(df):,}행")
     
     # Parquet 저장
@@ -568,7 +641,7 @@ def preprocess_load_employee_data(
     output_xcom_key,
     **context
 ):
-    """직원 데이터 전처리 - 매장명 추출"""
+    """직원 데이터 전처리 - 끝 2단어로 매장명 정규화"""
     import numpy as np
     ti = context['task_instance']
     
@@ -583,19 +656,38 @@ def preprocess_load_employee_data(
         return "0건 (입력 없음)"
     
     df = pd.read_parquet(parquet_path)
-    print(f"전처리 시작: {len(df):,}행")
+    print(f"[직원 전처리] 시작: {len(df):,}행, 컬럼: {list(df.columns)}")
     
     if "매장명" in df.columns:
-        df["store_names"] = df["매장명"].str.split(" ").str[-2:].str.join(" ")
-        print(f"매장명 샘플: {df['store_names'].head().tolist()}")
+        # ⭐ 끝 2단어 추출 (join 키)
+        df["store_names_match"] = (
+            df["매장명"].astype(str)
+            .str.strip()
+            .str.split()
+            .str[-2:]
+            .str.join(" ")
+        )
+        print(f"[직원 전처리] store_names_match 샘플: {df['store_names_match'].head(3).tolist()}")
+        
+        # 플랫폼별 중복 제거 (첫 행만 유지)
         before = len(df)
-        df = df.drop_duplicates(subset=["store_names"], keep="first")
+        df = df.drop_duplicates(subset=["store_names_match"], keep="first")
         removed = before - len(df)
         if removed > 0:
-            print(f"[INFO] store_names 기준 중복 제거: {removed}건")
+            print(f"[직원 전처리] 중복 제거: {removed}건 → {len(df)}건")
     else:
         print(f"[에러] '매장명' 컬럼 없음. 실제 컬럼: {list(df.columns)}")
         raise KeyError("'매장명' 컬럼을 찾을 수 없습니다.")
+    
+    # 필요한 컬럼만 유지
+    keep_cols = [
+        '매장명', '담당자', 'email', '실오픈일', 
+        '상세주소', '광역', '시군구', '읍면동', 'store_names_match'
+    ]
+    available_cols = [c for c in keep_cols if c in df.columns]
+    df = df[available_cols].copy()
+    
+    print(f"[직원 전처리] 최종 컬럼: {list(df.columns)}")
     
     temp_dir = LOCAL_DB / 'temp'
     temp_dir.mkdir(exist_ok=True, parents=True)
@@ -605,7 +697,7 @@ def preprocess_load_employee_data(
     
     ti.xcom_push(key=output_xcom_key, value=str(processed_path))
     
-    return f"전처리: {len(df):,}행"
+    return f"[직원 전처리] 완료: {len(df):,}행"
 
 
 def preprocess_join_orders_with_stores(
@@ -651,51 +743,240 @@ def preprocess_join_orders_with_stores(
     else:
         orders_df['platform'] = 'UNKNOWN'
 
-    if 'store_names' not in orders_df.columns and 'store_name' in orders_df.columns:
-        orders_df['store_names'] = orders_df['store_name'].astype(str).str.split(' ').str[-2:].str.join(' ')
+    # ⭐⭐⭐ 주문 데이터: store_name에서 끝 2단어 추출 → store_names ⭐⭐⭐
+    if 'store_name' in orders_df.columns:
+        # 끝 2단어 추출 (예: "[음식배달] 닭도리탕 전문 도리당 강동점" → "도리당 강동점")
+        orders_df['store_names'] = (
+            orders_df['store_name'].astype(str)
+            .str.strip()
+            .str.split()
+            .str[-2:]
+            .str.join(' ')
+        )
+        print(f"[주문데이터] store_names (끝 2단어) 샘플: {orders_df['store_names'].head(5).tolist()}")
+    else:
+        print("[경고] store_name 컬럼 없음")
+        orders_df['store_names'] = 'UNKNOWN'
 
     employee_df = _pull_parquet(employee_task_id, employee_xcom_key)
+    
+    print(f"\n[DEBUG] employee_df 상태 확인:")
+    print(f"  - employee_df is None: {employee_df is None}")
+    if employee_df is not None:
+        print(f"  - len(employee_df): {len(employee_df)}")
+        print(f"  - 컬럼: {list(employee_df.columns) if employee_df is not None else 'N/A'}")
+    
     if employee_df is not None and len(employee_df) > 0:
-        if 'store_names' not in employee_df.columns:
-            if '매장명' in employee_df.columns:
-                employee_df['store_names'] = employee_df['매장명'].astype(str).str.split(' ').str[-2:].str.join(' ')
-            elif 'store_name' in employee_df.columns:
-                employee_df['store_names'] = employee_df['store_name'].astype(str)
-
-        if 'store_names' in employee_df.columns:
-            employee_df = employee_df.drop_duplicates(subset=['store_names'], keep='first')
-            joined_df = orders_df.merge(employee_df, how='left', on='store_names')
+        print(f"\n[직원정보] 로드: {len(employee_df)}건")
+        print(f"[직원정보] 컬럼: {list(employee_df.columns)}")
+        
+        if '매장명' in employee_df.columns:
+            # ⭐⭐⭐ 직원 정보: 매장명에서 끝 2단어 추출 ⭐⭐⭐
+            employee_df['store_names_match'] = (
+                employee_df['매장명'].astype(str)
+                .str.strip()
+                .str.split()
+                .str[-2:]
+                .str.join(' ')
+            )
+            
+            print(f"[직원정보] store_names_match (끝 2단어) 샘플: {employee_df['store_names_match'].head(5).tolist()}")
+            
+            # email 컬럼 확인
+            if 'email' not in employee_df.columns:
+                employee_df['email'] = np.nan
+                print("[경고] 직원정보에 email 컬럼 없음 - 추가됨")
+            
+            # 플랫폼별로 여러 행이 있을 수 있으므로, 매장명별 첫 행만 사용 (dedup)
+            employee_df_dedup = employee_df.drop_duplicates(subset=['store_names_match'], keep='first')
+            removed_dup = len(employee_df) - len(employee_df_dedup)
+            if removed_dup > 0:
+                print(f"[직원정보] 플랫폼별 중복 제거: {removed_dup}건 → {len(employee_df_dedup)}건")
+            employee_df = employee_df_dedup
+            
+            # ⭐⭐⭐ LEFT JOIN: store_names 기준 ⭐⭐⭐
+            print(f"\n[매칭 전] orders: {len(orders_df):,}건, employee: {len(employee_df):,}건")
+            print(f"[디버그] orders_df.store_names 샘플: {orders_df['store_names'].head(3).tolist()}")
+            print(f"[디버그] employee_df.store_names_match 샘플: {employee_df['store_names_match'].head(3).tolist()}")
+            
+            # ⭐ 조인할 데이터 컬럼 (join key는 따로 처리)
+            data_cols = ['담당자', 'email']
+            if '실오픈일' in employee_df.columns:
+                data_cols.append('실오픈일')
+            if '상세주소' in employee_df.columns:
+                data_cols.append('상세주소')
+            if '광역' in employee_df.columns:
+                data_cols.append('광역')
+            if '시군구' in employee_df.columns:
+                data_cols.append('시군구')
+            if '읍면동' in employee_df.columns:
+                data_cols.append('읍면동')
+            
+            # 실제 존재하는 컬럼만 선택
+            data_cols = [c for c in data_cols if c in employee_df.columns]
+            
+            print(f"[조인컬럼] join key: store_names_match → store_names")
+            print(f"[조인컬럼] data cols: {data_cols}")
+            
+            # ⭐ LEFT JOIN (store_names_match는 join key이므로 별도로 추가)
+            join_df = employee_df[['store_names_match'] + data_cols].copy()
+            
+            joined_df = orders_df.merge(
+                join_df, 
+                left_on='store_names',
+                right_on='store_names_match',
+                how='left'
+            )
+            
+            # 매칭 결과 통계
+            matched = joined_df['담당자'].notna().sum() if '담당자' in joined_df.columns else 0
+            print(f"[매칭 완료] 전체: {len(joined_df):,}건, 담당자 매칭: {matched:,}건 ({matched/len(joined_df)*100:.1f}%)")
+            
+            # 디버그: 샘플 확인
+            if matched > 0:
+                sample_matched = joined_df[joined_df['담당자'].notna()][['store_names', '담당자', 'email']].head(3)
+                print(f"[디버그] 매칭된 샘플:")
+                for idx, row in sample_matched.iterrows():
+                    print(f"  {row['store_names']} → 담당자: {row['담당자']}, email: {row['email']}")
+            
+            # 매칭 안된 매장 로그
+            if matched < len(joined_df):
+                unmatched = joined_df[joined_df['담당자'].isna()]
+                unmatched_stores = unmatched['store_names'].unique()
+                print(f"[매칭실패] {len(unmatched_stores)}개 매장:")
+                for store in list(unmatched_stores)[:10]:
+                    print(f"  - '{store}'")
+                
+                # 직원 데이터와 비교해서 왜 안 맞는지 확인
+                print(f"[디버그] employee_df에 있는 매장명들:")
+                for emp_store in employee_df['store_names_match'].unique()[:10]:
+                    print(f"  - '{emp_store}'")
+                    
+            # 임시 컬럼 제거
+            if 'store_names_match' in joined_df.columns:
+                joined_df = joined_df.drop(columns=['store_names_match'])
+            
+            # email 없는 경우 NaN 설정 (명시적)
+            if 'email' not in joined_df.columns:
+                joined_df['email'] = np.nan
+            
+            # 담당자/email이 NaN이면 빈 값으로 설정
+            if '담당자' in joined_df.columns:
+                joined_df['담당자'] = joined_df['담당자'].fillna('')
+            if 'email' in joined_df.columns:
+                joined_df['email'] = joined_df['email'].fillna('')
+            
+            print(f"[최종] 담당자 입력: {(joined_df['담당자'] != '').sum():,}건, 이메일 입력: {(joined_df['email'] != '').sum():,}건")
+            
         else:
-            print("[경고] 직원 데이터에 store_names 컬럼이 없어 조인 생략")
+            print("[경고] 직원 데이터에 '매장명' 컬럼이 없어 조인 생략")
             joined_df = orders_df.copy()
+            joined_df['담당자'] = np.nan
+            joined_df['email'] = np.nan
     else:
         print("[경고] 직원 데이터 없음: 조인 없이 진행")
         joined_df = orders_df.copy()
+        joined_df['담당자'] = np.nan
+        joined_df['email'] = np.nan
 
-    if 'collected_at' in joined_df.columns and 'collected_at_x' not in joined_df.columns:
-        joined_df.rename(columns={'collected_at': 'collected_at_x'}, inplace=True)
+    # collected_at 컬럼 정리
+    # 배민과 쿠팡의 collected_at이 다를 수 있으므로 통합
+    if 'collected_at_x' in joined_df.columns and 'collected_at_y' in joined_df.columns:
+        # 둘 다 있으면 _x 사용 (배민 기준)
+        joined_df['collected_at'] = joined_df['collected_at_x'].fillna(joined_df['collected_at_y'])
+        joined_df = joined_df.drop(columns=['collected_at_x', 'collected_at_y'])
+    elif 'collected_at_x' in joined_df.columns:
+        joined_df.rename(columns={'collected_at_x': 'collected_at'}, inplace=True)
+    elif 'collected_at_y' in joined_df.columns:
+        joined_df.rename(columns={'collected_at_y': 'collected_at'}, inplace=True)
 
+    # ⭐⭐⭐ 메뉴 옵션 분리 (order_summary와 menu_option_name 별도 유지) ⭐⭐⭐
+    if 'order_summary' in joined_df.columns and 'menu_option_name' in joined_df.columns:
+        def extract_pure_option(row):
+            """order_summary와 중복되는 부분을 제거하고 순수 옵션만 추출"""
+            summary = str(row['order_summary']).strip() if pd.notna(row['order_summary']) else ''
+            option = str(row['menu_option_name']).strip() if pd.notna(row['menu_option_name']) else ''
+            
+            # 둘 다 비어있으면 빈 문자열
+            if (not summary or summary == 'None') and (not option or option == 'None'):
+                return ''
+            
+            # option이 비어있으면 summary를 반환 (옵션 없는 경우)
+            if not option or option == 'None':
+                return summary
+            
+            # summary가 비어있으면 option을 그대로 반환
+            if not summary or summary == 'None':
+                return option
+            
+            # "|" 구분자가 있는 경우 처리
+            if '|' in option:
+                parts = [p.strip() for p in option.split('|')]
+                # summary와 일치하는 부분 제거
+                pure_options = [p for p in parts if p != summary]
+                if pure_options:
+                    return ' | '.join(pure_options)
+                else:
+                    # 모든 부분이 summary와 일치하면 빈 문자열 (옵션 없음)
+                    return ''
+            
+            # "|" 없이 summary와 완전히 일치하면 빈 문자열 (옵션 없음)
+            if option == summary:
+                return ''
+            
+            # 그 외의 경우 원본 반환
+            return option
+        
+        # menu_option_name을 순수 옵션으로 변환
+        joined_df['menu_option_name'] = joined_df.apply(extract_pure_option, axis=1)
+        
+        # ⭐ order_summary는 제거하지 않고 유지
+        print(f"[메뉴옵션] order_summary 유지, menu_option_name에서 중복 제거 완료")
+        print(f"[샘플] order_summary: {joined_df['order_summary'].head(3).tolist()}")
+        print(f"[샘플] menu_option_name: {joined_df['menu_option_name'].head(3).tolist()}")
+    else:
+        print(f"[경고] order_summary 또는 menu_option_name 컬럼 없음")
+
+    # ⭐ 임시 컬럼 제거
+    temp_cols_to_drop = [c for c in joined_df.columns if c in ['store_names_match']]
+    if temp_cols_to_drop:
+        joined_df = joined_df.drop(columns=temp_cols_to_drop)
+        print(f"[임시컬럼] 제거: {temp_cols_to_drop}")
+
+    # ⭐ 최종 컬럼 순서 (order_summary 포함)
     col = [
         'platform', 'order_date', 'store_id', 'store_names',
-        'ad_id', 'ad_product', 'order_id', 'sub_order_id', 'order_summary', 'menu_option_name',
+        'ad_id', 'ad_product', 'order_id', 'sub_order_id', 
+        'order_summary',  # ⭐ 메인 메뉴
+        'menu_option_name',  # ⭐ 순수 옵션만
         'delivery_type', 'total_amount', 'menu_amount', 'menu_option_price',
-        'instant_discount_coupon',
-        'collected_at_x', 'option_qty', 'fee_ad', 'settlement_amount',
-        '매장명', '담당자', '상세주소',
-        '광역', '시군구', '읍면동', 'collected_at_y', 'email', '_row_hash',
+        'instant_discount_coupon', 'instant_discount_coupon_YN',
+        'collected_at', 'option_qty', 'fee_ad', 'settlement_amount',
+        '매장명', '담당자', 'email', '상세주소',
         '실오픈일'
     ]
 
+    # ⭐ 필수 컬럼 확인 및 추가
+    print(f"\n[컬럼 확인] 현재 joined_df 컬럼: {list(joined_df.columns)}")
+    print(f"[컬럼 확인] 담당자 값 존재: {(joined_df['담당자'] != '').sum():,}건")
+    print(f"[컬럼 확인] email 값 존재: {(joined_df['email'] != '').sum():,}건")
+    
     for c in col:
         if c not in joined_df.columns:
             joined_df[c] = np.nan
-            print(f"[INFO] 컬럼 추가: {c} (NaN)")
+            print(f"[컬럼 추가] {c} (NaN)")
 
     joined_df = joined_df[[c for c in col if c in joined_df.columns]]
     joined_df.rename(columns={'collected_at_x': 'collected_at', 'collected_at_y': 'employee_collected_at'}, inplace=True)
 
-    if 'platform' in joined_df.columns:
-        print(f"📊 저장 전 Platform 분포: {joined_df['platform'].value_counts().to_dict()}")
+    # ⭐ 디버깅: 실오픈일 확인
+    if '실오픈일' in joined_df.columns:
+        non_null_count = joined_df['실오픈일'].notna().sum()
+        print(f"[DEBUG] 실오픈일 컬럼 존재 - 값 있음: {non_null_count}건")
+        if non_null_count > 0:
+            print(f"[DEBUG] 실오픈일 샘플: {joined_df['실오픈일'].dropna().head(3).tolist()}")
+    else:
+        print(f"[경고] 실오픈일 컬럼 없음!")
 
     temp_dir = LOCAL_DB / 'temp'
     temp_dir.mkdir(exist_ok=True, parents=True)
@@ -765,7 +1046,7 @@ def send_completion_email(except_employee=None, **context):
     # ⭐ 날짜 정의 (명확히 구분)
     # ============================================================
     # 수집일자 = DAG 실행일
-    collection_date = context.get('ds', datetime.now().strftime('%Y-%m-%d'))
+    collection_date = datetime.now().strftime('%Y-%m-%d')  # ⭐ ds 제거
     
     # 수집기준일 = 어제 (주문 데이터 기준일)
     target_date = (pd.to_datetime(collection_date) - timedelta(days=1)).strftime('%Y-%m-%d')
@@ -809,7 +1090,7 @@ def send_completion_email(except_employee=None, **context):
         return "CSV 로드 실패"
     
     print(f"[집계] 전체 데이터: {len(orders_df):,}건")
-    
+
     # ============================================================
     # ⭐ order_date 파싱 개선 (배민/쿠팡 형식 모두 지원)
     # ============================================================
@@ -945,26 +1226,123 @@ def send_completion_email(except_employee=None, **context):
         print(f"[오류] 직원 DB 파일 없음: {employee_path}")
         return "직원 DB 파일 없음"
     
-    # 4. 수집 현황 집계 (매장명 기준)
+    # ⭐ 직원 데이터와 merge (매장명 기준 담당자/이메일 추가)
+    print(f"[이메일] 매장명 기준 직원 데이터 merge 시작...")
+    
+    try:
+        # 직원 데이터에서 최종 매장명 추출 (끝 2단어)
+        employee_df['매장명_key'] = employee_df['매장명'].astype(str).str.split(' ').str[-2:].str.join(' ')
+        employee_df = employee_df[['매장명', '매장명_key', '담당자', 'email']].drop_duplicates(subset=['매장명_key'], keep='first')
+        
+        # orders_df와 merge
+        orders_df = orders_df.merge(
+            employee_df[['매장명_key', '담당자', 'email']],
+            left_on='매장명',
+            right_on='매장명_key',
+            how='left'
+        )
+        
+        # merge된 담당자/email로 업데이트
+        orders_df['담당자'] = orders_df['담당자'].fillna('미배정')
+        orders_df['email'] = orders_df['email'].fillna('')
+        
+        # 불필요한 컬럼 제거
+        if '매장명_key' in orders_df.columns:
+            orders_df.drop(columns=['매장명_key'], inplace=True)
+        
+        print(f"[이메일] Merge 완료: {(orders_df['담당자'] != '미배정').sum():,}건 / {len(orders_df):,}건")
+        
+    except Exception as e:
+        print(f"[이메일] Merge 실패 (계속 진행): {e}")
+    
+    # 4. 수집 현황 집계 (매장명 기준) - 수집기준일 기준으로 필터링
     collected_by_store_platform = {}
+    orders_filtered = pd.DataFrame()  # 초기화
     
     if len(orders_df) > 0:
-        for _, row in orders_df.iterrows():
-            # ⭐ 매장명 우선 순위: 매장명 > store_name
-            store = row.get('매장명', None)
-            if pd.isna(store) or not store:
-                store = row.get('store_name', None)
-            
-            platform = row.get('platform', None)
-            
-            if store and platform and not pd.isna(store) and not pd.isna(platform):
-                if store not in collected_by_store_platform:
-                    collected_by_store_platform[store] = set()
-                collected_by_store_platform[store].add(platform)
+        print(f"[수집 현황] 전체 데이터 건수: {len(orders_df):,}건")
+        print(f"[수집 현황] 데이터 날짜 범위: {orders_df['order_date'].min()} ~ {orders_df['order_date'].max()}")
+        
+        # ⭐ 수집기준일 데이터만 필터링 (이메일 현황용)
+        target_date_str = target_date  # 'YYYY-MM-DD' 형식
+        orders_filtered = orders_df[orders_df['order_date'].dt.strftime('%Y-%m-%d') == target_date_str].copy()
+        
+        print(f"[수집 현황] 수집기준일({target_date_str}) 데이터: {len(orders_filtered):,}건")
+        
+        if len(orders_filtered) > 0:
+            for _, row in orders_filtered.iterrows():
+                # ⭐ 매장명 우선 순위: 매장명 > store_name > store_names > stores
+                store = None
+                store_columns = ['매장명', 'store_name', 'store_names', 'stores']
+                
+                for col in store_columns:
+                    if col in row.index:
+                        store_val = row.get(col, None)
+                        if pd.notna(store_val) and str(store_val).strip():
+                            store = str(store_val).strip()
+                            break
+                
+                if not store:
+                    print(f"[경고] 매장명 없음: {dict(row)}")
+                    continue
+                
+                platform = row.get('platform', None)
+                
+                # ⭐ platform 표준화 (배민/쿠팡으로 통일)
+                if platform and not pd.isna(platform):
+                    platform = str(platform).strip()
+                    if not platform or platform == 'nan':
+                        platform = None
+                    else:
+                        # 플랫폼 이름 표준화
+                        platform_lower = platform.lower()
+                        if 'baemin' in platform_lower or '배민' in platform_lower:
+                            platform = '배민'
+                        elif 'coupang' in platform_lower or '쿠팡' in platform_lower:
+                            platform = '쿠팡'
+                        else:
+                            print(f"[경고] 알 수 없는 플랫폼: {platform}")
+                
+                if store and platform and not pd.isna(store) and platform:
+                    store = str(store).strip()
+                    if store not in collected_by_store_platform:
+                        collected_by_store_platform[store] = set()
+                    collected_by_store_platform[store].add(platform)
+        else:
+            print(f"[경고] 수집기준일({target_date_str})에 해당하는 데이터가 없습니다.")
+    else:
+        print(f"[경고] 전체 주문 데이터가 없습니다.")
     
     print(f"[이메일] 수집된 매장 수: {len(collected_by_store_platform)}개")
     if len(collected_by_store_platform) > 0:
         print(f"[이메일] 수집된 매장 목록 샘플: {list(collected_by_store_platform.keys())[:5]}")
+        print(f"[이메일] 수집된 플랫폼 분포:")
+        for store, platforms in list(collected_by_store_platform.items())[:5]:
+            print(f"  {store}: {list(platforms)}")
+    else:
+        print(f"[경고] 수집된 매장이 없습니다. 데이터 확인 필요!")
+        # 원본 데이터 확인 (컬럼명 안전하게 처리)
+        if len(orders_df) > 0:
+            print(f"[디버깅] 원본 데이터 플랫폼 분포: {orders_df['platform'].value_counts().to_dict()}")
+            # 매장 관련 컬럼 찾기
+            store_columns = [col for col in orders_df.columns if '매장' in col or 'store' in col.lower()]
+            print(f"[디버깅] 매장 관련 컬럼: {store_columns}")
+            if store_columns:
+                main_store_col = store_columns[0]
+                store_sample = orders_df[main_store_col].dropna().unique()[:5].tolist()
+                print(f"[디버깅] 원본 데이터 매장 샘플({main_store_col}): {store_sample}")
+            else:
+                print(f"[디버깅] 매장 관련 컬럼이 없습니다. 전체 컬럼: {list(orders_df.columns)}")
+        if len(orders_filtered) > 0:
+            print(f"[디버깅] 필터링된 데이터 플랫폼 분포: {orders_filtered['platform'].value_counts().to_dict()}")
+            # 매장 관련 컬럼 찾기
+            store_columns = [col for col in orders_filtered.columns if '매장' in col or 'store' in col.lower()]
+            if store_columns:
+                main_store_col = store_columns[0]
+                store_sample = orders_filtered[main_store_col].dropna().unique()[:5].tolist()
+                print(f"[디버깅] 필터링된 데이터 매장 샘플({main_store_col}): {store_sample}")
+            else:
+                print(f"[디버깅] 필터링된 데이터에 매장 관련 컬럼이 없습니다.")
     
     # 담당자별 보고서 생성
     manager_reports = {}
@@ -984,6 +1362,7 @@ def send_completion_email(except_employee=None, **context):
             for platform in available_platforms:
                 if store in collected_by_store_platform:
                     if platform in collected_by_store_platform[store]:
+
                         collected_count += 1
                         store_has_data = True
             if store_has_data:
@@ -1258,8 +1637,10 @@ def send_completion_email(except_employee=None, **context):
         print(f"[이메일] ❌ 발송 실패 (무시하고 진행): {e}")
         return f"이메일 발송 실패: {e}"
 
+
 # ============================================================
 # 📧 매출 이상 알람 이메일 (점수 상세 내역 표시 버전)
+# ============================================================
 # ============================================================
 def send_alert_email(**context):
     """
@@ -1296,9 +1677,8 @@ def send_alert_email(**context):
     # ⭐ 날짜 정의 (명확히 구분)
     # ============================================================
     # 수집일자 = DAG 실행일
-    dag_run_date = context.get('ds', datetime.now().strftime('%Y-%m-%d'))
+    dag_run_date = datetime.now().strftime('%Y-%m-%d')  # ✅ 추가
     
-    # 알림기준일 = 어제 (매출 분석일)
     yesterday = (pd.to_datetime(dag_run_date) - timedelta(days=1)).strftime('%Y-%m-%d')
     
     print(f"[알림] 수집일자 (DAG 실행일): {dag_run_date}")
@@ -1654,66 +2034,87 @@ def aggregate_daily_sales(
     from datetime import datetime, timedelta
     ti = context['task_instance']
     
-    csv_path = LOCAL_DB / '영업관리부_DB' / 'sales_daily_orders.csv'
-    
-    if not csv_path.exists():
-        print(f"[경고] CSV 파일 없음: {csv_path}")
-        ti.xcom_push(key=output_xcom_key, value=None)
-        return "0건 (CSV 없음)"
-    
     # ============================================================
-    # ⭐ CSV 로드 (파싱 전략 개선)
+    # ⭐ Parquet 로드 (merge된 데이터 사용)
     # ============================================================
     print(f"\n{'='*60}")
-    print(f"[CSV 로드] 시작: {csv_path.name}")
+    print(f"[데이터 로드] 시작...")
     
-    try:
-        # 1차: parse_dates 없이 먼저 읽기 (원본 확인용)
-        for encoding in ['utf-8-sig', 'utf-8', 'cp949']:
-            try:
-                orders_df_raw = pd.read_csv(
-                    csv_path, 
-                    encoding=encoding, 
-                    low_memory=False,
-                    nrows=5
-                )
-                print(f"[샘플 로드] 성공 ({encoding})")
-                print(f"[샘플] order_date 원본: {orders_df_raw['order_date'].tolist()}")
-                break
-            except UnicodeDecodeError:
-                continue
+    # 이전 단계의 merge된 parquet 파일 사용
+    parquet_path = ti.xcom_pull(task_ids=input_task_id, key=input_xcom_key)
+    
+    if parquet_path:
+        print(f"[Parquet 로드] 경로: {parquet_path}")
+        try:
+            orders_df = pd.read_parquet(parquet_path)
+            print(f"[Parquet 로드] 성공: {len(orders_df):,}건")
+        except Exception as e:
+            print(f"[경고] Parquet 로드 실패: {e}")
+            # Fallback: CSV 사용
+            print(f"[Fallback] CSV로 전환")
+            orders_df = None
+    else:
+        print(f"[경고] Parquet 경로 없음")
+        orders_df = None
+    
+    # Parquet 실패 시 CSV로 Fallback
+    if orders_df is None:
+        csv_path = LOCAL_DB / '영업관리부_DB' / 'sales_daily_orders.csv'
         
-        # 2차: 전체 로드 (parse_dates 사용)
-        for encoding in ['utf-8-sig', 'utf-8', 'cp949']:
-            try:
-                orders_df = pd.read_csv(
-                    csv_path, 
-                    encoding=encoding, 
-                    low_memory=False,
-                    parse_dates=['order_date'],
-                    date_format='%Y-%m-%d %H:%M'
-                )
-                print(f"[전체 로드] 성공: {len(orders_df):,}건 ({encoding})")
-                break
-            except UnicodeDecodeError:
-                continue
-            except Exception as e:
-                print(f"[경고] parse_dates 실패 ({encoding}): {e}")
+        if not csv_path.exists():
+            print(f"[오류] CSV 파일도 없음: {csv_path}")
+            ti.xcom_push(key=output_xcom_key, value=None)
+            return "0건 (데이터 없음)"
+        
+        print(f"[CSV 로드] 시작: {csv_path.name}")
+        
+        try:
+            # 1차: parse_dates 없이 먼저 읽기 (원본 확인용)
+            for encoding in ['utf-8-sig', 'utf-8', 'cp949']:
+                try:
+                    orders_df_raw = pd.read_csv(
+                        csv_path, 
+                        encoding=encoding, 
+                        low_memory=False,
+                        nrows=5
+                    )
+                    print(f"[샘플 로드] 성공 ({encoding})")
+                    print(f"[샘플] order_date 원본: {orders_df_raw['order_date'].tolist()}")
+                    break
+                except UnicodeDecodeError:
+                    continue
+            
+            # 2차: 전체 로드 (parse_dates 사용)
+            for encoding in ['utf-8-sig', 'utf-8', 'cp949']:
                 try:
                     orders_df = pd.read_csv(
                         csv_path, 
                         encoding=encoding, 
-                        low_memory=False
+                        low_memory=False,
+                        parse_dates=['order_date'],
+                        date_format='%Y-%m-%d %H:%M'
                     )
-                    print(f"[전체 로드] 성공 (parse_dates 없음): {len(orders_df):,}건")
+                    print(f"[전체 로드] 성공: {len(orders_df):,}건 ({encoding})")
                     break
                 except UnicodeDecodeError:
                     continue
-    
-    except Exception as e:
-        print(f"[오류] CSV 로드 실패: {e}")
-        ti.xcom_push(key=output_xcom_key, value=None)
-        return "CSV 로드 실패"
+                except Exception as e:
+                    print(f"[경고] parse_dates 실패 ({encoding}): {e}")
+                    try:
+                        orders_df = pd.read_csv(
+                            csv_path, 
+                            encoding=encoding, 
+                            low_memory=False
+                        )
+                        print(f"[전체 로드] 성공 (parse_dates 없음): {len(orders_df):,}건")
+                        break
+                    except UnicodeDecodeError:
+                        continue
+        
+        except Exception as e:
+            print(f"[오류] CSV 로드 실패: {e}")
+            ti.xcom_push(key=output_xcom_key, value=None)
+            return "CSV 로드 실패"
     
     print(f"[로드 완료] 전체 데이터: {len(orders_df):,}건")
     
@@ -1828,40 +2229,8 @@ def aggregate_daily_sales(
     print(f"\n{'='*60}")
     print(f"[날짜 필터링] 시작...")
     
-    dag_run_date = context.get('ds', datetime.now().strftime('%Y-%m-%d'))
-    yesterday = (pd.to_datetime(dag_run_date) - timedelta(days=1)).strftime('%Y-%m-%d')
-    yesterday_end = pd.to_datetime(yesterday) + timedelta(days=1)
-    
-    print(f"[기준일] DAG 실행일: {dag_run_date}")
-    print(f"[기준일] 집계 대상: {yesterday} (전날까지)")
-    print(f"[필터링] 조건: order_date < {yesterday_end}")
-    
-    # 필터링 전 통계
-    before_filter = len(orders_df)
-    date_min_before = orders_df['order_date'].min()
-    date_max_before = orders_df['order_date'].max()
-    
-    print(f"[필터링 전] 건수: {before_filter:,}건")
-    print(f"[필터링 전] 날짜 범위: {date_min_before} ~ {date_max_before}")
-    
-    # 필터링 실행
-    orders_df = orders_df[orders_df['order_date'] < yesterday_end].copy()
-    
-    # 필터링 후 통계
-    after_filter = len(orders_df)
-    
-    if after_filter > 0:
-        date_min_after = orders_df['order_date'].min()
-        date_max_after = orders_df['order_date'].max()
-        
-        print(f"[필터링 후] 건수: {after_filter:,}건")
-        print(f"[필터링 후] 날짜 범위: {date_min_after} ~ {date_max_after}")
-        print(f"[필터링 후] 제거: {before_filter - after_filter:,}건")
-    else:
-        print(f"[오류] ❌ 필터링 후 데이터 없음!")
-        ti.xcom_push(key=output_xcom_key, value=None)
-        return "0건 (필터링 후 데이터 없음)"
-    
+    dag_run_date = datetime.now().strftime('%Y-%m-%d')
+
     # order_daily 컬럼 생성
     orders_df['order_daily'] = orders_df['order_date'].dt.strftime('%Y-%m-%d')
     
@@ -1874,10 +2243,182 @@ def aggregate_daily_sales(
     
     print(f"{'='*60}\n")
     
+    # ⭐ 매장명 정제 (담당자 매칭 정확도 향상)
+    # 우선순위: 매장명 > stores > store_names > store_name > Unknown
     if '매장명' in orders_df.columns:
         orders_df['매장명_clean'] = orders_df['매장명']
-    else:
+    elif 'stores' in orders_df.columns:
+        orders_df['매장명_clean'] = orders_df['stores']
+    elif 'store_names' in orders_df.columns:
+        orders_df['매장명_clean'] = orders_df['store_names']
+    elif 'store_name' in orders_df.columns:
         orders_df['매장명_clean'] = orders_df['store_name']
+    else:
+        orders_df['매장명_clean'] = 'Unknown'
+    
+    # 매장명 정제 (공백 제거, null 처리)
+    orders_df['매장명_clean'] = orders_df['매장명_clean'].astype(str).str.strip()
+    orders_df.loc[orders_df['매장명_clean'].isin(['', 'nan', 'None', 'null']), '매장명_clean'] = 'Unknown'
+    
+    print(f"[매장명 정제] 완료")
+    print(f"[매장명 샘플] {orders_df['매장명_clean'].unique()[:5].tolist()}")
+    
+    # '매장명' 컬럼이 없으면 생성
+    if '매장명' not in orders_df.columns:
+        orders_df['매장명'] = orders_df['매장명_clean']
+    
+    # ============================================================
+    # ⭐ 직원 데이터 로드 및 merge (담당자/email 정보 추가)
+    # ============================================================
+    print(f"[직원 데이터] 로드 시작...")
+    
+    employee_path = LOCAL_DB / '영업관리부_DB' / 'sales_employee.csv'
+    
+    if employee_path.exists():
+        try:
+            # 여러 인코딩 시도
+            for encoding in ['utf-8-sig', 'utf-8', 'cp949']:
+                try:
+                    employee_df = pd.read_csv(employee_path, encoding=encoding)
+                    print(f"[직원 데이터] 로드 성공: {len(employee_df):,}건 ({encoding})")
+                    print(f"[직원 데이터] 컬럼: {list(employee_df.columns)}")
+                    break
+                except UnicodeDecodeError:
+                    continue
+            
+            # 직원 데이터 정제 (개선된 매장명 매칭)
+            # '매장명' 컬럼 기준으로 merge 
+            if '매장명' in employee_df.columns:
+                # ⭐ 개선: 다양한 매장명 변형으로 매칭 시도
+                # 1) 원본 매장명 (전체)
+                employee_df['store_names_full'] = employee_df['매장명'].astype(str).str.strip()
+                
+                # 2) 매장명 끝 2단어 (예: "도리당 강남점" → "강남점")  
+                employee_df['store_names_short'] = employee_df['매장명'].astype(str).str.split(' ').str[-2:].str.join(' ')
+                
+                # 3) 매장명 끝 1단어 (예: "강남점")
+                employee_df['store_names_last'] = employee_df['매장명'].astype(str).str.split(' ').str[-1]
+                
+                # 중복 제거 (같은 매장명에 여러 담당자가 있을 수 있으므로 첫 번째만 사용)
+                employee_df = employee_df.drop_duplicates(subset=['store_names_full'], keep='first')
+                
+                print(f"[직원 데이터] 중복 제거 후: {len(employee_df):,}건")
+                print(f"[직원 데이터] 매장명 샘플: {employee_df['store_names_full'].head(3).tolist()}")
+                print(f"[직원 데이터] 담당자 샘플: {employee_df['담당자'].head(3).tolist()}")
+                
+                orders_df_before = len(orders_df)
+                orders_df['매칭성공'] = False  # 매칭 추적용
+                
+                # ⭐ 단계별 매칭 시도 (정확도 순서)
+                # 1단계: 전체 매장명 매칭
+                emp_full = employee_df[['store_names_full', '담당자', 'email']].copy()
+                emp_full.columns = ['매장명_key', 'emp_담당자', 'emp_email']
+                
+                orders_merge1 = orders_df.merge(
+                    emp_full, left_on='매장명_clean', right_on='매장명_key', how='left'
+                )
+                
+                # 매칭된 행 업데이트
+                matched_mask = orders_merge1['emp_담당자'].notna()
+                orders_df.loc[matched_mask, '담당자'] = orders_merge1.loc[matched_mask, 'emp_담당자']
+                orders_df.loc[matched_mask, 'email'] = orders_merge1.loc[matched_mask, 'emp_email']
+                orders_df.loc[matched_mask, '매칭성공'] = True
+                
+                match1_count = matched_mask.sum()
+                print(f"[1단계 매칭] 전체 매장명: {match1_count:,}건")
+                
+                # 2단계: 끝 2단어 매칭 (1단계에서 매칭 안된 것들)
+                remaining_mask = ~orders_df['매칭성공']
+                if remaining_mask.sum() > 0:
+                    emp_short = employee_df[['store_names_short', '담당자', 'email']].copy()
+                    emp_short.columns = ['매장명_key', 'emp_담당자', 'emp_email']
+                    
+                    orders_remaining = orders_df[remaining_mask].copy()
+                    orders_merge2 = orders_remaining.merge(
+                        emp_short, left_on='매장명_clean', right_on='매장명_key', how='left'
+                    )
+                    
+                    matched_mask2 = orders_merge2['emp_담당자'].notna()
+                    if matched_mask2.sum() > 0:
+                        remaining_indices = orders_df[remaining_mask].index[matched_mask2]
+                        orders_df.loc[remaining_indices, '담당자'] = orders_merge2.loc[matched_mask2, 'emp_담당자']
+                        orders_df.loc[remaining_indices, 'email'] = orders_merge2.loc[matched_mask2, 'emp_email']
+                        orders_df.loc[remaining_indices, '매칭성공'] = True
+                    
+                    match2_count = matched_mask2.sum()
+                    print(f"[2단계 매칭] 끝 2단어: {match2_count:,}건")
+                
+                # 3단계: 끝 1단어 매칭 (1,2단계에서 매칭 안된 것들)
+                remaining_mask = ~orders_df['매칭성공']
+                if remaining_mask.sum() > 0:
+                    emp_last = employee_df[['store_names_last', '담당자', 'email']].copy()
+                    emp_last.columns = ['매장명_key', 'emp_담당자', 'emp_email']
+                    
+                    orders_remaining = orders_df[remaining_mask].copy()
+                    orders_merge3 = orders_remaining.merge(
+                        emp_last, left_on='매장명_clean', right_on='매장명_key', how='left'
+                    )
+                    
+                    matched_mask3 = orders_merge3['emp_담당자'].notna()
+                    if matched_mask3.sum() > 0:
+                        remaining_indices = orders_df[remaining_mask].index[matched_mask3]
+                        orders_df.loc[remaining_indices, '담당자'] = orders_merge3.loc[matched_mask3, 'emp_담당자']
+                        orders_df.loc[remaining_indices, 'email'] = orders_merge3.loc[matched_mask3, 'emp_email']
+                        orders_df.loc[remaining_indices, '매칭성공'] = True
+                    
+                    match3_count = matched_mask3.sum()
+                    print(f"[3단계 매칭] 끝 1단어: {match3_count:,}건")
+                
+                # 전체 매칭 결과
+                total_matched = orders_df['매칭성공'].sum()
+                print(f"[전체 매칭] 성공: {total_matched:,}건 / {orders_df_before:,}건 ({total_matched/orders_df_before*100:.1f}%)")
+                
+                # 매칭 안된 매장 확인
+                unmatched_stores = orders_df[~orders_df['매칭성공']]['매장명_clean'].unique()
+                if len(unmatched_stores) > 0:
+                    print(f"[미매칭 매장] {len(unmatched_stores)}개: {unmatched_stores[:5].tolist()}")
+                
+                # 임시 컬럼 제거
+                orders_df.drop(columns=['매칭성공'], inplace=True)
+                
+            else:
+                print(f"[직원 데이터] '매장명' 컬럼 없음: {list(employee_df.columns)}")
+                
+        except Exception as e:
+            print(f"[경고] 직원 데이터 merge 실패: {e}")
+            import traceback
+            traceback.print_exc()
+            # merge 실패시 기본값 사용
+            pass
+    else:
+        print(f"[경고] 직원 데이터 파일 없음: {employee_path}")
+    
+    # ⭐ 최종 담당자/이메일 정리
+    if '담당자' not in orders_df.columns:
+        orders_df['담당자'] = '미배정'
+        print(f"[INFO] 담당자 컬럼 추가 (기본값: 미배정)")
+    else:
+        # NaN을 '미배정'으로 변환
+        before_na = orders_df['담당자'].isna().sum()
+        orders_df['담당자'] = orders_df['담당자'].fillna('미배정')
+        print(f"[INFO] 담당자 NaN → '미배정' 변환: {before_na}건")
+    
+    if 'email' not in orders_df.columns:
+        orders_df['email'] = ''
+        print(f"[INFO] email 컬럼 추가 (기본값: 공백)")
+    else:
+        # NaN을 공백으로 변환
+        before_na = orders_df['email'].isna().sum()
+        orders_df['email'] = orders_df['email'].fillna('')
+        print(f"[INFO] email NaN → 공백 변환: {before_na}건")
+    
+    # 담당자 분포 확인
+    manager_dist = orders_df['담당자'].value_counts()
+    print(f"[담당자 분포] 총 {len(manager_dist)}명:")
+    for manager, count in manager_dist.head(10).items():
+        print(f"  {manager}: {count:,}건")
+    if len(manager_dist) > 10:
+        print(f"  ... 외 {len(manager_dist)-10}명")
     
     # ============================================================
     # ⭐ 1️⃣ 기본 집계 (플랫폼 합침) - 알람용
@@ -1885,7 +2426,10 @@ def aggregate_daily_sales(
     print(f"\n{'='*60}")
     print(f"[1단계] 플랫폼 합친 기본 집계...")
     
-    daily_agg = orders_df.groupby(['order_daily', '매장명_clean', '담당자', 'email']).agg(
+    daily_agg = orders_df.groupby(
+        ['order_daily', '매장명_clean', '담당자', 'email'],
+        dropna=False  # ⭐ NaN도 그룹에 포함 (안전장치)
+    ).agg(
         total_order_count=('order_id', 'nunique'),
         total_amount=('total_amount', 'sum'),
         fee_ad=('fee_ad', 'sum'),
@@ -1909,7 +2453,10 @@ def aggregate_daily_sales(
     print(f"\n{'='*60}")
     print(f"[2단계] 플랫폼별 집계 및 Pivot 변환...")
     
-    daily_platform = orders_df.groupby(['order_daily', '매장명_clean', '담당자', 'email', 'platform']).agg(
+    daily_platform = orders_df.groupby(
+        ['order_daily', '매장명_clean', '담당자', 'email', 'platform'],
+        dropna=False  # ⭐ NaN도 그룹에 포함 (안전장치)
+    ).agg(
         total_order_count=('order_id', 'nunique'),
         total_amount=('total_amount', 'sum'),
         fee_ad=('fee_ad', 'sum'),
@@ -2424,50 +2971,6 @@ def calculate_scores(
         if ti and output_xcom_key:
             ti.xcom_push(key=output_xcom_key, value=str(output_path))
 
-        # ⭐ CSV 저장: sales_daily_orders_alerts.csv
-        csv_path = LOCAL_DB / '영업관리부_DB' / 'sales_daily_orders_alerts.csv'
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        try:
-            df_csv = df.copy()
-            
-            # ⭐ 불필요한 컬럼 제거 (저장용)
-            cols_to_drop = ['_row_hash', 'collected_at', 'order_date_with_time']
-            for col in cols_to_drop:
-                if col in df_csv.columns:
-                    df_csv.drop(columns=[col], inplace=True)
-                    print(f"[CSV 저장] {col} 컬럼 제거")
-            
-            # ⭐ order_daily 문자열로 확정 (datetime 아님!)
-            if 'order_daily' in df_csv.columns:
-                if pd.api.types.is_datetime64_any_dtype(df_csv['order_daily']):
-                    df_csv['order_daily'] = df_csv['order_daily'].dt.strftime('%Y-%m-%d')
-                    print(f"[CSV 저장] order_daily를 datetime에서 문자열로 변환")
-                else:
-                    df_csv['order_daily'] = df_csv['order_daily'].astype(str)
-                    print(f"[CSV 저장] order_daily 타입 확인: {df_csv['order_daily'].dtype}")
-            
-            # 임시 파일로 저장 후 교체
-            import tempfile
-            import shutil
-            
-            with tempfile.NamedTemporaryFile(
-                mode='w', delete=False, dir=str(csv_path.parent),
-                prefix='tmp_alerts_', suffix='.csv'
-            ) as tmp_file:
-                tmp_csv_path = tmp_file.name
-            
-            df_csv.to_csv(tmp_csv_path, index=False, encoding='utf-8-sig')
-            shutil.move(tmp_csv_path, csv_path)
-            print(f"[CSV 저장] sales_daily_orders_alerts.csv: {len(df_csv):,}건")
-            print(f"[CSV 저장] 저장 경로: {csv_path}")
-            shutil.move(tmp_csv_path, csv_path)
-            print(f"[CSV 저장] sales_daily_orders_alerts.csv: {len(df_csv):,}건")
-        except Exception as e:
-            print(f"[CSV 저장 실패] {e}")
-            if 'tmp_csv_path' in locals() and os.path.exists(tmp_csv_path):
-                os.remove(tmp_csv_path)
-        
         print("\n" + "="*50)
         print("[스코어 계산] 완료")
         print("="*50)
@@ -2497,8 +3000,62 @@ def filter_alerts(
     import numpy as np
     import shutil
     import tempfile
+    import time
     from datetime import datetime, timedelta
     ti = context['task_instance']
+    
+    def safe_csv_save(df, csv_path, description="CSV", max_attempts=3):
+        """
+        안전한 CSV 저장 함수 (권한 문제 해결)
+        """
+        for attempt in range(max_attempts):
+            try:
+                # 임시 파일에 먼저 저장
+                temp_path = csv_path.parent / f"temp_{csv_path.name}.tmp"
+                df.to_csv(temp_path, index=False, encoding='utf-8-sig')
+                
+                # 기존 파일 제거 시도 (있는 경우)
+                if csv_path.exists():
+                    try:
+                        # 파일 읽기 전용 속성 제거 시도
+                        import stat
+                        csv_path.chmod(stat.S_IWRITE | stat.S_IREAD)
+                        csv_path.unlink()  # pathlib의 unlink 사용 (더 안전)
+                    except (OSError, PermissionError) as e:
+                        print(f"[경고] {description} 기존 파일 삭제 실패 (시도 {attempt+1}/{max_attempts}): {e}")
+                        # 파일명에 타임스탬프 추가하여 새 파일로 저장 시도
+                        if attempt == max_attempts - 1:
+                            from datetime import datetime
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            new_name = csv_path.stem + f"_{timestamp}" + csv_path.suffix
+                            csv_path = csv_path.parent / new_name
+                            print(f"[INFO] 기존 파일 삭제 불가로 새 파일명으로 저장: {csv_path.name}")
+                        else:
+                            time.sleep(1)  # 1초 대기 후 재시도
+                            continue
+                
+                # 임시 파일을 최종 파일로 이동
+                temp_path.rename(csv_path)
+                print(f"[✅ {description}] 저장 완료: {len(df):,}건 → {csv_path.name}")
+                return True
+                
+            except (OSError, PermissionError) as e:
+                print(f"[경고] {description} 저장 실패 (시도 {attempt+1}/{max_attempts}): {e}")
+                
+                # 임시 파일 정리
+                if 'temp_path' in locals() and temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except:
+                        pass
+                
+                if attempt == max_attempts - 1:
+                    print(f"[❌ 에러] {max_attempts}번 시도 후에도 {description} 저장 실패: {e}")
+                    raise
+                else:
+                    time.sleep(1)  # 1초 대기 후 재시도
+        
+        return False
     
     parquet_path = ti.xcom_pull(task_ids=input_task_id, key=input_xcom_key)
     
@@ -2528,7 +3085,7 @@ def filter_alerts(
     print(f"[필터링] ds: {ds_dt.date() if ds_dt is not None else 'None'}")
     print(f"[필터링] 사용 일자: {target_date.date() if pd.notnull(target_date) else 'N/A'} ({target_reason})")
 
-    # ⭐⭐⭐ 전체 집계 CSV는 항상 저장 (어제 데이터 유무와 상관없이) ⭐⭐⭐
+    # ⭐⭐⭐ 1. 전체 집계 CSV 저장: sales_daily_orders_alerts.csv ⭐⭐⭐
     csv_path = LOCAL_DB / '영업관리부_DB' / 'sales_daily_orders_alerts.csv'
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -2536,53 +3093,58 @@ def filter_alerts(
     combined_df = df.sort_values(['매장명', '담당자', 'order_daily']).reset_index(drop=True)
     print(f"[CSV] 전체 집계 데이터: {len(combined_df):,}건")
     
+    # ⭐ 담당자 정보 확인 (CSV 저장 전)
+    if '담당자' in combined_df.columns:
+        manager_counts = combined_df['담당자'].value_counts()
+        print(f"[CSV 저장 전] 담당자 분포: 총 {len(manager_counts)}명")
+        print(f"[CSV 저장 전] 미배정 건수: {manager_counts.get('미배정', 0):,}건")
+        print(f"[CSV 저장 전] 담당자 TOP 5: {dict(manager_counts.head())}")
+        
+        # 담당자별 샘플 매장 표시
+        for manager in manager_counts.head(3).index:
+            sample_stores = combined_df[combined_df['담당자'] == manager]['매장명'].unique()[:3]
+            print(f"[담당자 샘플] {manager}: {list(sample_stores)}")
+    else:
+        print(f"[경고] '담당자' 컬럼이 없습니다: {list(combined_df.columns)}")
+    
     try:
-        # order_daily 문자열 변환
         combined_df_save = combined_df.copy()
         
-        # ⭐ 불필요한 컬럼 제거 (저장용)
+        # 불필요한 컬럼 제거
         cols_to_drop = ['_row_hash', 'collected_at', 'order_date_with_time']
         for col in cols_to_drop:
             if col in combined_df_save.columns:
                 combined_df_save.drop(columns=[col], inplace=True)
                 print(f"[CSV 저장] {col} 컬럼 제거")
         
-        # ⭐ order_daily 문자열로 확정 (datetime 아님!)
+        # order_daily 문자열 변환
         if 'order_daily' in combined_df_save.columns:
             if pd.api.types.is_datetime64_any_dtype(combined_df_save['order_daily']):
                 combined_df_save['order_daily'] = combined_df_save['order_daily'].dt.strftime('%Y-%m-%d')
-                print(f"[CSV 저장] order_daily를 datetime에서 문자열로 변환")
             else:
                 combined_df_save['order_daily'] = combined_df_save['order_daily'].astype(str)
-                print(f"[CSV 저장] order_daily 타입 확인: {combined_df_save['order_daily'].dtype}")
         
-        # 전체 집계 CSV 저장
-        with tempfile.NamedTemporaryFile(
-            mode='w', delete=False, dir=str(csv_path.parent),
-            prefix='tmp_grp_', suffix='.csv'
-        ) as tmp_file:
-            tmp_path = tmp_file.name
+        # 안전한 CSV 저장 (헬퍼 함수 사용)
+        safe_csv_save(combined_df_save, csv_path, "전체 집계 CSV")
         
-        combined_df_save.to_csv(tmp_path, index=False, encoding='utf-8-sig')
-        shutil.move(tmp_path, csv_path)
-        print(f"[✅ CSV] 전체 집계 저장 완료: {len(combined_df_save):,}건 → {csv_path.name}")
+        print(f"[✅ CSV] 전체 집계 저장: {len(combined_df_save):,}건 → {csv_path.name}")
         
     except Exception as e:
         print(f"[❌ 에러] 전체 집계 CSV 저장 실패: {e}")
-        if 'tmp_path' in locals() and os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        raise
 
-    # ⭐ 대상 일자만 필터링
+    # ============================================================
+    # 2. 대상 일자 필터링
+    # ============================================================
     df_target = df[df['order_daily'] == target_date].copy()
-
     print(f"[필터링] 대상일({target_date.date() if pd.notnull(target_date) else 'N/A'}) 데이터: {len(df_target):,}건")
 
     if len(df_target) == 0:
-        print(f"[경고] 대상일 데이터가 없습니다 → 알림 대상 없음 (전체 집계는 저장됨)")
+        print(f"[경고] 대상일 데이터가 없습니다 → 알림 대상 없음")
         ti.xcom_push(key=output_xcom_key, value=None)
-        return f"알림 대상 없음 (대상일 데이터 없음, 전체 집계 {len(combined_df):,}건 저장됨)"
+        return f"알림 대상 없음 (전체 집계 {len(combined_df):,}건 저장됨)"
     
-    # 알람 조건 (대상 일자 데이터)
+    # 알람 조건
     alert_targets = df_target[
         (df_target['status'] == '위험') |
         ((df_target['status'] == '주의') & (df_target['pre_status'] == '주의'))
@@ -2590,7 +3152,46 @@ def filter_alerts(
     
     print(f"[필터링] 알람 대상: {len(alert_targets):,}건")
     
-    # ⭐ Parquet 저장
+    # ============================================================
+    # ⭐ 3. 알림 대상 CSV 저장: sales_daily_orders_alerts_grp.csv
+    # ============================================================
+    alerts_csv_path = LOCAL_DB / '영업관리부_DB' / 'sales_daily_orders_alerts_grp.csv'
+    alerts_csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if len(alert_targets) > 0:
+        alert_targets_sorted = alert_targets.sort_values(
+            ['매장명', '담당자', 'order_daily']
+        ).reset_index(drop=True)
+        
+        try:
+            alert_save = alert_targets_sorted.copy()
+            
+            # 불필요한 컬럼 제거
+            cols_to_drop = ['_row_hash', 'collected_at', 'order_date_with_time']
+            for col in cols_to_drop:
+                if col in alert_save.columns:
+                    alert_save.drop(columns=[col], inplace=True)
+                    print(f"[CSV 저장] {col} 컬럼 제거")
+            
+            # order_daily 문자열 변환
+            if 'order_daily' in alert_save.columns:
+                if pd.api.types.is_datetime64_any_dtype(alert_save['order_daily']):
+                    alert_save['order_daily'] = alert_save['order_daily'].dt.strftime('%Y-%m-%d')
+                else:
+                    alert_save['order_daily'] = alert_save['order_daily'].astype(str)
+
+            # 안전한 CSV 저장 (헬퍼 함수 사용)
+            safe_csv_save(alert_save, alerts_csv_path, "알림 대상 CSV")
+            
+        except Exception as e:
+            print(f"[❌ 에러] 알림 대상 CSV 저장 실패: {e}")
+            raise
+    else:
+        print(f"[INFO] 알림 대상 없음 → {alerts_csv_path.name} 파일 미생성")
+
+    # ============================================================
+    # 4. Parquet 저장 (XCom 전달용)
+    # ============================================================
     temp_dir = LOCAL_DB / 'temp'
     temp_dir.mkdir(exist_ok=True, parents=True)
     
@@ -2598,44 +3199,10 @@ def filter_alerts(
     alert_targets.to_parquet(parquet_output, index=False, engine='pyarrow')
     print(f"[Parquet] 저장: {parquet_output.name}")
     
-    # ⭐ Alert 대상 CSV 저장: sales_daily_orders_grp_alert.csv (어제 기준)
-    alerts_csv_path = LOCAL_DB / '영업관리부_DB' / 'sales_daily_orders_grp_alert.csv'
-    alerts_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    ti.xcom_push(key=output_xcom_key, value=str(parquet_output) if len(alert_targets) > 0 else None)
 
-    alert_targets_sorted = alert_targets.sort_values(['매장명', '담당자', 'order_daily']).reset_index(drop=True)
-    try:
-        alert_save = alert_targets_sorted.copy()
-        
-        # ⭐ 불필요한 컬럼 제거 (저장용)
-        cols_to_drop = ['_row_hash', 'collected_at', 'order_date_with_time']
-        for col in cols_to_drop:
-            if col in alert_save.columns:
-                alert_save.drop(columns=[col], inplace=True)
-                print(f"[CSV 저장] {col} 컬럼 제거")
-        
-        # ⭐ order_daily 문자열로 확정 (datetime 아님!)
-        if 'order_daily' in alert_save.columns:
-            if pd.api.types.is_datetime64_any_dtype(alert_save['order_daily']):
-                alert_save['order_daily'] = alert_save['order_daily'].dt.strftime('%Y-%m-%d')
-                print(f"[CSV 저장] order_daily를 datetime에서 문자열로 변환")
-            else:
-                alert_save['order_daily'] = alert_save['order_daily'].astype(str)
-                print(f"[CSV 저장] order_daily 타입 확인: {alert_save['order_daily'].dtype}")
+    return f"✅ 저장 완료: 전체 {len(combined_df):,}건, 알림 {len(alert_targets):,}건"
 
-        with tempfile.NamedTemporaryFile(
-            mode='w', delete=False, dir=str(alerts_csv_path.parent),
-            prefix='tmp_alert_', suffix='.csv'
-        ) as tmp_file:
-            tmp_alert_path = tmp_file.name
 
-        alert_save.to_csv(tmp_alert_path, index=False, encoding='utf-8-sig')
-        shutil.move(tmp_alert_path, alerts_csv_path)
-        print(f"[CSV] 알림 대상 저장 완료: {len(alert_save):,}건 → {alerts_csv_path.name}")
-    except Exception as e:
-        if 'tmp_alert_path' in locals() and os.path.exists(tmp_alert_path):
-            os.remove(tmp_alert_path)
-        raise e
 
-    ti.xcom_push(key=output_xcom_key, value=str(parquet_output))
-
-    return f"✅ CSV 저장 완료: alert {len(alert_targets):,}건 (어제 기준), 전체 {len(combined_df):,}건"
+# 전처리 추가

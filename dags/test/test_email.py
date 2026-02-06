@@ -1,3 +1,4 @@
+# 테스트 26-01-23 문제없음
 import pendulum
 from airflow import DAG
 from airflow.providers.smtp.operators.smtp import EmailOperator

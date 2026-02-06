@@ -6,9 +6,10 @@ import pandas as pd
 import sys
 from pathlib import Path
 import datetime as dt
+from airflow.sensors.external_task import ExternalTaskSensor
+from modules.transform.utility.io3 import SMD_ORDERS_TIME
 
-# sales_operation_now_dags.py 파일 상단
-from modules.transform.pipelines.sales_04_orders_marketing import (
+from modules.transform.pipelines.SMD_05_store_ordesr_marketing import (
     load_beamin_ad_change_history_df,
     baemin_marketing_store_click_df,
     coupangeats_cmg_df,
@@ -20,29 +21,26 @@ from modules.transform.pipelines.sales_04_orders_marketing import (
     left_join_orders_history,
     left_join_orders_history_click,
     left_join_orders_history_click_coupang,
-    preprocess_fin_df, # 전처리
-    fin_save_to_csv # 저장
+    preprocess_fin_df,
+    fin_save_to_csv
 )
 
-from modules.transform.utility.io3 import join_dataframes
+from modules.transform.utility.io3 import join_dataframes, sales_cleanup_collected_csvs
+from modules.transform.utility.paths import COLLECT_DB, LOCAL_DB
 
 filename = os.path.basename(__file__)
 
 # 1. 주문 로직 정의
 def merge_orders_history_df(left_df, right_df):
     """주문 데이터 + 변경 이력 병합"""
-    
-    # 1. 날짜 전처리 (merge 전에)
     left_df["order_daily_day"] = (
         pd.to_datetime(
             left_df["order_daily"].astype(str),
             format="mixed",
             errors="coerce"
-        )
-        .dt.normalize()  # 00:00:00으로 정규화
+        ).dt.normalize()
     )
     
-    # 2. 병합
     merged_df = pd.merge(
         left_df,
         right_df,
@@ -64,68 +62,98 @@ def join_orders_history(**context):
         **context
     )
 
+
+def _smd_04_execution_date_fn(execution_date):
+    """SMD_04의 최근 스케줄 실행 시간을 기준으로 대기"""
+    kst = execution_date.in_timezone("Asia/Seoul")
+    target = kst.replace(hour=12, minute=30, second=0, microsecond=0)
+
+    # 수동 실행이 12:30 이전이면 직전 주차(월요일) 실행으로 이동
+    if target > kst:
+        target = target.subtract(weeks=1)
+
+    return target.in_timezone("UTC")
+
+
 with DAG(
     dag_id=filename.replace('.py', ''),
-    schedule="0 11 * * 1,3",
+    schedule=SMD_ORDERS_TIME,  # 매주 월,수 10:30 실행
     start_date=pendulum.datetime(2023, 1, 1, tz="Asia/Seoul"),
     catchup=False,
+    max_active_runs=1,  # 🔒 동시 실행 방지
+    default_args={
+        'retries': 1,
+        'retry_delay': dt.timedelta(minutes=5),
+        'depends_on_past': False,
+        'email_on_failure': False,
+        'email_on_retry': False,
+    },
     tags=['02_sales', 'crawling', 'coupang'],
 ) as dag:
     
-    # 변경이력 수집
+    # ============================================================
+    # 0️⃣ SMD_04 완료 대기
+    # ============================================================
+    wait_for_smd_04 = ExternalTaskSensor(
+        task_id='wait_for_smd_04',
+        external_dag_id='SMD_04_store_orders_amount_join_Dags',
+        external_task_id='upload_final_csv',
+        allowed_states=['success'],
+        failed_states=['failed', 'skipped'],
+        execution_date_fn=_smd_04_execution_date_fn,
+        mode='reschedule',  # ⭐ poke → reschedule
+        timeout=600,  # ← 수정: 1800 → 600 (10분, SMD_04 완료 안되면 빠르게 실패)
+        poke_interval=120,  # ← 수정: 60 → 120 (2분마다 체크)
+        check_existence=False,  # ← 추가: task 없으면 skip
+        soft_fail=True,  # ← 추가: timeout 시 DAG 실패하지 않고 스킵
+    )
+    
+    # ============================================================
+    # 1️⃣ 데이터 로드 및 전처리
+    # ============================================================
     task_load_beamin_ad_change_history = PythonOperator(
         task_id='load_beamin_ad_change_history_df',
         python_callable=load_beamin_ad_change_history_df,
     )
     
-    # 변경이력 전처리
     task_preprocess_beamin_ad_change_history = PythonOperator(
         task_id='preprocess_beamin_ad_change_history_df',
         python_callable=preprocess_beamin_ad_change_history_df,
     )
     
-    
-    # store_click_df 수집
     task_load_baemin_marketing_store_click = PythonOperator(
         task_id='baemin_marketing_store_click_df',
         python_callable=baemin_marketing_store_click_df,
     )
     
-    # store_click_df 전처리
     task_preprocess_store_click = PythonOperator(
         task_id='preprocess_store_click_df',
         python_callable=preprocess_store_click_df,
     )
     
-    
-    
-    # 쿠팡광고 수집
     task_load_coupangeats_cmg = PythonOperator(
         task_id='coupangeats_cmg_df',
         python_callable=coupangeats_cmg_df,
     )
     
-    # 쿠팡광고 전처리
     task_preprocess_coupangeats_cmg = PythonOperator(
         task_id='preprocess_coupangeats_cmg_df',
         python_callable=preprocess_coupangeats_cmg_df,
     )   
-        
     
-    # 주문데이터 수집
     task_load_orders_upload = PythonOperator(
         task_id='load_orders_upload_df',
         python_callable=load_orders_upload_df,
     )
     
-    # 주문데이터 전처리
     task_preprocess_orders_upload = PythonOperator(
         task_id='preprocess_orders_upload_df',
         python_callable=preprocess_orders_upload_df,
     )   
-
-    # 병합
-    # 주문 + 변경이력 left 조인
+    
+    # ============================================================
+    # 2️⃣ JOIN 태스크들
+    # ============================================================
     task_left_orders_history = PythonOperator(
         task_id='left_join_orders_history',
         python_callable=left_join_orders_history,
@@ -146,7 +174,6 @@ with DAG(
         }
     )
     
-    ## 주문 + 변경이력 + 우가클 left 조인
     task_left_orders_history_click = PythonOperator(
         task_id='left_join_orders_history_click',
         python_callable=left_join_orders_history_click,
@@ -167,7 +194,6 @@ with DAG(
         }
     )
     
-    ## 주문 + 변경이력 + 우가클 left 조인 + 쿠팡광고
     task_left_orders_history_click_coupang = PythonOperator(
         task_id='left_join_orders_history_click_coupang',
         python_callable=left_join_orders_history_click_coupang,
@@ -188,46 +214,56 @@ with DAG(
         }
     )
     
-    # 최종 전처리
     task_preprocess_fin_df = PythonOperator(
         task_id='preprocess_fin_df',
         python_callable=preprocess_fin_df,
-        op_kwargs={
-            'input_xcom_key': 'joined_orders_history_click_coupang_path',
-            'output_xcom_key': 'final_processed_path',
-        },
     )
     
-    # 2. 최종 저장 태스크
     task_fin_save_to_csv = PythonOperator(
         task_id='fin_save_to_csv',
         python_callable=fin_save_to_csv,
         op_kwargs={
-            'input_task_id': 'preprocess_fin_df',  # 전처리 태스크 ID
-            'input_xcom_key': 'final_processed_path' # 저장된 XCom 키
+            'input_task_id': 'preprocess_fin_df',
+            'input_xcom_key': 'final_processed_path'
         },
     )
-
-
-
-# 1. 개별 수집 및 전처리 흐름
-task_load_beamin_ad_change_history >> task_preprocess_beamin_ad_change_history
-task_load_baemin_marketing_store_click >> task_preprocess_store_click
-task_load_coupangeats_cmg >> task_preprocess_coupangeats_cmg
-task_load_orders_upload >> task_preprocess_orders_upload
-
-# 2. 병합 흐름 (파이프라인)
-# 주문 데이터 전처리가 완료되면 -> 변경이력 병합 -> 그 결과에 우리가게클릭 병합
-task_preprocess_orders_upload >> task_left_orders_history
-
-# 변경이력 전처리가 완료되어야 병합이 가능함
-task_preprocess_beamin_ad_change_history >> task_left_orders_history
-
-# 우리가게클릭 전처리가 완료되어야 병합이 가능함
-task_preprocess_store_click >> task_left_orders_history_click
-
-# (주문+변경이력) 결과와 (우리가게클릭) 전처리가 완료되면 최종 병합
-[task_left_orders_history, task_preprocess_store_click] >> task_left_orders_history_click
-
-# (주문+변경이력+우리가게클릭) 결과와 (쿠팡광고) 전처리가 완료되면 최종 병합
-[task_left_orders_history_click, task_preprocess_coupangeats_cmg] >> task_left_orders_history_click_coupang >> task_preprocess_fin_df >> task_fin_save_to_csv
+    
+    cleanup_task = PythonOperator(
+        task_id='move_collected_files',
+        python_callable=sales_cleanup_collected_csvs,
+        op_kwargs={
+            'patterns': [
+                'baemin_ad_change_history_*.csv',
+                'baemin_marketing_*.csv',
+                'coupangeats_cmg_*.csv'
+            ],
+            'source_dir': str(COLLECT_DB / '영업관리부_수집'),
+            'dest_dir': '/opt/airflow/download/업로드_temp'
+        }
+    )
+    
+    # ============================================================
+    # 의존성 정의 (⭐ 핵심 수정)
+    # ============================================================
+    
+    # 0. SMD_04 완료 후 모든 로드 시작
+    wait_for_smd_04 >> [
+        task_load_beamin_ad_change_history,
+        task_load_baemin_marketing_store_click,
+        task_load_coupangeats_cmg,
+        task_load_orders_upload
+    ]
+    
+    # 1. 개별 전처리
+    task_load_beamin_ad_change_history >> task_preprocess_beamin_ad_change_history
+    task_load_baemin_marketing_store_click >> task_preprocess_store_click
+    task_load_coupangeats_cmg >> task_preprocess_coupangeats_cmg
+    task_load_orders_upload >> task_preprocess_orders_upload
+    
+    # 2. JOIN 체인
+    [task_preprocess_orders_upload, task_preprocess_beamin_ad_change_history] >> task_left_orders_history
+    [task_left_orders_history, task_preprocess_store_click] >> task_left_orders_history_click
+    [task_left_orders_history_click, task_preprocess_coupangeats_cmg] >> task_left_orders_history_click_coupang
+    
+    # 3. 최종 처리
+    task_left_orders_history_click_coupang >> task_preprocess_fin_df >> task_fin_save_to_csv >> cleanup_task

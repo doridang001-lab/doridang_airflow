@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from modules.transform.utility.paths import LOCAL_DB
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -145,6 +146,48 @@ def crawl_toorder_review(**context):
     }
 
 
+def cleanup_collected_csvs(patterns, dest_dir, **context):
+    """
+    OneDrive 수집 폴더의 CSV 파일들을 지정된 경로로 이동
+    
+    Args:
+        patterns: 이동할 파일 패턴 리스트 (예: ['baemin_*.csv'])
+        dest_dir: 목적지 디렉토리 (컨테이너 경로)
+    """
+    import glob as glob_module
+    import shutil
+    from pathlib import Path
+    from modules.transform.utility.paths import COLLECT_DB
+    
+    collect_dir = LOCAL_DB # 적재 전 수집 폴더
+    dest_path = Path(dest_dir) # LOCAL_DB "업로드_temp"
+    
+    # 목적지 디렉토리 생성
+    dest_path.mkdir(parents=True, exist_ok=True)
+    
+    moved_count = 0
+    for pattern in patterns:
+        file_pattern = str(collect_dir / pattern)
+        files = glob_module.glob(file_pattern)
+        
+        print(f"\n[이동] 패턴: {pattern}")
+        print(f"   찾은 파일: {len(files)}개")
+        
+        for file_path in files:
+            try:
+                source = Path(file_path)
+                destination = dest_path / source.name
+                
+                shutil.move(str(source), str(destination))
+                print(f"   ✅ 이동: {source.name} → {destination}")
+                moved_count += 1
+            except Exception as e:
+                print(f"   ⚠️  이동 실패: {Path(file_path).name} - {e}")
+    
+    print(f"\n✅ 총 {moved_count}개 파일 이동 완료")
+    return f"이동 완료: {moved_count}개"
+
+
 # ============================================================
 # DAG 정의
 # ============================================================
@@ -166,4 +209,14 @@ with DAG(
         python_callable=crawl_toorder_review,
     )
     
-    crawl_task
+    # 적재파일 이동
+    move_files_task = PythonOperator(
+        task_id='cleanup_collected_csvs',
+        python_callable=cleanup_collected_csvs,
+        op_kwargs={
+            'patterns': ['toorder_review_*.csv'], # 이동할 파일 패턴
+            'dest_dir': str(LOCAL_DB / "업로드_temp"), # 목적지 디렉토리
+        },
+    )
+    
+    crawl_task >> move_files_task

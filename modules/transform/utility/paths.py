@@ -7,7 +7,7 @@ import platform
 # 2) 컨테이너 마운트 경로 (/opt/airflow/Doridang) 존재 시
 # 3) Windows 로컬 사용자 OneDrive 경로
 # 4) 마지막으로 홈 디렉터리 내 OneDrive 추정 경로
-
+# from modules.transform.utility.paths import ONEDRIVE_DB, COLLECT_DB, LOCAL_DB, TEMP_D
 
 def resolve_onedrive_db() -> Path:
 	# 1) 환경변수 우선
@@ -113,7 +113,42 @@ def resolve_temp_dir() -> Path:
 	return fallback
 
 
+def resolve_down_dir() -> Path:
+	"""다운로드 기본 디렉터리 경로.
+
+	우선순위:
+	1) 환경변수 `DOWN_DIR`
+	2) Windows 기본 경로 `E:/down`
+	3) 컨테이너 기본 경로 `/opt/airflow/download`
+	4) 현재 작업 디렉터리 하위 `download`
+	"""
+	# 1) 환경변수 우선
+	env_path = os.getenv("DOWN_DIR")
+	if env_path:
+		p = Path(env_path)
+		p.mkdir(parents=True, exist_ok=True)
+		return p
+
+	# 2) Windows 기본 경로
+	if platform.system() == "Windows":
+		win_down = Path("E:/down")
+		win_down.mkdir(parents=True, exist_ok=True)
+		return win_down
+
+	# 3) 컨테이너 기본 경로
+	container_down = Path("/opt/airflow/download")
+	if container_down.parent.exists():
+		container_down.mkdir(parents=True, exist_ok=True)
+		return container_down
+
+	# 4) Fallback
+	fallback = Path.cwd() / "download"
+	fallback.mkdir(parents=True, exist_ok=True)
+	return fallback
+
+
 ONEDRIVE_DB = resolve_onedrive_db()
 COLLECT_DB = resolve_collect_db()
 LOCAL_DB = resolve_local_db()
 TEMP_DIR = resolve_temp_dir()
+DOWN_DIR = resolve_down_dir()

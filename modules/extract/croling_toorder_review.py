@@ -26,6 +26,7 @@ import re
 import shutil
 import os
 import platform
+import subprocess  # 추가
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
@@ -173,6 +174,27 @@ def split_into_random_batches(items: List, size_range: tuple) -> List[List]:
     
     return batches
 
+def get_chrome_version():
+    """Chrome 버전 감지"""
+    try:
+        chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/google-chrome")
+        result = subprocess.run(
+            [chrome_bin, "--version"], 
+            capture_output=True, 
+            text=True, 
+            timeout=5
+        )
+        # "Google Chrome 143.0.7499.192" → 143
+        version_str = result.stdout.strip()
+        version_match = re.search(r'(\d+)\.', version_str)
+        if version_match:
+            major_version = int(version_match.group(1))
+            log(f"Chrome 감지 버전: {major_version} (전체: {version_str})", "SYSTEM")
+            return major_version
+    except Exception as e:
+        log(f"Chrome 버전 감지 실패: {e}", "SYSTEM")
+    return None
+
 
 # ============================================================================
 # 브라우저 / 로그인
@@ -207,13 +229,25 @@ def launch_browser(account_id: str):
     options.add_experimental_option("prefs", prefs)
     
     try:
-        driver = uc.Chrome(options=options)
+        # Chrome 버전 자동 감지
+        chrome_version = get_chrome_version()
+        
+        if chrome_version:
+            log(f"ChromeDriver 버전: {chrome_version} 사용", account_id)
+            driver = uc.Chrome(
+                options=options,
+                version_main=chrome_version
+            )
+        else:
+            # 버전 감지 실패 시 자동
+            log(f"Chrome 버전 자동 매칭 시도", account_id)
+            driver = uc.Chrome(options=options)
+            
         log(f"✅ 브라우저 실행 성공", account_id)
         return driver
     except Exception as e:
         log(f"❌ 브라우저 실행 실패: {e}", account_id)
         raise
-
 
 def wait_for_react_load(driver, timeout=10):
     """React 앱 로드 대기"""
@@ -1118,7 +1152,7 @@ if __name__ == "__main__":
     print("\n[테스트 2] 특정 기간 수집")
     result_df = run_toorder_review_crawling(
         test_account_df,
-        start_date="2026-01-17",
-        end_date="2026-01-17"
+        start_date="2026-01-31",
+        end_date="2026-02-01"
     )
     print(result_df[["account_id", "target_date", "success", "file_size_mb", "error"]])

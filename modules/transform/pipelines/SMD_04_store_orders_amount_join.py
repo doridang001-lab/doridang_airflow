@@ -409,7 +409,7 @@ def preprocess_baemin_store_now_df(**context):
     col = ['collected_date', 'stores_name', '조리소요시간',
            '조리소요시간_순위비율', '주문접수시간', '주문접수시간_순위비율',
            '조리시간준수율', '조리시간준수율_순위비율', '주문접수율',
-           '주문접수율_순위비율', '최근별점']
+           '주문접수율_순위비율', '최근재주문율', '최근별점']
     
     now_df = now_df[col]
     
@@ -1172,6 +1172,621 @@ def preprocess_add_main_left_join_df(
     
     return f"전처리: {len(df):,}행"
 
+
+# ============================================================
+# 담당자별 점수 계산 (매장별 집계 데이터 → 담당자별 재집계)
+# ============================================================
+def calculate_manager_scores(
+    input_task_id,
+    input_xcom_key,
+    output_xcom_key,
+    **context
+):
+    """
+    매장별 집계 데이터를 담당자별로 재집계하여 점수 계산
+    """
+    import numpy as np
+    from datetime import datetime, timedelta
+    ti = context['task_instance']
+    
+    print(f"\n{'='*60}")
+    print(f"[담당자 점수 계산] 시작...")
+    
+    # ============================================================
+    # 1. 매장별 집계 데이터 로드
+    # ============================================================
+    parquet_path = ti.xcom_pull(task_ids=input_task_id, key=input_xcom_key)
+    
+    if not parquet_path:
+        csv_path = LOCAL_DB / '영업관리부_DB' / 'sales_daily_orders.csv'
+        
+        if not csv_path.exists():
+            print(f"[오류] 데이터 파일 없음")
+            ti.xcom_push(key=output_xcom_key, value=None)
+            return "0건 (데이터 없음)"
+        
+        print(f"[CSV 로드] {csv_path.name}")
+        
+        try:
+            for encoding in ['utf-8-sig', 'utf-8', 'cp949']:
+                try:
+                    df = pd.read_csv(csv_path, encoding=encoding, low_memory=False)
+                    print(f"[로드 성공] {len(df):,}건 ({encoding})")
+                    break
+                except UnicodeDecodeError:
+                    continue
+        except Exception as e:
+            print(f"[오류] CSV 로드 실패: {e}")
+            ti.xcom_push(key=output_xcom_key, value=None)
+            return "CSV 로드 실패"
+    else:
+        print(f"[Parquet 로드] {parquet_path}")
+        df = pd.read_parquet(parquet_path)
+        print(f"[로드 성공] {len(df):,}건")
+    
+    # ⭐ order_date → order_daily 컬럼명 통일
+    if 'order_date' in df.columns and 'order_daily' not in df.columns:
+        df.rename(columns={'order_date': 'order_daily'}, inplace=True)
+        print(f"[컬럼 변환] order_date → order_daily")
+    
+    # ⭐ store_names → 매장명 (담당자 집계용)
+    if 'store_names' in df.columns and '매장명' not in df.columns:
+        df.rename(columns={'store_names': '매장명'}, inplace=True)
+        print(f"[컬럼 변환] store_names → 매장명")
+    
+    # ⭐ 필수 컬럼 확인
+    required_cols = ['order_daily', '담당자', 'email']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    
+    if missing_cols:
+        print(f"\n[❌ 에러] 필수 컬럼 없음: {missing_cols}")
+        print(f"[사용 가능 컬럼] {df.columns.tolist()[:20]}")
+        ti.xcom_push(key=output_xcom_key, value=None)
+        return f"0건 (필수 컬럼 없음: {missing_cols})"
+    
+    # ============================================================
+    # 2. 날짜 변환 (⭐ 필터링 제거 - 모든 데이터 사용)
+    # ============================================================
+    df['order_daily'] = pd.to_datetime(df['order_daily'])
+    
+    print(f"[날짜 범위] {df['order_daily'].min()} ~ {df['order_daily'].max()}")
+    print(f"[전체 데이터] {len(df):,}건")
+    
+    if len(df) == 0:
+        print(f"[오류] 데이터 없음")
+        ti.xcom_push(key=output_xcom_key, value=None)
+        return "0건 (데이터 없음)"
+    
+    # ============================================================
+    # 3. 담당자별 일별 재집계
+    # ============================================================
+    print(f"\n[담당자별 재집계] 시작...")
+
+    # ⭐ 집계 딕셔너리 생성
+    agg_dict = {}
+
+    if 'total_amount' in df.columns:
+        agg_dict['total_amount'] = ('total_amount', 'sum')
+    if 'fee_ad' in df.columns:
+        agg_dict['fee_ad'] = ('fee_ad', 'sum')
+    if 'settlement_amount' in df.columns:
+        agg_dict['settlement_amount'] = ('settlement_amount', 'sum')
+    if '매장명' in df.columns:
+        agg_dict['store_count'] = ('매장명', 'nunique')
+    if 'platform' in df.columns:
+        agg_dict['platform'] = ('platform', lambda x: ','.join(sorted(set(str(v) for v in x.dropna() if str(v) != 'nan'))))
+
+    # 주문 건수 계산
+    if 'order_id' in df.columns:
+        agg_dict['total_order_count'] = ('order_id', 'nunique')
+    elif 'sub_order_id' in df.columns:
+        agg_dict['total_order_count'] = ('sub_order_id', 'nunique')
+
+    if not agg_dict:
+        print(f"[❌ 에러] 집계 가능한 컬럼 없음")
+        ti.xcom_push(key=output_xcom_key, value=None)
+        return "0건 (집계 컬럼 없음)"
+
+    print(f"[집계 컬럼] {list(agg_dict.keys())}")
+
+    # ⭐ groupby + agg 실행
+    manager_daily = df.groupby(
+        ['order_daily', '담당자', 'email'],
+        dropna=False
+    ).agg(**agg_dict).reset_index()
+
+    # ⭐ 날짜 타입 명시적 변환
+    manager_daily['order_daily'] = pd.to_datetime(manager_daily['order_daily'])
+
+    # ARPU 계산
+    if 'total_amount' in manager_daily.columns and 'total_order_count' in manager_daily.columns:
+        manager_daily['ARPU'] = (
+            manager_daily['total_amount'] / 
+            manager_daily['total_order_count'].replace(0, np.nan)
+        ).round(0).fillna(0).astype(int)
+
+    print(f"[재집계 완료] {len(manager_daily):,}건")
+    print(f"[담당자 수] {manager_daily['담당자'].nunique()}명")
+    print(f"[날짜 범위] {manager_daily['order_daily'].min()} ~ {manager_daily['order_daily'].max()}")
+    print(f"[컬럼] {manager_daily.columns.tolist()}")
+    
+    # ============================================================
+    # 4. 담당자별 정렬 후 이동평균 계산
+    # ============================================================
+    print(f"\n[이동평균] 계산 중...")
+    
+    manager_daily = manager_daily.sort_values(['담당자', 'order_daily']).reset_index(drop=True)
+    
+    # ⭐ 요일 컬럼 먼저 생성
+    manager_daily['weekday'] = manager_daily['order_daily'].dt.day_name()
+    
+    # ⭐ 담당자별 그룹 인덱스 생성 (shift 연산용)
+    manager_daily['_담당자_idx'] = manager_daily.groupby('담당자').cumcount()
+    manager_daily['_담당자_요일_idx'] = manager_daily.groupby(['담당자', 'weekday']).cumcount()
+    
+    # --- 이동평균 계산 ---
+    # 14일 이동평균
+    manager_daily['ma_14'] = manager_daily.groupby('담당자')['total_amount'].transform(
+        lambda x: x.rolling(window=14, min_periods=7).mean()
+    ).round(2)
+    
+    # 28일 이동평균
+    manager_daily['ma_28'] = manager_daily.groupby('담당자')['total_amount'].transform(
+        lambda x: x.rolling(window=28, min_periods=14).mean()
+    ).round(2)
+    
+    # 최근 2주 평균 (= ma_14와 동일)
+    manager_daily['current_avg_2week'] = manager_daily['ma_14'].copy()
+    
+    # --- 요일별 shift 계산 (⭐ 핵심 수정) ---
+    # 담당자 + 요일별로 그룹화하여 매출만 shift
+    def safe_shift(group, periods):
+        """안전한 shift - 매출 컬럼만 shift"""
+        result = group['total_amount'].shift(periods).fillna(0).astype(int)
+        return result
+    
+    # 1주 전 동일 요일
+    manager_daily['prev_week_same_day'] = manager_daily.groupby(
+        ['담당자', 'weekday'], group_keys=False
+    ).apply(lambda x: safe_shift(x, 1)).values
+    
+    # 2주 전 동일 요일
+    manager_daily['prev_2week_same_day'] = manager_daily.groupby(
+        ['담당자', 'weekday'], group_keys=False
+    ).apply(lambda x: safe_shift(x, 2)).values
+    
+    # 3주 전 동일 요일
+    manager_daily['prev_3week_same_day'] = manager_daily.groupby(
+        ['담당자', 'weekday'], group_keys=False
+    ).apply(lambda x: safe_shift(x, 3)).values
+    
+    # 4주 전 동일 요일
+    manager_daily['prev_4week_same_day'] = manager_daily.groupby(
+        ['담당자', 'weekday'], group_keys=False
+    ).apply(lambda x: safe_shift(x, 4)).values
+    
+    # ⭐ 최근 4주 동일 요일 평균 (1~4주 전)
+    def calc_4week_avg(group):
+        """최근 4주 동일 요일 평균"""
+        result = group['total_amount'].shift(1).rolling(
+            window=4, min_periods=2
+        ).mean().fillna(0).round(2)
+        return result
+    
+    manager_daily['avg_4week_same_day'] = manager_daily.groupby(
+        ['담당자', 'weekday'], group_keys=False
+    ).apply(calc_4week_avg).values
+    
+    # --- 7일 합계 계산 ---
+    # 최근 7일 합계
+    manager_daily['sum_7d_recent'] = manager_daily.groupby('담당자')['total_amount'].transform(
+        lambda x: x.rolling(window=7, min_periods=1).sum()
+    ).astype(int)
+    
+    # 이전 7일 합계 (8~14일 전)
+    manager_daily['sum_7d_prev'] = manager_daily.groupby('담당자')['total_amount'].transform(
+        lambda x: x.shift(7).rolling(window=7, min_periods=1).sum()
+    ).fillna(0).astype(int)
+    
+    # ⭐ 임시 인덱스 컬럼 제거
+    manager_daily.drop(columns=['_담당자_idx', '_담당자_요일_idx'], inplace=True)
+    
+    print(f"[이동평균] 완료")
+    
+    # ============================================================
+    # 5. 점수 계산
+    # ============================================================
+    print(f"\n[점수 계산] 시작...")
+    
+    def calc_score(current, baseline):
+        """점수 계산 (0~2점)"""
+        if pd.isna(current) or pd.isna(baseline) or baseline == 0:
+            return 0
+        
+        change_rate = (current - baseline) / baseline
+        
+        if change_rate >= 0:
+            return 0
+        elif change_rate > -0.1:
+            return 1
+        else:
+            return 2
+    
+    # 1. 트렌드 점수 (14일MA vs 28일MA)
+    manager_daily['score_trend'] = manager_daily.apply(
+        lambda row: calc_score(row['ma_14'], row['ma_28']),
+        axis=1
+    )
+    
+    # 2. 일일 점수 (오늘 vs 전주 동일 요일)
+    manager_daily['score_total'] = manager_daily.apply(
+        lambda row: calc_score(row['total_amount'], row['prev_week_same_day']),
+        axis=1
+    )
+    
+    # 3. 주간 점수 (최근7일 vs 이전7일)
+    manager_daily['score_7d_total'] = manager_daily.apply(
+        lambda row: calc_score(row['sum_7d_recent'], row['sum_7d_prev']),
+        axis=1
+    )
+    
+    # 4. 월간 점수 (오늘 vs 최근 4주 동일요일 평균)
+    manager_daily['score_4week_total'] = manager_daily.apply(
+        lambda row: calc_score(row['total_amount'], row['avg_4week_same_day']),
+        axis=1
+    )
+    
+    # 종합 점수
+    manager_daily['score'] = (
+        manager_daily['score_trend'] + 
+        manager_daily['score_total'] + 
+        manager_daily['score_7d_total'] + 
+        manager_daily['score_4week_total']
+    )
+    
+    # 상태 판정
+    manager_daily['status'] = np.where(
+        manager_daily['score'] >= 6, '위험',
+        np.where(
+            manager_daily['score'] >= 4, '주의',
+            '정상'
+        )
+    )
+    
+    # 이전 상태
+    manager_daily['pre_status'] = manager_daily.groupby('담당자')['status'].shift(1).fillna('정상')
+    
+    print(f"[점수 분포]")
+    print(f"  {manager_daily['score'].value_counts().sort_index().to_dict()}")
+    print(f"[상태 분포]")
+    print(f"  {manager_daily['status'].value_counts().to_dict()}")
+    
+    # ============================================================
+    # 6. 전일/전주/전월 비교
+    # ============================================================
+    print(f"\n[비교 데이터] 계산 중...")
+
+    # ⭐ 원본 데이터 백업
+    manager_daily_original = manager_daily[['order_daily', '담당자', 'total_amount', 'settlement_amount']].copy()
+    manager_daily_original['order_daily'] = pd.to_datetime(manager_daily_original['order_daily'])
+
+    # ⭐ 주/월 단위 Period 추가
+    manager_daily['order_week'] = manager_daily['order_daily'].dt.to_period('W')
+    manager_daily['order_month'] = manager_daily['order_daily'].dt.to_period('M')
+
+    # ────────────────────────────────────────
+    # 1. 전일 비교 (일별) - 유지
+    # ────────────────────────────────────────
+    df_prev = manager_daily_original.copy()
+    df_prev['join_date'] = df_prev['order_daily'] + pd.Timedelta(days=1)
+    df_prev = df_prev.rename(columns={
+        'total_amount': '전일_매출',
+        'settlement_amount': '전일_정산금액'
+    })
+    df_prev = df_prev[['join_date', '담당자', '전일_매출', '전일_정산금액']]
+
+    manager_daily = manager_daily.merge(
+        df_prev,
+        left_on=['order_daily', '담당자'],
+        right_on=['join_date', '담당자'],
+        how='left'
+    ).drop(columns=['join_date'])
+
+    print(f"  ✓ 전일 비교 완료")
+
+    # ────────────────────────────────────────
+    # 2-1. 전주 동요일 비교 (7일 전 동일 요일) - 기존 유지
+    # ────────────────────────────────────────
+    df_prev_week = manager_daily_original.copy()
+    df_prev_week['join_date'] = df_prev_week['order_daily'] + pd.Timedelta(days=7)
+    df_prev_week = df_prev_week.rename(columns={
+        'total_amount': '전주_매출',  # ⭐ 전주 동요일
+        'settlement_amount': '전주_정산금액'
+    })
+    df_prev_week = df_prev_week[['join_date', '담당자', '전주_매출', '전주_정산금액']]
+
+    manager_daily = manager_daily.merge(
+        df_prev_week,
+        left_on=['order_daily', '담당자'],
+        right_on=['join_date', '담당자'],
+        how='left'
+    ).drop(columns=['join_date'])
+
+    print(f"  ✓ 전주 동요일 비교 완료")
+
+    # ────────────────────────────────────────
+    # 2-2. 전주 총합 비교 (주간 총합) - ⭐ 새로 추가
+    # ────────────────────────────────────────
+    # 담당자별 주간 총합 계산
+    manager_daily_original['order_week'] = manager_daily_original['order_daily'].dt.to_period('W')
+
+    weekly = manager_daily_original.groupby(['담당자', 'order_week']).agg({
+        'total_amount': 'sum',
+        'settlement_amount': 'sum'
+    }).reset_index()
+
+    # 전주 데이터 생성
+    weekly['order_week_next'] = weekly['order_week'] + 1
+    weekly = weekly.rename(columns={
+        'total_amount': '전주_총매출',  # ⭐ 전주 7일 총합
+        'settlement_amount': '전주_총정산금액'
+    })
+
+    # 조인
+    manager_daily = manager_daily.merge(
+        weekly[['담당자', 'order_week_next', '전주_총매출', '전주_총정산금액']],
+        left_on=['담당자', 'order_week'],
+        right_on=['담당자', 'order_week_next'],
+        how='left'
+    ).drop(columns=['order_week_next'])
+
+    print(f"  ✓ 전주 총합 비교 완료")
+
+    # ────────────────────────────────────────
+    # 3. 전월 비교 (월 단위 총합)
+    # ────────────────────────────────────────
+    print(f"[전월 총합] 계산 중...")
+
+    # 담당자별 월간 총합 계산
+    manager_daily_original['order_month'] = manager_daily_original['order_daily'].dt.to_period('M')
+
+    monthly_sum = manager_daily_original.groupby(['담당자', 'order_month']).agg({
+        'total_amount': 'sum',
+        'settlement_amount': 'sum'
+    }).reset_index()
+
+    # 전월 데이터 생성
+    monthly_sum['order_month_next'] = monthly_sum['order_month'] + 1
+
+    monthly_sum = monthly_sum.rename(columns={
+        'total_amount': '전월_매출',  # ⭐ 컬럼명 통일
+        'settlement_amount': '전월_정산금액'
+    })
+
+    # 조인
+    manager_daily = manager_daily.merge(
+        monthly_sum[['담당자', 'order_month_next', '전월_매출', '전월_정산금액']],
+        left_on=['담당자', 'order_month'],
+        right_on=['담당자', 'order_month_next'],
+        how='left'
+    ).drop(columns=['order_month_next'])
+
+    print(f"   ✓ 전월 총합 완료")
+
+    # ⭐ 날짜 타입 재확인
+    manager_daily['order_daily'] = pd.to_datetime(manager_daily['order_daily'])
+
+    # 결측치 0 처리
+    for col in ['전일_매출', '전일_정산금액', 
+                '전주_매출', '전주_정산금액',  # 전주 동요일
+                '전주_총매출', '전주_총정산금액',  # 전주 총합 ⭐
+                '전월_매출', '전월_정산금액']:
+        if col in manager_daily.columns:
+            manager_daily[col] = manager_daily[col].fillna(0).astype(int)
+
+    # ────────────────────────────────────────
+    # 4. 증감액/증감률 계산
+    # ────────────────────────────────────────
+    # 전일 대비 (일별)
+    manager_daily['전일대비_증감액'] = (manager_daily['total_amount'] - manager_daily['전일_매출']).astype('Int64')
+    manager_daily['전일대비_증감률'] = (
+        (manager_daily['total_amount'] - manager_daily['전일_매출']) / 
+        manager_daily['전일_매출'].replace(0, np.nan) * 100
+    ).round(2)
+
+    # ⭐ 전주 동요일 대비 (일별 vs 일별)
+    manager_daily['전주동요일대비_증감액'] = (manager_daily['total_amount'] - manager_daily['전주_매출']).astype('Int64')
+    manager_daily['전주동요일대비_증감률'] = (
+        (manager_daily['total_amount'] - manager_daily['전주_매출']) / 
+        manager_daily['전주_매출'].replace(0, np.nan) * 100
+    ).round(2)
+
+    # ⭐ 전주 총합 대비 (현재 주 누적 vs 전주 총합)
+    manager_daily['현재주_누적매출'] = manager_daily.groupby(['담당자', 'order_week'])['total_amount'].transform('cumsum')
+
+    manager_daily['전주대비_증감액'] = (manager_daily['현재주_누적매출'] - manager_daily['전주_총매출']).astype('Int64')
+    manager_daily['전주대비_증감률'] = (
+        (manager_daily['현재주_누적매출'] - manager_daily['전주_총매출']) / 
+        manager_daily['전주_총매출'].replace(0, np.nan) * 100
+    ).round(2)
+
+    # ⭐ 전월 대비 (현재 월 누적 vs 전월 총합)
+    manager_daily['현재월_누적매출'] = manager_daily.groupby(['담당자', 'order_month'])['total_amount'].transform('cumsum')
+
+    manager_daily['전월대비_증감액'] = (manager_daily['현재월_누적매출'] - manager_daily['전월_매출']).astype('Int64')
+    manager_daily['전월대비_증감률'] = (
+        (manager_daily['현재월_누적매출'] - manager_daily['전월_매출']) / 
+        manager_daily['전월_매출'].replace(0, np.nan) * 100
+    ).round(2)
+
+    # 정산금액 비교
+    manager_daily['전일대비_정산증감액'] = (manager_daily['settlement_amount'] - manager_daily['전일_정산금액']).astype('Int64')
+    manager_daily['전일대비_정산증감률'] = (
+        (manager_daily['settlement_amount'] - manager_daily['전일_정산금액']) / 
+        manager_daily['전일_정산금액'].replace(0, np.nan) * 100
+    ).round(2)
+
+    # 전주 총합 정산금액 비교
+    manager_daily['전주대비_정산증감액'] = (manager_daily['settlement_amount'] - manager_daily['전주_총정산금액']).astype('Int64')
+    manager_daily['전주대비_정산증감률'] = (
+        (manager_daily['settlement_amount'] - manager_daily['전주_총정산금액']) / 
+        manager_daily['전주_총정산금액'].replace(0, np.nan) * 100
+    ).round(2)
+
+    # 전월 정산금액 비교
+    manager_daily['전월대비_정산증감액'] = (manager_daily['settlement_amount'] - manager_daily['전월_정산금액']).astype('Int64')
+    manager_daily['전월대비_정산증감률'] = (
+        (manager_daily['settlement_amount'] - manager_daily['전월_정산금액']) / 
+        manager_daily['전월_정산금액'].replace(0, np.nan) * 100
+    ).round(2)
+
+    # ⭐ 주/월 단위 컬럼 제거 (저장 전 정리)
+    manager_daily.drop(columns=['order_week', 'order_month', '현재주_누적매출', '현재월_누적매출'], inplace=True, errors='ignore')
+
+    print(f"[비교 데이터] 완료")
+    
+    # ============================================================
+    # 7. 저장
+    # ============================================================
+    temp_dir = LOCAL_DB / 'temp'
+    temp_dir.mkdir(exist_ok=True, parents=True)
+    
+    output_path = temp_dir / f"{output_xcom_key}_{context['ds_nodash']}.parquet"
+    manager_daily.to_parquet(output_path, index=False, engine='pyarrow')
+    
+    ti.xcom_push(key=output_xcom_key, value=str(output_path))
+    
+    print(f"\n[저장] {output_path.name}")
+    print(f"[저장 완료] {len(manager_daily):,}건")
+    print(f"[컬럼 수] {len(manager_daily.columns)}개")
+    print(f"{'='*60}\n")
+    
+    return f"담당자별 점수: {len(manager_daily):,}건"
+
+# ============================================================
+# 담당자별 점수 조인 함수
+# ============================================================
+def left_join_manager_scores(
+    left_task,
+    right_task,
+    on=None,
+    left_on=["order_daily", "담당자"],
+    right_on=["order_daily", "담당자"],
+    how='left',
+    drop_columns=None,
+    output_xcom_key='final_preprocessed_with_scores_path',
+    **context
+):
+    """
+    매장별 집계 데이터에 담당자별 점수 조인
+    
+    ⭐ 주의:
+    - 매장별 데이터 (왼쪽): order_daily, 매장명, 담당자
+    - 담당자별 데이터 (오른쪽): order_daily, 담당자 (매장명 없음)
+    - 조인 키: order_daily + 담당자
+    - 같은 날짜/담당자의 모든 매장에 동일한 담당자 점수가 붙음
+    """
+    ti = context['task_instance']
+    
+    # Task 정보 파싱
+    if isinstance(left_task, str):
+        left_task = {'task_id': left_task, 'xcom_key': 'final_preprocessed_path'}
+    if isinstance(right_task, str):
+        right_task = {'task_id': right_task, 'xcom_key': 'manager_scores_path'}
+    
+    # 왼쪽 데이터 (매장별)
+    left_path = ti.xcom_pull(
+        task_ids=left_task['task_id'],
+        key=left_task['xcom_key']
+    )
+    if not left_path:
+        print(f"[에러] 왼쪽 데이터 없음: {left_task['task_id']}")
+        ti.xcom_push(key=output_xcom_key, value=None)
+        return "join 실패: 왼쪽 데이터 없음"
+    
+    left_df = pd.read_parquet(left_path)
+    print(f"[왼쪽] 매장별 데이터: {len(left_df):,}행 × {len(left_df.columns)}컬럼")
+    
+    # 오른쪽 데이터 (담당자별)
+    right_path = ti.xcom_pull(
+        task_ids=right_task['task_id'],
+        key=right_task['xcom_key']
+    )
+    
+    if not right_path:
+        print(f"[경고] 담당자별 점수 데이터 없음 - 왼쪽 데이터만 저장")
+        temp_dir = TEMP_DIR
+        temp_dir.mkdir(exist_ok=True, parents=True)
+        output_path = temp_dir / f"{output_xcom_key}_{context['ds_nodash']}.parquet"
+        left_df.to_parquet(output_path, index=False, engine='pyarrow')
+        ti.xcom_push(key=output_xcom_key, value=str(output_path))
+        return f"⚠️ 담당자 점수 없음, 매장별 데이터만 저장: {len(left_df):,}행"
+    
+    right_df = pd.read_parquet(right_path)
+    print(f"[오른쪽] 담당자별 데이터: {len(right_df):,}행 × {len(right_df.columns)}컬럼")
+    
+    # ⭐ 담당자별 컬럼에 접두사 추가 (매장별 컬럼과 구분)
+    # 조인 키 제외하고 모든 컬럼에 '담당자_' 접두사
+    rename_dict = {}
+    for col in right_df.columns:
+        if col not in ['order_daily', '담당자', 'email']:  # 조인 키 + email은 유지
+            rename_dict[col] = f'담당자_{col}'
+    
+    right_df = right_df.rename(columns=rename_dict)
+    
+    print(f"\n[컬럼 변환] 담당자별 컬럼에 '담당자_' 접두사 추가")
+    print(f"  예시: total_amount → 담당자_total_amount")
+    print(f"  변환된 컬럼 수: {len(rename_dict)}개")
+    
+    # JOIN 실행
+    print(f"\n[JOIN] 조인 중...")
+    print(f"  방식: {how}")
+    print(f"  조인 키: {left_on}")
+    
+    joined_df = left_df.merge(
+        right_df,
+        left_on=left_on,
+        right_on=right_on,
+        how=how,
+        suffixes=('', '_담당자중복')  # 혹시 모를 중복 대비
+    )
+    
+    print(f"[JOIN] 완료: {len(joined_df):,}행 × {len(joined_df.columns)}컬럼")
+    
+    # ⭐ 중복 컬럼 확인 및 제거
+    dup_cols = [col for col in joined_df.columns if col.endswith('_담당자중복')]
+    if dup_cols:
+        print(f"[정리] 중복 컬럼 제거: {dup_cols}")
+        joined_df.drop(columns=dup_cols, inplace=True)
+    
+    # email 컬럼 중복 처리 (email_x, email_y)
+    if 'email_x' in joined_df.columns and 'email_y' in joined_df.columns:
+        # 둘 중 하나 선택 (보통 왼쪽 우선)
+        joined_df['email'] = joined_df['email_x'].fillna(joined_df['email_y'])
+        joined_df.drop(columns=['email_x', 'email_y'], inplace=True)
+        print(f"[정리] email_x, email_y → email 통합")
+    
+    # ⭐ 조인 결과 검증
+    matched = joined_df['담당자_total_amount'].notna().sum() if '담당자_total_amount' in joined_df.columns else 0
+    match_rate = matched / len(joined_df) * 100 if len(joined_df) > 0 else 0
+    
+    print(f"\n[검증] 담당자 점수 매칭률: {matched:,}건 / {len(joined_df):,}건 ({match_rate:.1f}%)")
+    
+    if match_rate < 50:
+        print(f"⚠️ 매칭률 낮음! order_daily, 담당자 컬럼 확인 필요")
+    
+    # Parquet 저장
+    temp_dir = TEMP_DIR
+    temp_dir.mkdir(exist_ok=True, parents=True)
+    output_path = temp_dir / f"{output_xcom_key}_{context['ds_nodash']}.parquet"
+    joined_df.to_parquet(output_path, index=False, engine='pyarrow')
+    
+    ti.xcom_push(key=output_xcom_key, value=str(output_path))
+    
+    print(f"\n[저장] {output_path.name}")
+    print(f"{'='*60}\n")
+    
+    return f"✅ 담당자 점수 조인 완료: {len(joined_df):,}행 ({match_rate:.1f}% 매칭)"
 
 
 # ============================================================

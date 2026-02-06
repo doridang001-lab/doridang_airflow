@@ -4,6 +4,7 @@ import pandas as pd
 from pathlib import Path
 from typing import List, Union, Optional
 from modules.transform.utility.paths import ONEDRIVE_DB, COLLECT_DB, LOCAL_DB, TEMP_DIR
+import numpy as np
 
 # ============================================================
 # CSV 로드 함수들
@@ -350,7 +351,14 @@ def save_to_csv(
     mode='append',
     **context
 ):
-    """Parquet 데이터를 로컬 DB에 CSV로 저장 (타입 최대한 보존)"""
+    """
+    Parquet 데이터를 로컬 DB에 CSV로 저장 (컬럼 순서 명확히 정의)
+    
+    ⭐ 개선:
+    - 컬럼 순서 명확히 정의
+    - 날짜 형식 통일
+    - 기존 CSV와 컬럼 순서 일치
+    """
     import os
     import shutil
     import tempfile
@@ -360,6 +368,21 @@ def save_to_csv(
     ti = context['task_instance']
     
     # ============================================================
+    # ⭐⭐⭐ 컬럼 순서 정의 (수정됨) ⭐⭐⭐
+    # ============================================================
+    STANDARD_COLUMNS = [
+        'platform', 'order_date', 'store_id', 'store_names',
+        'ad_id', 'ad_product', 'order_id', 'sub_order_id',
+        'order_summary', 'menu_option_name',
+        'delivery_type', 'total_amount', 'menu_amount', 'menu_option_price',
+        'instant_discount_coupon', 'instant_discount_coupon_YN',
+        'collected_at', 'option_qty', 'fee_ad', 'settlement_amount',
+        # 매장명 컬럼은 최종 CSV에서 제외 (store_names로 충분)
+        '담당자', 'email', '상세주소', '광역', '시군구', '읍면동',
+        '_row_hash', '실오픈일'
+    ]
+    
+    # ============================================================
     # 1. 입력 데이터 로드
     # ============================================================
     parquet_path = ti.xcom_pull(task_ids=input_task_id, key=input_xcom_key)
@@ -367,23 +390,105 @@ def save_to_csv(
         print(f"[에러] 입력 데이터 없음: {input_task_id}")
         return "저장 실패: 데이터 없음"
     
-    # Parquet 읽기 (타입 유지)
+    # Parquet 읽기
     new_df = pd.read_parquet(parquet_path)
     print(f"\n{'='*60}")
     print(f"[입력] 새 데이터: {len(new_df):,}행 × {len(new_df.columns)}컬럼")
+    print(f"[입력] 실제 컬럼: {list(new_df.columns)}")  # ⭐ 디버깅 추가
+
+    # ============================================================
+    # ⭐⭐⭐ 컬럼 이름 매핑 (호환성) ⭐⭐⭐
+    # ============================================================
+    # instant_discount_amount_YN → instant_discount_coupon_YN로 변경 없음
+    # (이미 처리됨)
+    
+    # collected_at_x → collected_at로 통일
+    if 'collected_at_x' in new_df.columns and 'collected_at' not in new_df.columns:
+        new_df.rename(columns={'collected_at_x': 'collected_at'}, inplace=True)
+        print(f"[컬럼 매핑] collected_at_x → collected_at")
+    
+    # collected_at_y는 제거 (중복)
+    if 'collected_at_y' in new_df.columns:
+        new_df = new_df.drop(columns=['collected_at_y'])
+        print(f"[컬럼 제거] collected_at_y (중복)")
+    # 쿠폰 YN 컬럼 통일: instant_discount_amount_YN → instant_discount_coupon_YN
+    if 'instant_discount_amount_YN' in new_df.columns and 'instant_discount_coupon_YN' not in new_df.columns:
+        new_df.rename(columns={'instant_discount_amount_YN': 'instant_discount_coupon_YN'}, inplace=True)
+        print(f"[컬럼 매핑] instant_discount_amount_YN → instant_discount_coupon_YN")
+    
+    
+    # 중복/임시 컬럼 제거
+    temp_cols = [
+        'store_names_key', 'store_name_normalized', 'store_name_original', 
+        '매장명_normalized', '매장명_full', 'store_names_match',
+        'stores'  # 이전 데이터의 중복 컬럼
+    ]
+    for col in temp_cols:
+        if col in new_df.columns:
+            new_df = new_df.drop(columns=[col])
+            print(f"[컬럼 제거] {col}")
+
+    
+    # ============================================================
+    # ⭐ 날짜 형식 통일 (문자열로 변환)
+    # ============================================================
+    print(f"\n[날짜 정규화] 시작...")
+    for col in ['order_date', 'collected_at', '실오픈일']:
+        if col in new_df.columns:
+            if pd.api.types.is_datetime64_any_dtype(new_df[col]):
+                if col == '실오픈일':
+                    new_df[col] = new_df[col].dt.strftime('%Y-%m-%d')
+                else:
+                    new_df[col] = new_df[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+                print(f"  ✓ {col}: datetime → 문자열")
+    
+    # ============================================================
+    # ⭐ 컬럼 순서 정렬 (표준 순서 적용)
+    # ============================================================
+    available_cols = [col for col in STANDARD_COLUMNS if col in new_df.columns]
+    missing_cols = set(STANDARD_COLUMNS) - set(new_df.columns)
+    extra_cols = set(new_df.columns) - set(STANDARD_COLUMNS)
+    
+    print(f"\n[컬럼 정렬]")
+    print(f"  - 표준 컬럼: {len(STANDARD_COLUMNS)}개")
+    print(f"  - 사용 가능: {len(available_cols)}개")
+    if missing_cols:
+        print(f"  - 누락: {missing_cols}")
+        # ⭐ 누락된 필수 컬럼 추가 (NaN)
+        for col in missing_cols:
+            if col in ['platform', 'order_date', 'store_names', 'order_id', 'sub_order_id', 
+                       'total_amount', '매장명', '담당자', 'order_summary']:  # 필수 컬럼만
+                new_df[col] = np.nan
+                print(f"    + {col} 추가 (NaN)")
+        
+        # 다시 available_cols 업데이트
+        available_cols = [col for col in STANDARD_COLUMNS if col in new_df.columns]
+    
+    if extra_cols:
+        print(f"  - 추가: {extra_cols}")
+        # 추가 컬럼도 포함
+        available_cols.extend(list(extra_cols))
+    
+    new_df = new_df[available_cols].copy()
+    print(f"  ✓ 컬럼 순서 정렬 완료: {len(available_cols)}개")
+    print(f"  ✓ 최종 컬럼 순서: {list(new_df.columns[:10])}... (총 {len(new_df.columns)}개)")  # ⭐ 확인
     
     # 타입 정보 출력 (디버깅용)
-    print(f"[타입] 입력 데이터 타입:")
+    print(f"\n[타입] 입력 데이터 타입:")
     for col in new_df.columns[:5]:  # 처음 5개만
         print(f"  - {col}: {new_df[col].dtype}")
     if len(new_df.columns) > 5:
         print(f"  ... (총 {len(new_df.columns)}개 컬럼)")
+
     
     # 중복 제거 키 확인
     if isinstance(dedup_key, str):
         dedup_cols = [dedup_key]
     else:
-        dedup_cols = dedup_key
+        dedup_cols = list(dedup_key)
+    # 옵션 수량도 중복 키에 포함 (권장)
+    if 'option_qty' in new_df.columns and 'option_qty' not in dedup_cols:
+        dedup_cols.append('option_qty')
     
     for key in dedup_cols:
         if key not in new_df.columns:
@@ -422,13 +527,18 @@ def save_to_csv(
                 encodings_to_try = ['utf-8-sig', 'utf-8', 'cp949', 'euc-kr']
                 for encoding in encodings_to_try:
                     try:
-                        # ⚠️ CSV 읽을 때 타입 추론 (low_memory=False)
                         existing_df = pd.read_csv(
                             local_csv_path, 
                             encoding=encoding, 
-                            low_memory=False  # 타입 추론 활성화
+                            low_memory=False
                         )
                         print(f"[기존] ✓ 성공: {len(existing_df):,}행 ({encoding})")
+                        print(f"[기존] 컬럼: {list(existing_df.columns[:10])}... (총 {len(existing_df.columns)}개)")  # ⭐ 확인
+                        
+                        # ⭐ 기존 CSV도 컬럼 이름 매핑
+                        if 'instant_discount_amount_YN' in existing_df.columns:
+                            existing_df.rename(columns={'instant_discount_amount_YN': 'instant_discount_coupon_YN'}, inplace=True)
+                            print(f"[기존] instant_discount_amount_YN → instant_discount_coupon_YN")
                         
                         # 중복 제거 키 확인
                         for key in dedup_cols:
@@ -455,9 +565,36 @@ def save_to_csv(
         combined_df = new_df.copy()
         print(f"\n[병합] 신규 생성: {len(combined_df):,}행")
     else:
-        # 기존 데이터와 새 데이터 병합
+        # ⭐ 기존 데이터 컬럼 순서 확인 및 정렬
+        print(f"\n[병합] 기존 데이터 컬럼 정렬 중...")
+        
+        # 공통 컬럼만 사용
+        common_cols = list(set(existing_df.columns) & set(new_df.columns))
+        print(f"  - 공통 컬럼: {len(common_cols)}개")
+        
+        if set(existing_df.columns) != set(new_df.columns):
+            print(f"  [경고] 컬럼 불일치 감지")
+            print(f"    기존: {len(existing_df.columns)}개")
+            print(f"    신규: {len(new_df.columns)}개")
+            
+            # 누락/추가 컬럼
+            old_only = set(existing_df.columns) - set(new_df.columns)
+            new_only = set(new_df.columns) - set(existing_df.columns)
+            
+            if old_only:
+                print(f"    기존에만: {old_only}")
+            if new_only:
+                print(f"    신규에만: {new_only}")
+        
+        # ⭐ 컬럼 순서를 new_df에 맞춰 정렬
+        col_order = [c for c in new_df.columns if c in existing_df.columns]
+        existing_df = existing_df[col_order]
+        print(f"  ✓ 기존 데이터 컬럼 순서 정렬 완료")
+        
+        # 병합
         combined_df = pd.concat([existing_df, new_df], ignore_index=True)
         print(f"\n[병합] 기존 {len(existing_df):,}행 + 신규 {len(new_df):,}행 = {len(combined_df):,}행")
+
     
     # ============================================================
     # 5. 중복 제거
@@ -470,7 +607,7 @@ def save_to_csv(
     if valid_cols:
         before = len(combined_df)
         
-        # 1단계: 기본 키 중복 제거 (keep='first' - 기존 데이터 우선, 중복 업로드 방지)
+        # 1단계: 기본 키 중복 제거 (keep='first' - 기존 데이터 우선)
         combined_df.drop_duplicates(subset=valid_cols, keep='first', inplace=True)
         after_step1 = len(combined_df)
         print(f"[1단계] {valid_cols} 기준: {before - after_step1:,}건 제거 → {after_step1:,}행")
@@ -486,19 +623,11 @@ def save_to_csv(
         print(f"[경고] 중복 제거 키 없음: {dedup_cols}")
     
     # ============================================================
-    # 6. CSV 저장 (타입 최대한 보존)
+    # 6. CSV 저장
     # ============================================================
     print(f"\n{'='*60}")
     print(f"[저장] CSV 저장 시작...")
-    
-    # datetime 컬럼 포맷 명시 (타입 보존 노력)
-    datetime_cols = combined_df.select_dtypes(include=['datetime64']).columns.tolist()
-    if datetime_cols:
-        print(f"[타입] datetime 컬럼: {datetime_cols}")
-        # datetime을 ISO 8601 포맷으로 저장 (YYYY-MM-DD HH:MM:SS)
-        for col in datetime_cols:
-            combined_df[col] = combined_df[col].dt.strftime('%Y-%m-%d %H:%M:%S')
-            print(f"  - {col}: datetime → 문자열 (ISO 8601)")
+    print(f"[저장] 최종 컬럼 순서: {list(combined_df.columns)}")  # ⭐ 최종 확인
     
     tmp_path = None
     try:
@@ -512,7 +641,7 @@ def save_to_csv(
         # CSV 저장
         combined_df.to_csv(tmp_path, index=False, encoding='utf-8-sig')
         
-        # 기존 파일 백업 (같은 디렉토리)
+        # 기존 파일 백업
         backup_path = None
         if local_csv_path.exists():
             backup_path = local_csv_path.parent / f"{local_csv_path.name}.bak"
@@ -537,7 +666,6 @@ def save_to_csv(
             
             onedrive_csv_path = ONEDRIVE_DB / output_subdir / output_filename
             print(f"\n[백업] OneDrive 백업 시작...")
-            print(f"[백업] 대상: {onedrive_csv_path}")
             
             backup_result = backup_to_onedrive(local_csv_path, onedrive_csv_path)
             

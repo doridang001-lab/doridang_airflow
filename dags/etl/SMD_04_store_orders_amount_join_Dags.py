@@ -17,9 +17,11 @@
 
 4. 최종 전처리 (전주/전월 비교 지표 추가)
 
-5. 검증 및 저장
+5. 담당자별 점수 계산 및 조인
 
-6. 정리 (수집 파일 이동)
+6. 검증 및 저장
+
+7. 정리 (수집 파일 이동)
 
 🔄 두 가지 모드:
 1. 정기 실행 (월/수 10:45): 모든 원본 데이터 새로 로드 후 JOIN
@@ -30,9 +32,12 @@
 
 import pendulum
 import os
+from datetime import timedelta
 from pathlib import Path
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.sensors.external_task import ExternalTaskSensor
+from modules.transform.utility.io3 import SMD_ORDERS_TIME
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -41,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 filename = os.path.basename(__file__)
 
 # 재업로드 함수 import (스마트 로딩)
-from modules.transform.pipelines.sales_store_amount_join import (
+from modules.transform.pipelines.SMD_04_store_orders_amount_join import (
     # 재업로드 함수 (업로드_temp + 원드라이브 동시 검색)
     load_reupload_toorder_review,
     load_reupload_baemin_store_now,
@@ -63,11 +68,15 @@ from modules.transform.pipelines.sales_store_amount_join import (
     # 최종 전처리 (전주/전월 비교 지표)
     preprocess_add_main_left_join_df,
     
+    # ⭐ 담당자 점수 계산 및 조인
+    calculate_manager_scores,
+    left_join_manager_scores,
+    
     # CSV 저장
     fin_save_to_csv
 )
 
-from modules.transform.pipelines.sales_store_amount_join_validator import validate_final_join
+
 from modules.load.load_df_glob import cleanup_collected_csvs, move_download_files, upload_final_csv
 from modules.transform.utility.paths import LOCAL_DB, COLLECT_DB
 
@@ -77,9 +86,17 @@ from modules.transform.utility.paths import LOCAL_DB, COLLECT_DB
 # ============================================================
 with DAG(
     dag_id=filename.replace('.py', ''),
-    schedule="45 10 * * 1,3",  # 매주 월, 수 10시 45분 실행
+    schedule=SMD_ORDERS_TIME,  # 매주 월, 수 10시 30분 실행
     start_date=pendulum.datetime(2023, 1, 1, tz="Asia/Seoul"),
     catchup=False,
+    max_active_runs=1,  # 🔒 동시 실행 방지
+    default_args={
+        'retries': 1,
+        'retry_delay': timedelta(minutes=5),
+        'depends_on_past': False,
+        'email_on_failure': False,
+        'email_on_retry': False,
+    },
     tags=['02_sales', 'crawling', 'toorder', 'baemin'],
 ) as dag:
     
@@ -88,7 +105,18 @@ with DAG(
     # 업로드_temp + 원드라이브에서 파일 찾기
     # 이전 파일 있으면 재사용, 없으면 원본 새로 로드
     # ============================================================
-    
+
+    wait_for_smd_03 = ExternalTaskSensor(
+        task_id='wait_for_smd_03',
+        external_dag_id='SMD_03_sales_orders_transform_Dags',
+        external_task_id='move_collected_files',
+        allowed_states=['success'],
+        failed_states=['failed', 'skipped'],
+        mode='poke',
+        timeout=3600,
+        poke_interval=60,
+    )
+
     # 토더 리뷰
     load_toorder_review_task = PythonOperator(
         task_id='load_toorder_review',
@@ -222,26 +250,49 @@ with DAG(
     )
     
     # ============================================================
-    # 5️⃣ 검증
+    # 5️⃣ 담당자별 점수 계산
     # ============================================================
-    validate_final_join_task = PythonOperator(
-        task_id='validate_final_join',
-        python_callable=validate_final_join,
+    calculate_manager_scores_task = PythonOperator(
+        task_id='calculate_manager_scores',
+        python_callable=calculate_manager_scores,
         op_kwargs={
             'input_task_id': 'preprocess_add_main_left_join',
-            'input_xcom_key': 'final_preprocessed_path'
+            'input_xcom_key': 'final_preprocessed_path',
+            'output_xcom_key': 'manager_scores_path'
         }
     )
     
     # ============================================================
-    # 6️⃣ CSV 저장
+    # 6️⃣ 담당자 점수 조인
+    # ============================================================
+    left_join_manager_scores_task = PythonOperator(
+        task_id='left_join_manager_scores',
+        python_callable=left_join_manager_scores,
+        op_kwargs={
+            'left_task': {
+                'task_id': 'preprocess_add_main_left_join',
+                'xcom_key': 'final_preprocessed_path'
+            },
+            'right_task': {
+                'task_id': 'calculate_manager_scores',
+                'xcom_key': 'manager_scores_path'
+            },
+            'left_on': ['order_daily', '담당자'],
+            'right_on': ['order_daily', '담당자'],
+            'how': 'left',
+            'output_xcom_key': 'final_preprocessed_with_scores_path'
+        }
+    )
+    
+    # ============================================================
+    # 7️⃣ CSV 저장
     # ============================================================
     fin_save_to_csv_task = PythonOperator(
         task_id='fin_save_to_csv',
         python_callable=fin_save_to_csv,
         op_kwargs={
-            'input_task_id': 'preprocess_add_main_left_join',
-            'input_xcom_key': 'final_preprocessed_path',
+            'input_task_id': 'left_join_manager_scores',
+            'input_xcom_key': 'final_preprocessed_with_scores_path',
             'output_filename': 'sales_daily_orders_upload.csv',
             'output_subdir': '영업관리부_DB',
             'dedup_key': ['order_daily', '매장명']
@@ -249,7 +300,7 @@ with DAG(
     )
     
     # ============================================================
-    # 7️⃣ 정리 및 업로드 (병렬 실행)
+    # 8️⃣ 정리 및 업로드 (병렬 실행)
     # ============================================================
     
     # OneDrive 수집 폴더 정리
@@ -264,7 +315,7 @@ with DAG(
                 'toorder_review_*.xlsx'
             ],
             'source_dir': str(COLLECT_DB / '영업관리부_수집'),
-            'dest_dir': str(COLLECT_DB / '영업관리부_수집' / '전달용')
+            'dest_dir': '/opt/airflow/download/업로드_temp'
         }
     )
     
@@ -282,25 +333,35 @@ with DAG(
     # ============================================================
     # Task 의존성 정의
     # ============================================================
-    
+
     # 1. 로드 → 전처리
-    load_toorder_review_task >> preprocess_toorder_review_task
-    load_baemin_store_now_task >> preprocess_baemin_store_now_task
-    load_baemin_history_task >> preprocess_baemin_history_task
-    
+    wait_for_smd_03 >> load_toorder_review_task >> preprocess_toorder_review_task
+    wait_for_smd_03 >> load_baemin_store_now_task >> preprocess_baemin_store_now_task
+    wait_for_smd_03 >> load_baemin_history_task >> preprocess_baemin_history_task
+    wait_for_smd_03 >> load_sales_daily_orders_alerts_task  # ⭐ 이 줄 추가!
+
     # 2. 조인 1: 주문 + 우리가게 now
     [load_sales_daily_orders_alerts_task, preprocess_baemin_store_now_task] >> left_join_orders_now_task
-    
+
     # 3. 조인 2: (주문 + 우리가게 now) + 토더 리뷰
     [left_join_orders_now_task, preprocess_toorder_review_task] >> left_join_orders_now_toorder_task
-    
+
     # 4. 조인 3: (주문 + 우리가게 now + 토더) + 변경이력
     [left_join_orders_now_toorder_task, preprocess_baemin_history_task] >> left_join_orders_now_toorder_history_task
-    
-    # 5. 최종 전처리 → 검증 → 저장
-    left_join_orders_now_toorder_history_task >> preprocess_add_main_task >> validate_final_join_task >> fin_save_to_csv_task
-    
-    # 6. 정리 및 업로드 (병렬)
+
+    # 5. 최종 전처리
+    left_join_orders_now_toorder_history_task >> preprocess_add_main_task
+
+    # 6. 담당자 점수 계산 (전처리 완료 후)
+    preprocess_add_main_task >> calculate_manager_scores_task
+
+    # 7. 담당자 점수 조인 (전처리 + 담당자 점수 둘 다 필요)
+    [preprocess_add_main_task, calculate_manager_scores_task] >> left_join_manager_scores_task
+
+    # 8. CSV 저장
+    left_join_manager_scores_task >> fin_save_to_csv_task
+
+    # 9. 정리 및 업로드 (병렬)
     fin_save_to_csv_task >> [cleanup_task, upload_task]
 
 
@@ -331,11 +392,15 @@ with DAG(
 └─────────────────────────────────────────────────────────────┘
                                 ↓
 ┌─────────────────────────────────────────────────────────────┐
-│  최종 전처리 및 검증                                         │
+│  최종 전처리 및 담당자 점수                                  │
 │                                                              │
 │  preprocess_add_main_left_join (전주/전월 비교 지표 추가)   │
-│          ↓                                                   │
-│  validate_final_join (검증)                                 │
+│          ├──────────────────────┐                           │
+│          ↓                       ↓                           │
+│  calculate_manager_scores   (원본 유지)                     │
+│          └──────────────────────┘                           │
+│                   ↓                                          │
+│  left_join_manager_scores (담당자 점수 조인)                │
 │          ↓                                                   │
 │  fin_save_to_csv (CSV 저장)                                 │
 └─────────────────────────────────────────────────────────────┘
@@ -350,6 +415,7 @@ with DAG(
 📌 주요 기능:
 - 매출 데이터에 매장 성실지표 조인
 - 전주/전월 비교 지표 자동 계산
+- 담당자별 점수 계산 및 조인
 - 스마트 로더로 파일 재사용 (성능 향상)
 - 수집 파일 자동 정리
 

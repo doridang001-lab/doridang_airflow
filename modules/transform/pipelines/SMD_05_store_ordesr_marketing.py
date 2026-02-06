@@ -30,21 +30,25 @@ def load_beamin_ad_change_history_df(**context):
 def transform_beamin_ad_change_history_df(df):
     df = df.copy()
     df = df.drop_duplicates(subset=["변경시간", "store_id"], keep="last")
-    df["수집주별"] = pd.to_datetime(df["변경시간"]).dt.to_period("W")
+    
+    # ⭐ format='mixed' 추가하여 혼합 포맷 처리
+    df["수집주별"] = pd.to_datetime(df["변경시간"], format="mixed", errors='coerce').dt.to_period("W")
     df["platform"] = "배민"
 
-    df2 = df.groupby(["store_id", "매장명", "수집주별", "platform"]).agg(변경전_희망가_최소 = ("변경전_희망가","min"),
-                                                    변경전_희망가_최대 = ("변경전_희망가","max"),
-                                                    변경전_희망가_평균 = ("변경전_희망가","mean"),
-                                                    변경후_희망가_최소 = ("변경후_희망가","min"),
-                                                    변경후_희망가_최대 = ("변경후_희망가","max"),
-                                                    변경후_희망가_평균 = ("변경후_희망가","mean")
-                                                ).reset_index()
+    df2 = df.groupby(["store_id", "매장명", "수집주별", "platform"]).agg(
+        변경전_희망가_최소 = ("변경전_희망가","min"),
+        변경전_희망가_최대 = ("변경전_희망가","max"),
+        변경전_희망가_평균 = ("변경전_희망가","mean"),
+        변경후_희망가_최소 = ("변경후_희망가","min"),
+        변경후_희망가_최대 = ("변경후_희망가","max"),
+        변경후_희망가_평균 = ("변경후_희망가","mean")
+    ).reset_index()
 
     df = df[['수집일시', '매장명', "platform",'store_id','캠페인정보', '변경시간','수집주별']]
     df = pd.merge(df, df2, on=['store_id', '매장명', '수집주별', "platform"], how='left')
 
-    df["join_date"] = pd.to_datetime(df["변경시간"]).dt.to_period("D")
+    # ⭐ 여기도 format='mixed' 추가
+    df["join_date"] = pd.to_datetime(df["변경시간"], format="mixed", errors='coerce').dt.to_period("D")
     df["join_date"] = df["join_date"].dt.to_timestamp()
     df["store_names"] = df["매장명"].str.split(" ").str[-2:].str.join(" ")
 
@@ -83,17 +87,24 @@ def baemin_marketing_store_click_df(**context):
     
 # 우리가게 클릭 전처리
 def transform_store_click_df(df):
-    # 전처리 시작
     click_df = df.copy()
+    
+    # collected_at을 datetime으로 변환하고 정렬
+    click_df['collected_at'] = pd.to_datetime(click_df['collected_at'])
+    click_df = click_df.sort_values('collected_at', ascending=True)
+    
+    # 정렬 후 중복 제거 (가장 최근 collected_at 데이터만 남김)
     click_df = click_df.drop_duplicates(subset=["날짜", "store_id"], keep="last")
+    
     click_df["store_names"] = click_df["store_name"].str.split(" ").str[-2:].str.join(" ")
-    click_df["join_date"] = pd.to_datetime(click_df["날짜"]).dt.to_period("D")
+    
+    # 날짜 형식 혼합 처리 후 기존 방식으로 변환
+    click_df["join_date"] = pd.to_datetime(click_df["날짜"], format='mixed', dayfirst=True, errors='coerce').dt.to_period("D")
     click_df["platform"] = "배민"
 
-    # 우가클 click_df
     click_df["join_date"] = click_df["join_date"].dt.to_timestamp()
     click_df = click_df[['join_date', 'store_names', 'platform', '날짜', '광고지출', '노출수', '클릭수',
-        '주문수', '주문금액', '광고효과', ]]
+        '주문수', '주문금액', '광고효과']]
     
     return click_df
 
@@ -404,221 +415,15 @@ def left_join_orders_history_click_coupang(
 def transform_fin_df(df):
     # 전처리 시작
     df = df.copy()
-    cols = ['order_daily',
-    '매장명',
-    '담당자',
-    'email',
-    'total_order_count',
-    'total_amount',
-    'fee_ad',
-    'ARPU',
-    'ma_14',
-    'ma_28',
-    'weekday',
-    'prev_week_same_day',
-    'current_avg_2week',
-    'prev_2week_same_day',
-    'prev_3week_same_day',
-    'current_avg_4week',
-    'sum_7d_recent',
-    'sum_7d_prev',
-    'score_trend',
-    'score_total',
-    'score_7d_total',
-    'score_4week_total',
-    'score',
-    'status',
-    'pre_status',
-    'uploaded_at',
-    '금일여부',
-    '전일여부',
-    '전일_매출',
-    '전일_주문건수',
-    '전일대비_증감액',
-    '전일대비_증감률',
-    '전주_매출',
-    '전주_주문건수',
-    '전주대비_증감액',
-    '전주대비_증감률',
-    '전월_매출',
-    '전월_주문건수',
-    '전월대비_증감액',
-    '전월대비_증감률',
-    '실오픈일',
-    'platform_x',
-    'settlement_amount',
-    '일별_담당자별_평균',
-    '일별_전체_평균',
-    'vs일별전체_비율',
-    'fee_ad_배민',
-    'fee_ad_쿠팡',
-    'settlement_amount_배민',
-    'settlement_amount_쿠팡',
-    'total_amount_배민',
-    'total_amount_쿠팡',
-    'total_order_count_배민',
-    'total_order_count_쿠팡',
-    '조리소요시간',
-    '조리소요시간_순위비율',
-    '주문접수시간',
-    '주문접수시간_순위비율',
-    '조리시간준수율',
-    '조리시간준수율_순위비율',
-    '주문접수율',
-    '주문접수율_순위비율',
-    '최근별점',
-    '전체_주문수',
-    '전체_리뷰수',
-    '전체_답변완료수',
-    '전체_평균별점',
-    '영업임시중지 변경',
-    '운영시간 변경',
-    '휴무일 변경',
-    '요일',
-    '요일_한글',
-    'order_week',
-    'order_month',
-    'join_pre_date',
-    'join_pre_week_sameday',
-    'join_pre_week',
-    'join_pre_month',
-    '전일_전체매출',
-    '전일_전체주문건수',
-    '전일_전체정산금액',
-    '전일_전체매출_배민',
-    '전일_전체매출_쿠팡',
-    '전일_전체정산금액_배민',
-    '전일_전체정산금액_쿠팡',
-    '전일_전체주문건수_배민',
-    '전일_전체주문건수_쿠팡',
-    '전일_매장매출',
-    '전일_매장주문건수',
-    '전일_매장정산금액',
-    '전일_매장매출_배민',
-    '전일_매장매출_쿠팡',
-    '전일_매장정산금액_배민',
-    '전일_매장정산금액_쿠팡',
-    '전일_매장주문건수_배민',
-    '전일_매장주문건수_쿠팡',
-    '전주동요일_전체매출',
-    '전주동요일_전체주문건수',
-    '전주동요일_전체정산금액',
-    '전주동요일_전체매출_배민',
-    '전주동요일_전체매출_쿠팡',
-    '전주동요일_전체정산금액_배민',
-    '전주동요일_전체정산금액_쿠팡',
-    '전주동요일_전체주문건수_배민',
-    '전주동요일_전체주문건수_쿠팡',
-    '전주동요일_매장매출',
-    '전주동요일_매장주문건수',
-    '전주동요일_매장정산금액',
-    '전주동요일_매장매출_배민',
-    '전주동요일_매장매출_쿠팡',
-    '전주동요일_매장정산금액_배민',
-    '전주동요일_매장정산금액_쿠팡',
-    '전주동요일_매장주문건수_배민',
-    '전주동요일_매장주문건수_쿠팡',
-    '전주_전체매출',
-    '전주_전체주문건수',
-    '전주_전체정산금액',
-    '전주_전체매출_배민',
-    '전주_전체매출_쿠팡',
-    '전주_전체정산금액_배민',
-    '전주_전체정산금액_쿠팡',
-    '전주_전체주문건수_배민',
-    '전주_전체주문건수_쿠팡',
-    '전주_매장매출',
-    '전주_매장주문건수',
-    '전주_매장정산금액',
-    '전주_매장매출_배민',
-    '전주_매장매출_쿠팡',
-    '전주_매장정산금액_배민',
-    '전주_매장정산금액_쿠팡',
-    '전주_매장주문건수_배민',
-    '전주_매장주문건수_쿠팡',
-    '전월_전체매출',
-    '전월_전체주문건수',
-    '전월_전체정산금액',
-    '전월_전체매출_배민',
-    '전월_전체매출_쿠팡',
-    '전월_전체정산금액_배민',
-    '전월_전체정산금액_쿠팡',
-    '전월_전체주문건수_배민',
-    '전월_전체주문건수_쿠팡',
-    '전월_매장매출',
-    '전월_매장주문건수',
-    '전월_매장정산금액',
-    '전월_매장매출_배민',
-    '전월_매장매출_쿠팡',
-    '전월_매장정산금액_배민',
-    '전월_매장정산금액_쿠팡',
-    '전월_매장주문건수_배민',
-    '전월_매장주문건수_쿠팡',
-    '수수료율',
-    '수수료율_배민',
-    '수수료율_쿠팡',
-    '전일_수수료율',
-    '전일_수수료율_배민',
-    '전일_수수료율_쿠팡',
-    '전주동요일_수수료율',
-    '전주동요일_수수료율_배민',
-    '전주동요일_수수료율_쿠팡',
-    '전일대비_매출증감액',
-    '전일대비_매출증감률',
-    '전일대비_수수료율증감',
-    '전일대비_매출증감률_배민',
-    '전일대비_수수료율증감_배민',
-    '전일대비_매출증감률_쿠팡',
-    '전일대비_수수료율증감_쿠팡',
-    '전주동요일대비_매출증감액',
-    '전주동요일대비_매출증감률',
-    '전주동요일대비_수수료율증감',
-    '전주동요일대비_매출증감률_배민',
-    '전주동요일대비_수수료율증감_배민',
-    '전주동요일대비_매출증감률_쿠팡',
-    '전주동요일대비_수수료율증감_쿠팡',
-    '기간구분',
-    'order_daily_day',
-    'store_id',
-    '캠페인정보',
-    '변경시간',
-    '수집주별',
-    '변경전_희망가_최소',
-    '변경전_희망가_최대',
-    '변경전_희망가_평균',
-    '변경후_희망가_최소',
-    '변경후_희망가_최대',
-    '변경후_희망가_평균',
-    '조회일자',
-    '광고비율',
-    '광고비용',
-    '신규고객',
-    '광고주문수',
-    '광고매출',
-    '전체매출',
-    '광고클릭수',
-    '광고노출수',
-    'store_names',
-    'platform',
-    '날짜',
-    '광고지출',
-    '노출수',
-    '클릭수',
-    '주문수',
-    '주문금액',
-    '광고효과']
-
-    df = df[cols]
     return df
 # baemin_ad_change_history_path
 # baemin_ad_change_history_processed_path
 def preprocess_fin_df(**context):
-    """ 처리"""
+    """최종 전처리"""
     return preprocess_df(
         input_xcom_key='joined_orders_history_click_coupang_path',
         output_xcom_key='final_processed_path',
-        transform_func=transform_fin_df,  # 위에서 정의한 함수
-        #natural_keys=['date', 'stores_name'],  # ID 생성용
+        transform_func=transform_fin_df,  # 전처리 함수 추가
         **context
     )
     

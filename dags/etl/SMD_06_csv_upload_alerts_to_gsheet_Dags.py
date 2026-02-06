@@ -6,7 +6,8 @@ sales_daily_orders_alerts.csv → Google Sheet (덮어쓰기)
 📋 처리 흐름:
 1. CSV 파일 읽기 (sales_daily_orders_alerts.csv)
 2. 데이터 정리 (NaN 처리, 날짜 정규화)
-3. Google Sheets 업로드 (overwrite 모드)
+3. **시트 크기 리셋** (누적 방지) ← 추가됨
+4. Google Sheets 업로드 (overwrite 모드)
 """
 
 import pendulum
@@ -15,6 +16,10 @@ import os
 from pathlib import Path
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from modules.transform.utility.io3 import SMD_ORDERS_TIME
+from airflow.sensors.external_task import ExternalTaskSensor
+from airflow.models import DagRun
+from airflow.utils.state import State
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -22,9 +27,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 # 파일명
 filename = os.path.basename(__file__)
 
+
+def _latest_successful_execution_date(dt, **context):
+    """외부 DAG의 최신 성공 실행일을 사용 (없으면 현재 dt 사용)."""
+    runs = DagRun.find(dag_id='SMD_05_store_ordesr_marketing_Dags', state=State.SUCCESS)
+    if not runs:
+        return dt
+    return max(r.execution_date for r in runs)
+
 from modules.transform.utility.paths import LOCAL_DB
 from modules.load.load_gsheet import save_to_gsheet
-
 
 # ============================================================
 # 설정
@@ -45,13 +57,14 @@ ALERTS_CSV_PATH = LOCAL_DB / '영업관리부_DB' / 'sales_daily_orders_upload.c
 # ============================================================
 def upload_alerts_to_gsheet(**context):
     """
-    sales_daily_orders_alerts.csv를 구글 시트에 업로드
+    sales_daily_orders_upload_fin.csv를 구글 시트에 업로드
     
     처리 순서:
     1. CSV 파일 읽기
     2. NaN → 빈 문자열 변환
     3. order_daily 날짜 정규화 (엑셀 직렬값/텍스트 모두 처리)
-    4. Google Sheets에 덮어쓰기 (overwrite 모드)
+    4. **시트 크기 리셋** (셀 누적 방지)
+    5. Google Sheets에 덮어쓰기 (overwrite 모드)
     """
     print(f"\n{'='*60}")
     print(f"[구글시트] 매출 이상 알림 데이터 업로드 시작 (덮어쓰기)")
@@ -100,6 +113,20 @@ def upload_alerts_to_gsheet(**context):
     df = df.fillna('')
     print(f"[데이터 정리] ✅ NaN 변환 완료")
 
+    # Infinity 값을 None으로 변환 (JSON serialization 오류 방지)
+    print(f"\n[데이터 정리] Infinity → None으로 변환 (Google Sheets JSON 호환성)")
+    import numpy as np
+    inf_count = 0
+    for col in df.select_dtypes(include=[np.floating]).columns:
+        mask = np.isinf(df[col])
+        inf_count += mask.sum()
+        df.loc[mask, col] = None
+    print(f"[데이터 정리] 변환한 Infinity 개수: {inf_count}개")
+    
+    # Infinity 변환 후 다시 NaN을 빈 문자열로
+    df = df.fillna('')
+
+
     # order_daily를 날짜 타입으로 정규화
     if 'order_daily' in df.columns:
         sample = df['order_daily'].head(3).tolist()
@@ -133,6 +160,55 @@ def upload_alerts_to_gsheet(**context):
     print(f"[컬럼] {', '.join(df.columns.tolist()[:10])}...")  # 처음 10개만 표시
     
     # ============================================================
+    # 3.5️⃣ 시트 크기 리셋 (셀 누적 방지) ← 🔥 핵심 추가 부분
+    # ============================================================
+    print(f"\n[시트 크기 리셋] 시작...")
+    
+    try:
+        from google.oauth2.service_account import Credentials
+        import gspread
+        
+        # 인증
+        creds = Credentials.from_service_account_file(
+            DEFAULT_CREDENTIALS_PATH,
+            scopes=['https://www.googleapis.com/auth/spreadsheets']
+        )
+        gc = gspread.authorize(creds)
+        
+        # 스프레드시트 열기
+        spreadsheet_id = ALERTS_GSHEET_URL.split('/d/')[1].split('/')[0]
+        sh = gc.open_by_key(spreadsheet_id)
+        
+        # 시트 찾기 or 생성
+        try:
+            ws = sh.worksheet(ALERTS_SHEET_NAME)
+            old_rows = ws.row_count
+            old_cols = ws.col_count
+            old_cells = old_rows * old_cols
+            print(f"[시트] 기존 크기: {old_rows:,}행 × {old_cols:,}열 = {old_cells:,}셀")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title=ALERTS_SHEET_NAME, rows=100, cols=50)
+            print(f"[시트] 새로 생성: {ALERTS_SHEET_NAME}")
+        
+        # 시트 비우기
+        ws.clear()
+        print(f"[시트] 데이터 삭제 완료")
+        
+        # 새 크기 계산 (데이터 + 여유 10행)
+        new_rows = len(df) + 10
+        new_cols = len(df.columns)
+        new_cells = new_rows * new_cols
+        
+        # 시트 크기 축소 (누적 방지)
+        print(f"[시트] 크기 축소: {new_rows:,}행 × {new_cols:,}열 = {new_cells:,}셀")
+        ws.resize(rows=new_rows, cols=new_cols)
+        print(f"[시트] ✅ 크기 리셋 완료")
+        
+    except Exception as e:
+        print(f"[경고] 시트 크기 리셋 실패: {e}")
+        print(f"[경고] save_to_gsheet로 계속 진행...")
+    
+    # ============================================================
     # 4️⃣ 구글 시트에 업로드 (overwrite 모드)
     # ============================================================
     print(f"\n[구글시트] 업로드 시작 (mode: overwrite)...")
@@ -150,10 +226,11 @@ def upload_alerts_to_gsheet(**context):
             uploaded_count = len(df)
             print(f"\n[구글시트] ✅ 업로드 완료")
             print(f"  - 업로드: {uploaded_count}건")
+            print(f"  - 최종 크기: {new_rows:,}행 × {new_cols:,}열 = {new_cells:,}셀")
             print(f"  - 시트: {ALERTS_SHEET_NAME}")
             print(f"  - URL: {ALERTS_GSHEET_URL}")
             print(f"{'='*60}\n")
-            return f"✅ 업로드 완료: {uploaded_count}건 (덮어쓰기)"
+            return f"✅ 업로드 완료: {uploaded_count}건 ({new_cells:,}셀)"
         else:
             error = result.get('error', '알 수 없는 오류')
             print(f"[구글시트] ⚠️ 업로드 실패: {error}")
@@ -172,11 +249,35 @@ def upload_alerts_to_gsheet(**context):
 with DAG(
     dag_id=filename.replace('.py', ''),
     description='매출 이상 알림 데이터를 구글 시트에 업로드 (덮어쓰기)',
-    schedule="0 11 * * 1,3",  # 매주 월/수 11:00 실행
+    schedule=SMD_ORDERS_TIME,  # 매주 월, 수 10시 30분 실행
     start_date=pendulum.datetime(2023, 1, 1, tz="Asia/Seoul"),
     catchup=False,
+    max_active_runs=1,  # 🔒 동시 실행 방지
+    default_args={
+        'retries': 1,
+        'retry_delay': pd.Timedelta(minutes=5),
+        'depends_on_past': False,
+        'email_on_failure': False,
+        'email_on_retry': False,
+    },
     tags=['03_gsheet', 'upload', 'alerts'],
 ) as dag:
+    # ============================================================
+    # task 정의
+    # ============================================================
+    wait_for_smd_05 = ExternalTaskSensor(
+        task_id='wait_for_smd_05',
+        external_dag_id='SMD_05_store_ordesr_marketing_Dags',
+        external_task_id='move_collected_files',
+        allowed_states=['success'],
+        failed_states=['failed', 'skipped'],
+        mode='reschedule',
+        timeout=1800,  # 30분 대기
+        poke_interval=60,  # 1분마다 확인
+        check_existence=True,  # 태스크 존재 여부 확인
+        soft_fail=False,  # 실패 시 즉시 실패
+        execution_date_fn=_latest_successful_execution_date,
+    )
     
     upload_task = PythonOperator(
         task_id='upload_alerts_to_gsheet',
@@ -206,6 +307,14 @@ with DAG(
 └─────────────────────────────────────────────────────────────┘
                         ↓
 ┌─────────────────────────────────────────────────────────────┐
+│  🔥 시트 크기 리셋 (NEW!)                                   │
+│                                                              │
+│  - 시트 데이터 삭제                                          │
+│  - 시트 크기 축소 (데이터 크기 + 여유 10행)                 │
+│  - 셀 누적 방지 → 1천만 셀 제한 해결                        │
+└─────────────────────────────────────────────────────────────┘
+                        ↓
+┌─────────────────────────────────────────────────────────────┐
 │  Google Sheets 업로드                                        │
 │                                                              │
 │  - 모드: overwrite (기존 데이터 삭제 후 덮어쓰기)           │
@@ -217,6 +326,7 @@ with DAG(
 - CSV 자동 인코딩 감지
 - NaN 안전 처리
 - 날짜 정규화 (엑셀/텍스트)
+- **시트 크기 리셋** (셀 누적 방지) ← NEW!
 - 덮어쓰기 모드로 항상 최신 데이터 유지
 
 ⚙️ 실행 시각: 매주 월/수 11:00 (KST)
@@ -225,4 +335,10 @@ with DAG(
 ⚠️ 주의사항:
 - sales_orders_01_load_baemin_data DAG가 먼저 실행되어야 함
 - Google Sheets API 인증 필요 (Service Account JSON)
+- gspread 라이브러리 필요 (pip install gspread)
+
+🔥 핵심 수정사항:
+- save_to_gsheet 호출 전에 시트 크기를 데이터 크기로 축소
+- 매 업로드마다 시트 크기가 누적되는 문제 해결
+- 기존 코드 구조 유지하면서 최소한의 수정만 추가
 """

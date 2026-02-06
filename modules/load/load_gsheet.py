@@ -172,6 +172,9 @@ def _df_to_rows(df: pd.DataFrame) -> List[List[str]]:
     def _fmt(v):
         if pd.isna(v):
             return ""
+        # Infinity 처리 (JSON serialization 오류 방지)
+        if isinstance(v, float) and (v == float('inf') or v == float('-inf')):
+            return ""
         # 빈 문자열 그대로 반환
         if v == '':
             return ''
@@ -198,6 +201,7 @@ def _df_to_rows(df: pd.DataFrame) -> List[List[str]]:
                     return int(v)
                 # 실수 확인
                 float_val = float(v)
+
                 return float_val
             except (ValueError, AttributeError):
                 return v  # 문자열 그대로
@@ -264,9 +268,16 @@ def _execute_overwrite(service, spreadsheet_id: str, sheet_name: str, df: pd.Dat
     헤더 + 데이터 전체 덮어쓰기
     """
     df_w = _add_timestamp_column(df)
-    # 전체 지우기
-    service.spreadsheets().values().clear(spreadsheetId=spreadsheet_id, range=sheet_name, body={}).execute()
+    
+    # 1단계: 전체 지우기 (셀 제한 오류 방지)
+    print(f"[덮어쓰기] 시트 전체 비우기 중...")
+    try:
+        service.spreadsheets().values().clear(spreadsheetId=spreadsheet_id, range=sheet_name, body={}).execute()
+        print(f"[덮어쓰기] ✓ 시트 비움")
+    except Exception as e:
+        print(f"[경고] 시트 비우기 실패 (계속 진행): {e}")
 
+    # 2단계: 헤더 + 데이터 준비
     data = [df_w.columns.tolist()] + _df_to_rows(df_w)
     
     # ⭐ 디버깅: 실제 업로드되는 데이터 확인
@@ -276,6 +287,7 @@ def _execute_overwrite(service, spreadsheet_id: str, sheet_name: str, df: pd.Dat
         print(f"  행{i}: {row[:5]}...")  # 첫 5개 컬럼만
     print(f"[디버그] 총 {len(data)}행 (헤더 포함)")
     
+    # 3단계: 데이터 업로드
     body = {"range": f"{sheet_name}!A1", "majorDimension": "ROWS", "values": data}
     result = service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
@@ -397,7 +409,8 @@ def save_to_gsheet(
     # 시트 존재 확인/생성 & 헤더 보장
     try:
         _add_sheet_if_missing(service, spreadsheet_id, sheet_name)
-        if df is not None:
+        # overwrite 모드가 아닐 때만 헤더 보장 (overwrite는 _execute_overwrite에서 처리)
+        if df is not None and mode != MODE_OVERWRITE:
             _update_header_if_empty(service, spreadsheet_id, sheet_name, df.columns.tolist())
             # ⭐ 날짜 포맷 지정 제거 (Looker Studio 에러 방지)
             # order_daily는 문자열로 저장되므로 별도 포맷 지정 불필요

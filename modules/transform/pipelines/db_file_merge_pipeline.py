@@ -2,7 +2,7 @@
 Compatibility layer for legacy db_file_merge_pipeline imports.
 Re-exports functions from existing pipelines.
 """
-from modules.transform.pipelines.sales_store_amount_join import (
+from modules.transform.pipelines.SMD_04_store_orders_amount_join import (
     load_reupload_toorder_review as load_df,
     preprocess_toorder_review_df,
     fin_save_to_csv,

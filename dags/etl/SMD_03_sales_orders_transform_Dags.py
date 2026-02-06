@@ -15,6 +15,9 @@ import os
 from pathlib import Path
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from datetime import datetime, timedelta
+from airflow.sensors.external_task import ExternalTaskSensor  # ⭐ 추가
+from modules.transform.utility.io3 import SMD_ORDERS_TIME
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -23,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 filename = os.path.basename(__file__)
 
 # Import 분리 (명확성)
-from modules.transform.pipelines.sales_daily_orders import (
+from modules.transform.pipelines.SMD_03_sales_orders_transform import (
     # 로드 함수
     load_baemin_data, 
     preprocess_load_baemin_data,
@@ -48,6 +51,9 @@ from modules.transform.pipelines.sales_daily_orders import (
 
 # CSV 저장 유틸
 from modules.transform.utility.io import save_to_csv
+from modules.transform.utility.io3 import sales_cleanup_collected_csvs
+from modules.transform.utility.paths import COLLECT_DB, LOCAL_DB
+
 
 
 # ============================================================
@@ -55,114 +61,51 @@ from modules.transform.utility.io import save_to_csv
 # ============================================================
 with DAG(
     dag_id=filename.replace('.py', ''),
-    schedule="30 10 * * *",  # 매일 10:30 실행
+    schedule=SMD_ORDERS_TIME,  # 매주 월,수 10:30 실행
     start_date=pendulum.datetime(2023, 1, 1, tz="Asia/Seoul"),
     catchup=False,
+    max_active_runs=1,  # 🔒 동시 실행 방지
+    default_args={
+        'retries': 1,
+        'retry_delay': timedelta(minutes=5),
+        'depends_on_past': False,
+        'email_on_failure': False,
+        'email_on_retry': False,
+    },
     tags=['sales', 'daily', 'baemin', 'coupang'],
 ) as dag:
+    # ============================================================
+    # ⭐ SMD_02 완료 대기
+    # ============================================================
+    wait_for_smd_02 = ExternalTaskSensor(
+        task_id='wait_for_smd_02', #⭐ SMD_02 완료 대기
+        external_dag_id='SMD_02_sales_orders_csv_review_Dags', # SMD_02 DAG ID
+        external_task_id='fin_save_to_csv',  # SMD_02의 마지막 task
+        allowed_states=['success'],
+        failed_states=['failed', 'skipped'],
+        mode='poke',
+        timeout=3600,
+        poke_interval=60,
+    )
+    
     
     # ============================================================
-    # 1️⃣ 데이터 로드 (병렬)
+    # 1️⃣  데이터 로드
     # ============================================================
-    load_baemin_task = PythonOperator(
+    load_baemin_data_task = PythonOperator(
         task_id='load_baemin_data',
         python_callable=load_baemin_data,
     )
     
-    load_coupang_task = PythonOperator(
-        task_id='load_coupang_data',
-        python_callable=load_coupang_data,
-    )
-    
-    load_employee_task = PythonOperator(
-        task_id='load_employee_data',
-        python_callable=load_employee_data,
-    )
-    
     # ============================================================
-    # 2️⃣ 전처리 (병렬)
-    # ============================================================
-    preprocess_baemin_task = PythonOperator(
-        task_id='preprocess_baemin',
-        python_callable=preprocess_load_baemin_data,
-        op_kwargs={
-            'input_task_id': 'load_baemin_data',
-            'input_xcom_key': 'baemin_parquet_path',
-            'output_xcom_key': 'baemin_processed_path'
-        }
-    )
-    
-    preprocess_coupang_task = PythonOperator(
-        task_id='preprocess_coupang',
-        python_callable=preprocess_load_coupang_data,
-        op_kwargs={
-            'input_task_id': 'load_coupang_data',
-            'input_xcom_key': 'coupang_parquet_path',
-            'output_xcom_key': 'coupang_processed_path'
-        }
-    )
-    
-    preprocess_employee_task = PythonOperator(
-        task_id='preprocess_employee',
-        python_callable=preprocess_load_employee_data,
-        op_kwargs={
-            'input_task_id': 'load_employee_data',
-            'input_xcom_key': 'employee_parquet_path',
-            'output_xcom_key': 'employee_processed_path'
-        }
-    )
-    
-    # ============================================================
-    # 3️⃣ 주문 데이터 + 담당자 조인
-    # ============================================================
-    join_orders_task = PythonOperator(
-        task_id='join_orders_with_stores',
-        python_callable=preprocess_join_orders_with_stores,
-        op_kwargs={
-            'baemin_task_id': 'preprocess_baemin',
-            'baemin_xcom_key': 'baemin_processed_path',
-            'coupang_task_id': 'preprocess_coupang',
-            'coupang_xcom_key': 'coupang_processed_path',
-            'employee_task_id': 'preprocess_employee',
-            'employee_xcom_key': 'employee_processed_path',
-            'output_xcom_key': 'orders_joined_path'
-        }
-    )
-    
-    # ============================================================
-    # 4️⃣ 최종 전처리 (중복 제거, 컬럼 정리)
-    # ============================================================
-    final_preprocess_task = PythonOperator(
-        task_id='preprocess_merged_orders',
-        python_callable=preprocess_merged_daily_orders,
-        op_kwargs={
-            'input_task_id': 'join_orders_with_stores',
-            'input_xcom_key': 'orders_joined_path',
-            'output_xcom_key': 'orders_final_path'
-        }
-    )
-    
-    # ============================================================
-    # 5️⃣ CSV 저장 (주문 데이터)
-    # ============================================================
-    save_csv_task = PythonOperator(
-        task_id='save_to_csv',
-        python_callable=save_to_csv,
-        op_kwargs={
-            'input_task_id': 'preprocess_merged_orders',
-            'input_xcom_key': 'orders_final_path'
-        }
-    )
-    
-    # ============================================================
-    # 6️⃣ 일별 매출 집계
+    # 6️⃣ 로드한 주문 데이터 일별 매출 집계
     # ============================================================
     aggregate_task = PythonOperator(
         task_id='aggregate_daily_sales',
         python_callable=aggregate_daily_sales,
         op_kwargs={
-            'input_task_id': 'preprocess_merged_orders',
-            'input_xcom_key': 'orders_final_path',
+            'input_task_id': 'save_final_orders_csv',
+            'input_xcom_key': 'final_orders_preprocessed',
             'output_xcom_key': 'daily_aggregated'
         }
     )
@@ -208,25 +151,29 @@ with DAG(
         python_callable=send_alert_email,
     )
     
+    
+    # OneDrive 수집 폴더 정리
+    cleanup_task = PythonOperator(
+        task_id='move_collected_files',
+        python_callable=sales_cleanup_collected_csvs,
+        op_kwargs={
+            'patterns': [
+                'baemin_orders_*.csv',
+                'coupangeats_orders_*.csv'
+            ],
+            'source_dir': str(COLLECT_DB / '영업관리부_수집'), # 수집 원본 폴더
+            'dest_dir': '/opt/airflow/download/업로드_temp' # 이동 목적지
+        }
+    )
+    
     # ============================================================
     # Task 의존성
     # ============================================================
-    # 1. 로드 → 전처리
-    load_baemin_task >> preprocess_baemin_task
-    load_coupang_task >> preprocess_coupang_task
-    load_employee_task >> preprocess_employee_task
-    
-    # 2. 전처리 → 조인
-    [preprocess_baemin_task, preprocess_coupang_task, preprocess_employee_task] >> join_orders_task
-    
-    # 3. 조인 → 최종 전처리 → CSV 저장
-    join_orders_task >> final_preprocess_task >> save_csv_task
-    
-    # 4. CSV 저장 → 집계 → 점수 계산 → 필터링
-    save_csv_task >> aggregate_task >> calculate_scores_task >> filter_alerts_task
+    # 1. 로드 → 집계 → 점수 계산 → 필터링
+    wait_for_smd_02 >> load_baemin_data_task >> aggregate_task >> calculate_scores_task >> filter_alerts_task
     
     # 5. 필터링 → 이메일 발송 (병렬)
-    filter_alerts_task >> [send_completion_task, send_alert_task]
+    filter_alerts_task >> [send_completion_task, send_alert_task] >> cleanup_task
 
 
 # ============================================================

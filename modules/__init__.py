@@ -22,7 +22,7 @@ from modules.extract.extract_db import read_table
 # ========== transform ==========
 from modules.transform.key_generator import add_surrogate_key
 from modules.transform.utility.io import read_csv_glob, load_data, preprocess_df
-from modules.transform.pipelines.sales_daily_orders import load_baemin_data
+from modules.transform.pipelines.SMD_03_sales_orders_transform import load_baemin_data
 
 # ========== extract ==========
 from modules.extract.extract_local_file import read_local_file

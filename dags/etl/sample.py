@@ -10,6 +10,7 @@ import pendulum
 import os
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.sensors.external_task import ExternalTaskSensor  # task 의존성 추가
 
 # 함수 import
 from modules.transform.pipelines.strategic_coupang_coupon import (

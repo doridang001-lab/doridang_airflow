@@ -3,11 +3,29 @@
 """
 
 from pathlib import Path
-from modules.transform.utility.paths import COLLECT_DB, LOCAL_DB, TEMP_DIR
+from modules.transform.utility.paths import COLLECT_DB, LOCAL_DB, TEMP_DIR, DOWN_DIR
 from modules.transform.utility.io3 import load_files, preprocess_df, save_to_csv, join_dataframes
 import pandas as pd
 import datetime as dt
 
+
+# 데이터 로드
+# from modules.transform.utility.io3 import load_files, preprocess_df, save_to_csv, join_dataframes
+def load_beamin_ad_change_history_df(**context):
+    """변경이력 수집"""
+    return load_files(
+        patterns=['baemin_ad_change_history_*.csv'], # 토더 리뷰 파일 패턴
+        search_paths=[
+            Path('/opt/airflow/download/업로드_temp'), # 업로드 임시 폴더
+            Path('/opt/airflow/download'), # 일반 다운로드 폴더
+            COLLECT_DB / "영업관리부_수집" # 수집 DB 폴더
+        ],
+        xcom_key='baemin_ad_change_history_path', # XCom 키
+        file_type='auto',  # CSV 우선, 없으면 Excel
+        **context
+    )
+    
+    
 
 # ============================================================
 # 전처리 로직 (데이터별로 커스터마이징)
@@ -43,11 +61,11 @@ def transform_df(df):
     
     return df
 
-def preprocess_df(**context):
+def preprocess_df(input_xcom_key, output_xcom_key, **context):
     """ 처리"""
     return preprocess_df(
-        input_xcom_key='toorder_review_path',
-        output_xcom_key='toorder_review_processed_path',
+        input_xcom_key=input_xcom_key,
+        output_xcom_key=output_xcom_key,
         transform_func=transform_df,  # 위에서 정의한 함수
         #natural_keys=['date', 'stores_name'],  # ID 생성용
         **context
@@ -228,3 +246,50 @@ def fin_save_to_csv(
     
     print(f"{'='*60}\n")
     return f"✅ 저장 완료: {len(df):,}건"
+
+
+# ============================================================
+# 수집된 CSV 파일 이동
+# ============================================================
+# 사용한 파일 이동
+def move_files(patterns, dest_dir, source_dir=None, **context):
+    """
+    수집 폴더의 CSV 파일들을 지정된 경로로 이동
+    
+    Args:
+        patterns: 이동할 파일 패턴 리스트 (예: ['baemin_*.csv'])
+        dest_dir: 목적지 디렉토리 (컨테이너 경로)
+        source_dir: 이동할 원본 디렉토리 (미지정 시 DOWN_DIR)
+    """
+    import glob as glob_module
+    import shutil
+    from pathlib import Path
+    from modules.transform.utility.paths import COLLECT_DB
+
+    collect_dir = Path(source_dir) if source_dir else DOWN_DIR
+    dest_path = Path(dest_dir)
+    
+    # 목적지 디렉토리 생성
+    dest_path.mkdir(parents=True, exist_ok=True)
+    
+    moved_count = 0
+    for pattern in patterns:
+        file_pattern = str(collect_dir / pattern)
+        files = glob_module.glob(file_pattern)
+        
+        print(f"\n[이동] 패턴: {pattern}")
+        print(f"   찾은 파일: {len(files)}개")
+        
+        for file_path in files:
+            try:
+                source = Path(file_path)
+                destination = dest_path / source.name
+                
+                shutil.move(str(source), str(destination))
+                print(f"   ✅ 이동: {source.name} → {destination}")
+                moved_count += 1
+            except Exception as e:
+                print(f"   ⚠️  이동 실패: {Path(file_path).name} - {e}")
+    
+    print(f"\n✅ 총 {moved_count}개 파일 이동 완료")
+    return f"이동 완료: {moved_count}개"
