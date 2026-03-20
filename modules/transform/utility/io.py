@@ -9,16 +9,16 @@ import hashlib
 
 from modules.transform.utility.paths import TEMP_DIR, LOCAL_DB
 
-# 스케줄 상수
-SMD_ORDERS_TIME      = "19 15 * * 1"    # 매주 월요일 15:19 실행
-SMD_VISIT_LOG        = "0 12 * * 1,3,5" # 매주 월,수,금 12:00 실행
-SMP_TOORDER_VOC_TIME = "30 9 * * *"     # 매일 09:30 실행
-SMP_FDAM_CS_TIME     = "5 9 * * *"      # 매일 09:05 실행
-
-# SMD_07 이메일 발송 제어
-SMD_07_EMAIL_TEST_MODE = False
-SMD_07_EMAIL_TEST_RECIPIENTS = ["a17019@kakao.com", "bulu1017@kakao.com"]
-SMD_07_EMAIL_DEV_CC_IN_PROD = True
+# 스케줄 상수 (schedule.py에서 re-export → 기존 import 호환)
+from modules.transform.utility.schedule import (
+    SMD_ORDERS_TIME,
+    SMD_VISIT_LOG,
+    SMP_TOORDER_VOC_TIME,
+    SMP_FDAM_CS_TIME,
+    SMD_07_EMAIL_TEST_MODE,
+    SMD_07_EMAIL_TEST_RECIPIENTS,
+    SMD_07_EMAIL_DEV_CC_IN_PROD,
+)
 
 
 # ============================================================
@@ -778,61 +778,8 @@ def load_data(
         return "0건 (에러)"
 
 
-def text_to_html(text):
-    """일반 텍스트를 HTML로 변환"""
-    text = text.replace('\n', '<br>')
-    return f"""<html>
-<head><meta charset="UTF-8"></head>
-<body style="font-family: 'Malgun Gothic', Arial, sans-serif; margin: 20px; line-height: 1.6;">
-<div style="background: #f8f9fa; padding: 20px; border-radius: 5px; border-left: 4px solid #27ae60;">
-{text}
-</div>
-<p style="color: #999; font-size: 12px; margin-top: 20px;">이 메일은 자동으로 발송되었습니다.</p>
-</body>
-</html>"""
-
-
-def send_email(
-    subject,
-    html_content,
-    to_emails,
-    conn_id='doridang_conn_smtp_gmail',
-    **context
-):
-    """이메일 발송 (Airflow SMTP Connection 사용)"""
-    import smtplib
-    from email.mime.text import MIMEText
-    from email.mime.multipart import MIMEMultipart
-    from airflow.hooks.base import BaseHook
-
-    connection = BaseHook.get_connection(conn_id)
-    assert connection.host and connection.port and connection.login and connection.password, \
-        f"SMTP 연결 설정 불완전: {conn_id}"
-    smtp_host: str = connection.host
-    smtp_port: int = connection.port
-    smtp_user: str = connection.login
-    smtp_password: str = connection.password
-    from_email = connection.extra_dejson.get('from_email') or smtp_user
-
-    to_list = [to_emails] if isinstance(to_emails, str) else to_emails
-
-    msg = MIMEMultipart('alternative')
-    msg['Subject'] = subject
-    msg['From'] = from_email
-    msg['To'] = ', '.join(to_list)
-    msg.attach(MIMEText(html_content, 'html', 'utf-8'))
-
-    try:
-        print(f"📧 이메일 발송 시작... 수신: {to_list}, 제목: {subject}")
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_password)
-            server.send_message(msg)
-        print(f"✅ 이메일 발송 성공: {len(to_list)}명")
-        return f"이메일 발송 완료: {len(to_list)}명"
-    except Exception as e:
-        print(f"❌ 이메일 발송 실패: {e}")
-        raise
+# 이메일 함수 (mailer.py에서 re-export → 기존 import 호환)
+from modules.transform.utility.mailer import text_to_html, send_email
 
 
 def create_sub_order_id_simple(
