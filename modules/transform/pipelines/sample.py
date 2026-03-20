@@ -4,13 +4,13 @@
 
 from pathlib import Path
 from modules.transform.utility.paths import COLLECT_DB, LOCAL_DB, TEMP_DIR, DOWN_DIR
-from modules.transform.utility.io3 import load_files, preprocess_df, save_to_csv, join_dataframes
+from modules.transform.utility.io import load_files, preprocess_df, save_to_csv, join_dataframes
 import pandas as pd
 import datetime as dt
 
 
 # 데이터 로드
-# from modules.transform.utility.io3 import load_files, preprocess_df, save_to_csv, join_dataframes
+# from modules.transform.utility.io import load_files, preprocess_df, save_to_csv, join_dataframes
 def load_beamin_ad_change_history_df(**context):
     """변경이력 수집"""
     return load_files(
@@ -22,6 +22,7 @@ def load_beamin_ad_change_history_df(**context):
         ],
         xcom_key='baemin_ad_change_history_path', # XCom 키
         file_type='auto',  # CSV 우선, 없으면 Excel
+        dedup_key=['변경시간', 'store_id'],  # 같은 이벤트 여러 파일 중복 제거
         **context
     )
     

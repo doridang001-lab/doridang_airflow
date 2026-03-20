@@ -18,3 +18,4 @@ undetected-chromedriver
 curl_cffi
 python-dotenv
 ollama
+tqdm

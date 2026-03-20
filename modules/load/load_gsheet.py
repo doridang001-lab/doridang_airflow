@@ -292,7 +292,7 @@ def _execute_overwrite(service, spreadsheet_id: str, sheet_name: str, df: pd.Dat
     result = service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
         range=f"{sheet_name}!A1",
-        valueInputOption="USER_ENTERED",  # ⭐ RAW → USER_ENTERED (숫자 자동 변환)
+        valueInputOption="RAW",  # ⭐ RAW: 자동 변환 방지 (숫자가 날짜로 변환되지 않음)
         body=body
     ).execute()
     
@@ -312,7 +312,7 @@ def _execute_append(service, spreadsheet_id: str, sheet_name: str, df: pd.DataFr
     service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
         range=f"{sheet_name}!A1",
-        valueInputOption="USER_ENTERED",
+        valueInputOption="RAW",  # ⭐ RAW: 자동 변환 방지
         insertDataOption="INSERT_ROWS",
         body=body
     ).execute()
@@ -356,6 +356,20 @@ def _execute_append_unique(service, spreadsheet_id: str, sheet_name: str, df: pd
 
     key_cols = _resolve_key_columns(df, primary_key)
     new_rows_df, duplicate_count = _filter_new_rows(df_w, existing_df, key_cols)
+
+    # 기존 시트 헤더 순서에 맞춰 컬럼 정렬 (위치 밀림 방지)
+    if len(existing_df) > 0 and len(new_rows_df) > 0:
+        existing_cols = list(existing_df.columns)
+
+        missing_cols = [c for c in existing_cols if c not in new_rows_df.columns]
+        for col in missing_cols:
+            new_rows_df[col] = ""
+
+        extra_cols = [c for c in new_rows_df.columns if c not in existing_cols]
+        if extra_cols:
+            print(f"[경고] 기존 시트에 없는 컬럼은 append에서 제외됨: {extra_cols}")
+
+        new_rows_df = new_rows_df[existing_cols]
 
     if len(new_rows_df) > 0:
         values = _df_to_rows(new_rows_df)

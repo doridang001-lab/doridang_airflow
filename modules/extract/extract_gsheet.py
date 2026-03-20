@@ -114,7 +114,36 @@ def _read_worksheet_as_dataframe(spreadsheet, sheet_name: Optional[str] = None) 
         worksheet = spreadsheet.worksheet(sheet_name)
     else:
         worksheet = spreadsheet.get_worksheet(FIRST_WORKSHEET_INDEX)
-    return pd.DataFrame(worksheet.get_all_records())
+
+    # get_all_records()는 헤더에 빈 컬럼이 있으면 0건 반환하는 문제가 있어
+    # get_all_values()로 원시 데이터를 가져온 뒤 수동으로 DataFrame 생성
+    all_values = worksheet.get_all_values()
+    if not all_values:
+        return pd.DataFrame()
+
+    # 첫 행을 헤더로 사용, 빈 헤더는 unnamed_N으로 처리
+    raw_headers = all_values[0]
+    headers = []
+    for i, h in enumerate(raw_headers):
+        h = str(h).strip()
+        headers.append(h if h else f'unnamed_{i}')
+
+    rows = all_values[1:]
+    if not rows:
+        return pd.DataFrame(columns=headers)
+
+    # 행 길이를 헤더 수에 맞춤
+    n = len(headers)
+    padded = [row + [''] * (n - len(row)) if len(row) < n else row[:n] for row in rows]
+
+    df = pd.DataFrame(padded, columns=headers)
+
+    # unnamed 컬럼 제거 (빈 헤더였던 컬럼)
+    unnamed_cols = [c for c in df.columns if c.startswith('unnamed_')]
+    if unnamed_cols:
+        df.drop(columns=unnamed_cols, inplace=True)
+
+    return df
 
 
 def _extract_excel_from_gdrive(file_id: str, sheet_name: Optional[str], credentials_path: str) -> pd.DataFrame:

@@ -13,7 +13,7 @@ from airflow.operators.python import PythonOperator
 from airflow.sensors.external_task import ExternalTaskSensor  # task 의존성 추가
 
 # 함수 import
-from modules.transform.pipelines.strategic_coupang_coupon import (
+from modules.transform.pipelines.strategy.strategic_coupang_coupon import (
     load_reupload_coupang_coupon
 )
 

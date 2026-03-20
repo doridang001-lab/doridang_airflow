@@ -14,15 +14,13 @@ from modules.load.load_gsheet import save_to_gsheet
 from modules.load.load_postgre_db import postgre_db_save
 from modules.load.load_onedrive import onedrive_csv_save
 
-from modules.notification.sales_alert import check_threshold
-from modules.notification.send_email_graph import send_email_graph
 from modules.extract.extract_db import read_table
 
 
 # ========== transform ==========
 from modules.transform.key_generator import add_surrogate_key
 from modules.transform.utility.io import read_csv_glob, load_data, preprocess_df
-from modules.transform.pipelines.SMD_03_sales_orders_transform import load_baemin_data
+from modules.transform.pipelines.sales.SMD_03_sales_orders_transform import load_baemin_data
 
 # ========== extract ==========
 from modules.extract.extract_local_file import read_local_file
@@ -65,8 +63,6 @@ __all__ = [
     'add_surrogate_key', 
     'save_to_gsheet', 
     'postgre_db_save',
-    'check_threshold',
-    'send_email_graph',
     'db_load_data',
     'onedrive_csv_save',
     'read_local_file',

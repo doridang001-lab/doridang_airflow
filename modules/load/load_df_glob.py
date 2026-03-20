@@ -168,43 +168,55 @@ def load_data(
 # 수집된 CSV 파일 정리 및 업로드 함수
 # ============================================================
 
-def cleanup_collected_csvs(patterns, dest_dir, **context):
+def cleanup_collected_csvs(patterns, dest_dir, source_dir=None, **context):
     """
     OneDrive 수집 폴더의 CSV 파일들을 지정된 경로로 이동
     
     Args:
         patterns: 이동할 파일 패턴 리스트 (예: ['baemin_*.csv'])
         dest_dir: 목적지 디렉토리 (컨테이너 경로)
+        source_dir: 원본 디렉토리 (없으면 영업관리부_수집 기본값 사용)
     """
     import glob as glob_module
     import shutil
     from pathlib import Path
     from modules.transform.utility.paths import COLLECT_DB
     
-    collect_dir = COLLECT_DB / "영업관리부_수집"
     dest_path = Path(dest_dir)
+    
+    # 검색할 소스 디렉토리 목록 (지정된 경로 + COLLECT_DB 루트)
+    source_dirs = []
+    if source_dir:
+        source_dirs.append(Path(source_dir))
+    else:
+        source_dirs.append(COLLECT_DB / "영업관리부_수집")
+    # 루트에 있는 파일도 커버
+    if COLLECT_DB not in source_dirs:
+        source_dirs.append(COLLECT_DB)
     
     # 목적지 디렉토리 생성
     dest_path.mkdir(parents=True, exist_ok=True)
     
     moved_count = 0
     for pattern in patterns:
-        file_pattern = str(collect_dir / pattern)
-        files = glob_module.glob(file_pattern)
-        
         print(f"\n[이동] 패턴: {pattern}")
-        print(f"   찾은 파일: {len(files)}개")
-        
-        for file_path in files:
-            try:
-                source = Path(file_path)
-                destination = dest_path / source.name
-                
-                shutil.move(str(source), str(destination))
-                print(f"   ✅ 이동: {source.name} → {destination}")
-                moved_count += 1
-            except Exception as e:
-                print(f"   ⚠️  이동 실패: {Path(file_path).name} - {e}")
+        for collect_dir in source_dirs:
+            file_pattern = str(collect_dir / pattern)
+            files = glob_module.glob(file_pattern)
+            
+            if files:
+                print(f"   경로: {collect_dir} → 찾은 파일: {len(files)}개")
+            
+            for file_path in files:
+                try:
+                    source = Path(file_path)
+                    destination = dest_path / source.name
+                    
+                    shutil.move(str(source), str(destination))
+                    print(f"   ✅ 이동: {source.name} → {destination}")
+                    moved_count += 1
+                except Exception as e:
+                    print(f"   ⚠️  이동 실패: {Path(file_path).name} - {e}")
     
     print(f"\n✅ 총 {moved_count}개 파일 이동 완료")
     return f"이동 완료: {moved_count}개"

@@ -3,7 +3,7 @@ import os
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-from modules.transform.pipelines.strategic_coupang_coupon import (
+from modules.transform.pipelines.strategy.strategic_coupang_coupon import (
     load_coupang_coupon_df,
     preprocess_coupang_coupon_df,
     coupon_fin_save_to_csv
