@@ -1,0 +1,63 @@
+[2026-03-24T08:45:22.955+0000] {local_task_job_runner.py:123} INFO - ::group::Pre task execution logs
+[2026-03-24T08:45:22.969+0000] {taskinstance.py:2613} INFO - Dependencies all met for dep_context=non-requeueable deps ti=<TaskInstance: Sales_Orders_07_Alert_Dags.send_alert_email scheduled__2026-03-23T08:38:00+00:00 [queued]>
+[2026-03-24T08:45:22.975+0000] {taskinstance.py:2613} INFO - Dependencies all met for dep_context=requeueable deps ti=<TaskInstance: Sales_Orders_07_Alert_Dags.send_alert_email scheduled__2026-03-23T08:38:00+00:00 [queued]>
+[2026-03-24T08:45:22.976+0000] {taskinstance.py:2866} INFO - Starting attempt 1 of 2
+[2026-03-24T08:45:22.986+0000] {taskinstance.py:2889} INFO - Executing <Task(PythonOperator): send_alert_email> on 2026-03-23 08:38:00+00:00
+[2026-03-24T08:45:22.994+0000] {warnings.py:112} WARNING - /home/***/.local/lib/python3.12/site-packages/***/task/task_runner/standard_task_runner.py:70: DeprecationWarning: This process (pid=21891) is multi-threaded, use of fork() may lead to deadlocks in the child.
+  pid = os.fork()
+
+[2026-03-24T08:45:22.996+0000] {standard_task_runner.py:72} INFO - Started process 21893 to run task
+[2026-03-24T08:45:22.997+0000] {standard_task_runner.py:104} INFO - Running: ['***', 'tasks', 'run', 'Sales_Orders_07_Alert_Dags', 'send_alert_email', 'scheduled__2026-03-23T08:38:00+00:00', '--job-id', '22574', '--raw', '--subdir', 'DAGS_FOLDER/sales/Sales_Orders_07_Alert_Dags.py', '--cfg-path', '/tmp/tmp0eqund85']
+[2026-03-24T08:45:22.999+0000] {standard_task_runner.py:105} INFO - Job 22574: Subtask send_alert_email
+[2026-03-24T08:45:23.050+0000] {task_command.py:467} INFO - Running <TaskInstance: Sales_Orders_07_Alert_Dags.send_alert_email scheduled__2026-03-23T08:38:00+00:00 [running]> on host dd4b55f6e1f9
+[2026-03-24T08:45:23.314+0000] {taskinstance.py:3132} INFO - Exporting env vars: AIRFLOW_CTX_DAG_OWNER='***' AIRFLOW_CTX_DAG_ID='Sales_Orders_07_Alert_Dags' AIRFLOW_CTX_TASK_ID='send_alert_email' AIRFLOW_CTX_EXECUTION_DATE='2026-03-23T08:38:00+00:00' AIRFLOW_CTX_TRY_NUMBER='1' AIRFLOW_CTX_DAG_RUN_ID='scheduled__2026-03-23T08:38:00+00:00'
+[2026-03-24T08:45:23.315+0000] {taskinstance.py:731} INFO - ::endgroup::
+[2026-03-24T08:45:23.324+0000] {logging_mixin.py:190} INFO - 
+============================================================
+[2026-03-24T08:45:23.324+0000] {logging_mixin.py:190} INFO - [알림] 이메일 발송 시작
+[2026-03-24T08:45:23.327+0000] {logging_mixin.py:190} INFO - [알림] 수집일자 (DAG 실행일): 2026-03-24
+[2026-03-24T08:45:23.327+0000] {logging_mixin.py:190} INFO - [알림] 알림기준일 (매출 분석일): 2026-03-23
+[2026-03-24T08:45:23.338+0000] {logging_mixin.py:190} INFO - [알림] CSV 파일 읽기 성공: 17건
+[2026-03-24T08:45:23.339+0000] {logging_mixin.py:190} INFO - [알람] 알람 대상: 17건 (기준일: 2026-03-22)
+[2026-03-24T08:45:23.344+0000] {logging_mixin.py:190} INFO - [알림] LLM 진단 결과 로드: 17개 매장
+[2026-03-24T08:45:23.353+0000] {logging_mixin.py:190} INFO - [점수 합계] 도리당 대화점: 9점 (매출:6, 수수료:3)
+[2026-03-24T08:45:23.354+0000] {logging_mixin.py:190} INFO - [점수 합계] 도리당 백석점: 5점 (매출:5)
+[2026-03-24T08:45:23.355+0000] {logging_mixin.py:190} INFO - [점수 합계] 도리당 연신내점: 5점 (매출:5)
+[2026-03-24T08:45:23.355+0000] {logging_mixin.py:190} INFO - [점수 합계] 도리당 응암점: 13점 (매출:5, 수수료:4, 쿠팡광고:4)
+[2026-03-24T08:45:23.356+0000] {logging_mixin.py:190} INFO - [점수 합계] 도리당 행신점: 9점 (매출:5, 수수료:4)
+[2026-03-24T08:45:23.357+0000] {logging_mixin.py:190} INFO - [점수 합계] 도리당 대전관평점: 17점 (매출:4, 수수료:6, 쿠팡광고:3, 배민광고:4)
+[2026-03-24T08:45:23.358+0000] {logging_mixin.py:190} INFO - [점수 합계] 도리당 삼송점: 16점 (매출:4, 수수료:4, 쿠팡광고:5, 배민광고:3)
+[2026-03-24T08:45:23.359+0000] {logging_mixin.py:190} INFO - [알람] 🚀 실전 | 김덕기 과장 (email=kdk1402@kakao.com): 7개 매장 -> ['a17019@kakao.com', 'kdk1402@kakao.com']
+[2026-03-24T08:45:23.368+0000] {base.py:84} INFO - Retrieving connection 'doridang_conn_smtp_gmail'
+[2026-03-24T08:45:23.370+0000] {logging_mixin.py:190} INFO - 📧 이메일 발송 시작... 수신: ['a17019@kakao.com', 'kdk1402@kakao.com'], 제목: 🚨 [운영이상] 도리당 대전관평점 외 6건
+[2026-03-24T08:45:25.488+0000] {logging_mixin.py:190} INFO - ✅ 이메일 발송 성공: 2명
+[2026-03-24T08:45:25.489+0000] {logging_mixin.py:190} INFO - [알람] ✅ 김덕기 과장 이메일 발송 성공
+[2026-03-24T08:45:25.492+0000] {logging_mixin.py:190} INFO - [점수 합계] 도리당 김포풍무점: 5점 (수수료:5)
+[2026-03-24T08:45:25.493+0000] {logging_mixin.py:190} INFO - [점수 합계] 도리당 창원내서점: 9점 (매출:6, 배민광고:3)
+[2026-03-24T08:45:25.493+0000] {logging_mixin.py:190} INFO - [점수 합계] 도리당 경북상주점: 5점 (매출:5)
+[2026-03-24T08:45:25.494+0000] {logging_mixin.py:190} INFO - [점수 합계] 도리당 김포장기점: 9점 (매출:5, 쿠팡광고:4)
+[2026-03-24T08:45:25.494+0000] {logging_mixin.py:190} INFO - [점수 합계] 도리당 부산장림점: 12점 (매출:4, 쿠팡광고:5, 배민광고:3)
+[2026-03-24T08:45:25.495+0000] {logging_mixin.py:190} INFO - [점수 합계] 도리당 김해구산점: 9점 (매출:3, 수수료:6)
+[2026-03-24T08:45:25.495+0000] {logging_mixin.py:190} INFO - [알람] 🚀 실전 | 이병두 과장 (email=byoungd201@kakao.com): 6개 매장 -> ['a17019@kakao.com', 'byoungd201@kakao.com']
+[2026-03-24T08:45:25.502+0000] {base.py:84} INFO - Retrieving connection 'doridang_conn_smtp_gmail'
+[2026-03-24T08:45:25.505+0000] {logging_mixin.py:190} INFO - 📧 이메일 발송 시작... 수신: ['a17019@kakao.com', 'byoungd201@kakao.com'], 제목: 🚨 [운영이상] 도리당 경북상주점 외 5건
+[2026-03-24T08:45:29.184+0000] {logging_mixin.py:190} INFO - ✅ 이메일 발송 성공: 2명
+[2026-03-24T08:45:29.185+0000] {logging_mixin.py:190} INFO - [알람] ✅ 이병두 과장 이메일 발송 성공
+[2026-03-24T08:45:29.190+0000] {logging_mixin.py:190} INFO - [점수 합계] 도리당 오산시청점: 8점 (매출:5, 수수료:3)
+[2026-03-24T08:45:29.191+0000] {logging_mixin.py:190} INFO - [점수 합계] 도리당 평택서정점: 8점 (매출:5, 수수료:3)
+[2026-03-24T08:45:29.191+0000] {logging_mixin.py:190} INFO - [점수 합계] 도리당 기흥테라타워점: 9점 (매출:4, 수수료:5)
+[2026-03-24T08:45:29.192+0000] {logging_mixin.py:190} INFO - [점수 합계] 도리당 노원점: 9점 (매출:4, 수수료:5)
+[2026-03-24T08:45:29.193+0000] {logging_mixin.py:190} INFO - [알람] 🚀 실전 | 황대성 대리 (email=gjddkemf@kakao.com): 4개 매장 -> ['a17019@kakao.com', 'gjddkemf@kakao.com']
+[2026-03-24T08:45:29.200+0000] {base.py:84} INFO - Retrieving connection 'doridang_conn_smtp_gmail'
+[2026-03-24T08:45:29.201+0000] {logging_mixin.py:190} INFO - 📧 이메일 발송 시작... 수신: ['a17019@kakao.com', 'gjddkemf@kakao.com'], 제목: 🚨 [운영이상] 도리당 기흥테라타워점 외 3건
+[2026-03-24T08:45:32.939+0000] {logging_mixin.py:190} INFO - ✅ 이메일 발송 성공: 2명
+[2026-03-24T08:45:32.940+0000] {logging_mixin.py:190} INFO - [알람] ✅ 황대성 대리 이메일 발송 성공
+[2026-03-24T08:45:32.941+0000] {logging_mixin.py:190} INFO - 
+[알람] 이메일 발송 완료: 성공 3명, 실패 0명
+[2026-03-24T08:45:32.942+0000] {logging_mixin.py:190} INFO - ============================================================
+[2026-03-24T08:45:32.942+0000] {python.py:240} INFO - Done. Returned value was: 알람 이메일 발송 완료: 성공 3명, 실패 0명, 기준일: 2026-03-22
+[2026-03-24T08:45:32.963+0000] {taskinstance.py:340} INFO - ::group::Post task execution logs
+[2026-03-24T08:45:32.963+0000] {taskinstance.py:352} INFO - Marking task as SUCCESS. dag_id=Sales_Orders_07_Alert_Dags, task_id=send_alert_email, run_id=scheduled__2026-03-23T08:38:00+00:00, execution_date=20260323T083800, start_date=20260324T084522, end_date=20260324T084532
+[2026-03-24T08:45:33.010+0000] {local_task_job_runner.py:266} INFO - Task exited with return code 0
+[2026-03-24T08:45:33.023+0000] {taskinstance.py:3895} INFO - 0 downstream tasks scheduled from follow-on schedule check
+[2026-03-24T08:45:33.024+0000] {local_task_job_runner.py:245} INFO - ::endgroup::

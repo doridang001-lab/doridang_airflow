@@ -321,15 +321,24 @@ def filter_alerts(
         ('service_status', 'pre_service_status'),          # 성실영업(서비스)
     ]
     
-    # 각 지표별 알림 조건: "위험"만 알림 (주의 연속 조건 제외)
+    # 각 지표별 알림 조건: 전주·금주 모두 "위험" (연속 위험)인 경우만 알림
     alert_mask = pd.Series(False, index=df_target.index)
 
     for st_col, pre_st_col in STATUS_PAIRS:
         if st_col in df_target.columns:
-            pair_mask = (df_target[st_col] == '위험')
-            matched = pair_mask.sum()
-            if matched > 0:
-                print(f"  [{st_col}] 알림 대상(위험): {matched}건")
+            curr_danger = df_target[st_col] == '위험'
+            if pre_st_col in df_target.columns:
+                # 전주(pre)도 위험인 경우만 포함
+                pair_mask = curr_danger & (df_target[pre_st_col] == '위험')
+                matched = pair_mask.sum()
+                if matched > 0:
+                    print(f"  [{st_col}] 연속위험 알림 대상: {matched}건")
+            else:
+                # pre 컬럼 없으면 금주 위험만 체크 (fallback)
+                pair_mask = curr_danger
+                matched = pair_mask.sum()
+                if matched > 0:
+                    print(f"  [{st_col}] 알림 대상(위험, pre 컬럼 없음): {matched}건")
             alert_mask = alert_mask | pair_mask
         else:
             if st_col in ['status']:  # 매출 status는 필수

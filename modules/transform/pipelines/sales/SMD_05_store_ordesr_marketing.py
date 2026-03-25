@@ -666,7 +666,7 @@ def transform_fin_df(df):
     df['fee_status'] = np.where(df["fee_score_total"] >= 5, '위험', 
                                 np.where(df["fee_score_total"] >= 3, '주의',
                                 np.where(df["fee_score_total"] >= 2, '관심', '정상')))
-    df["pre_fee_status"] = df.groupby(["매장명"])["fee_status"].shift(1).fillna('정상')
+    df["pre_fee_status"] = df.groupby(["매장명"])["fee_status"].shift(7).fillna('정상')
 
     # 수수료 MTD 계산용 임시 컬럼 제거
     df.drop(columns=['_fee_amount', '_fee_amount_mtd_curr_month', '_total_amount_mtd_curr_month'], inplace=True)
@@ -725,7 +725,7 @@ def transform_fin_df(df):
     df['쿠팡_광고효과_status'] = np.where(df["쿠팡_광고효과_score_total"] >= 5, '위험', 
                                         np.where(df["쿠팡_광고효과_score_total"] >= 3, '주의',
                                         np.where(df["쿠팡_광고효과_score_total"] >= 2, '관심', '정상')))
-    df["pre_쿠팡_광고효과_status"] = df.groupby(["매장명"])["쿠팡_광고효과_status"].shift(1).fillna('정상')
+    df["pre_쿠팡_광고효과_status"] = df.groupby(["매장명"])["쿠팡_광고효과_status"].shift(7).fillna('정상')
 
     # 쿠팡 광고효과 MTD 계산용 임시 컬럼 제거
     df.drop(columns=['_쿠팡_광고클릭수_mtd_curr_month', '_쿠팡_광고노출수_mtd_curr_month'], inplace=True)
@@ -784,7 +784,7 @@ def transform_fin_df(df):
     df['배민_광고효과_status'] = np.where(df["배민_광고효과_score_total"] >= 5, '위험', 
                                         np.where(df["배민_광고효과_score_total"] >= 3, '주의',
                                         np.where(df["배민_광고효과_score_total"] >= 2, '관심', '정상')))
-    df["pre_배민_광고효과_status"] = df.groupby(["매장명"])["배민_광고효과_status"].shift(1).fillna('정상')
+    df["pre_배민_광고효과_status"] = df.groupby(["매장명"])["배민_광고효과_status"].shift(7).fillna('정상')
 
     # 배민 광고효과 MTD 계산용 임시 컬럼 제거
     df.drop(columns=['_배민_클릭수_mtd_curr_month', '_배민_노출수_mtd_curr_month'], inplace=True)
@@ -1022,7 +1022,7 @@ def transform_fin_df(df):
     )
     
     df = df.sort_values(['매장명', 'order_daily'])
-    df['pre_service_status'] = df.groupby('매장명')['service_status'].shift(1).fillna('정상')
+    df['pre_service_status'] = df.groupby('매장명')['service_status'].shift(7).fillna('정상')
     
     return df
 # baemin_ad_change_history_path

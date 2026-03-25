@@ -73,7 +73,7 @@ def _credential_candidates() -> list:
 
 def _latest_successful_execution_date(dt, **context):
     """SMP_Fdam_CS_ETL_Dags 의 최신 성공 실행일 반환 (없으면 현재 dt 사용)"""
-    runs = DagRun.find(dag_id='SMP_Fdam_CS_ETL_Dags', state=DagRunState.SUCCESS)
+    runs = DagRun.find(dag_id='Strategy_FdamCS_01_Process_Dags', state=DagRunState.SUCCESS)
     if not runs:
         return dt
     execution_dates = [r.execution_date for r in runs if r.execution_date is not None]
@@ -431,7 +431,7 @@ with DAG(
     # soft_fail=True : upstream이 없거나 타임아웃 시 skipped 처리 후 계속 진행 (SMD_02 패턴)
     wait_for_cs_alert = ExternalTaskSensor(
         task_id='wait_for_cs_alert',
-        external_dag_id='SMP_Fdam_CS_ETL_Dags',
+        external_dag_id='Strategy_FdamCS_01_Process_Dags',
         external_task_id='send_overdue_cs_alert',
         allowed_states=['success'],
         failed_states=['failed', 'skipped'],

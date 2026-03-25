@@ -45,7 +45,7 @@ def _latest_smd02_execution_date(dt, **context):
                 """
             ),
             {
-                'dag_id': 'SMD_02_sales_orders_csv_review_Dags',
+                'dag_id': 'Sales_Orders_02_Review_Dags',
                 'task_id': 'fin_save_to_csv',
                 'state': 'success',
             },
@@ -121,7 +121,7 @@ with DAG(
     # ============================================================
     wait_for_smd_02 = ExternalTaskSensor(
         task_id='wait_for_smd_02', #⭐ SMD_02 완료 대기
-        external_dag_id='SMD_02_sales_orders_csv_review_Dags', # SMD_02 DAG ID
+        external_dag_id='Sales_Orders_02_Review_Dags',
         external_task_id='fin_save_to_csv',  # SMD_02의 마지막 task
         execution_date_fn=_latest_smd02_execution_date,  # ⭐ 최신 성공 실행 찾기
         allowed_states=['success'],

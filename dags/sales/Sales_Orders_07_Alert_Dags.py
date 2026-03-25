@@ -69,7 +69,7 @@ with DAG(
     # ============================================================
     wait_for_smd_06 = ExternalTaskSensor(
         task_id='wait_for_smd_06',
-        external_dag_id='SMD_06_csv_upload_alerts_to_gsheet_Dags',
+        external_dag_id='Sales_Orders_06_Gsheet_Dags',
         external_task_id='upload_alerts_to_gsheet',
         allowed_states=['success'],
         failed_states=['failed'],

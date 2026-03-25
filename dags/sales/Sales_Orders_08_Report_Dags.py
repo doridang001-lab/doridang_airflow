@@ -14,6 +14,7 @@ SMD_08 - 매장별 조치 현황 리포트 GSheet 업로드 DAG
 """
 
 import os
+import logging
 import pendulum
 import pandas as pd
 from pathlib import Path
@@ -24,6 +25,8 @@ from airflow.sensors.external_task import ExternalTaskSensor
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+logger = logging.getLogger(__name__)
 
 from modules.transform.utility.paths import LOCAL_DB
 from modules.load.load_gsheet import save_to_gsheet
@@ -83,7 +86,7 @@ TMP_CSV_PATH    = LOCAL_DB / 'temp' / 'tmp_gsheet.csv'
 
 # grp → gsheet 1 업로드 시 포함할 컬럼 (담당자 입력 템플릿)
 TEMPLATE_COLUMNS = [
-    '날짜', '매장명', '담당자',
+    '날짜', '매장명', '전주상태', '담당자',
     '매출', '수수료', '배민광고', '쿠팡광고', '성실지표',
     '조치일자', '목표치', '핵심조치', '조치내용', '문제점',
 ]
@@ -93,7 +96,7 @@ BUFFER_COLUMNS = TEMPLATE_COLUMNS + ['수집날짜', '구분']
 
 # 최종 출력 컬럼
 SELECTED_COLUMNS = [
-    'order_daily', '매장명', '담당자', '매출', '수수료',
+    'order_daily', '매장명', '전주상태', '담당자', '매출', '수수료',
     '배민광고', '쿠팡광고', '성실지표', '조치일자', '목표치', '핵심조치', '조치내용', '문제점',
     '담당자_order', 'email',
     'total_order_count', 'total_amount', 'fee_ad', 'ARPU',
@@ -118,7 +121,7 @@ def collect_to_buffer(**context):
     수집날짜(오늘)를 추가한 뒤 gsheet2(버퍼 시트)에 append.
     gsheet2는 조치일자+7일 대기 후 gsheet3 누적 이동 전 임시 보관소 역할.
     """
-    print("[collect_to_buffer] gsheet1 데이터 수집 시작")
+    logger.info("[collect_to_buffer] gsheet1 데이터 수집 시작")
 
     df = extract_gsheet(
         url=REPORT_GSHEET_URL,
@@ -127,7 +130,7 @@ def collect_to_buffer(**context):
     )
 
     if df is None or df.empty:
-        print("[collect_to_buffer] gsheet1 데이터 없음 → 버퍼 이동 없음")
+        logger.info("[collect_to_buffer] gsheet1 데이터 없음 → 버퍼 이동 없음")
         return "gsheet1 데이터 없음"
 
     # 매장명 빈 행 제거
@@ -148,10 +151,10 @@ def collect_to_buffer(**context):
     filled_mask = action_date_filled | action_content_filled
     df_filled = df[filled_mask].copy().reset_index(drop=True)
 
-    print(f"[collect_to_buffer] gsheet1 전체: {len(df)}건, 조치일자/조치내용 입력: {len(df_filled)}건")
+    logger.info(f"[collect_to_buffer] gsheet1 전체: {len(df)}건, 조치일자/조치내용 입력: {len(df_filled)}건")
 
     if df_filled.empty:
-        print("[collect_to_buffer] 조치일자/조치내용 입력 없음 → 버퍼 이동 없음")
+        logger.info("[collect_to_buffer] 조치일자/조치내용 입력 없음 → 버퍼 이동 없음")
         return "조치일자/조치내용 미입력 → 버퍼 이동 없음"
 
     # 날짜 컬럼 정규화
@@ -169,12 +172,12 @@ def collect_to_buffer(**context):
         .astype(str).str.strip().replace('nan', '').ne('')
     )
     df_filled['구분'] = (has_action_date & has_action_category).map({True: '조치', False: '미조치'})
-    print(f"[collect_to_buffer] 조치: {(df_filled['구분']=='조치').sum()}건, 미조치: {(df_filled['구분']=='미조치').sum()}건")
+    logger.info(f"[collect_to_buffer] 조치: {(df_filled['구분']=='조치').sum()}건, 미조치: {(df_filled['구분']=='미조치').sum()}건")
 
     # BUFFER_COLUMNS 기준으로 컬럼 정렬
     buf_df = df_filled.reindex(columns=BUFFER_COLUMNS)
 
-    print(f"[collect_to_buffer] gsheet2 버퍼에 {len(buf_df)}건 append 예정")
+    logger.info(f"[collect_to_buffer] gsheet2 버퍼에 {len(buf_df)}건 append 예정")
 
     result = save_to_gsheet(
         df=buf_df,
@@ -185,7 +188,7 @@ def collect_to_buffer(**context):
         url=BUFFER_GSHEET_URL,
     )
     if result.get('success'):
-        print(f"[collect_to_buffer] ✅ gsheet2 버퍼 append 완료: {len(buf_df)}건")
+        logger.info(f"[collect_to_buffer] ✅ gsheet2 버퍼 append 완료: {len(buf_df)}건")
     else:
         raise RuntimeError(f"gsheet2 버퍼 append 실패: {result.get('error')}")
 
@@ -201,12 +204,12 @@ def upload_grp_template(**context):
     gsheet 1에 overwrite 업로드.
     담당자가 조치일자·핵심조치·조치내용을 직접 기입할 템플릿 역할.
     """
-    print("[upload_grp_template] 시작")
+    logger.info("[upload_grp_template] 시작")
     if not GRP_CSV_PATH.exists():
         raise FileNotFoundError(f"grp CSV 없음: {GRP_CSV_PATH}")
 
     grp = pd.read_csv(GRP_CSV_PATH, encoding='utf-8-sig')
-    print(f"[grp] {len(grp):,}건  컬럼: {grp.columns.tolist()}")
+    logger.info(f"[grp] {len(grp):,}건  컬럼: {grp.columns.tolist()}")
 
     # order_daily → 날짜 컬럼으로 사용 (Excel 시리얼 숫자 포함 변환)
     grp['날짜'] = _parse_date_series(
@@ -236,17 +239,35 @@ def upload_grp_template(**context):
     if '담당자' not in grp.columns:
         grp['담당자'] = ''
 
+    # ── 전주상태 계산 (pre_* 컬럼 → JSON {"매출":"위험","수수료":"정상",...}) ──
+    import json as _json
+    _PRE_MAP = {
+        '매출':     'pre_status',
+        '수수료':   'pre_fee_status',
+        '배민광고': 'pre_배민_광고효과_status',
+        '쿠팡광고': 'pre_쿠팡_광고효과_status',
+        '성실지표': 'pre_service_status',
+    }
+    def _calc_prev_status(row):
+        return _json.dumps(
+            {label: str(row.get(col, '정상') or '정상') for label, col in _PRE_MAP.items()},
+            ensure_ascii=False
+        )
+    grp['전주상태'] = grp.apply(_calc_prev_status, axis=1)
+    logger.info(f"[전주상태] JSON 형태 계산 완료: {len(grp):,}건")
+    # grp.csv는 SMD_07에서 이미 연속위험 필터링 완료 → 추가 필터 불필요
+
     # 매장별 1개만 (최신 날짜 기준 중복 제거)
     grp = grp.sort_values('날짜', ascending=False).drop_duplicates(subset=['매장명'], keep='first')
     grp = grp.sort_values(['담당자', '매장명']).reset_index(drop=True)
-    print(f"[중복 제거] 매장별 1개: {len(grp):,}건")
+    logger.info(f"[중복 제거] 매장별 1개: {len(grp):,}건")
 
     # 조치일자·목표치·핵심조치·조치내용·문제점: 담당자 입력 전용 열 → 코드에서 절대 쓰지 않음
-    # (I:M 열은 clear / write 대상에서 제외 → 드롭다운 유효성 규칙 보존)
-    AUTO_COLUMNS = ['날짜', '매장명', '담당자', '매출', '수수료', '배민광고', '쿠팡광고', '성실지표']  # A:H
+    # (J:N 열은 clear / write 대상에서 제외 → 드롭다운 유효성 규칙 보존)
+    AUTO_COLUMNS = ['날짜', '매장명', '전주상태', '담당자', '매출', '수수료', '배민광고', '쿠팡광고', '성실지표']  # A:I
 
     tmpl = grp.reindex(columns=AUTO_COLUMNS)
-    print(f"[template] {len(tmpl):,}건 업로드 예정 (A:H 자동입력 / I:M 담당자 입력 보존)")
+    logger.info(f"[template] {len(tmpl):,}건 업로드 예정 (A:I 자동입력 / J:N 담당자 입력 보존)")
 
     # ── 드롭다운(데이터유효성) 보존 방식으로 업로드 ─────────────────────────
     # mode='overwrite'는 시트 전체를 지우고 헤더까지 재작성하여 드롭다운이 사라짐.
@@ -273,19 +294,19 @@ def upload_grp_template(**context):
             valueInputOption='RAW',
             body={'values': [TEMPLATE_COLUMNS]},
         ).execute()
-        print(f"[upload_grp_template] 헤더 작성: {TEMPLATE_COLUMNS}")
+        logger.info(f"[upload_grp_template] 헤더 작성: {TEMPLATE_COLUMNS}")
 
-    # ② A:H(자동입력 열)만 값 지우기 → I:M(조치일자·목표치·핵심조치·조치내용·문제점) 절대 건드리지 않음
+    # ② A:I(자동입력 열)만 값 지우기 → J:N(조치일자·목표치·핵심조치·조치내용·문제점) 절대 건드리지 않음
     # values().clear()는 값만 삭제하고 유효성 검사(드롭다운) 규칙은 보존하지만,
-    # I:M 열은 담당자 입력 전용이므로 아예 범위에서 제외
+    # J:N 열은 담당자 입력 전용이므로 아예 범위에서 제외
     _last_data_row = len(tmpl) + 100          # 여유분 포함
-    _clear_range   = f"{_sname}!A2:H{_last_data_row}"
+    _clear_range   = f"{_sname}!A2:I{_last_data_row}"
     _svc.spreadsheets().values().clear(
         spreadsheetId=_sid, range=_clear_range, body={}
     ).execute()
-    print(f"[upload_grp_template] {_clear_range} 값만 지움 (I:M 드롭다운/입력값 보존)")
+    logger.info(f"[upload_grp_template] {_clear_range} 값만 지움 (J:N 드롭다운/입력값 보존)")
 
-    # ③ A2:H 범위에만 데이터 작성 (헤더 제외, I:M 미접촉)
+    # ③ A2:I 범위에만 데이터 작성 (헤더 제외, J:N 미접촉)
     def _fmt(v):
         if v is None or (isinstance(v, float) and v != v):
             return ''
@@ -300,7 +321,7 @@ def upload_grp_template(**context):
             body={'values': _rows},
         ).execute()
 
-    print(f"[upload_grp_template] ✅ 업로드 완료 ({len(tmpl):,}건, A:H만 작성 / I:M 드롭다운 보존)")
+    logger.info(f"[upload_grp_template] ✅ 업로드 완료 ({len(tmpl):,}건, A:I만 작성 / J:N 드롭다운 보존)")
     return f"템플릿 업로드: {len(tmpl):,}건"
 
 
@@ -324,7 +345,7 @@ def process_buffer_to_accum(**context):
     from googleapiclient.discovery import build as _build
 
     today = pd.Timestamp.now(tz='Asia/Seoul').normalize().tz_localize(None)
-    print(f"[process_buffer] 기준일: {today.date()}")
+    logger.info(f"[process_buffer] 기준일: {today.date()}")
 
     # ── gsheet2(버퍼) 읽기 ───────────────────────────────
     df_buf = extract_gsheet(
@@ -334,7 +355,7 @@ def process_buffer_to_accum(**context):
     )
 
     if df_buf is None or df_buf.empty:
-        print("[process_buffer] gsheet2 데이터 없음 → Skip")
+        logger.info("[process_buffer] gsheet2 데이터 없음 → Skip")
         raise AirflowSkipException("[process_buffer] gsheet2 데이터 없음")
 
     # 매장명 빈 행 제거
@@ -353,10 +374,10 @@ def process_buffer_to_accum(**context):
     df_ready   = df_buf[ready_mask].copy().reset_index(drop=True)
     df_pending = df_buf[~ready_mask].copy().reset_index(drop=True)
 
-    print(f"[process_buffer] 전체: {len(df_buf)}건, 처리 대상(7일 경과): {len(df_ready)}건, 대기 중: {len(df_pending)}건")
+    logger.info(f"[process_buffer] 전체: {len(df_buf)}건, 처리 대상(7일 경과): {len(df_ready)}건, 대기 중: {len(df_pending)}건")
 
     if df_ready.empty:
-        print("[process_buffer] 7일 경과 데이터 없음 → Skip")
+        logger.info("[process_buffer] 7일 경과 데이터 없음 → Skip")
         raise AirflowSkipException("[process_buffer] 처리할 데이터 없음")
 
     # 구분 == '조치' 행만 gsheet3으로 이동 (미조치는 버퍼에서 제거만 됨)
@@ -364,7 +385,7 @@ def process_buffer_to_accum(**context):
         df_ready_action = df_ready[df_ready['구분'].astype(str).str.strip() == '조치'].copy().reset_index(drop=True)
     else:
         df_ready_action = df_ready.copy()
-    print(f"[process_buffer] gsheet3 이동(조치): {len(df_ready_action)}건, 미조치 제거: {len(df_ready) - len(df_ready_action)}건")
+    logger.info(f"[process_buffer] gsheet3 이동(조치): {len(df_ready_action)}건, 미조치 제거: {len(df_ready) - len(df_ready_action)}건")
 
     # ── 컬럼 호환: 날짜 → order_daily ────────────────────
     df_filled = df_ready_action.copy()
@@ -374,8 +395,8 @@ def process_buffer_to_accum(**context):
     df_filled['order_daily'] = _parse_date_series(df_filled['order_daily'].astype(str))
     df_filled['매장명'] = df_filled['매장명'].astype(str).str.strip()
 
-    print(f"[조치일자] 처리 행: {len(df_filled):,}건")
-    print(f"[조치일자] 범위: {df_filled['조치일자'].min()} ~ {df_filled['조치일자'].max()}")
+    logger.info(f"[조치일자] 처리 행: {len(df_filled):,}건")
+    logger.info(f"[조치일자] 범위: {df_filled['조치일자'].min()} ~ {df_filled['조치일자'].max()}")
 
     # ── orders 로드 ───────────────────────────────────────
     if not ORDERS_CSV_PATH.exists():
@@ -394,7 +415,7 @@ def process_buffer_to_accum(**context):
     )
     order_df['매장명'] = order_df['매장명'].astype(str).str.strip()
     order_df['_dt'] = pd.to_datetime(order_df['order_daily'], errors='coerce')
-    print(f"[orders] {len(order_df):,}건  날짜범위: {order_df['order_daily'].min()} ~ {order_df['order_daily'].max()}")
+    logger.info(f"[orders] {len(order_df):,}건  날짜범위: {order_df['order_daily'].min()} ~ {order_df['order_daily'].max()}")
 
     # ── 7일 전후 윈도우 직접 계산 (영업일 기준) ─────────────────────────────
     # prev:   조치일자 당일 제외, 바로 이전 영업일 7개 (설날/휴무일 자동 스킵)
@@ -443,7 +464,7 @@ def process_buffer_to_accum(**context):
         after_start = action_dt + pd.Timedelta(days=1)
         recent_data = store_data[store_data['_dt'] >= after_start].nsmallest(7, '_dt')
 
-        print(
+        logger.info(
             f"[{store}] 조치일자={action_dt.date()} "
             f"prev({len(prev_data)}영업일 {prev_data['_dt'].min().date() if not prev_data.empty else 'N/A'}~{prev_data['_dt'].max().date() if not prev_data.empty else 'N/A'}) "
             f"recent({len(recent_data)}영업일 {recent_data['_dt'].min().date() if not recent_data.empty else 'N/A'}~{recent_data['_dt'].max().date() if not recent_data.empty else 'N/A'} / 시작기준={after_start.date()})"
@@ -464,8 +485,8 @@ def process_buffer_to_accum(**context):
 
     merged = pd.DataFrame(rows)
     merged = merged.drop_duplicates(subset=['order_daily', '매장명'], keep='last').reset_index(drop=True)
-    print(f"[order_daily] {sorted(merged['order_daily'].dropna().unique().tolist())}")
-    print(f"[조치일자]    {sorted(merged['조치일자'].dropna().unique().tolist())}")
+    logger.info(f"[order_daily] {sorted(merged['order_daily'].dropna().unique().tolist())}")
+    logger.info(f"[조치일자]    {sorted(merged['조치일자'].dropna().unique().tolist())}")
 
     # ── 컬럼 선택 ─────────────────────────────────────────
     fin_df = merged.reindex(columns=SELECTED_COLUMNS)
@@ -479,7 +500,7 @@ def process_buffer_to_accum(**context):
 
     # ── gsheet3(누적)에 append (조치 건만) ───────────────────
     if fin_df.empty:
-        print("[process_buffer] 조치 건 없음 → gsheet3 append 생략")
+        logger.info("[process_buffer] 조치 건 없음 → gsheet3 append 생략")
         # 버퍼에서 만료된 행만 제거하고 종료
         _scopes = ['https://www.googleapis.com/auth/spreadsheets']
         _creds  = _Creds.from_service_account_file(CREDENTIALS_PATH, scopes=_scopes)
@@ -504,7 +525,7 @@ def process_buffer_to_accum(**context):
                 valueInputOption='RAW',
                 body={'values': buf_rows},
             ).execute()
-            print(f"[process_buffer] gsheet2 미처리 행 {len(df_pending)}건 유지")
+            logger.info(f"[process_buffer] gsheet2 미처리 행 {len(df_pending)}건 유지")
         return f"처리 완료(조치 없음): 만료 {len(df_ready)}건 제거 / 대기 중: {len(df_pending)}건"
 
     result = save_to_gsheet(
@@ -516,7 +537,7 @@ def process_buffer_to_accum(**context):
         url=ACCUM_GSHEET_URL,
     )
     if result.get('success'):
-        print(f"[process_buffer] ✅ gsheet3 append 완료: {len(fin_df)}건")
+        logger.info(f"[process_buffer] ✅ gsheet3 append 완료: {len(fin_df)}건")
     else:
         raise RuntimeError(f"누적 GSheet append 실패: {result.get('error')}")
 
@@ -549,9 +570,9 @@ def process_buffer_to_accum(**context):
             valueInputOption='RAW',
             body={'values': buf_rows},
         ).execute()
-        print(f"[process_buffer] gsheet2 미처리 행 {len(df_pending)}건 유지")
+        logger.info(f"[process_buffer] gsheet2 미처리 행 {len(df_pending)}건 유지")
     else:
-        print("[process_buffer] gsheet2 모든 행 처리 완료 (빈 상태)")
+        logger.info("[process_buffer] gsheet2 모든 행 처리 완료 (빈 상태)")
 
     return f"처리 완료: 조치 {len(df_ready_action)}건 → gsheet3 / 미조치 {len(df_ready) - len(df_ready_action)}건 제거 / 대기 중: {len(df_pending)}건"
 
@@ -582,7 +603,7 @@ def clear_report_data(**context):
         body={}
     ).execute()
 
-    print(f"[clear] ✅ 리포트 시트 값 지우기 완료 (1행 헤더 유지, 드롭다운/서식 보존)")
+    logger.info(f"[clear] ✅ 리포트 시트 값 지우기 완료 (1행 헤더 유지, 드롭다운/서식 보존)")
     return "리포트 시트 클리어 완료"
 
 
@@ -608,7 +629,7 @@ with DAG(
 
     wait_for_smd_07 = ExternalTaskSensor(
         task_id='wait_for_smd_07',
-        external_dag_id='SMD_07_store_ordesr_alert_Dags',
+        external_dag_id='Sales_Orders_07_Alert_Dags',
         external_task_id='send_alert_email',
         # execution_date_fn 미사용: 현재 DAG run과 같은 logical date의
         # SMD_07.send_alert_email 성공만 대기한다.

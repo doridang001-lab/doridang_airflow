@@ -1,0 +1,65 @@
+[2026-03-24T08:45:19.432+0000] {local_task_job_runner.py:123} INFO - ::group::Pre task execution logs
+[2026-03-24T08:45:19.449+0000] {taskinstance.py:2613} INFO - Dependencies all met for dep_context=non-requeueable deps ti=<TaskInstance: Sales_Orders_07_Alert_Dags.filter_alerts scheduled__2026-03-23T08:38:00+00:00 [queued]>
+[2026-03-24T08:45:19.455+0000] {taskinstance.py:2613} INFO - Dependencies all met for dep_context=requeueable deps ti=<TaskInstance: Sales_Orders_07_Alert_Dags.filter_alerts scheduled__2026-03-23T08:38:00+00:00 [queued]>
+[2026-03-24T08:45:19.456+0000] {taskinstance.py:2866} INFO - Starting attempt 1 of 2
+[2026-03-24T08:45:19.467+0000] {taskinstance.py:2889} INFO - Executing <Task(PythonOperator): filter_alerts> on 2026-03-23 08:38:00+00:00
+[2026-03-24T08:45:19.476+0000] {warnings.py:112} WARNING - /home/***/.local/lib/python3.12/site-packages/***/task/task_runner/standard_task_runner.py:70: DeprecationWarning: This process (pid=21883) is multi-threaded, use of fork() may lead to deadlocks in the child.
+  pid = os.fork()
+
+[2026-03-24T08:45:19.479+0000] {standard_task_runner.py:72} INFO - Started process 21885 to run task
+[2026-03-24T08:45:19.478+0000] {standard_task_runner.py:104} INFO - Running: ['***', 'tasks', 'run', 'Sales_Orders_07_Alert_Dags', 'filter_alerts', 'scheduled__2026-03-23T08:38:00+00:00', '--job-id', '22572', '--raw', '--subdir', 'DAGS_FOLDER/sales/Sales_Orders_07_Alert_Dags.py', '--cfg-path', '/tmp/tmpf47ghyu0']
+[2026-03-24T08:45:19.480+0000] {standard_task_runner.py:105} INFO - Job 22572: Subtask filter_alerts
+[2026-03-24T08:45:19.534+0000] {task_command.py:467} INFO - Running <TaskInstance: Sales_Orders_07_Alert_Dags.filter_alerts scheduled__2026-03-23T08:38:00+00:00 [running]> on host dd4b55f6e1f9
+[2026-03-24T08:45:19.604+0000] {taskinstance.py:3132} INFO - Exporting env vars: AIRFLOW_CTX_DAG_OWNER='***' AIRFLOW_CTX_DAG_ID='Sales_Orders_07_Alert_Dags' AIRFLOW_CTX_TASK_ID='filter_alerts' AIRFLOW_CTX_EXECUTION_DATE='2026-03-23T08:38:00+00:00' AIRFLOW_CTX_TRY_NUMBER='1' AIRFLOW_CTX_DAG_RUN_ID='scheduled__2026-03-23T08:38:00+00:00'
+[2026-03-24T08:45:19.606+0000] {taskinstance.py:731} INFO - ::endgroup::
+[2026-03-24T08:45:19.626+0000] {logging_mixin.py:190} INFO - 
+============================================================
+[2026-03-24T08:45:19.626+0000] {logging_mixin.py:190} INFO - [필터링] 알림 대상 필터링 시작
+[2026-03-24T08:45:19.717+0000] {logging_mixin.py:190} INFO - [필터링] CSV 파일 읽기 성공: 4,121건
+[2026-03-24T08:45:19.718+0000] {logging_mixin.py:190} INFO - 
+[필터링] 날짜 컬럼 변환 중...
+[2026-03-24T08:45:19.728+0000] {logging_mixin.py:190} INFO - 
+[필터링] 데이터 최신일자: 2026-03-22
+[2026-03-24T08:45:19.729+0000] {logging_mixin.py:190} INFO - [필터링] ds: 2026-03-23
+[2026-03-24T08:45:19.729+0000] {logging_mixin.py:190} INFO - [필터링] 사용 일자: 2026-03-22 (데이터 최신일자(고정))
+[2026-03-24T08:45:19.729+0000] {logging_mixin.py:190} INFO - [주의] ds(2026-03-23)와 최신 데이터일(2026-03-22)이 다릅니다. 최신 데이터일로 처리합니다.
+[2026-03-24T08:45:19.742+0000] {logging_mixin.py:190} INFO - 
+[CSV] 전체 집계 데이터: 4,121건
+[2026-03-24T08:45:19.743+0000] {logging_mixin.py:190} INFO - 
+============================================================
+[2026-03-24T08:45:19.743+0000] {logging_mixin.py:190} INFO - [담당자 업데이트] sales_employee.csv로 최신 담당자 정보 반영 시작...
+[2026-03-24T08:45:19.749+0000] {logging_mixin.py:190} INFO - [담당자 업데이트] sales_employee.csv 로드: 315건 (utf-8-sig)
+[2026-03-24T08:45:19.751+0000] {logging_mixin.py:190} INFO - [담당자 업데이트] 매장명 지점명 매핑 적용 완료
+[2026-03-24T08:45:19.753+0000] {logging_mixin.py:190} INFO - [담당자 업데이트] 중복 제거 후: 66건
+[2026-03-24T08:45:19.773+0000] {logging_mixin.py:190} INFO - [담당자 업데이트] 변경된 건수: 0건
+[2026-03-24T08:45:19.791+0000] {logging_mixin.py:190} INFO - [검증 완료] 컬럼 개수: 148 → 148 (기존 컬럼 유지됨)
+[2026-03-24T08:45:19.792+0000] {logging_mixin.py:190} INFO - [담당자 업데이트 후] 담당자 분포: 총 6명
+[2026-03-24T08:45:19.793+0000] {logging_mixin.py:190} INFO - [담당자 업데이트 후] 미배정 건수: 91건
+[2026-03-24T08:45:19.794+0000] {logging_mixin.py:190} INFO - [담당자 업데이트 후] 담당자 TOP 5: {'이병두 과장': 1420, '김덕기 과장': 1114, '황대성 대리': 982, '심성준 이사': 313, '김대진 팀장': 201}
+[2026-03-24T08:45:19.794+0000] {logging_mixin.py:190} INFO - ============================================================
+[2026-03-24T08:45:19.794+0000] {logging_mixin.py:190} INFO - [INFO] 중간 파일 sales_daily_orders_alerts.csv 저장 생략 (alerts_grp만 생성)
+[2026-03-24T08:45:19.796+0000] {logging_mixin.py:190} INFO - 
+[필터링] 대상일(2026-03-22) 데이터: 64건
+[2026-03-24T08:45:19.796+0000] {logging_mixin.py:190} INFO - 
+[필터링] 숫자 컬럼 변환 중...
+[2026-03-24T08:45:19.798+0000] {logging_mixin.py:190} INFO - 
+[7d재계산] 생략 (recalc_business_7d=False)
+[2026-03-24T08:45:19.798+0000] {logging_mixin.py:190} INFO - 
+[필터링] 알람 조건 적용 중...
+[2026-03-24T08:45:19.799+0000] {logging_mixin.py:190} INFO -   [status] 알림 대상(위험): 10건
+[2026-03-24T08:45:19.800+0000] {logging_mixin.py:190} INFO -   [fee_status] 알림 대상(위험): 5건
+[2026-03-24T08:45:19.800+0000] {logging_mixin.py:190} INFO -   [쿠팡_광고효과_status] 알림 대상(위험): 2건
+[2026-03-24T08:45:19.802+0000] {logging_mixin.py:190} INFO - [필터링] 알람 대상: 17건
+[2026-03-24T08:45:19.803+0000] {logging_mixin.py:190} INFO - [매출] 🚨 위험: 10건, ⚠️ 주의: 6건
+[2026-03-24T08:45:19.803+0000] {logging_mixin.py:190} INFO - [수수료] ⚠️ 이상: 11건
+[2026-03-24T08:45:19.804+0000] {logging_mixin.py:190} INFO - [쿠팡광고] ⚠️ 이상: 5건
+[2026-03-24T08:45:19.804+0000] {logging_mixin.py:190} INFO - [배민광고] ⚠️ 이상: 4건
+[2026-03-24T08:45:19.811+0000] {logging_mixin.py:190} INFO - [✅ CSV] 알림 대상 저장: 17건 → sales_daily_orders_alerts_grp.csv
+[2026-03-24T08:45:19.932+0000] {logging_mixin.py:190} INFO - [Parquet] 저장: alert_targets_20260323.parquet
+[2026-03-24T08:45:19.944+0000] {logging_mixin.py:190} INFO - ============================================================
+[2026-03-24T08:45:19.948+0000] {python.py:240} INFO - Done. Returned value was: ✅ 저장 완료: 전체 4,121건, 알림 17건
+[2026-03-24T08:45:19.965+0000] {taskinstance.py:340} INFO - ::group::Post task execution logs
+[2026-03-24T08:45:19.965+0000] {taskinstance.py:352} INFO - Marking task as SUCCESS. dag_id=Sales_Orders_07_Alert_Dags, task_id=filter_alerts, run_id=scheduled__2026-03-23T08:38:00+00:00, execution_date=20260323T083800, start_date=20260324T084519, end_date=20260324T084519
+[2026-03-24T08:45:20.028+0000] {local_task_job_runner.py:266} INFO - Task exited with return code 0
+[2026-03-24T08:45:20.048+0000] {taskinstance.py:3895} INFO - 1 downstream tasks scheduled from follow-on schedule check
+[2026-03-24T08:45:20.051+0000] {local_task_job_runner.py:245} INFO - ::endgroup::

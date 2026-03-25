@@ -1529,8 +1529,8 @@ def calculate_manager_scores(
         )
     )
     
-    # 이전 상태
-    manager_daily['pre_status'] = manager_daily.groupby('담당자')['status'].shift(1).fillna('정상')
+    # 전주 상태 (영업일 기준 7일전)
+    manager_daily['pre_status'] = manager_daily.groupby('담당자')['status'].shift(7).fillna('정상')
     
     print(f"[점수 분포]")
     print(f"  {manager_daily['score'].value_counts().sort_index().to_dict()}")

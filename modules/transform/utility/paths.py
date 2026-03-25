@@ -182,9 +182,36 @@ def resolve_analytics_db() -> Path:
 	return fallback
 
 
+def resolve_report_sales_db() -> Path:
+	"""영업/마케팅 분석 리포트 저장 경로.
+
+	우선순위:
+	1) 환경변수 `REPORT_SALES_DB`
+	2) 컨테이너 마운트 경로 `/opt/airflow/report/sales`
+	3) Windows 로컬 OneDrive 경로
+	4) Fallback
+	"""
+	env_path = os.getenv("REPORT_SALES_DB")
+	if env_path:
+		return Path(env_path)
+
+	container_mount = Path("/opt/airflow/report/sales")
+	if container_mount.parent.parent.exists():
+		container_mount.mkdir(parents=True, exist_ok=True)
+		return container_mount
+
+	if platform.system() == "Windows":
+		user_home = Path.home()
+		return user_home / "OneDrive - 주식회사 도리당" / "data" / "report" / "sales"
+
+	return Path.home() / "OneDrive - 주식회사 도리당" / "data" / "report" / "sales"
+
+
 ONEDRIVE_DB = resolve_onedrive_db()
 COLLECT_DB = resolve_collect_db()
 LOCAL_DB = resolve_local_db()
 TEMP_DIR = resolve_temp_dir()
 DOWN_DIR = resolve_down_dir()
 ANALYTICS_DB = resolve_analytics_db()
+BAEMIN_MARKETING_DB = ANALYTICS_DB / "baemin_marketing"
+REPORT_SALES_DB = resolve_report_sales_db()

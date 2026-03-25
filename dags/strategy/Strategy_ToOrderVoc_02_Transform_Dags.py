@@ -41,7 +41,7 @@ with DAG(
     # ── 01 DAG 완료 대기 ───────────────────────────────────────────
     wait_for_crawling = ExternalTaskSensor(
         task_id='wait_for_crawling',
-        external_dag_id='SMP_crawling_toorder_voc_01_Dags',
+        external_dag_id='Strategy_ToOrderVoc_01_Crawl_Dags',
         external_task_id='move_voc_files',
         allowed_states=['success'],
         failed_states=['failed', 'skipped'],

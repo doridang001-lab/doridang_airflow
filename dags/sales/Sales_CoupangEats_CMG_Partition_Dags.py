@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-from modules.transform.pipelines.strategy.SMP_CoupangEats_CMG_Partition import (
+from modules.transform.pipelines.sales.SMD_CoupangEats_CMG_Partition import (
     load_coupangeats_cmg_partition
 )
 
@@ -23,13 +23,13 @@ default_args = {
 }
 
 dag = DAG(
-    'Strategy_CoupangEats_CMG_Partition_Dags',
+    'Sales_CoupangEats_CMG_Partition_Dags',
     default_args=default_args,
     description='쿠팡이츠 CMG 파티션 저장 및 OneDrive 백업',
-    schedule_interval='0 22 * * *',  # 매일 22:00
+    schedule_interval='30 15 * * 1',  # 매주 월요일 15:30
     start_date=datetime(2026, 3, 23),
     catchup=False,
-    tags=['strategy', 'coupang', 'partition'],
+    tags=['sales', 'coupang', 'partition'],
 )
 
 task_partition = PythonOperator(

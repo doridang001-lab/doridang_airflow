@@ -87,7 +87,7 @@ with DAG(
     # ============================================================
     wait_for_smd_04 = ExternalTaskSensor(
         task_id='wait_for_smd_04',
-        external_dag_id='SMD_04_store_orders_amount_join_Dags',
+        external_dag_id='Sales_Orders_04_Join_Dags',
         external_task_id='upload_final_csv',
         allowed_states=['success'],
         failed_states=['failed', 'skipped'],

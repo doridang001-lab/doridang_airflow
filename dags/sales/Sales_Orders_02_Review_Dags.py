@@ -28,7 +28,7 @@ def _latest_smd01_execution_date(dt, **context):
     session = settings.Session()
     try:
         ti = session.query(TI).filter(
-            TI.dag_id == 'SMD_01_sales_orders_csv_Dags',
+            TI.dag_id == 'Sales_Orders_01_Extract_Dags',
             TI.task_id == 'save_to_csv',
             TI.state == 'success'
         ).order_by(TI.execution_date.desc()).first()
@@ -76,7 +76,7 @@ with DAG(
     # ⭐ SMD_01 완료 대기 (최신 성공 실행 자동 검색)
     wait_for_smd_01 = ExternalTaskSensor(
         task_id='wait_for_smd_01_completion',
-        external_dag_id='SMD_01_sales_orders_csv_Dags',  # SMD_01 DAG ID
+        external_dag_id='Sales_Orders_01_Extract_Dags',
         external_task_id='save_to_csv',  # SMD_01의 마지막 task
         execution_date_fn=_latest_smd01_execution_date,  # ⭐ 최신 성공 실행 찾기
         allowed_states=['success'],

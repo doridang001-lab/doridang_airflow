@@ -109,7 +109,7 @@ with DAG(
     # ⭐ SMD_03 완료 대기 - 최신 성공 실행 자동 검색
     wait_for_smd_03 = ExternalTaskSensor(
         task_id='wait_for_smd_03',
-        external_dag_id='SMD_03_sales_orders_transform_Dags',
+        external_dag_id='Sales_Orders_03_Transform_Dags',
         external_task_id='move_collected_files',
         allowed_states=['success'],
         failed_states=['failed', 'skipped'],

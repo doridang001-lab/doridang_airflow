@@ -2869,8 +2869,8 @@ def calculate_scores(
             )
         )
         
-        # 이전 상태
-        df['pre_status'] = df.groupby(['매장명', '담당자'])['status'].shift(1)
+        # 전주 상태 (영업일 기준 7일전)
+        df['pre_status'] = df.groupby(['매장명', '담당자'])['status'].shift(7)
         df['pre_status'] = df['pre_status'].fillna('정상')
         
         # ============================================================
@@ -3317,10 +3317,9 @@ def filter_alerts(
         ti.xcom_push(key=output_xcom_key, value=None)
         return f"알림 대상 없음 (전체 집계 {len(combined_df):,}건 저장됨)"
     
-    # ⭐ 알람 조건: 위험(즉시) / 주의(2일 연속)
+    # ⭐ 알람 조건: 연속 위험 (전주·금주 모두 위험인 경우만)
     alert_targets = df_target[
-        (df_target['status'] == '위험') |
-        ((df_target['status'] == '주의') & (df_target['pre_status'] == '주의'))
+        (df_target['status'] == '위험') & (df_target['pre_status'] == '위험')
     ].copy()
     
     print(f"[필터링] 알람 대상: {len(alert_targets):,}건")

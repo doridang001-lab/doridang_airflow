@@ -126,7 +126,7 @@ def _process_coupangeats_cmg() -> Dict[str, Any]:
     initial_rows = len(df)
     df = df.sort_values(timestamp_col, ascending=False)
     df = df.drop_duplicates(subset=dedup_cols, keep='first')
-    logger.info(f"중복 제거: {initial_rows} → {len(df)}행 ({initial_rows - len(df)}행 제거)")
+    logger.info(f"중복 제제: {initial_rows} → {len(df)}행 ({initial_rows - len(df)}행 제거)")
 
     # 5. 파티션 저장 및 OneDrive 백업
     saved_partitions = []

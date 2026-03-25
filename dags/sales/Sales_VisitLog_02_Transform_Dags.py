@@ -36,7 +36,7 @@ filename = os.path.basename(__file__)
 
 def _latest_successful_execution_date(dt, **context):
     """외부 DAG의 최신 성공 실행일을 사용 (없으면 현재 dt 사용)."""
-    runs = DagRun.find(dag_id='SMD_sales_visit_log_01_crawling_Dags', state=State.SUCCESS)
+    runs = DagRun.find(dag_id='Sales_VisitLog_01_Crawl_Dags', state=State.SUCCESS)
     if not runs:
         return dt
     return max(r.execution_date for r in runs)
@@ -50,7 +50,7 @@ with DAG(
 ) as dag:
     wait_for_smd_01 = ExternalTaskSensor(
         task_id='wait_for_smd_01',
-        external_dag_id='SMD_sales_visit_log_01_crawling_Dags',
+        external_dag_id='Sales_VisitLog_01_Crawl_Dags',
         external_task_id='crawl_flow_visit',
         allowed_states=['success'],
         failed_states=['failed', 'skipped'],

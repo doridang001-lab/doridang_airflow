@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 filename = os.path.basename(__file__)
 dag_file_stem = Path(__file__).stem
-pipeline_module_name = dag_file_stem.removesuffix("_Dags")
+pipeline_module_name = "SMP_crawling_toorder_voc_01"
 pipeline_module_path = f"modules.transform.pipelines.strategy.{pipeline_module_name}"
 pipeline_module = importlib.import_module(pipeline_module_path)
 

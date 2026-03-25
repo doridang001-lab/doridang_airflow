@@ -207,7 +207,7 @@ def transform_sales_orders_daily_csv(df):
 def clear_sales_orders_daily_csv(**context):
     """ 처리"""
 
-    return io3_preprocess_df(
+    return preprocess_df(
         input_xcom_key='sales_orders_daily_path',
         output_xcom_key='sales_orders_daily_processed_path',
         transform_func=transform_sales_orders_daily_csv,  # 위에서 정의한 함수

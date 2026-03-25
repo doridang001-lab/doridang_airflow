@@ -1,7 +1,7 @@
 """
 매출 이상 알림 데이터를 구글 시트에 업로드하는 DAG
 
-sales_daily_orders_alerts.csv → Google Sheet (덮어쓰기)
+visit_sales_log_master.csv → Google Sheet (덮어쓰기)
 
 📋 처리 흐름:
 1. CSV 파일 읽기 (sales_daily_orders_alerts.csv)
@@ -19,10 +19,9 @@ from airflow.operators.python import PythonOperator
 from modules.transform.utility.io import SMD_ORDERS_TIME
 from airflow.sensors.external_task import ExternalTaskSensor
 from airflow.models import DagRun
-from airflow.models.baseoperator import chain
 from airflow.utils.state import State
-from airflow import settings
-from sqlalchemy import text
+from datetime import datetime, timedelta
+from modules.transform.utility.io import SMD_ORDERS_TIME, SMD_VISIT_LOG
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -32,42 +31,11 @@ filename = os.path.basename(__file__)
 
 
 def _latest_successful_execution_date(dt, **context):
-    """
-    SMD_05의 fin_save_to_csv 태스크가 성공한 최신 execution_date를 찾는다.
-    DagRun 상태가 아닌 TaskInstance 상태 기준.
-    """
-    session = settings.Session()
-    try:
-        row = session.execute(
-            text(
-                """
-                SELECT execution_date
-                FROM task_instance
-                WHERE dag_id = :dag_id
-                  AND task_id = :task_id
-                  AND state = :state
-                ORDER BY execution_date DESC
-                LIMIT 1
-                """
-            ),
-            {
-                'dag_id': 'SMD_05_store_ordesr_marketing_Dags',
-                'task_id': 'fin_save_to_csv',
-                'state': 'success',
-            },
-        ).first()
-
-        if row:
-            execution_date = row[0]
-            print(f"[sensor] SMD_05 fin_save_to_csv 성공 찾음: {execution_date}")
-            return execution_date
-    except Exception as e:
-        print(f"[sensor] TaskInstance 조회 실패: {e}")
-    finally:
-        session.close()
-    
-    print(f"[sensor] 성공한 fin_save_to_csv 없음, 기본값 사용: {dt}")
-    return dt
+    """외부 DAG의 최신 성공 실행일을 사용 (없으면 현재 dt 사용)."""
+    runs = DagRun.find(dag_id='Sales_VisitLog_02_Transform_Dags', state=State.SUCCESS)
+    if not runs:
+        return dt
+    return max(r.execution_date for r in runs)
 
 from modules.transform.utility.paths import LOCAL_DB
 from modules.load.load_gsheet import save_to_gsheet
@@ -79,11 +47,11 @@ from modules.load.load_gsheet import save_to_gsheet
 DEFAULT_CREDENTIALS_PATH = r"/opt/airflow/config/rare-ethos-483607-i5-45c9bec5b193.json"
 
 # Google Sheets 설정
-ALERTS_GSHEET_URL = "https://docs.google.com/spreadsheets/d/1JJSPLuqAgSSVaXQjZUwdBug-IyBouwUlsXHZiE20VZU/edit?usp=sharing"
+ALERTS_GSHEET_URL = "https://docs.google.com/spreadsheets/d/1irF9Sbqc7-x9o_tT6lipKwQPLVV-euTp-_Ph0F4ZB8U/edit?usp=sharing"
 ALERTS_SHEET_NAME = "시트1"
 
 # CSV 경로
-ALERTS_CSV_PATH = LOCAL_DB / '영업관리부_DB' / 'sales_daily_orders_upload.csv'
+ALERTS_CSV_PATH = LOCAL_DB / '영업관리부_DB' / 'visit_sales_log_master.csv'
 
 
 # ============================================================
@@ -91,7 +59,7 @@ ALERTS_CSV_PATH = LOCAL_DB / '영업관리부_DB' / 'sales_daily_orders_upload.c
 # ============================================================
 def upload_alerts_to_gsheet(**context):
     """
-    sales_daily_orders_upload.csv를 구글 시트에 업로드
+    sales_daily_orders_upload_fin.csv를 구글 시트에 업로드
     
     처리 순서:
     1. CSV 파일 읽기
@@ -192,24 +160,12 @@ def upload_alerts_to_gsheet(**context):
     
     print(f"\n[데이터] 행: {len(df):,}건, 열: {len(df.columns)}개")
     print(f"[컬럼] {', '.join(df.columns.tolist()[:10])}...")  # 처음 10개만 표시
-
-    # ============================================================
-    # 3.5️⃣ GSheet 업로드 컬럼 — CSV와 동일한 컬럼명 그대로 전체 업로드
-    # ============================================================
-    # uploaded_at: CSV에 없으므로 업로드 시점 타임스탬프 생성
-    df['uploaded_at'] = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[컬럼] ✅ CSV 원본 컬럼명 그대로 {len(df.columns)}개 업로드 준비 완료")
-
+    
     # ============================================================
     # 3.5️⃣ 시트 크기 리셋 (셀 누적 방지) ← 🔥 핵심 추가 부분
     # ============================================================
     print(f"\n[시트 크기 리셋] 시작...")
-
-    # 업로드 후 크기 출력에서 NameError 방지 — try 블록 실패 시에도 참조 가능
-    new_rows = len(df) + 10
-    new_cols = len(df.columns)
-    new_cells = new_rows * new_cols
-
+    
     try:
         from google.oauth2.service_account import Credentials
         import gspread
@@ -239,8 +195,13 @@ def upload_alerts_to_gsheet(**context):
         # 시트 비우기
         ws.clear()
         print(f"[시트] 데이터 삭제 완료")
-
-        # 시트 크기 축소 (누적 방지) — new_rows/new_cols는 try 블록 전에 이미 계산됨
+        
+        # 새 크기 계산 (데이터 + 여유 10행)
+        new_rows = len(df) + 10
+        new_cols = len(df.columns)
+        new_cells = new_rows * new_cols
+        
+        # 시트 크기 축소 (누적 방지)
         print(f"[시트] 크기 축소: {new_rows:,}행 × {new_cols:,}열 = {new_cells:,}셀")
         ws.resize(rows=new_rows, cols=new_cols)
         print(f"[시트] ✅ 크기 리셋 완료")
@@ -263,7 +224,7 @@ def upload_alerts_to_gsheet(**context):
             url=ALERTS_GSHEET_URL,
         )
         
-        if isinstance(result, dict) and bool(result.get('success', False)):
+        if result.get('success'):
             uploaded_count = len(df)
             print(f"\n[구글시트] ✅ 업로드 완료")
             print(f"  - 업로드: {uploaded_count}건")
@@ -273,7 +234,7 @@ def upload_alerts_to_gsheet(**context):
             print(f"{'='*60}\n")
             return f"✅ 업로드 완료: {uploaded_count}건 ({new_cells:,}셀)"
         else:
-            error = result.get('error', '알 수 없는 오류') if isinstance(result, dict) else '알 수 없는 반환 형식'
+            error = result.get('error', '알 수 없는 오류')
             print(f"[구글시트] ⚠️ 업로드 실패: {error}")
             return f"업로드 실패: {error}"
             
@@ -290,7 +251,7 @@ def upload_alerts_to_gsheet(**context):
 with DAG(
     dag_id=filename.replace('.py', ''),
     description='매출 이상 알림 데이터를 구글 시트에 업로드 (덮어쓰기)',
-    schedule=SMD_ORDERS_TIME,  # 매주 월, 수 10시 30분 실행
+    schedule=SMD_VISIT_LOG,  # 매주 화 오전 10시
     start_date=pendulum.datetime(2023, 1, 1, tz="Asia/Seoul"),
     catchup=False,
     max_active_runs=1,  # 🔒 동시 실행 방지
@@ -306,82 +267,25 @@ with DAG(
     # ============================================================
     # task 정의
     # ============================================================
-    wait_for_smd_05 = ExternalTaskSensor(
-        task_id='wait_for_smd_05',
-        external_dag_id='SMD_05_store_ordesr_marketing_Dags',
-        external_task_id='fin_save_to_csv',
+    wait_for_smd_02 = ExternalTaskSensor(
+        task_id='wait_for_smd_02',
+        external_dag_id='Sales_VisitLog_02_Transform_Dags',
+        external_task_id='append_to_master',
         allowed_states=['success'],
-        failed_states=['failed'],
+        failed_states=['failed', 'skipped'],
         mode='reschedule',
         timeout=1800,  # 30분 대기
         poke_interval=60,  # 1분마다 확인
-        check_existence=False,
-        soft_fail=True,  # 실패해도 다음 태스크 계속 실행
+        check_existence=True,  # 태스크 존재 여부 확인
+        soft_fail=False,  # 실패 시 즉시 실패
         execution_date_fn=_latest_successful_execution_date,
     )
     
     upload_task = PythonOperator(
         task_id='upload_alerts_to_gsheet',
         python_callable=upload_alerts_to_gsheet,
-        trigger_rule='all_done',  # sensor가 skip되더라도 실행
     )
     
-    # 의존성: 센서가 성공하거나 soft fail해도 업로드 실행
-    chain(wait_for_smd_05, upload_task)
+    wait_for_smd_02 >> upload_task
 
 
-# ============================================================
-# DAG 플로우 요약
-# ============================================================
-"""
-┌─────────────────────────────────────────────────────────────┐
-│  CSV 읽기                                                    │
-│                                                              │
-│  sales_daily_orders_alerts.csv 로드                         │
-│  - 자동 인코딩 감지 (utf-8-sig, utf-8, cp949)               │
-└─────────────────────────────────────────────────────────────┘
-                        ↓
-┌─────────────────────────────────────────────────────────────┐
-│  데이터 정리                                                 │
-│                                                              │
-│  - NaN → 빈 문자열 변환                                      │
-│  - order_daily 날짜 정규화                                  │
-│    (엑셀 직렬값 + 텍스트 날짜 모두 처리)                    │
-└─────────────────────────────────────────────────────────────┘
-                        ↓
-┌─────────────────────────────────────────────────────────────┐
-│  🔥 시트 크기 리셋 (NEW!)                                   │
-│                                                              │
-│  - 시트 데이터 삭제                                          │
-│  - 시트 크기 축소 (데이터 크기 + 여유 10행)                 │
-│  - 셀 누적 방지 → 1천만 셀 제한 해결                        │
-└─────────────────────────────────────────────────────────────┘
-                        ↓
-┌─────────────────────────────────────────────────────────────┐
-│  Google Sheets 업로드                                        │
-│                                                              │
-│  - 모드: overwrite (기존 데이터 삭제 후 덮어쓰기)           │
-│  - 시트: 시트1                                               │
-│  - 인증: Service Account JSON                                │
-└─────────────────────────────────────────────────────────────┘
-
-📌 주요 기능:
-- CSV 자동 인코딩 감지
-- NaN 안전 처리
-- 날짜 정규화 (엑셀/텍스트)
-- **시트 크기 리셋** (셀 누적 방지) ← NEW!
-- 덮어쓰기 모드로 항상 최신 데이터 유지
-
-⚙️ 실행 시각: 매주 월/수 11:00 (KST)
-📊 대상 파일: sales_daily_orders_alerts.csv
-
-⚠️ 주의사항:
-- sales_orders_01_load_baemin_data DAG가 먼저 실행되어야 함
-- Google Sheets API 인증 필요 (Service Account JSON)
-- gspread 라이브러리 필요 (pip install gspread)
-
-🔥 핵심 수정사항:
-- save_to_gsheet 호출 전에 시트 크기를 데이터 크기로 축소
-- 매 업로드마다 시트 크기가 누적되는 문제 해결
-- 기존 코드 구조 유지하면서 최소한의 수정만 추가
-"""
