@@ -207,6 +207,30 @@ def resolve_report_sales_db() -> Path:
 	return Path.home() / "OneDrive - 주식회사 도리당" / "data" / "report" / "sales"
 
 
+def resolve_mart_db() -> Path:
+	"""OneDrive data/mart 경로.
+
+	우선순위:
+	1) 환경변수 `MART_DB`
+	2) Windows 로컬 OneDrive 경로
+	3) 컨테이너 마운트 경로 `/opt/airflow/onedrive_mart`
+	4) Fallback
+	"""
+	env_path = os.getenv("MART_DB")
+	if env_path:
+		return Path(env_path)
+
+	if platform.system() == "Windows":
+		user_home = Path.home()
+		return user_home / "OneDrive - 주식회사 도리당" / "data" / "mart"
+
+	container_mount = Path("/opt/airflow/onedrive_mart")
+	if container_mount.exists():
+		return container_mount
+
+	return Path.home() / "OneDrive - 주식회사 도리당" / "data" / "mart"
+
+
 ONEDRIVE_DB = resolve_onedrive_db()
 COLLECT_DB = resolve_collect_db()
 LOCAL_DB = resolve_local_db()
@@ -215,3 +239,4 @@ DOWN_DIR = resolve_down_dir()
 ANALYTICS_DB = resolve_analytics_db()
 BAEMIN_MARKETING_DB = ANALYTICS_DB / "baemin_marketing"
 REPORT_SALES_DB = resolve_report_sales_db()
+MART_DB = resolve_mart_db()

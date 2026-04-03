@@ -178,12 +178,34 @@ def login_relay_fms(driver, user_id: str, password: str, server_name: str = "도
         except Exception as e:
             print(f"⚠️ 서버 목록 버튼 없음 (스킵): {e.__class__.__name__}")
 
+        # ✅ 서버 모달 닫힌 후 폼 필드가 리셋될 수 있으므로 재확인·재입력
+        time.sleep(1.0)
+        try:
+            id_field = driver.find_element(By.ID, "login_form_id")
+            pw_field = driver.find_element(By.ID, "login_form_pw")
+            id_val = id_field.get_attribute("value") or ""
+            pw_val = pw_field.get_attribute("value") or ""
+            if not id_val:
+                print("  ⚠️ ID 필드 비어있음 → 재입력")
+                id_field.clear()
+                id_field.send_keys(user_id)
+                time.sleep(0.3)
+            if not pw_val:
+                print("  ⚠️ PW 필드 비어있음 → 재입력")
+                pw_field.clear()
+                pw_field.send_keys(password)
+                time.sleep(0.3)
+        except Exception as e:
+            print(f"  ⚠️ 폼 필드 재확인 중 오류: {e}")
+
         pre_url = driver.current_url
 
         print("🚀 로그인 버튼 클릭 중...")
         login_button = wait.until(
             EC.element_to_be_clickable(
-                (By.XPATH, "//button[@type='submit' and contains(@class, 'ant-btn-primary')]")
+                (By.XPATH,
+                 "//button[contains(@class, 'ant-btn-primary') and "
+                 "(.//span[text()='Login'] or .//span[text()='로그인'] or @type='submit')]")
             )
         )
         driver.execute_script("arguments[0].click();", login_button)
@@ -195,6 +217,25 @@ def login_relay_fms(driver, user_id: str, password: str, server_name: str = "도
             print(f"✅ URL 변경 확인: {driver.current_url}")
         except Exception:
             print(f"⚠️ URL 미변경, 현재: {driver.current_url}")
+            # ✅ Enter 키 폴백: 버튼 클릭이 안 먹혔을 경우
+            print("  🔄 Enter 키로 로그인 재시도...")
+            try:
+                pw_field = driver.find_element(By.ID, "login_form_pw")
+                pw_field.send_keys(Keys.RETURN)
+                time.sleep(3.0)
+                if driver.current_url != pre_url:
+                    print(f"  ✅ Enter 키로 로그인 성공: {driver.current_url}")
+                else:
+                    # 에러 메시지 확인
+                    err_els = driver.find_elements(
+                        By.XPATH,
+                        "//*[contains(@class,'ant-form-item-explain') or contains(@class,'ant-message-error') or contains(@class,'ant-alert-error')]"
+                    )
+                    for el in err_els[:3]:
+                        print(f"  ❗ 에러 메시지: {el.text}")
+                    print(f"  ⚠️ Enter 키 후에도 URL 미변경: {driver.current_url}")
+            except Exception as enter_err:
+                print(f"  ⚠️ Enter 키 재시도 실패: {enter_err}")
 
         wait_page_ready(driver, timeout=30)
 
@@ -243,7 +284,11 @@ def login_relay_fms(driver, user_id: str, password: str, server_name: str = "도
             
             # 혹시 에러 메시지나 로그인 페이지로 돌아갔는지 확인
             if 'login' in driver.current_url.lower():
-                print("  ❌ 로그인 페이지로 돌아감 → 로그인 실패했을 가능성")
+                print("  ❌ 로그인 페이지로 돌아감 → 로그인 실패")
+                raise RuntimeError(
+                    "로그인 실패: 로그인 페이지에서 벗어나지 못함. "
+                    "자격증명 또는 서버 선택 상태를 확인하세요."
+                )
 
     except Exception as e:
         print(f"❌ 로그인 실패: {e}")
@@ -461,20 +506,36 @@ def click_excel_download_and_get_file(
     new_file = None
 
     while time.time() < deadline:
-        time.sleep(1.0)
-        crdownloads = glob.glob(os.path.join(download_dir, "*.crdownload"))
-        if crdownloads:
-            print("  ⏳ 다운로드 진행 중...")
-            continue
+        time.sleep(2.0)
+
+        # .crdownload 여부 관계없이 새 xlsx 파일 직접 탐지
         after_files = set(
             glob.glob(os.path.join(download_dir, "*.xlsx")) +
             glob.glob(os.path.join(download_dir, "*.xls"))
         )
         new_files = after_files - before_files
+
         if new_files:
-            new_file = max(new_files, key=os.path.getctime)
-            print(f"✅ 다운로드 완료: {new_file}")
-            break
+            candidate = max(new_files, key=os.path.getctime)
+            # 파일 크기가 안정적(변화 없음)이면 다운로드 완료로 판단
+            try:
+                size1 = os.path.getsize(candidate)
+                time.sleep(2.0)
+                size2 = os.path.getsize(candidate)
+                if size1 == size2 and size1 > 0:
+                    new_file = candidate
+                    print(f"✅ 다운로드 완료: {new_file} ({size1:,} bytes)")
+                    break
+                else:
+                    print(f"  ⏳ 다운로드 진행 중... ({size1:,} → {size2:,} bytes)")
+            except OSError:
+                print("  ⏳ 파일 준비 중...")
+        else:
+            crdownloads = glob.glob(os.path.join(download_dir, "*.crdownload"))
+            if crdownloads:
+                print(f"  ⏳ 다운로드 진행 중... (.crdownload 감지됨)")
+            else:
+                print("  ⏳ 파일 생성 대기 중...")
 
     if not new_file:
         raise TimeoutError("❌ 엑셀 파일 다운로드 시간 초과")
@@ -505,7 +566,7 @@ def run_relay_cs_crawling(
         driver = setup_chrome_driver(headless=headless, download_dir=download_dir)
         login_relay_fms(driver, user_id, password, server_name, server_number, download_dir=download_dir)
         navigate_to_cs_market(driver)
-        file_path = click_excel_download_and_get_file(driver, download_dir=download_dir, timeout=60)
+        file_path = click_excel_download_and_get_file(driver, download_dir=download_dir, timeout=180)
 
         print("="*60)
         print(f"🎉 크롤링 완료: {file_path}")

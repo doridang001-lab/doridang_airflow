@@ -120,6 +120,89 @@ def _get_effect_html(row: pd.Series, action_category: str) -> str:
 
 
 # ============================================================
+# 전전주 결과 지표 변화 헬퍼
+# ============================================================
+def _get_indicator_result(row: pd.Series, indicator: str) -> str:
+    """
+    전전주 결과요약용: 플래그된 지표의 7일 비교 결과를 반환.
+    예) '매출(7일합): 4,454,400원→4,979,800원 ▲11.8% (개선)'
+    """
+    def _sf(val) -> float | None:
+        try:
+            v = float(str(val).replace(',', '').strip())
+            return None if pd.isna(v) else v
+        except (ValueError, TypeError):
+            return None
+
+    # 지표별 컬럼/라벨/포맷/개선 방향 매핑
+    METRIC_MAP = {
+        '매출': {
+            'col_recent': 'sum_7d_recent', 'col_prev': 'sum_7d_prev',
+            'label': '매출(7일합)',
+            'fmt': lambda v: f'{v:,.0f}원',
+            'higher_is_better': True,
+        },
+        '수수료': {
+            'col_recent': 'avg_7d_recent', 'col_prev': 'avg_7d_prev',
+            'label': '수수료율(7일평균)',
+            'fmt': lambda v: f'{v:.2%}',
+            'higher_is_better': False,
+        },
+        '배민광고': {
+            'col_recent': '배민_광고효과_avg_7d_recent', 'col_prev': '배민_광고효과_avg_7d_prev',
+            'label': '배민광고효과(7일평균)',
+            'fmt': lambda v: f'{v:.4f}',
+            'higher_is_better': True,
+        },
+        '쿠팡광고': {
+            'col_recent': '쿠팡_광고효과_avg_7d_recent', 'col_prev': '쿠팡_광고효과_avg_7d_prev',
+            'label': '쿠팡광고효과(7일평균)',
+            'fmt': lambda v: f'{v:.4f}',
+            'higher_is_better': True,
+        },
+    }
+
+    if indicator == '성실지표':
+        # 성실지표는 여러 하위 지표를 묶어서 표시
+        subs = [
+            ('조리시간', '조리시간_7d_recent', '조리시간_7d_prev', lambda v: f'{v:.0f}분', False),
+            ('접수시간', '접수시간_7d_recent', '접수시간_7d_prev', lambda v: f'{v:.0f}분', False),
+            ('재주문율', '재주문율_7d_recent', '재주문율_7d_prev', lambda v: f'{v:.1%}', True),
+            ('별점', '별점_7d_recent', '별점_7d_prev', lambda v: f'{v:.1f}', True),
+        ]
+        results = []
+        for sub_label, col_r, col_p, fmt, higher_better in subs:
+            r, p = _sf(row.get(col_r)), _sf(row.get(col_p))
+            if r is not None and p is not None:
+                improved = (r >= p) if higher_better else (r <= p)
+                arrow = '▲' if r > p else ('▼' if r < p else '→')
+                status = '개선' if improved else '악화'
+                results.append(f'{sub_label}: {fmt(p)}→{fmt(r)} {arrow} ({status})')
+        return ' / '.join(results) if results else ''
+
+    cfg = METRIC_MAP.get(indicator)
+    if not cfg:
+        return ''
+
+    recent = _sf(row.get(cfg['col_recent']))
+    prev = _sf(row.get(cfg['col_prev']))
+
+    if recent is None or prev is None:
+        return ''
+
+    improved = (recent >= prev) if cfg['higher_is_better'] else (recent <= prev)
+    arrow = '▲' if recent > prev else ('▼' if recent < prev else '→')
+    if prev != 0:
+        change = (recent - prev) / abs(prev) * 100
+        change_str = f'{arrow}{abs(change):.1f}%'
+    else:
+        change_str = arrow
+    status = '개선' if improved else '악화'
+
+    return f'{cfg["label"]}: {cfg["fmt"](prev)}→{cfg["fmt"](recent)} {change_str} ({status})'
+
+
+# ============================================================
 # HTML 리포트 빌드
 # ============================================================
 def _build_flow_report_html(
@@ -138,7 +221,7 @@ def _build_flow_report_html(
         df_prev_prev: 전전주 결과 데이터 (전전주 GSheet에서 로드, uploaded_at 최신 회차)
 
     컬럼: 날짜, 매장명, 전주상태, 담당자, 매출, 수수료, 배민광고, 쿠팡광고, 성실지표,
-          조치일자, 목표치, 핵심조치, 조치내용, 문제점, 수집날짜, 구분
+          조치일자, 목표치, 핵심조치, 조치내용, 조치전, 조치후, 문제점, 수집날짜, 구분
     """
     if df_prev_prev is None:
         df_prev_prev = pd.DataFrame()
@@ -178,16 +261,14 @@ def _build_flow_report_html(
 
     # ── 알림개요 ──
     parts.append('<div class="post-editor-wrap">')
-    parts.append('<h1>알림개요</h1>')
+    parts.append('<h1>개요</h1>')
     parts.append('<ul>')
-    parts.append('<li>영업관리 알림 시스템 기준에 따라 매출/광고/수수료 지표 기반 조치 필요 매장 안내</li>')
-    parts.append('<li>담당자 확인 후 조치 및 사유 공유 목적</li>')
-    parts.append('<li>점주 소통 강화 목적</li>')
-    parts.append('<li>AX 전환 목표<ul>')
-    parts.append('<li>영업관리 조치 및 점주 의견을 데이터 기반으로 검증하여 매장 관리 의사결정을 고도화</li>')
-    parts.append('</ul></li>')
+    parts.append('<li>본 회의는 회사의 DX/AX 전환 방향에 따라 데이터 기반 매장 관리를 위한 필수 운영 기준</li>')
+    parts.append('<li>매출 하락 및 관리 누락 매장을 사전 대응하여 점주 이탈을 방지하고 소통을 강화하기 위함</li>')
+    parts.append('<li>조치 및 점주 의견을 데이터로 검증하여 동일 기준의 매장 관리 의사결정을 정착시키기 위함</li>')
     parts.append('</ul>')
     parts.append('<div>&nbsp;</div>')
+    parts.append('</div>')
 
     # ── 확인필요 (이전주 미조치 + 금주 재알림) ──
     if not df_need_check.empty:
@@ -272,13 +353,25 @@ def _build_flow_report_html(
                 label = f' [{gubun}]' if gubun and gubun != 'nan' else ''
                 parts.append(f'<li>{store}{prev_status_label}{label}<ul>')
 
-                detail = action_content if action_content and action_content != 'nan' else ''
-                if not detail and action_category and action_category != 'nan':
-                    detail = action_category
-                if detail:
-                    parts.append(f'<li>{detail}</li>')
+                # 핵심조치 표시
+                if action_category and action_category != 'nan':
+                    parts.append(f'<li>핵심조치: {action_category}</li>')
+                if action_content and action_content != 'nan':
+                    parts.append(f'<li>조치내용: {action_content}</li>')
+                # 조치전/조치후 표시
+                before_action = str(row.get('조치전', '')).strip()
+                after_action = str(row.get('조치후', '')).strip()
+                if before_action and before_action != 'nan':
+                    parts.append(f'<li>조치전: {before_action}</li>')
+                if after_action and after_action != 'nan':
+                    parts.append(f'<li>조치후: {after_action}</li>')
                 if issue and issue != 'nan':
                     parts.append(f'<li>문제점: {issue}</li>')
+
+                # 핵심조치 기준 결과(개선/악화) 표시
+                result_str = _get_indicator_result(row, action_category)
+                if result_str:
+                    parts.append(f'<li>→ {result_str}</li>')
 
                 parts.append('</ul></li>')
             parts.append('</ul>')
@@ -314,6 +407,13 @@ def _build_flow_report_html(
                     detail = action_category
                 if detail:
                     parts.append(f'<li>{detail}</li>')
+                # 조치전/조치후 표시
+                before_action = str(row.get('조치전', '')).strip()
+                after_action = str(row.get('조치후', '')).strip()
+                if before_action and before_action != 'nan':
+                    parts.append(f'<li>조치전: {before_action}</li>')
+                if after_action and after_action != 'nan':
+                    parts.append(f'<li>조치후: {after_action}</li>')
                 if issue and issue != 'nan':
                     parts.append(f'<li>문제점: {issue}</li>')
                 parts.append('</ul></li>')
@@ -504,13 +604,45 @@ def post_flow_report(**context):
             (By.CSS_SELECTOR, "li[data-code='project'].my-project")
         ))
         driver.execute_script("arguments[0].click();", my_project)
-        time.sleep(2)
+        time.sleep(3)
         logger.info("[FlowReport] 내 프로젝트 클릭")
 
+        # 프로젝트 목록 로딩 대기 (li[id^='project-'] 요소가 1개 이상 나타날 때까지)
+        try:
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "li[id^='project-']"))
+            )
+            logger.info("[FlowReport] 프로젝트 목록 로딩 확인")
+        except Exception:
+            logger.warning("[FlowReport] 프로젝트 목록 로딩 대기 타임아웃 → 계속 진행")
+
+        # 사이드바 내 프로젝트 목록 스크롤 (목록이 길면 대상이 뷰포트 밖)
+        driver.execute_script("""
+            var sidebar = document.querySelector('.project-list, .lnb-list, .snb-list, [class*="project"]');
+            if (sidebar) {
+                var target = document.querySelector('li#project-""" + FLOW_PROJECT_SRNO + """');
+                if (target) {
+                    target.scrollIntoView({block: 'center'});
+                } else {
+                    sidebar.scrollTop = sidebar.scrollHeight;
+                }
+            }
+        """)
+        time.sleep(1)
+
         # ② [영업관리부] 영업관리 DX/AX 전환 프로젝트 클릭
-        project_item = wait.until(EC.presence_of_element_located(
-            (By.CSS_SELECTOR, f"li#project-{FLOW_PROJECT_SRNO}")
-        ))
+        project_selector = f"li#project-{FLOW_PROJECT_SRNO}"
+        try:
+            project_item = WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, project_selector))
+            )
+        except Exception:
+            # 디버그: 현재 페이지에서 프로젝트 목록 상태 확인
+            project_items = driver.find_elements(By.CSS_SELECTOR, "li[id^='project-']")
+            project_ids = [el.get_attribute("id") for el in project_items[:10]]
+            logger.warning("[FlowReport] 프로젝트 목록에서 '%s' 미발견 | 현재 목록(상위10): %s", project_selector, project_ids)
+            logger.warning("[FlowReport] 현재 URL: %s", driver.current_url)
+            raise
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", project_item)
         time.sleep(0.5)
         driver.execute_script("arguments[0].click();", project_item)

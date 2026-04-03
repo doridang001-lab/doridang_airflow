@@ -39,9 +39,12 @@ ORDER_DETAIL_URL = "https://admin.posfeed.co.kr/#/order/edit/{code}"
 HEADLESS_MODE = os.getenv("AIRFLOW_HOME") is not None
 
 # 수집 모드
-# "yesterday"        : 어제 일자 기준 (기본, 매일 스케줄 실행)
+# "yesterday"        : posfeed_sales 최신 등록날짜 기준 자동 감지 (기본, 매일 스케줄 실행)
 # "backfill_missing" : posfeed_sales 전체 파티션 스캔 → 상세 누락 주문 전부 수집
-COLLECT_MODE = "2026-03-24"
+# "2026-03-01"       : 특정 날짜 단건
+# "2026-03-01~2026-03-02" : 날짜 범위
+COLLECT_MODE = "yesterday"
+# COLLECT_MODE = "2026-03-23"
 
 
 # ============================================================
@@ -246,14 +249,16 @@ def _load_source_df() -> pd.DataFrame:
     mode_type, date_list = _parse_collect_mode()
 
     if mode_type == "yesterday":
-        data_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        ym = data_date[:7]
+        # posfeed_sales 전체에서 가장 최신 등록날짜 자동 감지
         try:
-            df = read_analytics_partition(sales_root, ym=ym)
+            df_all = read_analytics_partition(sales_root)
         except FileNotFoundError:
-            raise AirflowSkipException(f"posfeed_sales 파티션 없음 | ym={ym}")
-        df = df[df["등록날짜"] == data_date]
-        logger.info("모드: yesterday | data_date: %s | 건수: %d", data_date, len(df))
+            raise AirflowSkipException("posfeed_sales 파티션 없음 (전체)")
+        if df_all.empty or "등록날짜" not in df_all.columns:
+            raise AirflowSkipException("posfeed_sales 데이터 없음 또는 등록날짜 컬럼 없음")
+        data_date = df_all["등록날짜"].dropna().max()
+        df = df_all[df_all["등록날짜"] == data_date]
+        logger.info("모드: yesterday(최신일자) | data_date: %s | 건수: %d", data_date, len(df))
 
     elif mode_type == "backfill_missing":
         try:
@@ -305,7 +310,9 @@ def extract_order_codes(**context) -> str:
     # 모드별 기수집 코드 제외 범위 결정
     mode_type, date_list = _parse_collect_mode()
     if mode_type == "yesterday":
-        ym_filter = (datetime.now() - timedelta(days=1)).strftime("%Y-%m")
+        # df에서 실제 감지된 최신 등록날짜의 ym 사용
+        latest_date = df["등록날짜"].dropna().max()
+        ym_filter = str(latest_date)[:7] if latest_date else None
     elif mode_type == "date_range" and len({d[:7] for d in date_list}) == 1:
         ym_filter = date_list[0][:7]  # 단일 ym이면 한정 스캔
     else:

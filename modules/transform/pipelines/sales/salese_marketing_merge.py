@@ -7,6 +7,7 @@ import glob
 from modules.load.load_df_glob import load_data
 from modules.transform.utility.paths import TEMP_DIR, LOCAL_DB, COLLECT_DB
 from modules.transform.utility.io import load_and_concat_csv, save_to_parquet
+from modules.transform.utility.store_name_mapping import normalize_store_names
 
 
 # ============================================================
@@ -368,12 +369,7 @@ def preprocess_toorder_review_df(
     toorder_review_df = add_surrogate_key(toorder_review_df, natural_key_cols=["date", "stores_name"])
     toorder_review_df.rename(columns={'key': 'id'}, inplace=True)
     toorder_review_df["stores_name"] = "도리당 " + toorder_review_df["stores_name"]
-    toorder_review_df["stores_name"] = toorder_review_df["stores_name"].replace({
-        "도리당 일산백석점": "도리당 백석점",
-        "도리당 서울대점": "도리당 서울대점",
-        "도리당 구로디지털단지점": "도리당 구로디지털점",
-        "도리당 충주봉방점": "도리당 충주역점"
-    })
+    toorder_review_df["stores_name"] = normalize_store_names(toorder_review_df["stores_name"])
     
     print(f"전처리 완료: {len(toorder_review_df):,}행")
     

@@ -35,12 +35,13 @@ def _latest_smd02_execution_date(dt, **context):
         row = session.execute(
             text(
                 """
-                SELECT execution_date
-                FROM task_instance
-                WHERE dag_id = :dag_id
-                  AND task_id = :task_id
-                  AND state = :state
-                ORDER BY execution_date DESC
+                SELECT dr.logical_date
+                FROM task_instance ti
+                JOIN dag_run dr ON ti.run_id = dr.run_id AND ti.dag_id = dr.dag_id
+                WHERE ti.dag_id = :dag_id
+                  AND ti.task_id = :task_id
+                  AND ti.state = :state
+                ORDER BY dr.logical_date DESC
                 LIMIT 1
                 """
             ),

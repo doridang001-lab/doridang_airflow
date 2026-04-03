@@ -18,6 +18,7 @@ filename = os.path.basename(__file__)
 
 from modules.transform.utility.paths import LOCAL_DB, ONEDRIVE_DB
 from modules.extract.extract_gsheet import extract_gsheet
+from modules.transform.utility.store_name_mapping import normalize_store_names
 
 # 설정
 DEFAULT_CREDENTIALS_PATH = r"/opt/airflow/config/rare-ethos-483607-i5-45c9bec5b193.json"
@@ -187,6 +188,10 @@ def load_employee_from_gsheet(**context):
                      '플랫폼', '계정ID', '계정PW', 'collected_at', 'email']
     
     df_final = df_final[[col for col in final_columns if col in df_final.columns]]
+    
+    # 매장명 정규화 (중앙 매핑: store_name_mapping.py)
+    df_final['매장명'] = normalize_store_names(df_final['매장명'])
+
     
     # CSV 저장 (2개 경로)
     EMPLOYEE_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)

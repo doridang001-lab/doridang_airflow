@@ -11,6 +11,7 @@ Posfeed 주문 데이터 자동 다운로드 DAG
 """
 
 import os
+import logging
 from pathlib import Path
 
 import pendulum
@@ -25,7 +26,42 @@ from modules.transform.pipelines.db.DB_Posfeed_Sales import (
     partition_to_onedrive,
 )
 
+logger = logging.getLogger(__name__)
+
 dag_id = Path(__file__).stem
+
+_ALERT_EMAILS = ["a17019@kakao.com"]
+
+
+def _on_failure_callback(context):
+    """Task 실패 시 이메일 알림 발송"""
+    from modules.transform.utility.mailer import send_email, text_to_html
+
+    ti = context.get("task_instance")
+    dag_id = ti.dag_id
+    task_id = ti.task_id
+    execution_date = ti.execution_date.strftime("%Y-%m-%d %H:%M")
+    exception = context.get("exception", "알 수 없음")
+    log_url = ti.log_url
+
+    subject = f"[Airflow 실패] {dag_id} / {task_id}"
+    body = (
+        f"DAG: {dag_id}\n"
+        f"Task: {task_id}\n"
+        f"실행일시: {execution_date}\n"
+        f"에러: {exception}\n"
+        f"로그: {log_url}"
+    )
+    try:
+        send_email(
+            subject=subject,
+            html_content=text_to_html(body),
+            to_emails=_ALERT_EMAILS,
+        )
+        logger.info(f"실패 알림 발송 완료: {_ALERT_EMAILS}")
+    except Exception as e:
+        logger.error(f"실패 알림 발송 실패: {e}")
+
 
 default_args = {
     'retries': 1,
@@ -33,6 +69,7 @@ default_args = {
     'depends_on_past': False,
     'email_on_failure': False,
     'email_on_retry': False,
+    'on_failure_callback': _on_failure_callback,
 }
 
 with DAG(

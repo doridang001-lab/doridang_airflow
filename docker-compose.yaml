@@ -67,6 +67,7 @@ x-airflow-common:
     COLLECT_DB: '/opt/airflow/Collect_Data'
     LOCAL_DB: '/opt/airflow/Local_DB'
     ANALYTICS_DB: '/opt/airflow/analytics'
+    MART_DB: '/opt/airflow/onedrive_mart'
     TEMP_DIR: '/opt/airflow/Local_DB/temp'
     # yamllint disable rule:line-length
     # Use simple http server on scheduler for health checks
@@ -88,6 +89,7 @@ x-airflow-common:
     - ./requirements.txt:/opt/airflow/requirements.txt
     - "c:/Users/민준/OneDrive - 주식회사 도리당/Repository:/opt/airflow/Repository"
     - "c:/Users/민준/OneDrive - 주식회사 도리당/Collect_Data:/opt/airflow/Collect_Data"
+    - "c:/Users/민준/OneDrive - 주식회사 도리당/data/mart:/opt/airflow/onedrive_mart"
     - "c:/Users/민준/OneDrive - 주식회사 도리당/data/analytics:/opt/airflow/analytics"
     - "c:/Local_DB:/opt/airflow/Local_DB"
     - "c:/Doridang:/opt/airflow/Doridang"

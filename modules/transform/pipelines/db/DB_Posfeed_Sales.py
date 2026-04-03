@@ -186,16 +186,28 @@ def _click_download(driver: uc.Chrome, wait: WebDriverWait) -> None:
         panel = panels[-1]  # 가장 마지막(최근 열린) 패널
 
         _CELL_CSS = "td.available:not(.prev-month):not(.next-month)"
+        # span 렌더링 대기: 최대 5초간 셀 내부 span이 나타날 때까지 재시도
         day_cell = None
-        for td in panel.find_elements(By.CSS_SELECTOR, _CELL_CSS):
-            span = td.find_element(By.TAG_NAME, "span")
-            if span.text.strip() == _yesterday_day:
-                day_cell = td
+        for _attempt in range(10):
+            for td in panel.find_elements(By.CSS_SELECTOR, _CELL_CSS):
+                try:
+                    span = td.find_element(By.TAG_NAME, "span")
+                except Exception:
+                    continue
+                if span.text.strip() == _yesterday_day:
+                    day_cell = td
+                    break
+            if day_cell is not None:
                 break
+            time.sleep(0.5)
 
         if day_cell is None:
-            found_days = [td.find_element(By.TAG_NAME, "span").text.strip()
-                          for td in panel.find_elements(By.CSS_SELECTOR, _CELL_CSS)]
+            found_days = []
+            for td in panel.find_elements(By.CSS_SELECTOR, _CELL_CSS):
+                try:
+                    found_days.append(td.find_element(By.TAG_NAME, "span").text.strip())
+                except Exception:
+                    found_days.append("(no span)")
             logger.error(f"달력 available 날짜 목록: {found_days}")
             raise TimeoutException(f"달력에서 어제 날짜({_yesterday_day}일) 셀을 찾을 수 없습니다.")
 

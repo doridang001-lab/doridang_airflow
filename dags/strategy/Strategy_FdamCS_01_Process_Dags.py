@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from modules.transform.utility.paths import DOWN_DIR
 from modules.transform.utility.io import SMP_FDAM_CS_TIME
 from modules.load.load_gsheet import save_to_gsheet
+from modules.transform.utility.store_name_mapping import normalize_store_names, normalize_for_join
 
 filename = os.path.basename(__file__)
 
@@ -47,7 +48,7 @@ FALLBACK_CREDENTIALS_PATH = "/opt/airflow/config/glowing-palace-465904-h6-7f82df
 CS_GSHEET_URL       = "https://docs.google.com/spreadsheets/d/1DHbZX5jDkiZfe0SPr3eRinPXuSFomYm2AN-gMADoBkI/edit?gid=1488056813#gid=1488056813"
 CS_SHEET_NAME       = "시트1"
 RELAY_USER_ID       = "조민준"
-RELAY_PASSWORD      = "1234"
+RELAY_PASSWORD      = "alswns3040@"
 RELAY_SERVER_NAME   = "도리당"
 RELAY_SERVER_NUMBER = "10625"
 
@@ -61,7 +62,8 @@ OLLAMA_HOST = 'http://host.docker.internal:11434'
 # 이메일 알림 설정
 # ============================================================
 CS_ALERT_EMAIL_CONN_ID = 'doridang_conn_smtp_gmail'
-CS_ALERT_OVERDUE_DAYS  = 7        # 처리소요기간 기준 (일)
+CS_ALERT_OVERDUE_DAYS  = 7        # 처리소요기간 기준 - 지연알림 (일)
+CS_ALERT_MEMO_DAYS     = 4        # 처리소요기간 기준 - 비공개메모 입력요청 (일)
 
 # 비공개메모 규격 필수 키 (모두 존재 + 값 비어있지 않아야 유효)
 MEMO_REQUIRED_KEYS = ['업체:', '이슈유형:', '완료예정일:', '지연사유:', '현재상태:', '메모:']
@@ -524,20 +526,14 @@ def preprocess_cs_df(df: pd.DataFrame) -> pd.DataFrame:
             .set_index('매장명')['담당자']
         )
 
-        # ============================================================
-        # ✏️ 매장명 정규화 매핑 (CS 데이터 ↔ sales_employee.csv 불일치 보정)
-        # CS 데이터의 매장명이 sales_employee.csv와 다를 경우 여기에 추가
-        # 형식: "CS에서 수신된 매장명": "sales_employee.csv의 정확한 매장명"
-        # ============================================================
-        STORE_NAME_NORMALIZE = {
-            "도리당 파주운정점": "도리당 운정점",
-            # "도리당 구매장명예시": "도리당 신매장명예시",  # 예시: 추가 시 이 형식으로
-        }
-        # ============================================================
-
-        df['_매장명_조인키'] = df['매장명'].replace(STORE_NAME_NORMALIZE)
-        df['담당자'] = df['_매장명_조인키'].map(emp_map).fillna('')
-        df.drop(columns=['_매장명_조인키'], inplace=True)
+        # 중앙 매핑(store_name_mapping.py) 적용 후 조인키로 매칭
+        emp_df['매장명'] = normalize_store_names(emp_df['매장명'])
+        emp_map = (
+            emp_df.drop_duplicates(subset='매장명')[['매장명', '담당자']]
+            .set_index('매장명')['담당자']
+        )
+        df['매장명'] = normalize_store_names(df['매장명'])
+        df['담당자'] = df['매장명'].map(emp_map).fillna('')
 
         mapped_count = (df['담당자'] != '').sum()
         print(f"  ✅ 담당자 JOIN 완료: {mapped_count}건 매핑")
@@ -557,6 +553,39 @@ def preprocess_cs_df(df: pd.DataFrame) -> pd.DataFrame:
         print(f"  ✅ 처리완료율 계산 완료: {done}/{total} = {done/total:.4f}")
     else:
         df['처리완료율'] = ''
+
+    # 🆕 처리소요기간 계산 (relay fms 제공값 덮어쓰기)
+    # - 비공개메모 있음: (비공개메모 최초 등장 수집일 - 등록일) → 고정값
+    # - 비공개메모 없음: (수집일 - 등록일) → 매일 증가
+    # ※ relay fms 엑셀이 다운로드 당일 기준으로 계산해서 넣어주므로 반드시 재계산
+    if {'비공개메모', '등록일', '수집일', '접수번호'}.issubset(df.columns):
+        has_memo = df['비공개메모'].apply(lambda x: pd.notna(x) and str(x).strip() != '')
+        # 현재 배치 내 접수번호별 비공개메모 최초 수집일
+        first_memo_date_elapsed = df[has_memo].groupby('접수번호')['수집일'].min()
+
+        def _calc_elapsed(row):
+            try:
+                reg_dt = pd.to_datetime(row['등록일'], errors='coerce')
+                if pd.isna(reg_dt):
+                    return ''
+                접수번호 = row['접수번호']
+                if pd.notna(row.get('비공개메모')) and str(row.get('비공개메모', '')).strip() != '':
+                    # 비공개메모 있음 → 최초 등장 수집일 기준 (고정값)
+                    first = pd.to_datetime(first_memo_date_elapsed.get(접수번호), errors='coerce')
+                    end_dt = first if not pd.isna(first) else pd.to_datetime(row['수집일'], errors='coerce')
+                else:
+                    # 비공개메모 없음 → 오늘 수집일 기준 (경과일)
+                    end_dt = pd.to_datetime(row['수집일'], errors='coerce')
+                if pd.isna(end_dt):
+                    return ''
+                return int((end_dt - reg_dt).days)
+            except Exception:
+                return ''
+        df['처리소요기간'] = df.apply(_calc_elapsed, axis=1)
+        valid = (df['처리소요기간'] != '').sum()
+        print(f"  ✅ 처리소요기간 재계산 완료: {valid}건")
+    else:
+        df['처리소요기간'] = ''
 
     # 🆕 응답소요일 계산 (비공개메모 최초 입력일 기준)
     # = 접수번호별 비공개메모가 처음 등장한 수집일 - 등록일 (일수)
@@ -812,10 +841,36 @@ def _recalc_completion_rate(df_new: pd.DataFrame, df_existing: pd.DataFrame) -> 
 
     df_new_calc['응답소요일'] = df_new_calc.apply(_response_days_recalc, axis=1)
 
+    # ── 처리소요기간 (기존+신규 합산 기준으로 최종 확정) ──────────
+    # - 비공개메모 있음: 기존+신규 합산의 접수번호별 최초 수집일 - 등록일 (고정값)
+    # - 비공개메모 없음: 신규 배치의 수집일 - 등록일 (경과일)
+    def _elapsed_days_recalc(row):
+        try:
+            접수번호 = row['접수번호']
+            reg = pd.to_datetime(reg_date_map.get(접수번호), errors='coerce')
+            if pd.isna(reg):
+                return ''
+            if pd.notna(row.get('비공개메모')) and str(row.get('비공개메모', '')).strip() != '':
+                # 비공개메모 있음 → 최초 등장 수집일 기준 고정
+                first = pd.to_datetime(first_memo_date.get(접수번호), errors='coerce')
+                end = first if not pd.isna(first) else pd.to_datetime(row['수집일'], errors='coerce')
+            else:
+                # 비공개메모 없음 → 이 배치의 수집일 기준 경과일
+                end = pd.to_datetime(row['수집일'], errors='coerce')
+            if pd.isna(end):
+                return ''
+            return int((end - reg).days)
+        except Exception:
+            return ''
+
+    df_new_calc['처리소요기간'] = df_new_calc.apply(_elapsed_days_recalc, axis=1)
+
     unique_days = df_new_calc['수집일'].dropna().astype(str).unique().tolist()
     answered = (df_new_calc['응답소요일'] != '').sum()
+    elapsed_cnt = (df_new_calc['처리소요기간'] != '').sum()
     print(f"  📊 수집일 기준 재계산 완료: {len(unique_days)}일")
     print(f"  📊 응답소요일: {answered}건 산출 (기존+신규 합산 기준)")
+    print(f"  📊 처리소요기간: {elapsed_cnt}건 산출 (비공개메모 최초 등장일 기준 고정)")
     for day in unique_days[:5]:
         total = int(daily_total.get(day, 0))
         done = int(daily_done.get(day, 0))
@@ -1135,7 +1190,7 @@ def _build_memo_alert_email_html(df: pd.DataFrame, today_str: str) -> str:
                                 올바르게 입력될 때까지 매일 알림이 발송됩니다.
                             </p>
                             <p style="margin:0 0 4px;font-size:12px;color:#555;">
-                                ① 비공개 메모 없음 → Relay FMS에서 비공개메모를 직접 입력해 주세요<br>
+                                ① 비공개 메모 없음 → 비공개메모를 직접 입력해 주세요<br>
                                 ② 형식 불일치 → 크롬 확장 프로그램으로 규격에 맞게 재작성해 주세요
                             </p>
                             <p style="margin:6px 0 0;font-size:11px;color:#7f8c8d;">
@@ -1319,14 +1374,16 @@ def send_overdue_cs_alert(**context):
         raise
 
     # ── 7. 비공개메모 누락/형식불일치 알림 ──────────────────────
-    if '비공개메모' not in df_alert.columns:
+    if '비공개메모' not in df_open.columns:
         print("[CS지연알림] '비공개메모' 컬럼 없음 → 메모 알림 스킵")
         return f"발송 완료 {len(df_alert)}건"
 
-    memo_check = df_alert['비공개메모'].apply(_validate_memo)
-    df_alert['_memo_valid']  = memo_check.apply(lambda x: x[0])
-    df_alert['_memo_reason'] = memo_check.apply(lambda x: x[1])
-    df_memo_alert = df_alert[~df_alert['_memo_valid']].copy()
+    # 메모 알림은 4일 이상 기준으로 별도 필터링 (지연알림 7일↑과 독립)
+    df_memo_base = df_open[df_open['처리소요기간'] >= CS_ALERT_MEMO_DAYS].copy()
+    memo_check = df_memo_base['비공개메모'].apply(_validate_memo)
+    df_memo_base['_memo_valid']  = memo_check.apply(lambda x: x[0])
+    df_memo_base['_memo_reason'] = memo_check.apply(lambda x: x[1])
+    df_memo_alert = df_memo_base[~df_memo_base['_memo_valid']].copy()
 
     cnt_missing = (df_memo_alert['_memo_reason'] == '미입력').sum()
     cnt_bad     = (df_memo_alert['_memo_reason'] == '형식불일치').sum()
@@ -1400,6 +1457,144 @@ def cleanup_files(**context):
 
 
 # ============================================================
+# Task 6: 데이터 수집 이상 감지 (uploaded_at 기준)
+# ============================================================
+def check_data_freshness(**context):
+    """
+    Google Sheets의 uploaded_at 컬럼 최대값이 오늘 날짜인지 확인.
+    당일 데이터가 없으면 a17019@kakao.com 에만 이메일 알림.
+    프담 매크로 로그인 실패로 데이터 미수집 시 조기 감지 목적.
+    """
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    now_kst   = pendulum.now("Asia/Seoul")
+    today_str = now_kst.to_date_string()
+
+    print(f"\n{'='*60}")
+    print(f"[데이터신선도] 수집 이상 감지 시작 | 기준일: {today_str}")
+
+    # ── 1. 구글시트 로드 ─────────────────────────────────────
+    try:
+        scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        candidates = _credential_candidates()
+        if not candidates:
+            raise RuntimeError("사용 가능한 서비스 계정 없음")
+        creds = Credentials.from_service_account_file(candidates[0], scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_url(CS_GSHEET_URL)
+        ws = sh.worksheet(CS_SHEET_NAME)
+        df_sheet = pd.DataFrame(ws.get_all_records())
+        print(f"[데이터신선도] 구글시트 로드 완료: {len(df_sheet)}건")
+    except Exception as e:
+        print(f"[데이터신선도] 구글시트 로드 실패 → 알림 발송: {e}")
+        _send_freshness_alert_email(today_str, max_date=None, reason=f"구글시트 로드 실패: {e}")
+        return "알림 발송 (로드 실패)"
+
+    # ── 2. uploaded_at 컬럼 확인 ─────────────────────────────
+    if 'uploaded_at' not in df_sheet.columns:
+        print("[데이터신선도] 'uploaded_at' 컬럼 없음 → 스킵")
+        return "스킵 (uploaded_at 컬럼 없음)"
+
+    if df_sheet.empty:
+        print("[데이터신선도] 데이터 없음 → 알림 발송")
+        _send_freshness_alert_email(today_str, max_date=None, reason="시트 데이터 없음")
+        return "알림 발송 (데이터 없음)"
+
+    # ── 3. 최신 uploaded_at 날짜 추출 ───────────────────────
+    uploaded_at_series = pd.to_datetime(df_sheet['uploaded_at'], errors='coerce').dropna()
+    if uploaded_at_series.empty:
+        print("[데이터신선도] uploaded_at 파싱 실패 → 알림 발송")
+        _send_freshness_alert_email(today_str, max_date=None, reason="uploaded_at 날짜 파싱 불가")
+        return "알림 발송 (파싱 불가)"
+
+    max_date   = uploaded_at_series.max().date()
+    today_date = now_kst.date()
+
+    print(f"[데이터신선도] uploaded_at 최신값: {max_date} | 오늘: {today_date}")
+
+    # ── 4. 당일 데이터 존재 여부 확인 ───────────────────────
+    if max_date >= today_date:
+        print(f"[데이터신선도] ✅ 정상 — 오늘 데이터 존재 ({max_date})")
+        return f"정상 (최신: {max_date})"
+
+    # ── 5. 이상 감지 → 알림 발송 ────────────────────────────
+    days_behind = (today_date - max_date).days
+    reason = f"마지막 수집일: {max_date} (오늘보다 {days_behind}일 전)"
+    print(f"[데이터신선도] ⚠️ 이상 감지 → 알림 발송 | {reason}")
+    _send_freshness_alert_email(today_str, max_date=str(max_date), reason=reason)
+    return f"알림 발송 ({reason})"
+
+
+def _send_freshness_alert_email(today_str: str, max_date, reason: str):
+    """프담 데이터 수집 이상 감지 알림 이메일 발송 (a17019@kakao.com 단독 수신)"""
+    max_date_text = max_date if max_date else "알 수 없음"
+    html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f5f5f5;font-family:'Apple SD Gothic Neo','Malgun Gothic',sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f5;padding:20px 0;">
+    <tr><td>
+      <table width="600" cellpadding="0" cellspacing="0" align="center"
+             style="background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">
+        <tr>
+          <td style="background:#c0392b;padding:24px 30px;">
+            <h2 style="margin:0;color:white;font-size:18px;">⚠️ 프담 CS 데이터 수집 이상 감지</h2>
+            <p style="margin:6px 0 0;color:rgba(255,255,255,0.85);font-size:13px;">기준일: {today_str}</p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:24px 30px;">
+            <p style="font-size:14px;color:#333;margin:0 0 16px;">
+              오늘({today_str}) 프담 CS 데이터가 구글시트에 수집되지 않았습니다.<br>
+              Relay FMS 매크로 로그인 실패 또는 수집 오류 가능성이 있습니다.
+            </p>
+            <table width="100%" cellpadding="0" cellspacing="0"
+                   style="border-collapse:collapse;font-size:13px;border:1px solid #dee2e6;border-radius:4px;">
+              <tr style="background:#f8f9fa;">
+                <th style="padding:10px 16px;text-align:left;border-bottom:1px solid #dee2e6;width:40%;">항목</th>
+                <th style="padding:10px 16px;text-align:left;border-bottom:1px solid #dee2e6;">내용</th>
+              </tr>
+              <tr>
+                <td style="padding:10px 16px;border-bottom:1px solid #f0f0f0;">오늘 날짜</td>
+                <td style="padding:10px 16px;border-bottom:1px solid #f0f0f0;font-weight:bold;color:#2c3e50;">{today_str}</td>
+              </tr>
+              <tr>
+                <td style="padding:10px 16px;border-bottom:1px solid #f0f0f0;">마지막 수집일 (uploaded_at 최대값)</td>
+                <td style="padding:10px 16px;border-bottom:1px solid #f0f0f0;font-weight:bold;color:#e74c3c;">{max_date_text}</td>
+              </tr>
+              <tr>
+                <td style="padding:10px 16px;">상태</td>
+                <td style="padding:10px 16px;color:#e74c3c;">{reason}</td>
+              </tr>
+            </table>
+            <p style="font-size:12px;color:#7f8c8d;margin:16px 0 0;">
+              Relay FMS(프담) 매크로를 수동으로 실행하거나 로그인 상태를 확인해 주세요.
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:12px 30px;text-align:center;border-top:1px solid #eee;">
+            <p style="margin:0;font-size:11px;color:#7f8c8d;">이 이메일은 자동 발송되었습니다 | Strategy_FdamCS_01_Process_Dags</p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+    subject = f"[도리당 CS] 프담 데이터 수집 이상 감지 | {today_str}"
+    _send_cs_alert_email(
+        subject=subject,
+        html_content=html,
+        to_emails=['a17019@kakao.com'],
+        cc_emails=[],
+    )
+    print(f"[데이터신선도] 알림 이메일 발송 완료 → a17019@kakao.com")
+
+
+# ============================================================
 # DAG 정의
 # ============================================================
 with DAG(
@@ -1450,4 +1645,11 @@ with DAG(
         execution_timeout=pd.Timedelta(minutes=5),
     )
 
-    t1_load_existing >> t2_download >> t3_upload >> t5_alert >> t4_cleanup
+    t6_check_freshness = PythonOperator(
+        task_id='check_data_freshness',
+        python_callable=check_data_freshness,
+        trigger_rule=TriggerRule.ALL_DONE,
+        execution_timeout=pd.Timedelta(minutes=5),
+    )
+
+    t1_load_existing >> t2_download >> t3_upload >> t5_alert >> t4_cleanup >> t6_check_freshness

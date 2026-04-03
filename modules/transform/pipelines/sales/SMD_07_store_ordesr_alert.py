@@ -6,7 +6,7 @@ SMD_07 DAG용 필터링 및 이메일 발송 함수
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 
 
 # ============================================================
@@ -93,18 +93,34 @@ def filter_alerts(
         return f"0건 (날짜 변환 실패: {e})"
     
     # ============================================================
-    # 3. 대상 일자 결정
+    # 3. 대상 일자 결정 (최신 완전 날짜 사용)
     # ============================================================
-    max_date = df['order_daily'].max()
+    abs_max_date = df['order_daily'].max()
     ds_str = context.get('ds')
     ds_dt = pd.to_datetime(ds_str) if ds_str else None
 
     # 날짜 역행 방지: logical date(ds)와 무관하게 실제 데이터 최신일자를 사용한다.
     # ds가 과거여도(수동 실행/재실행) 최신 수집일 기준으로 grp를 생성해야 한다.
+    #
+    # ⭐ 불완전한 날짜 방지: 수집이 끝나지 않은 최신 날짜(행 수가 중간값의 50% 미만)는
+    #    건너뛰고 직전 완전 날짜를 사용한다.
+    date_counts = df['order_daily'].value_counts()
+    median_count = date_counts.median()
+    completeness_threshold = max(median_count * 0.5, 10)
+
+    complete_dates = date_counts[date_counts >= completeness_threshold].index
+    if len(complete_dates) > 0:
+        max_date = complete_dates.max()
+    else:
+        max_date = abs_max_date
+
     target_date = max_date
-    target_reason = "데이터 최신일자(고정)"
+    target_reason = "최신 완전 날짜"
+    if abs_max_date != max_date:
+        target_reason = f"최신 완전 날짜 (절대 최신 {abs_max_date.date()} → {date_counts.get(abs_max_date, 0)}행, 기준 {completeness_threshold:.0f}행 미달)"
     
-    print(f"\n[필터링] 데이터 최신일자: {max_date.date() if pd.notnull(max_date) else 'N/A'}")
+    print(f"\n[필터링] 절대 최신일자: {abs_max_date.date() if pd.notnull(abs_max_date) else 'N/A'} ({date_counts.get(abs_max_date, 0)}행)")
+    print(f"[필터링] 완전성 기준: {completeness_threshold:.0f}행 이상 (중간값 {median_count:.0f}의 50%)")
     print(f"[필터링] ds: {ds_dt.date() if ds_dt is not None else 'None'}")
     print(f"[필터링] 사용 일자: {target_date.date() if pd.notnull(target_date) else 'N/A'} ({target_reason})")
     if ds_dt is not None and pd.notnull(max_date) and ds_dt.date() != max_date.date():
@@ -406,7 +422,13 @@ def filter_alerts(
             import traceback
             print(f"[상세 오류]\n{traceback.format_exc()}")
     else:
-        print(f"[INFO] 알림 대상 없음 → {alerts_csv_path.name} 파일 미생성")
+        # ⭐ 알림 대상 없어도 항상 빈 CSV 저장 → 스테일 데이터 방지
+        try:
+            empty_df = pd.DataFrame(columns=['order_daily', '매장명', '담당자', 'email'])
+            empty_df.to_csv(alerts_csv_path, index=False, encoding='utf-8-sig')
+            print(f"[INFO] 알림 대상 없음 → {alerts_csv_path.name} 빈 파일 저장 (기준일: {target_date.date() if pd.notnull(target_date) else 'N/A'}, 스테일 방지)")
+        except Exception as e:
+            print(f"[경고] 빈 CSV 저장 실패: {e}")
     
     # ============================================================
     # 10. Parquet 저장 (XCom 전달용)
@@ -1615,6 +1637,7 @@ def send_alert_email(**context):
     1. 수수료율/광고/성실지표도 매출과 동일한 표 구조
     2. 모든 담당자에게 이메일 발송 (누락 방지)
     3. LLM 진단 결과 포함
+    4. 알림 기준일은 어제가 아니라 CSV 내 최신 order_daily로 고정
     """
     from modules.transform.utility.paths import LOCAL_DB
     from modules.transform.utility.io import (
@@ -1656,10 +1679,7 @@ def send_alert_email(**context):
     
     # 날짜 정의
     dag_run_date = datetime.now().strftime('%Y-%m-%d')
-    yesterday = (pd.to_datetime(dag_run_date) - timedelta(days=1)).strftime('%Y-%m-%d')
-    
-    print(f"[알림] 수집일자 (DAG 실행일): {dag_run_date}")
-    print(f"[알림] 알림기준일 (매출 분석일): {yesterday}")
+    print(f"[알림] 실행일자 (DAG 실행일): {dag_run_date}")
     
     # CSV 파일 로드
     alerts_csv_path = LOCAL_DB / '영업관리부_DB' / 'sales_daily_orders_alerts_grp.csv'
@@ -1679,8 +1699,29 @@ def send_alert_email(**context):
         print("[알람] 알람 대상 0건 - 이메일 발송 생략")
         return "알람 대상 0건"
     
-    target_date = alert_df['order_daily'].max()
-    target_date_str = pd.to_datetime(target_date).strftime('%Y-%m-%d')
+    # 기준일은 어제가 아니라 CSV 내부 최신 order_daily로 결정한다.
+    # CSV에 여러 날짜가 섞여 있어도 최신일만 알림 대상으로 사용한다.
+    target_date_str = dag_run_date
+    if 'order_daily' in alert_df.columns:
+        order_daily_dt = pd.to_datetime(alert_df['order_daily'], errors='coerce')
+        latest_order_daily = order_daily_dt.max()
+
+        if pd.notna(latest_order_daily):
+            target_date_str = latest_order_daily.strftime('%Y-%m-%d')
+            latest_mask = order_daily_dt.dt.normalize() == latest_order_daily.normalize()
+            before_count = len(alert_df)
+            alert_df = alert_df[latest_mask].copy()
+            print(f"[알림] 최신 기준일 추출: {target_date_str}")
+            print(f"[알림] 최신일 필터 적용: {before_count:,}건 → {len(alert_df):,}건")
+        else:
+            print("[경고] order_daily 파싱 실패로 기준일 추출 불가, 전체 데이터로 진행")
+    else:
+        print("[경고] order_daily 컬럼 없음, 전체 데이터로 진행")
+
+    if len(alert_df) == 0:
+        print(f"[알람] 최신 기준일({target_date_str}) 알림 대상 0건 - 이메일 발송 생략")
+        return f"알람 대상 0건 (기준일: {target_date_str})"
+
     print(f"[알람] 알람 대상: {len(alert_df):,}건 (기준일: {target_date_str})")
     
     # LLM 진단 결과 로드
@@ -1961,10 +2002,10 @@ def send_alert_email(**context):
                                     </td>
                                 </tr>
                                 
-                                <!-- 어제 매출 -->
+                                <!-- 기준일 매출 -->
                                 <tr>
                                     <td style="padding: 15px; background: #f8f9fa; border-bottom: 1px solid #eee;">
-                                        <p style="margin: 0; font-size: 13px; color: #666;">어제({target_date_str}) 매출</p>
+                                        <p style="margin: 0; font-size: 13px; color: #666;">기준일({target_date_str}) 매출</p>
                                         <p style="margin: 5px 0 0 0; font-size: 24px; font-weight: 700; color: #2c3e50;">{total_amount:,}원</p>
                                     </td>
                                 </tr>

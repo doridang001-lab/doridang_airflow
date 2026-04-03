@@ -12,6 +12,7 @@ from modules.transform.utility.io import load_data, send_email, text_to_html, cr
 from modules.load.load_local_db import local_db_save
 from modules.load.backup_to_onedrive import backup_to_onedrive
 from modules.transform.utility.io import load_files, preprocess_df, save_to_csv, join_dataframes, validate_and_alert_settlement
+from modules.transform.utility.store_name_mapping import normalize_store_names
 
 from modules.transform.utility.io import (
     load_files, 
@@ -814,6 +815,7 @@ def preprocess_join_orders_with_stores(
 
     # ⭐⭐⭐ 주문 데이터: store_name에서 끝 2단어 추출 → store_names ⭐⭐⭐
     if 'store_name' in orders_df.columns:
+        orders_df['store_name'] = normalize_store_names(orders_df['store_name'])
         orders_df['store_names'] = (
             orders_df['store_name'].astype(str)
             .str.strip()

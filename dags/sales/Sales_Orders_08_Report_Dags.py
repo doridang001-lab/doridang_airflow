@@ -88,7 +88,7 @@ TMP_CSV_PATH    = LOCAL_DB / 'temp' / 'tmp_gsheet.csv'
 TEMPLATE_COLUMNS = [
     '날짜', '매장명', '전주상태', '담당자',
     '매출', '수수료', '배민광고', '쿠팡광고', '성실지표',
-    '조치일자', '목표치', '핵심조치', '조치내용', '문제점',
+    '조치일자', '목표치', '핵심조치', '조치내용', '조치전', '조치후', '문제점',
 ]
 
 # 버퍼 시트 컬럼 (TEMPLATE_COLUMNS + 수집날짜 + 구분)
@@ -97,7 +97,7 @@ BUFFER_COLUMNS = TEMPLATE_COLUMNS + ['수집날짜', '구분']
 # 최종 출력 컬럼
 SELECTED_COLUMNS = [
     'order_daily', '매장명', '전주상태', '담당자', '매출', '수수료',
-    '배민광고', '쿠팡광고', '성실지표', '조치일자', '목표치', '핵심조치', '조치내용', '문제점',
+    '배민광고', '쿠팡광고', '성실지표', '조치일자', '목표치', '핵심조치', '조치내용', '조치전', '조치후', '문제점',
     '담당자_order', 'email',
     'total_order_count', 'total_amount', 'fee_ad', 'ARPU',
     'sum_7d_recent', 'sum_7d_prev', 'fee_ratio',
@@ -262,12 +262,12 @@ def upload_grp_template(**context):
     grp = grp.sort_values(['담당자', '매장명']).reset_index(drop=True)
     logger.info(f"[중복 제거] 매장별 1개: {len(grp):,}건")
 
-    # 조치일자·목표치·핵심조치·조치내용·문제점: 담당자 입력 전용 열 → 코드에서 절대 쓰지 않음
-    # (J:N 열은 clear / write 대상에서 제외 → 드롭다운 유효성 규칙 보존)
+    # 조치일자·목표치·핵심조치·조치내용·조치전·조치후·문제점: 담당자 입력 전용 열 → 코드에서 절대 쓰지 않음
+    # (J:P 열은 clear / write 대상에서 제외 → 드롭다운 유효성 규칙 보존)
     AUTO_COLUMNS = ['날짜', '매장명', '전주상태', '담당자', '매출', '수수료', '배민광고', '쿠팡광고', '성실지표']  # A:I
 
     tmpl = grp.reindex(columns=AUTO_COLUMNS)
-    logger.info(f"[template] {len(tmpl):,}건 업로드 예정 (A:I 자동입력 / J:N 담당자 입력 보존)")
+    logger.info(f"[template] {len(tmpl):,}건 업로드 예정 (A:I 자동입력 / J:P 담당자 입력 보존)")
 
     # ── 드롭다운(데이터유효성) 보존 방식으로 업로드 ─────────────────────────
     # mode='overwrite'는 시트 전체를 지우고 헤더까지 재작성하여 드롭다운이 사라짐.
@@ -296,15 +296,15 @@ def upload_grp_template(**context):
         ).execute()
         logger.info(f"[upload_grp_template] 헤더 작성: {TEMPLATE_COLUMNS}")
 
-    # ② A:I(자동입력 열)만 값 지우기 → J:N(조치일자·목표치·핵심조치·조치내용·문제점) 절대 건드리지 않음
+    # ② A:I(자동입력 열)만 값 지우기 → J:P(조치일자·목표치·핵심조치·조치내용·조치전·조치후·문제점) 절대 건드리지 않음
     # values().clear()는 값만 삭제하고 유효성 검사(드롭다운) 규칙은 보존하지만,
-    # J:N 열은 담당자 입력 전용이므로 아예 범위에서 제외
+    # J:P 열은 담당자 입력 전용이므로 아예 범위에서 제외
     _last_data_row = len(tmpl) + 100          # 여유분 포함
     _clear_range   = f"{_sname}!A2:I{_last_data_row}"
     _svc.spreadsheets().values().clear(
         spreadsheetId=_sid, range=_clear_range, body={}
     ).execute()
-    logger.info(f"[upload_grp_template] {_clear_range} 값만 지움 (J:N 드롭다운/입력값 보존)")
+    logger.info(f"[upload_grp_template] {_clear_range} 값만 지움 (J:P 드롭다운/입력값 보존)")
 
     # ③ A2:I 범위에만 데이터 작성 (헤더 제외, J:N 미접촉)
     def _fmt(v):
@@ -321,7 +321,7 @@ def upload_grp_template(**context):
             body={'values': _rows},
         ).execute()
 
-    logger.info(f"[upload_grp_template] ✅ 업로드 완료 ({len(tmpl):,}건, A:I만 작성 / J:N 드롭다운 보존)")
+    logger.info(f"[upload_grp_template] ✅ 업로드 완료 ({len(tmpl):,}건, A:I만 작성 / J:P 드롭다운 보존)")
     return f"템플릿 업로드: {len(tmpl):,}건"
 
 
