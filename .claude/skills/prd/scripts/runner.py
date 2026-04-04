@@ -20,6 +20,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 TEMP_DIR = SCRIPT_DIR / "temp"
 SIGNALS = ["questions", "prd", "spec", "trd", "child", "chat"]
+IDLE_TIMEOUT = 120  # 2분 유휴 시 조기 종료
 
 
 def _fallback_response(sig: str, error_text: str) -> str:
@@ -71,9 +72,10 @@ def _run_claude(prompt: str, sig: str) -> str:
         ],
         capture_output=True,
         text=True,
-        timeout=180,
+        timeout=90,
         env=env,
     )
+
     if result.returncode == 0:
         return result.stdout
 
@@ -90,13 +92,21 @@ def main():
     port = sys.argv[1]
     print(f"RUNNER_START: port={port}", flush=True)
 
-    for _ in range(1800):  # 30분 타임아웃
+    for _ in range(720):  # 12분 타임아웃
         time.sleep(1)
 
         # export_complete 체크
         if (TEMP_DIR / "export_complete").exists():
             print("RUNNER_DONE: export_complete", flush=True)
             sys.exit(0)
+
+        # 유휴 타임아웃 체크 (last_activity 파일 기준)
+        activity_file = TEMP_DIR / "last_activity"
+        if activity_file.exists():
+            idle_seconds = time.time() - activity_file.stat().st_mtime
+            if idle_seconds > IDLE_TIMEOUT:
+                print(f"RUNNER_IDLE_EXIT: {idle_seconds:.0f}s idle, shutting down", flush=True)
+                sys.exit(0)
 
         # 시그널 감지
         for sig in SIGNALS:

@@ -29,6 +29,29 @@ if [ ! -f "$VENV" ]; then
     exit 1
 fi
 
+# 네트워크 대기 (최대 2분)
+echo "[$(date)] 네트워크 연결 대기 중..."
+for i in $(seq 1 24); do
+    if ping -c 1 -W 2 8.8.8.8 &>/dev/null; then
+        echo "[$(date)] 네트워크 연결됨 (${i}번째 시도)"
+        break
+    fi
+    echo "[$(date)] 네트워크 대기 중... (${i}/24)"
+    sleep 5
+done
+
+# 중복 Claude 텔레그램 프로세스 제거 (claude-channels-session 외 다른 세션의 claude 종료)
+echo "[$(date)] 중복 Claude 프로세스 확인..."
+CHANNEL_PANE_PID=$(tmux list-panes -t claude-channels-session -F "#{pane_pid}" 2>/dev/null | head -1)
+for PID in $(pgrep -x claude 2>/dev/null); do
+    # claude-channels-session 하위 프로세스인지 확인
+    SESSION_PANE=$(tmux list-panes -a -F "#{pane_pid}" 2>/dev/null | grep -w "$PID")
+    if [ -z "$SESSION_PANE" ] && [ "$PID" != "$CHANNEL_PANE_PID" ]; then
+        echo "[$(date)] 중복 Claude 종료: PID=$PID"
+        kill "$PID" 2>/dev/null
+    fi
+done
+
 # tmux 서버가 실행 중인지 확인
 if ! tmux list-sessions 2>/dev/null; then
     echo "[$(date)] tmux 서버 시작"
@@ -38,10 +61,17 @@ fi
 if ! tmux has-session -t claude-channels-session 2>/dev/null; then
     echo "[$(date)] claude-channels-session 생성"
     tmux new-session -d -s claude-channels-session -c "$AIRFLOW_DIR" \
-        "bash -c 'source $VENV; while true; do claude --channels plugin:telegram@claude-plugins-official --dangerously-skip-permissions; sleep 5; done'"
+        "bash -c 'source $VENV; while true; do echo \"[재시작: \$(date)]\"; claude --channels plugin:telegram@claude-plugins-official --dangerously-skip-permissions 2>&1 | tee -a /tmp/claude_channels.log; sleep 5; done'"
     echo "[$(date)] claude-channels-session 시작 완료"
 else
     echo "[$(date)] claude-channels-session 이미 실행 중"
+    # 세션은 있지만 claude 프로세스가 죽었는지 확인
+    if ! tmux list-panes -t claude-channels-session -F "#{pane_current_command}" 2>/dev/null | grep -q "claude\|bash"; then
+        echo "[$(date)] 세션 재시작 (프로세스 없음)"
+        tmux kill-session -t claude-channels-session
+        tmux new-session -d -s claude-channels-session -c "$AIRFLOW_DIR" \
+            "bash -c 'source $VENV; while true; do echo \"[재시작: \$(date)]\"; claude --channels plugin:telegram@claude-plugins-official --dangerously-skip-permissions 2>&1 | tee -a /tmp/claude_channels.log; sleep 5; done'"
+    fi
 fi
 
 echo "[$(date)] autostart_telegram.sh 완료"

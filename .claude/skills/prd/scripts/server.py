@@ -18,7 +18,7 @@ TEMP_DIR.mkdir(exist_ok=True)
 # 세션 시작 시 이전 temp 파일 전체 초기화
 for _f in TEMP_DIR.glob("request_*.json"):
     _f.unlink(missing_ok=True)
-for _f in ["export_complete", "questions.txt", "prd.txt", "spec.txt", "trd.txt", "child.txt", "chat.txt"]:
+for _f in ["export_complete", "last_activity", "questions.txt", "prd.txt", "spec.txt", "trd.txt", "child.txt", "chat.txt"]:
     (_tmp := TEMP_DIR / _f).unlink(missing_ok=True)
 
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -133,6 +133,7 @@ def get_state():
 # ── Questions endpoint ────────────────────────────────────────────────────────
 @app.route("/api/questions")
 def get_questions():
+    (TEMP_DIR / "last_activity").touch()
     if state["questions"] is not None:
         return jsonify({"questions": state["questions"]})
     if not state.get("_questions_pending"):
@@ -167,6 +168,7 @@ def poll_questions():
 # ── Generate endpoints ─────────────────────────────────────────────────────────
 @app.route("/api/generate/prd", methods=["POST"])
 def generate_prd():
+    (TEMP_DIR / "last_activity").touch()
     data = request.json or {}
     state["answers"] = data.get("answers", {})
     state["prd"] = None
@@ -189,6 +191,12 @@ def generate_prd():
 
 @app.route("/api/generate/spec", methods=["POST"])
 def generate_spec():
+    (TEMP_DIR / "last_activity").touch()
+    data = request.json or {}
+    prd_override = data.get("prd")
+    if isinstance(prd_override, str) and prd_override.strip():
+        state["prd"] = prd_override.strip()
+
     if not state["prd"]:
         return jsonify({"error": "PRD를 먼저 생성하세요."}), 400
     state["feature_spec"] = None
@@ -218,6 +226,12 @@ def generate_spec():
 
 @app.route("/api/generate/trd", methods=["POST"])
 def generate_trd():
+    (TEMP_DIR / "last_activity").touch()
+    data = request.json or {}
+    prd_override = data.get("prd")
+    if isinstance(prd_override, str) and prd_override.strip():
+        state["prd"] = prd_override.strip()
+
     if not state["prd"]:
         return jsonify({"error": "PRD를 먼저 생성하세요."}), 400
     state["trd_md"] = None

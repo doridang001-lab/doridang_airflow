@@ -310,6 +310,7 @@ body.spec-active main{overflow:hidden}
 <div class="prd-outer">
   <div class="prd-top-bar">
     <h2>PRD <span style="color:var(--muted);font-size:13px;font-weight:400" id="prd-product-subtitle"></span></h2>
+    <button class="btn-next" id="btn-apply-prd" disabled style="background:var(--blue);color:#fff">수정 반영</button>
     <button class="btn-next" id="btn-to-spec" disabled>기능명세서 생성 →</button>
   </div>
 
@@ -332,6 +333,7 @@ body.spec-active main{overflow:hidden}
       <div class="prd-main" id="prd-main">
         <!-- sections injected here -->
         <div class="prd-section-actions">
+          <button class="btn-next" id="btn-apply-prd2" disabled style="background:var(--blue);color:#fff">수정 반영</button>
           <button class="btn-next" id="btn-to-spec2" disabled>기능명세서 생성 →</button>
         </div>
       </div>
@@ -490,6 +492,7 @@ const app = {
   prdStructured: {},
   specData: null,
   trdText: '',
+  prdReviewConfirmed: false,
 };
 
 // ── Init ──────────────────────────────────────────────────────────────────
@@ -742,10 +745,18 @@ async function triggerAndPoll(triggerUrl, body, pollUrl, onReady, onTick) {
     body: JSON.stringify(body),
   });
   let dots = 0;
+  const startedAt = Date.now();
+  const maxWaitMs = 180000;
   return new Promise((resolve) => {
     const id = setInterval(async () => {
       dots = (dots + 1) % 4;
       if (onTick) onTick('.'.repeat(dots + 1));
+      if (Date.now() - startedAt > maxWaitMs) {
+        clearInterval(id);
+        alert('요청 처리 시간이 길어 자동 중단되었습니다. 잠시 후 다시 시도해주세요.');
+        resolve({ready: false, timeout: true});
+        return;
+      }
       try {
         const res = await fetch(pollUrl);
         const data = await res.json();
@@ -918,8 +929,21 @@ function renderPRD(raw) {
 
   document.getElementById('prd-loading').style.display = 'none';
   document.getElementById('prd-content').style.display = 'block';
-  document.getElementById('btn-to-spec').disabled = false;
-  document.getElementById('btn-to-spec2').disabled = false;
+  app.prdReviewConfirmed = false;
+  document.getElementById('btn-to-spec').disabled = true;
+  document.getElementById('btn-to-spec2').disabled = true;
+  document.getElementById('btn-apply-prd').disabled = false;
+  document.getElementById('btn-apply-prd2').disabled = false;
+
+  // 수정이 발생하면 다시 "수정 반영"을 요구한다.
+  const prdMain = document.getElementById('prd-main');
+  prdMain.addEventListener('input', () => {
+    app.prdReviewConfirmed = false;
+    document.getElementById('btn-to-spec').disabled = true;
+    document.getElementById('btn-to-spec2').disabled = true;
+    document.getElementById('btn-apply-prd').disabled = false;
+    document.getElementById('btn-apply-prd2').disabled = false;
+  });
 
   // Sidebar nav active highlight on scroll
   setupSidebarScroll();
@@ -992,7 +1016,20 @@ function collectPRDText() {
 }
 
 // ── PRD → Spec ───────────────────────────────────────────────────────────
+function applyPrdEdits() {
+  app.prdRaw = collectPRDText() || app.prdRaw;
+  app.prdReviewConfirmed = true;
+  document.getElementById('btn-to-spec').disabled = false;
+  document.getElementById('btn-to-spec2').disabled = false;
+  document.getElementById('btn-apply-prd').disabled = true;
+  document.getElementById('btn-apply-prd2').disabled = true;
+}
+
 async function goToSpec() {
+  if (!app.prdReviewConfirmed) {
+    alert('PRD를 검토/수정한 뒤 먼저 "수정 반영" 버튼을 눌러주세요.');
+    return;
+  }
   app.prdRaw = collectPRDText() || app.prdRaw;
   unlockTab('spec');
   switchTab('spec');
@@ -1000,7 +1037,7 @@ async function goToSpec() {
   document.getElementById('spec-content').style.display = 'none';
   document.getElementById('spec-loading').style.display = 'block';
 
-  await triggerAndPoll('/api/generate/spec', {}, '/api/poll/spec',
+  await triggerAndPoll('/api/generate/spec', {prd: app.prdRaw}, '/api/poll/spec',
     (data) => {
       document.getElementById('spec-loading').style.display = 'none';
       if (data.spec) { app.specData = data.spec; renderSpecTree(app.specData); saveCurrentSession(); }
@@ -1012,6 +1049,8 @@ async function goToSpec() {
     }
   );
 }
+document.getElementById('btn-apply-prd').addEventListener('click', applyPrdEdits);
+document.getElementById('btn-apply-prd2').addEventListener('click', applyPrdEdits);
 document.getElementById('btn-to-spec').addEventListener('click', goToSpec);
 document.getElementById('btn-to-spec2').addEventListener('click', goToSpec);
 
