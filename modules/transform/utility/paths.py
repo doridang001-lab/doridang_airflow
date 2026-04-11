@@ -64,19 +64,19 @@ def resolve_local_db() -> Path:
 		p = Path(env_path)
 		p.mkdir(parents=True, exist_ok=True)
 		return p
-	
+
 	# 2) 컨테이너 마운트 경로
 	container_mount = Path("/opt/airflow/Local_DB")
 	if container_mount.parent.exists():  # /opt/airflow가 있으면 컨테이너 환경
 		container_mount.mkdir(parents=True, exist_ok=True)
 		return container_mount
-	
+
 	# 3) Windows 로컬 경로
 	if platform.system() == "Windows":
 		local_db = Path("C:/Local_DB")
 		local_db.mkdir(parents=True, exist_ok=True)
 		return local_db
-	
+
 	# 4) Fallback - 현재 작업 디렉터리
 	fallback = Path.cwd() / "Local_DB"
 	fallback.mkdir(parents=True, exist_ok=True)
@@ -231,6 +231,14 @@ def resolve_mart_db() -> Path:
 	return Path.home() / "OneDrive - 주식회사 도리당" / "data" / "mart"
 
 
+def resolve_raw_okpos_sales() -> Path:
+	env_path = os.getenv("RAW_OKPOS_SALES")
+	if env_path:
+		return Path(env_path)
+	# ANALYTICS_DB 하위에 저장 (컨테이너/Windows 모두 동일 경로 기준)
+	return resolve_analytics_db() / "okpos_sales_raw"
+
+
 ONEDRIVE_DB = resolve_onedrive_db()
 COLLECT_DB = resolve_collect_db()
 LOCAL_DB = resolve_local_db()
@@ -238,5 +246,17 @@ TEMP_DIR = resolve_temp_dir()
 DOWN_DIR = resolve_down_dir()
 ANALYTICS_DB = resolve_analytics_db()
 BAEMIN_MARKETING_DB = ANALYTICS_DB / "baemin_marketing"
+BAEMIN_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "baemin_policy_raw.csv"
+CHICKEN_PRICE_CSV_PATH  = ANALYTICS_DB / "chicken_price" / "chicken_price.csv"
+COUPANG_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "coupang_policy_raw.csv"
+YOGIYO_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "yogiyo_policy_raw.csv"
+DDANGYO_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "ddangyo_policy_raw.csv"
+BAEDALTTEUK_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "baedaltteuk_policy_raw.csv"
+MUKKEBI_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "mukkebi_policy_raw.csv"
+BAEDALEUM_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "baedaleum_policy_raw.csv"
+NAVER_PLACE_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "naver_place_policy_raw.csv"
+POLICY_LOG_PATH = ANALYTICS_DB / "policy" / "log.parquet"
+POLICY_CONSOLIDATED_CSV = ANALYTICS_DB / "policy" / "policy_consolidated_latest.csv"
 REPORT_SALES_DB = resolve_report_sales_db()
 MART_DB = resolve_mart_db()
+RAW_OKPOS_SALES = resolve_raw_okpos_sales()
