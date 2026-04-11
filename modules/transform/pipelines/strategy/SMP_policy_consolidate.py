@@ -572,6 +572,4 @@ def _build_flow_policy_html(df: pd.DataFrame, today_str: str) -> str:
 {rows_html}
   </tbody>
 </table>
-<div>&nbsp;</div>
-<p>※ 정책별 세부 내용과 히스토리는 Flow 내 <strong>[물류] 프담CS 알림 BOT</strong> 프로젝트에서 확인 가능합니다.</p>
 </div>"""
