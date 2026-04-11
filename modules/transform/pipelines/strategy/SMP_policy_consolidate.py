@@ -247,7 +247,10 @@ def _build_alert_html(policies: list, new_platforms: set, today: str) -> str:
         platform_key = str(p.get("platform", ""))
         platform_kr = _PLATFORM_KR.get(platform_key, platform_key)
         is_new = platform_key in new_platforms
-        platform_label = f"🆕 {platform_kr}" if is_new else platform_kr
+        platform_label = (
+            f'<span style="color:#e67e22; font-weight:700;">{platform_kr}</span>'
+            if is_new else platform_kr
+        )
         policy_type = str(p.get("policy_type", "기타"))
         badge_color = _TYPE_COLOR.get(policy_type, "#bdc3c7")
         title = str(p.get("title", ""))
@@ -263,7 +266,7 @@ def _build_alert_html(policies: list, new_platforms: set, today: str) -> str:
 
         rows_html += f"""
         <tr>
-          <td style="padding:10px 12px; border-bottom:1px solid #eee; font-weight:600; white-space:nowrap;">
+          <td style="padding:10px 12px; border-bottom:1px solid #eee; white-space:nowrap;">
             {platform_label}
           </td>
           <td style="padding:10px 12px; border-bottom:1px solid #eee; white-space:nowrap; color:#666; font-size:12px;">
@@ -558,7 +561,10 @@ def _build_flow_policy_html(df: pd.DataFrame, today_str: str, new_platforms: set
         platform_key = str(row.get("platform", ""))
         platform_kr = _PLATFORM_KR.get(platform_key, platform_key)
         is_new = platform_key in new_platforms
-        platform_label = f"🆕 {platform_kr}" if is_new else platform_kr
+        platform_label = (
+            f'<span style="color:#e67e22;font-weight:700;">{platform_kr}</span>'
+            if is_new else platform_kr
+        )
         policy_date = escape(str(row.get("policy_date", "")))
         policy_type = escape(str(row.get("policy_type", "")))
         title = escape(str(row.get("title", "")))
