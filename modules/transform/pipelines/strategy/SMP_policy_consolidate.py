@@ -235,7 +235,7 @@ def send_policy_alert(**context) -> str:
         html_content=html,
         to_emails="a17019@kakao.com",
     )
-    logger.info(f"정책 알림 이메일 발송 완료: {count}건")
+    logger.info(f"정책 알림 이메일 발송 완료: {new_count}건")
     return result
 
 
