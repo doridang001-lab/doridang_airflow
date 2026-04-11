@@ -6,8 +6,11 @@
 """
 
 import logging
+import time
+import pendulum
 import pandas as pd
 from datetime import datetime
+from html import escape
 from pathlib import Path
 from airflow.exceptions import AirflowSkipException
 
@@ -24,6 +27,10 @@ from modules.transform.utility.paths import (
     POLICY_CONSOLIDATED_CSV,
 )
 from modules.transform.utility.mailer import send_email
+
+# Flow 자동화
+FLOW_POLICY_URL = "https://flow.team/l/QdNBw"
+_WEEKDAY_KR = {0: "월", 1: "화", 2: "수", 3: "목", 4: "금", 5: "토", 6: "일"}
 
 logger = logging.getLogger(__name__)
 
@@ -366,3 +373,205 @@ def write_consolidate_log(**context) -> None:
 
     df_all.to_parquet(log_path, index=False)
     logger.info(f"실행 로그 기록 완료: {log_path}")
+
+
+# ============================================================
+# post_to_flow
+# ============================================================
+
+def post_to_flow(**context) -> str:
+    """Flow 프로젝트에 오늘 날짜 하위업무 생성 + 정책 테이블 본문 삽입"""
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from modules.transform.pipelines.sales.SMD_sales_visit_log_01_crawling import (
+        launch_browser, do_login,
+    )
+
+    latest_json = context["ti"].xcom_pull(
+        task_ids="task_load_and_filter", key="latest_policies"
+    )
+    if not latest_json:
+        raise AirflowSkipException("latest_policies XCom 없음 → Flow 게시 스킵")
+
+    df = pd.read_json(latest_json, orient="records")
+
+    now_kst = pendulum.now("Asia/Seoul")
+    today_title = f"{now_kst.strftime('%y.%m.%d')}({_WEEKDAY_KR[now_kst.weekday()]})"
+    today_str = now_kst.to_date_string()
+    body_html = _build_flow_policy_html(df, today_str)
+
+    driver = launch_browser()
+    driver.set_window_size(1920, 1080)
+    try:
+        if not do_login(driver):
+            raise RuntimeError("Flow 로그인 실패")
+
+        wait = WebDriverWait(driver, 20)
+
+        # ① 프로젝트 직접 URL 이동
+        driver.get(FLOW_POLICY_URL)
+        time.sleep(5)
+
+        # ② 콘텐츠 로딩 대기
+        wait.until(EC.presence_of_element_located(
+            (By.CSS_SELECTOR, ".subtask-list, .js-add-subtask-button")
+        ))
+        time.sleep(2)
+
+        # ③ 하단 스크롤 → 하위업무 추가 버튼 클릭
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2)
+        add_btn = wait.until(EC.presence_of_element_located(
+            (By.CSS_SELECTOR, "button.js-add-subtask-button")
+        ))
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", add_btn)
+        driver.execute_script("arguments[0].click();", add_btn)
+        time.sleep(2)
+
+        # ④ 하위업무 제목 입력 (JS 이벤트 디스패치 — send_keys 금지)
+        subtask_input = wait.until(lambda d: next(
+            (el for el in d.find_elements(By.CSS_SELECTOR, "input.js-subtask-input")
+             if not el.get_attribute("readonly")),
+            None
+        ))
+        driver.execute_script("""
+            var el = arguments[0], title = arguments[1];
+            el.scrollIntoView({block:'center'});
+            el.focus();
+            el.value = title;
+            el.dispatchEvent(new Event('input', {bubbles:true}));
+            el.dispatchEvent(new Event('change', {bubbles:true}));
+            el.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter',code:'Enter',keyCode:13,bubbles:true}));
+            el.dispatchEvent(new KeyboardEvent('keypress',{key:'Enter',code:'Enter',keyCode:13,bubbles:true}));
+            el.dispatchEvent(new KeyboardEvent('keyup',  {key:'Enter',code:'Enter',keyCode:13,bubbles:true}));
+        """, subtask_input, today_title)
+        time.sleep(3)
+
+        # ⑤ 생성된 하위업무 클릭
+        target = next(
+            (el for el in driver.find_elements(By.CSS_SELECTOR, "p.subtask__tit--display")
+             if today_title in el.text),
+            None
+        )
+        if not target:
+            raise RuntimeError(f"하위업무 '{today_title}' 찾기 실패")
+        driver.execute_script("arguments[0].click();", target)
+        time.sleep(2)
+
+        # ⑥ 설정(점3개) → 수정
+        setting_btn = wait.until(EC.element_to_be_clickable(
+            (By.CSS_SELECTOR, "button.js-setting-button.set-btn")
+        ))
+        driver.execute_script("arguments[0].click();", setting_btn)
+        time.sleep(1)
+        modify_item = wait.until(EC.element_to_be_clickable(
+            (By.CSS_SELECTOR, "li.js-setting-item[data-code='modify']")
+        ))
+        driver.execute_script("arguments[0].click();", modify_item)
+        time.sleep(2)
+
+        # ⑦ CKEditor 본문 삽입
+        ckeditor_ready = False
+        for _ in range(15):
+            try:
+                if driver.execute_script("""
+                    if (typeof CKEDITOR==='undefined' || !CKEDITOR.instances) return false;
+                    var keys = Object.keys(CKEDITOR.instances);
+                    return keys.length > 0
+                        && CKEDITOR.instances[keys[keys.length-1]].status==='ready';
+                """):
+                    ckeditor_ready = True
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+
+        if ckeditor_ready:
+            driver.execute_script("""
+                var keys = Object.keys(CKEDITOR.instances);
+                CKEDITOR.instances[keys[keys.length-1]].setData(arguments[0]);
+            """, body_html)
+        else:
+            cke_iframe = wait.until(EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "iframe.cke_wysiwyg_frame")
+            ))
+            driver.switch_to.frame(cke_iframe)
+            driver.execute_script("document.body.innerHTML = arguments[0];", body_html)
+            driver.switch_to.default_content()
+        time.sleep(1)
+
+        # ⑧ 등록
+        submit_btn = wait.until(EC.presence_of_element_located(
+            (By.CSS_SELECTOR, "button.js-complete-btn.confirm")
+        ))
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", submit_btn)
+        time.sleep(0.5)
+        driver.execute_script("arguments[0].click();", submit_btn)
+        time.sleep(3)
+
+        logger.info(f"Flow 하위업무 생성 완료: {today_title}")
+        return f"Flow 게시 완료: {today_title}"
+
+    finally:
+        driver.quit()
+
+
+def _build_flow_policy_html(df: pd.DataFrame, today_str: str) -> str:
+    """Flow CKEditor용 정책 테이블 HTML 빌드"""
+    _th = "padding:8px;text-align:left;border:1px solid #dee2e6;background:#f8f9fa;font-size:12px;"
+    _td = "padding:8px;font-size:12px;border:1px solid #dee2e6;word-break:break-word;"
+    _td_nowrap = "padding:8px;font-size:12px;border:1px solid #dee2e6;white-space:nowrap;"
+
+    rows = []
+    for _, row in df.iterrows():
+        platform_key = str(row.get("platform", ""))
+        platform_kr = _PLATFORM_KR.get(platform_key, platform_key)
+        policy_date = escape(str(row.get("policy_date", "")))
+        policy_type = escape(str(row.get("policy_type", "")))
+        title = escape(str(row.get("title", "")))
+        summary = escape(str(row.get("content_summary", "")))
+        action = escape(str(row.get("recommended_action", "")))
+        source_url = str(row.get("source_url", "")).strip()
+
+        title_cell = (
+            f'<a href="{escape(source_url)}" target="_blank" '
+            f'style="color:#2980b9;text-decoration:none;">{title}</a>'
+            if source_url and source_url != "None" and source_url.startswith("http")
+            else title
+        )
+
+        rows.append(f"""<tr>
+  <td style="{_td_nowrap}">{escape(platform_kr)}</td>
+  <td style="{_td_nowrap}">{policy_date}</td>
+  <td style="{_td_nowrap}">{policy_type}</td>
+  <td style="{_td}">{title_cell}</td>
+  <td style="{_td}">{summary}</td>
+  <td style="{_td}">{action}</td>
+</tr>""")
+
+    rows_html = "\n".join(rows)
+    count = len(df)
+
+    return f"""<div class="post-editor-wrap">
+<h1>KPI</h1>
+<ul><li>정책/이벤트 적용 전후 결과(매출, 전환율 등) 변화 검증</li></ul>
+<div>&nbsp;</div>
+<h2>🍽 도리당 정책 변경 알림</h2>
+<p>{escape(today_str)} 기준 &middot; {count}건</p>
+<table style="border-collapse:collapse;width:100%;border:1px solid #dee2e6;">
+  <thead><tr>
+    <th style="{_th}">플랫폼</th>
+    <th style="{_th}">공지일</th>
+    <th style="{_th}">유형</th>
+    <th style="{_th}">제목</th>
+    <th style="{_th}">요약</th>
+    <th style="{_th}">권장 조치</th>
+  </tr></thead>
+  <tbody>
+{rows_html}
+  </tbody>
+</table>
+<div>&nbsp;</div>
+<p>※ 정책별 세부 내용과 히스토리는 Flow 내 <strong>[물류] 프담CS 알림 BOT</strong> 프로젝트에서 확인 가능합니다.</p>
+</div>"""

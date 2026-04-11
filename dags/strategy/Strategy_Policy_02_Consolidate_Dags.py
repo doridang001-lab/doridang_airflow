@@ -4,9 +4,10 @@
 📋 처리 흐름:
 1. 8개 플랫폼 raw 정책 CSV 로드 → 플랫폼별 최신 policy_date 1건 필터링
 2. 기존 통합 CSV와 비교하여 신규/변경 정책 감지
-3. 통합 CSV 저장 (platform, title, content_summary, policy_type, recommended_action)
+3. 통합 CSV 저장 (전체 컬럼)
 4. 신규/변경 정책 있을 시 HTML 이메일 알림 (a17019@kakao.com)
-5. 실행 로그 기록
+5. Flow 하위업무 자동 게시 (https://flow.team/l/QdNBw)
+6. 실행 로그 기록
 
 ⚙️ 실행 시각: 매일 10:45 KST (각 플랫폼 수집 완료 후)
 📊 출력: analytics/policy/policy_consolidated_latest.csv
@@ -15,9 +16,11 @@
 import pendulum
 import importlib
 import sys
+from datetime import timedelta
 from pathlib import Path
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.utils.trigger_rule import TriggerRule
 from modules.transform.utility.schedule import SMP_POLICY_CONSOLIDATE_TIME
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -31,6 +34,7 @@ load_and_filter_latest = pipeline_module.load_and_filter_latest
 detect_new_policies = pipeline_module.detect_new_policies
 save_consolidated_csv = pipeline_module.save_consolidated_csv
 send_policy_alert = pipeline_module.send_policy_alert
+post_to_flow = pipeline_module.post_to_flow
 write_consolidate_log = pipeline_module.write_consolidate_log
 
 
@@ -75,6 +79,16 @@ def task_send_alert(**context):
 
 
 # ============================================================
+# Task 5: Flow 하위업무 게시
+# ============================================================
+
+def task_post_to_flow(**context):
+    """Flow 프로젝트에 오늘 날짜 하위업무 생성 + 정책 테이블 본문 삽입"""
+    result = post_to_flow(**context)
+    return result
+
+
+# ============================================================
 # DAG 정의
 # ============================================================
 
@@ -114,10 +128,17 @@ with DAG(
     )
 
     t5 = PythonOperator(
+        task_id="task_post_to_flow",
+        python_callable=task_post_to_flow,
+        execution_timeout=timedelta(minutes=15),
+        trigger_rule=TriggerRule.ALL_DONE,
+    )
+
+    t6 = PythonOperator(
         task_id="task_write_log",
         python_callable=write_consolidate_log,
-        trigger_rule="all_done",
+        trigger_rule=TriggerRule.ALL_DONE,
     )
 
     # Task 의존성
-    t1 >> t2 >> [t3, t4] >> t5
+    t1 >> t2 >> [t3, t4] >> t5 >> t6
