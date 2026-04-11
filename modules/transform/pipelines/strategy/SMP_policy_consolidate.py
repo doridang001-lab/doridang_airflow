@@ -118,8 +118,7 @@ def load_and_filter_latest(**context) -> str:
 
     logger.info(f"플랫폼별 최신 1건 필터링 완료: {len(df_latest)}개 플랫폼")
 
-    extra_cols = [c for c in ["policy_date", "source_url"] if c in df_latest.columns]
-    result_json = df_latest[_OUTPUT_COLS + extra_cols].to_json(
+    result_json = df_latest.to_json(
         orient="records", force_ascii=False
     )
     context["ti"].xcom_push(key="latest_policies", value=result_json)
@@ -178,21 +177,17 @@ def detect_new_policies(**context) -> list:
 # ============================================================
 
 def save_consolidated_csv(**context) -> str:
-    """통합 최신 정책 CSV 덮어쓰기 저장 (5개 컬럼만)"""
+    """통합 최신 정책 CSV 덮어쓰기 저장 (전체 컬럼)"""
     latest_json = context["ti"].xcom_pull(
         task_ids="task_load_and_filter", key="latest_policies"
     )
     df = pd.read_json(latest_json, orient="records")
 
-    # 5개 출력 컬럼만
-    save_cols = [c for c in _OUTPUT_COLS if c in df.columns]
-    df_save = df[save_cols]
-
     out_path = Path(POLICY_CONSOLIDATED_CSV)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    df_save.to_csv(out_path, index=False, encoding="utf-8-sig")
+    df.to_csv(out_path, index=False, encoding="utf-8-sig")
 
-    logger.info(f"통합 CSV 저장 완료: {out_path} ({len(df_save)}행)")
+    logger.info(f"통합 CSV 저장 완료: {out_path} ({len(df)}행, {len(df.columns)}컬럼)")
     return str(out_path)
 
 
