@@ -27,15 +27,27 @@ from modules.transform.utility.mailer import send_email
 
 logger = logging.getLogger(__name__)
 
-# 플랫폼별 raw CSV 경로 목록
+# 플랫폼 정렬 순서 (CSV 출력 및 이메일 표시 순서)
+_PLATFORM_ORDER = [
+    "baemin",
+    "coupang",
+    "ddangyo",
+    "yogiyo",
+    "baedaltteuk",
+    "baedaleum",
+    "mukkebi",
+    "naver_place",
+]
+
+# 플랫폼별 raw CSV 경로 목록 (정렬 순서 동일)
 _POLICY_CSV_PATHS = [
     BAEMIN_POLICY_CSV_PATH,
     COUPANG_POLICY_CSV_PATH,
-    YOGIYO_POLICY_CSV_PATH,
     DDANGYO_POLICY_CSV_PATH,
+    YOGIYO_POLICY_CSV_PATH,
     BAEDALTTEUK_POLICY_CSV_PATH,
-    MUKKEBI_POLICY_CSV_PATH,
     BAEDALEUM_POLICY_CSV_PATH,
+    MUKKEBI_POLICY_CSV_PATH,
     NAVER_PLACE_POLICY_CSV_PATH,
 ]
 
@@ -43,11 +55,11 @@ _POLICY_CSV_PATHS = [
 _PLATFORM_KR = {
     "baemin": "배민",
     "coupang": "쿠팡이츠",
-    "yogiyo": "요기요",
     "ddangyo": "땡겨요",
+    "yogiyo": "요기요",
     "baedaltteuk": "배달특급",
-    "mukkebi": "먹깨비",
     "baedaleum": "배달e음",
+    "mukkebi": "먹깨비",
     "naver_place": "네이버플레이스",
 }
 
@@ -93,10 +105,16 @@ def load_and_filter_latest(**context) -> str:
 
     df_all = pd.concat(dfs, ignore_index=True)
 
-    # policy_date 내림차순 → platform 기준 중복 제거(최신 1건)
+    # policy_date 내림차순 → platform 기준 중복 제거(최신 1건) → 플랫폼 순서 정렬
     df_all["policy_date"] = df_all["policy_date"].astype(str)
     df_all = df_all.sort_values("policy_date", ascending=False)
-    df_latest = df_all.drop_duplicates(subset=["platform"], keep="first").reset_index(drop=True)
+    df_latest = df_all.drop_duplicates(subset=["platform"], keep="first")
+
+    # 지정 순서대로 정렬 (목록에 없는 플랫폼은 뒤로)
+    order_map = {p: i for i, p in enumerate(_PLATFORM_ORDER)}
+    df_latest = df_latest.assign(
+        _order=df_latest["platform"].map(lambda p: order_map.get(p, 999))
+    ).sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
 
     logger.info(f"플랫폼별 최신 1건 필터링 완료: {len(df_latest)}개 플랫폼")
 
