@@ -84,7 +84,6 @@ _TYPE_COLOR = {
     "기타": "#bdc3c7",
 }
 
-_OUTPUT_COLS = ["platform", "title", "content_summary", "policy_type", "recommended_action"]
 
 
 # ============================================================
@@ -148,6 +147,8 @@ def detect_new_policies(**context) -> list:
     latest_json = context["ti"].xcom_pull(
         task_ids="task_load_and_filter", key="latest_policies"
     )
+    if not latest_json:
+        raise AirflowSkipException("latest_policies XCom 없음 → detect 스킵")
     df_new = pd.read_json(StringIO(latest_json), orient="records")
     # policy_date를 문자열로 통일 (Timestamp → str 방지)
     df_new["policy_date"] = df_new["policy_date"].astype(str)
@@ -365,9 +366,18 @@ def write_consolidate_log(**context) -> None:
         task_ids="task_detect_new_policies", key="new_policies"
     ) or []
 
+    try:
+        dag_id = context["dag"].dag_id
+    except Exception:
+        dag_id = "unknown"
+    try:
+        run_id = context["dag_run"].run_id
+    except Exception:
+        run_id = ""
+
     record = {
-        "dag_id": context.get("dag").dag_id if context.get("dag") else "unknown",
-        "run_id": context.get("run_id", ""),
+        "dag_id": dag_id,
+        "run_id": run_id,
         "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "new_policy_count": len(new_policies),
     }
@@ -408,9 +418,12 @@ def post_to_flow(**context) -> str:
 
     df = pd.read_json(StringIO(latest_json), orient="records")
 
-    new_policies = context["ti"].xcom_pull(
-        task_ids="task_detect_new_policies", key="new_policies"
-    ) or []
+    try:
+        new_policies = context["ti"].xcom_pull(
+            task_ids="task_detect_new_policies", key="new_policies"
+        ) or []
+    except Exception:
+        new_policies = []
     new_platforms = {str(p.get("platform", "")) for p in new_policies}
 
     now_kst = pendulum.now("Asia/Seoul")
