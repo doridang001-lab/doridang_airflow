@@ -118,7 +118,8 @@ def load_and_filter_latest(**context) -> str:
 
     logger.info(f"플랫폼별 최신 1건 필터링 완료: {len(df_latest)}개 플랫폼")
 
-    result_json = df_latest[_OUTPUT_COLS + ["policy_date"]].to_json(
+    extra_cols = [c for c in ["policy_date", "source_url"] if c in df_latest.columns]
+    result_json = df_latest[_OUTPUT_COLS + extra_cols].to_json(
         orient="records", force_ascii=False
     )
     context["ti"].xcom_push(key="latest_policies", value=result_json)
@@ -235,6 +236,13 @@ def _build_alert_html(policies: list, today: str) -> str:
         summary = str(p.get("content_summary", ""))
         action = str(p.get("recommended_action", ""))
         policy_date = str(p.get("policy_date", ""))
+        source_url = str(p.get("source_url", "")).strip()
+        title_html = (
+            f'<a href="{source_url}" target="_blank" '
+            f'style="color:#2980b9; text-decoration:none; font-weight:500;">{title}</a>'
+            if source_url and source_url != "None" and source_url.startswith("http")
+            else title
+        )
 
         rows_html += f"""
         <tr>
@@ -249,8 +257,8 @@ def _build_alert_html(policies: list, today: str) -> str:
               {policy_type}
             </span>
           </td>
-          <td style="padding:10px 12px; border-bottom:1px solid #eee; font-weight:500;">
-            {title}
+          <td style="padding:10px 12px; border-bottom:1px solid #eee;">
+            {title_html}
           </td>
           <td style="padding:10px 12px; border-bottom:1px solid #eee; color:#555; font-size:13px;">
             {summary}
