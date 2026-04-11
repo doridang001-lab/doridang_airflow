@@ -5,11 +5,13 @@
 통합 CSV 저장 → 신규/변경 공지 이메일 알림
 """
 
+import json
 import logging
 import time
 import pendulum
 import pandas as pd
 from datetime import datetime
+from io import StringIO
 from html import escape
 from pathlib import Path
 from airflow.exceptions import AirflowSkipException
@@ -146,12 +148,14 @@ def detect_new_policies(**context) -> list:
     latest_json = context["ti"].xcom_pull(
         task_ids="task_load_and_filter", key="latest_policies"
     )
-    df_new = pd.read_json(latest_json, orient="records")
+    df_new = pd.read_json(StringIO(latest_json), orient="records")
+    # policy_date를 문자열로 통일 (Timestamp → str 방지)
+    df_new["policy_date"] = df_new["policy_date"].astype(str)
 
     consolidated_path = Path(POLICY_CONSOLIDATED_CSV)
     if not consolidated_path.exists():
         # 최초 실행 → 전체가 신규
-        new_policies = df_new.to_dict(orient="records")
+        new_policies = _rows_to_json_safe(df_new)
         logger.info(f"최초 실행: 전체 {len(new_policies)}건 신규 처리")
         context["ti"].xcom_push(key="new_policies", value=new_policies)
         return new_policies
@@ -159,24 +163,27 @@ def detect_new_policies(**context) -> list:
     # 이전 스냅샷 읽기 (아직 overwrite 전)
     df_prev = pd.read_csv(consolidated_path, encoding="utf-8-sig")
 
-    # 비교 기준: platform별 이전 policy_date
-    # 통합 CSV에 policy_date가 없으면 title로 폴백
+    # 비교 기준: platform별 이전 policy_date (없으면 title 폴백)
     if "policy_date" in df_prev.columns:
-        prev_state = dict(zip(df_prev["platform"], df_prev["policy_date"]))
-        new_policies = [
-            row for _, row in df_new.iterrows()
-            if prev_state.get(row["platform"]) != row["policy_date"]
-        ]
+        prev_state = dict(zip(df_prev["platform"], df_prev["policy_date"].astype(str)))
+        new_policies = _rows_to_json_safe(
+            df_new[df_new["platform"].map(lambda p: prev_state.get(p)) != df_new["policy_date"]]
+        )
     else:
-        prev_state = dict(zip(df_prev["platform"], df_prev["title"]))
-        new_policies = [
-            row for _, row in df_new.iterrows()
-            if prev_state.get(row["platform"]) != row["title"]
-        ]
+        prev_state = dict(zip(df_prev["platform"], df_prev["title"].astype(str)))
+        new_policies = _rows_to_json_safe(
+            df_new[df_new["platform"].map(lambda p: prev_state.get(p)) != df_new["title"]]
+        )
 
     logger.info(f"신규/변경 정책 감지: {len(new_policies)}건")
     context["ti"].xcom_push(key="new_policies", value=new_policies)
     return new_policies
+
+
+def _rows_to_json_safe(df: pd.DataFrame) -> list:
+    """DataFrame rows → XCom JSON 직렬화 가능한 순수 Python dict 리스트.
+    pandas Timestamp, int64, float64 등을 JSON 호환 타입으로 변환한다."""
+    return json.loads(df.to_json(orient="records", force_ascii=False, date_format="iso"))
 
 
 # ============================================================
@@ -188,7 +195,7 @@ def save_consolidated_csv(**context) -> str:
     latest_json = context["ti"].xcom_pull(
         task_ids="task_load_and_filter", key="latest_policies"
     )
-    df = pd.read_json(latest_json, orient="records")
+    df = pd.read_json(StringIO(latest_json), orient="records")
 
     out_path = Path(POLICY_CONSOLIDATED_CSV)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -394,7 +401,7 @@ def post_to_flow(**context) -> str:
     if not latest_json:
         raise AirflowSkipException("latest_policies XCom 없음 → Flow 게시 스킵")
 
-    df = pd.read_json(latest_json, orient="records")
+    df = pd.read_json(StringIO(latest_json), orient="records")
 
     now_kst = pendulum.now("Asia/Seoul")
     today_title = f"{now_kst.strftime('%y.%m.%d')}({_WEEKDAY_KR[now_kst.weekday()]})"
