@@ -210,7 +210,7 @@ def save_consolidated_csv(**context) -> str:
 # ============================================================
 
 def send_policy_alert(**context) -> str:
-    """신규/변경 정책이 있을 때 HTML 이메일 알림 발송"""
+    """신규/변경 정책이 있을 때 HTML 이메일 알림 발송 (전체 표시, 신규에 🆕 마킹)"""
     new_policies = context["ti"].xcom_pull(
         task_ids="task_detect_new_policies", key="new_policies"
     )
@@ -219,11 +219,17 @@ def send_policy_alert(**context) -> str:
         logger.info("신규 정책 없음 → 이메일 스킵")
         raise AirflowSkipException("신규/변경 정책이 없어 이메일을 발송하지 않습니다.")
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    count = len(new_policies)
-    subject = f"[도리당] 플랫폼 정책 변경 알림 - {count}건 ({today})"
+    latest_json = context["ti"].xcom_pull(
+        task_ids="task_load_and_filter", key="latest_policies"
+    )
+    all_policies = json.loads(latest_json) if latest_json else new_policies
+    new_platforms = {str(p.get("platform", "")) for p in new_policies}
 
-    html = _build_alert_html(new_policies, today)
+    today = datetime.now().strftime("%Y-%m-%d")
+    new_count = len(new_policies)
+    subject = f"[플랫폼 공지] 플랫폼 정책 추가 알림 - {new_count}건 ({today})"
+
+    html = _build_alert_html(all_policies, new_platforms, today)
     result = send_email(
         subject=subject,
         html_content=html,
@@ -233,17 +239,18 @@ def send_policy_alert(**context) -> str:
     return result
 
 
-def _build_alert_html(policies: list, today: str) -> str:
-    """정책 알림 HTML 이메일 생성"""
+def _build_alert_html(policies: list, new_platforms: set, today: str) -> str:
+    """정책 알림 HTML 이메일 생성 (전체 표시, 신규 플랫폼에 🆕 마킹)"""
     rows_html = ""
     for p in policies:
         platform_key = str(p.get("platform", ""))
         platform_kr = _PLATFORM_KR.get(platform_key, platform_key)
+        is_new = platform_key in new_platforms
+        platform_label = f"🆕 {platform_kr}" if is_new else platform_kr
         policy_type = str(p.get("policy_type", "기타"))
         badge_color = _TYPE_COLOR.get(policy_type, "#bdc3c7")
         title = str(p.get("title", ""))
         summary = str(p.get("content_summary", ""))
-        action = str(p.get("recommended_action", ""))
         policy_date = str(p.get("policy_date", ""))
         source_url = str(p.get("source_url", "")).strip()
         title_html = (
@@ -256,7 +263,7 @@ def _build_alert_html(policies: list, today: str) -> str:
         rows_html += f"""
         <tr>
           <td style="padding:10px 12px; border-bottom:1px solid #eee; font-weight:600; white-space:nowrap;">
-            {platform_kr}
+            {platform_label}
           </td>
           <td style="padding:10px 12px; border-bottom:1px solid #eee; white-space:nowrap; color:#666; font-size:12px;">
             {policy_date}
@@ -272,9 +279,6 @@ def _build_alert_html(policies: list, today: str) -> str:
           <td style="padding:10px 12px; border-bottom:1px solid #eee; color:#555; font-size:13px;">
             {summary}
           </td>
-          <td style="padding:10px 12px; border-bottom:1px solid #eee; color:#c0392b; font-size:13px; font-weight:500;">
-            {action}
-          </td>
         </tr>"""
 
     return f"""<!DOCTYPE html>
@@ -288,7 +292,7 @@ def _build_alert_html(policies: list, today: str) -> str:
         <!-- 헤더 -->
         <tr>
           <td style="background:linear-gradient(135deg,#27ae60,#2ecc71); padding:28px 32px;">
-            <div style="color:#fff; font-size:22px; font-weight:700; letter-spacing:-0.5px;">🍽 도리당 정책 변경 알림</div>
+            <div style="color:#fff; font-size:22px; font-weight:700; letter-spacing:-0.5px;">플랫폼 정책 변경 알림</div>
             <div style="color:rgba(255,255,255,0.85); font-size:13px; margin-top:6px;">{today} 기준 · 신규/변경 {len(policies)}건</div>
           </td>
         </tr>
@@ -297,7 +301,9 @@ def _build_alert_html(policies: list, today: str) -> str:
         <tr>
           <td style="padding:24px 32px;">
             <p style="margin:0 0 16px; color:#333; font-size:14px;">
-              안녕하세요. 아래 플랫폼에서 <strong>새로운 정책 공지</strong>가 감지되었습니다.
+              플랫폼에서 <strong>새로운 정책 및 공지</strong>가 감지되었습니다.,<br>
+              아래 리스트는 플랫폼별 최신 공지 1건씩 수집되었으며, 제목 클릭 시 원문 링크로 이동합니다.<br>
+              정책 변경 사항을 확인하시고, 필요한 조치를 검토해주시기 바랍니다.
             </p>
             <div style="overflow-x:auto;">
               <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:13px;">
@@ -308,7 +314,6 @@ def _build_alert_html(policies: list, today: str) -> str:
                     <th style="padding:10px 12px; text-align:left; color:#555; font-weight:600; border-bottom:2px solid #dee2e6; white-space:nowrap;">유형</th>
                     <th style="padding:10px 12px; text-align:left; color:#555; font-weight:600; border-bottom:2px solid #dee2e6;">제목</th>
                     <th style="padding:10px 12px; text-align:left; color:#555; font-weight:600; border-bottom:2px solid #dee2e6;">요약</th>
-                    <th style="padding:10px 12px; text-align:left; color:#555; font-weight:600; border-bottom:2px solid #dee2e6;">권장 조치</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -334,8 +339,8 @@ def _build_alert_html(policies: list, today: str) -> str:
         <tr>
           <td style="background:#f8f9fa; padding:16px 32px; border-top:1px solid #eee; margin-top:8px;">
             <p style="margin:0; color:#999; font-size:11px; line-height:1.6;">
-              이 메일은 Airflow 자동화 파이프라인에서 발송되었습니다.<br>
-              문의: a17019@kakao.com
+              이 메일은 도리당 자동화 시스템에서 발송되었습니다.<br>
+              문의: 조민준 PM a17019@doridang.com
             </p>
           </td>
         </tr>
@@ -403,10 +408,15 @@ def post_to_flow(**context) -> str:
 
     df = pd.read_json(StringIO(latest_json), orient="records")
 
+    new_policies = context["ti"].xcom_pull(
+        task_ids="task_detect_new_policies", key="new_policies"
+    ) or []
+    new_platforms = {str(p.get("platform", "")) for p in new_policies}
+
     now_kst = pendulum.now("Asia/Seoul")
     today_title = f"{now_kst.strftime('%y.%m.%d')}({_WEEKDAY_KR[now_kst.weekday()]})"
     today_str = now_kst.to_date_string()
-    body_html = _build_flow_policy_html(df, today_str)
+    body_html = _build_flow_policy_html(df, today_str, new_platforms)
 
     driver = launch_browser()
     driver.set_window_size(1920, 1080)
@@ -524,8 +534,8 @@ def post_to_flow(**context) -> str:
         driver.quit()
 
 
-def _build_flow_policy_html(df: pd.DataFrame, today_str: str) -> str:
-    """Flow CKEditor용 정책 테이블 HTML 빌드"""
+def _build_flow_policy_html(df: pd.DataFrame, today_str: str, new_platforms: set) -> str:
+    """Flow CKEditor용 정책 테이블 HTML 빌드 (신규 플랫폼에 🆕 마킹)"""
     _th = "padding:8px;text-align:left;border:1px solid #dee2e6;background:#f8f9fa;font-size:12px;"
     _td = "padding:8px;font-size:12px;border:1px solid #dee2e6;word-break:break-word;"
     _td_nowrap = "padding:8px;font-size:12px;border:1px solid #dee2e6;white-space:nowrap;"
@@ -534,11 +544,12 @@ def _build_flow_policy_html(df: pd.DataFrame, today_str: str) -> str:
     for _, row in df.iterrows():
         platform_key = str(row.get("platform", ""))
         platform_kr = _PLATFORM_KR.get(platform_key, platform_key)
+        is_new = platform_key in new_platforms
+        platform_label = f"🆕 {platform_kr}" if is_new else platform_kr
         policy_date = escape(str(row.get("policy_date", "")))
         policy_type = escape(str(row.get("policy_type", "")))
         title = escape(str(row.get("title", "")))
         summary = escape(str(row.get("content_summary", "")))
-        action = escape(str(row.get("recommended_action", "")))
         source_url = str(row.get("source_url", "")).strip()
 
         title_cell = (
@@ -549,12 +560,11 @@ def _build_flow_policy_html(df: pd.DataFrame, today_str: str) -> str:
         )
 
         rows.append(f"""<tr>
-  <td style="{_td_nowrap}">{escape(platform_kr)}</td>
+  <td style="{_td_nowrap}">{platform_label}</td>
   <td style="{_td_nowrap}">{policy_date}</td>
   <td style="{_td_nowrap}">{policy_type}</td>
   <td style="{_td}">{title_cell}</td>
   <td style="{_td}">{summary}</td>
-  <td style="{_td}">{action}</td>
 </tr>""")
 
     rows_html = "\n".join(rows)
@@ -564,7 +574,7 @@ def _build_flow_policy_html(df: pd.DataFrame, today_str: str) -> str:
 <h1>KPI</h1>
 <ul><li>정책/이벤트 적용 전후 결과(매출, 전환율 등) 변화 검증</li></ul>
 <div>&nbsp;</div>
-<h2>🍽 도리당 정책 변경 알림</h2>
+<h2>플랫폼 정책 변경 알림</h2>
 <p>{escape(today_str)} 기준 &middot; {count}건</p>
 <table style="border-collapse:collapse;width:100%;border:1px solid #dee2e6;">
   <thead><tr>
@@ -573,7 +583,6 @@ def _build_flow_policy_html(df: pd.DataFrame, today_str: str) -> str:
     <th style="{_th}">유형</th>
     <th style="{_th}">제목</th>
     <th style="{_th}">요약</th>
-    <th style="{_th}">권장 조치</th>
   </tr></thead>
   <tbody>
 {rows_html}
