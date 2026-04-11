@@ -305,9 +305,20 @@ def _build_alert_html(policies: list, today: str) -> str:
           </td>
         </tr>
 
+        <!-- Flow 링크 -->
+        <tr>
+          <td style="padding:20px 32px 8px; text-align:center;">
+            <a href="https://flow.team/l/QdNBw" target="_blank"
+               style="display:inline-block; background:#5b5ef6; color:#fff; font-size:14px; font-weight:600;
+                      padding:12px 28px; border-radius:8px; text-decoration:none; letter-spacing:-0.3px;">
+              Flow에서 확인하기 →
+            </a>
+          </td>
+        </tr>
+
         <!-- 푸터 -->
         <tr>
-          <td style="background:#f8f9fa; padding:16px 32px; border-top:1px solid #eee;">
+          <td style="background:#f8f9fa; padding:16px 32px; border-top:1px solid #eee; margin-top:8px;">
             <p style="margin:0; color:#999; font-size:11px; line-height:1.6;">
               이 메일은 Airflow 자동화 파이프라인에서 발송되었습니다.<br>
               문의: a17019@kakao.com
