@@ -121,7 +121,23 @@ def _launch_browser(account_id: str, download_dir: Path) -> uc.Chrome:
     }
     options.add_experimental_option("prefs", prefs)
 
-    driver = uc.Chrome(options=options, version_main=None)
+    # 설치된 Chrome 메이저 버전을 직접 감지해서 ChromeDriver 버전을 맞춘다.
+    # version_main=None 이면 undetected_chromedriver가 최신 드라이버를 자동 다운로드해
+    # 설치된 Chrome 버전과 불일치할 수 있으므로, 명시적으로 지정한다.
+    version_main: int | None = None
+    try:
+        import subprocess
+        result = subprocess.run(
+            [chrome_bin, "--version"],
+            capture_output=True, text=True, timeout=5
+        )
+        version_str = result.stdout.strip()  # e.g. "Google Chrome 145.0.7632.109"
+        version_main = int(version_str.split()[-1].split(".")[0])
+        logger.info("[%s] 감지된 Chrome 메이저 버전: %s", account_id, version_main)
+    except Exception as e:
+        logger.warning("[%s] Chrome 버전 감지 실패, version_main=None 사용: %s", account_id, e)
+
+    driver = uc.Chrome(options=options, version_main=version_main)
     logger.info("[%s] 브라우저 실행 완료", account_id)
     return driver
 

@@ -27,10 +27,15 @@ RUN apt-get update && apt-get install -y \
 # Chrome 경로 환경변수 설정
 ENV CHROME_BIN=/usr/bin/google-chrome
 ENV CHROMEDRIVER_PATH=/usr/local/bin/chromedriver
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+# Playwright 브라우저 캐시 경로를 모든 런타임 사용자(root/airflow)에서 공용으로 사용
+RUN mkdir -p /ms-playwright && chmod -R 755 /ms-playwright
 
 # airflow 유저로 복귀
 USER airflow
 
 # Python 패키지 설치 (requirements.txt 사용)
 COPY requirements.txt /requirements.txt
-RUN pip install --no-cache-dir -r /requirements.txt
+RUN pip install --no-cache-dir -r /requirements.txt \
+    && python -m playwright install chromium

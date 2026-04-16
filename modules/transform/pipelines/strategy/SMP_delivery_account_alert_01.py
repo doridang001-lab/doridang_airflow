@@ -149,10 +149,19 @@ def save_alerts_to_csv(**context) -> None:
     today = dt.date.today().isoformat()
     try:
         df_check = pd.read_csv(CSV_PATH, encoding="utf-8-sig")
-        if "updated_at" not in df_check.columns or today not in df_check["updated_at"].astype(str).values:
+        if "updated_at" not in df_check.columns:
+            _send_failure_email("CSV 저장 검증 실패: updated_at 컬럼 없음", context)
+            raise ValueError("CSV 저장 검증 실패")
+
+        # 알림 대상이 0건이면 빈 CSV(헤더만)도 정상 결과로 간주한다.
+        if not df_check.empty and today not in df_check["updated_at"].astype(str).values:
             _send_failure_email(f"CSV 저장 검증 실패: updated_at에 {today} 없음", context)
             raise ValueError("CSV 저장 검증 실패")
-        logger.info("CSV 저장 검증 통과 (updated_at=%s)", today)
+
+        if df_check.empty:
+            logger.info("CSV 저장 검증 통과 (0행, updated_at 컬럼 확인)")
+        else:
+            logger.info("CSV 저장 검증 통과 (updated_at=%s)", today)
     except FileNotFoundError:
         _send_failure_email("CSV 파일 재읽기 실패 (파일 없음)", context)
         raise

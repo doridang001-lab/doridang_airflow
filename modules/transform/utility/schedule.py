@@ -34,6 +34,7 @@ SMP_POLICY_CONSOLIDATE_TIME = "45 10 * * *"  # 매일 10:45 (수집 완료 후 �
 DB_POSFEED_SALES_TIME        = "15 9 * * *"  # 매일 09:15 실행
 DB_POSFEED_SALES_DETAIL_TIME = "45 9 * * *"  # 매일 09:45 실행
 DB_OKPOS_SALES_TIME          = "35 9 * * *"  # 매일 09:35 실행
+DB_EASYPOS_SALES_TIME        = "50 9 * * *"  # 매일 09:50 실행
 
 SMD_TOORDER_SALES_REPORT_TIME = "0 9 * * *"  # 매일 09:00 실행
 

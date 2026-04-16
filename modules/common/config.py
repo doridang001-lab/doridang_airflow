@@ -44,6 +44,9 @@ STORES = [
     {"store_id": "14535911", "store_name": "[음식배달] 닭도리탕 전문 도리당 가락점"},
 ]
 
+# 관리자 이메일
+ADMIN_EMAIL = ["a17019@kakao.com"]
+
 # 구글 인증 경로
 GSHEET_CRED_PATH = os.path.join(
     os.path.dirname(__file__), "../../config/glowing-palace-465904-h6-7f82df929812.json"

@@ -37,3 +37,7 @@ graph LR
 ## 참조
 - `docs/architecture.md` - ETL 흐름 + 모듈 구조도
 - `docs/db-schema.md` - DB/경로 참조
+
+
+## 읽기 제외
+- `.claudeignore`

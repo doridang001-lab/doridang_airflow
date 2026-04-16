@@ -25,7 +25,7 @@ from modules.transform.utility.schedule import SMP_DELIVERY_ALERT_TIME
 # TEST_MODE: True → 테스트 수신자(a17019@kakao.com)로만 발송
 #            False → 담당자 실 발송 + CC
 # ============================================================
-TEST_MODE = True
+TEST_MODE = False
 
 # ============================================================
 # 파이프라인 모듈 동적 임포트

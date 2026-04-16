@@ -69,6 +69,9 @@ x-airflow-common:
     ANALYTICS_DB: '/opt/airflow/analytics'
     MART_DB: '/opt/airflow/onedrive_mart'
     TEMP_DIR: '/opt/airflow/Local_DB/temp'
+    PLAYWRIGHT_BROWSERS_PATH: '/ms-playwright'
+    LOCAL_GPT_OSS_20B_ENDPOINT: 'http://host.docker.internal:11434/v1/chat/completions'
+    LOCAL_GPT_OSS_20B_MODEL: 'gpt-oss:20b'
     # yamllint disable rule:line-length
     # Use simple http server on scheduler for health checks
     # See https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/check-health.html#scheduler-health-check-server

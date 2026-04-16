@@ -211,7 +211,7 @@ def save_consolidated_csv(**context) -> str:
 # ============================================================
 
 def send_policy_alert(**context) -> str:
-    """신규/변경 정책이 있을 때 HTML 이메일 알림 발송 (전체 표시, 신규에 🆕 마킹)"""
+    """신규/변경 정책이 있을 때 HTML 이메일 알림 발송."""
     new_policies = context["ti"].xcom_pull(
         task_ids="task_detect_new_policies", key="new_policies"
     )
@@ -234,21 +234,22 @@ def send_policy_alert(**context) -> str:
     result = send_email(
         subject=subject,
         html_content=html,
-        to_emails="a17019@kakao.com",
+        to_emails=["a17019@kakao.com", "puding83@kakao.com", "bulu1017@kakao.com"]
+        ,
     )
     logger.info(f"정책 알림 이메일 발송 완료: {new_count}건")
     return result
 
 
 def _build_alert_html(policies: list, new_platforms: set, today: str) -> str:
-    """정책 알림 HTML 이메일 생성 (전체 표시, 신규 플랫폼에 🆕 마킹)"""
+    """정책 알림 HTML 이메일 생성 (전체 표시, 신규 플랫폼 강조)."""
     rows_html = ""
     for p in policies:
         platform_key = str(p.get("platform", ""))
         platform_kr = _PLATFORM_KR.get(platform_key, platform_key)
         is_new = platform_key in new_platforms
         platform_label = (
-            f'<span style="color:#e67e22; font-weight:700;">{platform_kr}</span>'
+            f'<span style="color:#e67e22; font-weight:700;">🆕 NEW {platform_kr}</span>'
             if is_new else platform_kr
         )
         policy_type = str(p.get("policy_type", "기타"))
@@ -267,7 +268,7 @@ def _build_alert_html(policies: list, new_platforms: set, today: str) -> str:
         rows_html += f"""
         <tr>
           <td style="padding:10px 12px; border-bottom:1px solid #eee; white-space:nowrap;">
-            {platform_label}
+                        {platform_label}
           </td>
           <td style="padding:10px 12px; border-bottom:1px solid #eee; white-space:nowrap; color:#666; font-size:12px;">
             {policy_date}
@@ -405,7 +406,10 @@ def write_consolidate_log(**context) -> None:
 # ============================================================
 
 def post_to_flow(**context) -> str:
-    """Flow 프로젝트에 오늘 날짜 하위업무 생성 + 정책 테이블 본문 삽입"""
+    """Flow 프로젝트에 오늘 날짜 하위업무 생성 + 정책 테이블 본문 삽입.
+
+    신규/변경 정책이 없으면 게시를 스킵한다.
+    """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
@@ -413,26 +417,29 @@ def post_to_flow(**context) -> str:
         launch_browser, do_login,
     )
 
-    latest_json = context["ti"].xcom_pull(
-        task_ids="task_load_and_filter", key="latest_policies"
-    )
-    if not latest_json:
-        raise AirflowSkipException("latest_policies XCom 없음 → Flow 게시 스킵")
-
-    df = pd.read_json(StringIO(latest_json), orient="records")
-
     try:
         new_policies = context["ti"].xcom_pull(
             task_ids="task_detect_new_policies", key="new_policies"
         ) or []
     except Exception:
         new_policies = []
+
+    if not new_policies:
+        logger.info("신규/변경 정책 없음 → Flow 게시 스킵")
+        raise AirflowSkipException("신규/변경 정책이 없어 Flow 게시를 생략합니다.")
+
+    df_new = pd.DataFrame(new_policies)
+    if df_new.empty:
+        logger.info("신규/변경 정책 DataFrame 비어 있음 → Flow 게시 스킵")
+        raise AirflowSkipException("신규/변경 정책 데이터가 없어 Flow 게시를 생략합니다.")
+
     new_platforms = {str(p.get("platform", "")) for p in new_policies}
 
     now_kst = pendulum.now("Asia/Seoul")
     today_title = f"{now_kst.strftime('%y.%m.%d')}({_WEEKDAY_KR[now_kst.weekday()]})"
     today_str = now_kst.to_date_string()
-    body_html = _build_flow_policy_html(df, today_str, new_platforms)
+    # Flow 본문은 전체가 아니라 "이번 실행에서 감지된 신규/변경 정책"만 올린다.
+    body_html = _build_flow_policy_html(df_new, today_str, new_platforms)
 
     driver = launch_browser()
     driver.set_window_size(1920, 1080)

@@ -38,8 +38,9 @@ from glob import glob
 from typing import Dict, List, Any
 import pandas as pd
 import json
+import os
 
-from modules.transform.utility.paths import ANALYTICS_DB
+from modules.transform.utility.paths import ANALYTICS_DB, DOWN_DIR
 from modules.transform.utility.onedrive import backup_to_onedrive
 
 logger = logging.getLogger(__name__)
@@ -62,7 +63,19 @@ def _process_coupangeats_cmg() -> Dict[str, Any]:
     """내부 처리 로직"""
 
     # 설정
-    source_dir = Path("E:/down/업로드_temp")
+    env_source_dir = os.getenv("COUPANGEATS_CMG_SOURCE_DIR")
+    if env_source_dir:
+        source_candidates = [Path(env_source_dir)]
+    else:
+        source_candidates = [
+            DOWN_DIR / "업로드_temp",
+            DOWN_DIR,
+            Path("E:/down/업로드_temp"),
+            Path("E:/down"),
+            Path("C:/down/업로드_temp"),
+            Path("C:/down"),
+        ]
+
     file_pattern = "coupangeats_cmg_*.csv"
     dataset_name = "coupang_marketing"
     brand = "도리당"
@@ -74,15 +87,29 @@ def _process_coupangeats_cmg() -> Dict[str, Any]:
     base_path = ANALYTICS_DB / dataset_name
 
     logger.info(f"쿠팡이츠 CMG 파티션 처리 시작")
-    logger.info(f"  소스: {source_dir}/{file_pattern}")
+    logger.info(f"  소스 후보: {[str(p) for p in source_candidates]}")
     logger.info(f"  목표: {base_path}")
 
     # 1. 파일 수집
-    files = sorted(glob(str(source_dir / file_pattern)))
+    files: List[str] = []
+    selected_source = None
+    for candidate in source_candidates:
+        matched = sorted(glob(str(candidate / file_pattern)))
+        if matched:
+            files = matched
+            selected_source = candidate
+            break
+
+    if selected_source:
+        logger.info(f"  선택된 소스: {selected_source}/{file_pattern}")
+
     logger.info(f"발견된 파일 수: {len(files)}")
 
     if not files:
-        raise FileNotFoundError(f"{source_dir}/{file_pattern} 파일을 찾을 수 없습니다")
+        raise FileNotFoundError(
+            f"{file_pattern} 파일을 찾을 수 없습니다. "
+            f"검색 경로: {', '.join(str(p) for p in source_candidates)}"
+        )
 
     # 2. DataFrame 병합
     dfs = []
@@ -139,7 +166,21 @@ def _process_coupangeats_cmg() -> Dict[str, Any]:
         csv_file = part_path / "data.csv"
         if csv_file.exists():
             existing_df = pd.read_csv(csv_file, encoding="utf-8-sig")
+
+            # 기존 CSV는 문자열 타입으로 들어오므로 병합 전 날짜 타입 통일
+            existing_df[timestamp_col] = pd.to_datetime(existing_df[timestamp_col], errors='coerce')
+            existing_df[date_col] = pd.to_datetime(existing_df[date_col], errors='coerce')
+            existing_df = existing_df.dropna(subset=[timestamp_col, date_col])
+
+            grp = grp.copy()
+            grp[timestamp_col] = pd.to_datetime(grp[timestamp_col], errors='coerce')
+            grp[date_col] = pd.to_datetime(grp[date_col], errors='coerce')
+            grp = grp.dropna(subset=[timestamp_col, date_col])
+
             grp_merged = pd.concat([existing_df, grp], ignore_index=True)
+            grp_merged[timestamp_col] = pd.to_datetime(grp_merged[timestamp_col], errors='coerce')
+            grp_merged[date_col] = pd.to_datetime(grp_merged[date_col], errors='coerce')
+            grp_merged = grp_merged.dropna(subset=[timestamp_col, date_col])
             grp_merged = grp_merged.sort_values(timestamp_col, ascending=False)
             grp_merged = grp_merged.drop_duplicates(subset=dedup_cols, keep='first')
             logger.info(f"  기존 병합: {part_brand}/{part_store}/{part_ym} ({len(existing_df)} + {len(grp)} → {len(grp_merged)}행)")

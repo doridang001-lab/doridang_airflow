@@ -70,6 +70,7 @@ CREDENTIALS_PATH = "/opt/airflow/config/rare-ethos-483607-i5-45c9bec5b193.json"
 # 리포트 시트 (담당자 입력용 템플릿 → 헤더만 유지)
 REPORT_GSHEET_URL  = "https://docs.google.com/spreadsheets/d/1OFTQ0WyKgcwmBxwESWWpCD6E6O2i9kYYN6-YxNlx9xQ/edit?gid=0#gid=0"
 REPORT_SHEET_NAME  = "시트1"
+REPORT_SHEET2_NAME = "시트2"   # 핵심조치/조치내용 소스 시트
 
 # 버퍼 시트 (gsheet1 수집 후 7일 대기소)
 BUFFER_GSHEET_URL  = "https://docs.google.com/spreadsheets/d/1xLhw-qS7zBBsAtwzyUO9N1AYT-zgECcfyTX9GBsi1k8/edit?gid=0#gid=0"
@@ -323,6 +324,60 @@ def upload_grp_template(**context):
 
     logger.info(f"[upload_grp_template] ✅ 업로드 완료 ({len(tmpl):,}건, A:I만 작성 / J:P 드롭다운 보존)")
     return f"템플릿 업로드: {len(tmpl):,}건"
+
+
+# ============================================================
+# task 5 – 시트2 L(핵심조치), M(조치내용) → 시트1 L:M 복사
+# ============================================================
+def copy_sheet2_lm_to_sheet1(**context):
+    """
+    시트2의 L(핵심조치), M(조치내용)을 시트1에 복사.
+    - 시트1의 데이터 행 수만큼만 복사 (초과분 무시)
+    - L:M 범위만 접근 → 드롭다운/서식 보존
+    """
+    import re
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+
+    scopes = ['https://www.googleapis.com/auth/spreadsheets']
+    creds = Credentials.from_service_account_file(CREDENTIALS_PATH, scopes=scopes)
+    service = build('sheets', 'v4', credentials=creds)
+    sid = re.search(r'/d/([a-zA-Z0-9_-]+)', REPORT_GSHEET_URL).group(1)
+
+    # ① 시트1 데이터 행 수 확인
+    sheet1_resp = service.spreadsheets().values().get(
+        spreadsheetId=sid, range=f"{REPORT_SHEET_NAME}!A2:A"
+    ).execute()
+    sheet1_row_count = len(sheet1_resp.get('values') or [])
+
+    if sheet1_row_count == 0:
+        logger.info("[copy_lm] 시트1 데이터 없음 → 복사 불필요")
+        return "시트1 데이터 없음"
+
+    # ② 시트2 L:M 읽기 (헤더 제외, 2행부터)
+    sheet2_resp = service.spreadsheets().values().get(
+        spreadsheetId=sid, range=f"{REPORT_SHEET2_NAME}!L2:M"
+    ).execute()
+    sheet2_values = sheet2_resp.get('values') or []
+
+    if not sheet2_values:
+        logger.info("[copy_lm] 시트2 L:M 데이터 없음 → 복사 불필요")
+        return "시트2 데이터 없음"
+
+    # ③ 시트1 행 수만큼만 자르기 + 셀 개수 맞추기 (행당 2칸 보장)
+    rows_to_copy = sheet2_values[:sheet1_row_count]
+    rows_to_copy = [r + [''] * (2 - len(r)) if len(r) < 2 else r[:2] for r in rows_to_copy]
+
+    # ④ 시트1 L2:M에 쓰기 (L:M 범위만 → J,K,N:P 드롭다운 무접촉)
+    service.spreadsheets().values().update(
+        spreadsheetId=sid,
+        range=f"{REPORT_SHEET_NAME}!L2",
+        valueInputOption='USER_ENTERED',
+        body={'values': rows_to_copy},
+    ).execute()
+
+    logger.info(f"[copy_lm] ✅ 시트2→시트1 L:M 복사 완료 ({len(rows_to_copy)}건)")
+    return f"L:M 복사 완료: {len(rows_to_copy)}건"
 
 
 # ============================================================
@@ -669,5 +724,11 @@ with DAG(
         trigger_rule='none_failed',
     )
 
-    # 체인: 센서 → 버퍼 수집 → (7일 경과 처리 → gsheet3 적재) → gsheet1 클리어 → 새 grp 업로드
-    wait_for_smd_07 >> collect_to_buffer_task >> process_buffer_task >> clear_report_task >> upload_grp_task
+    copy_lm_task = PythonOperator(
+        task_id='copy_sheet2_lm_to_sheet1',
+        python_callable=copy_sheet2_lm_to_sheet1,
+        trigger_rule='none_failed',
+    )
+
+    # 체인: 센서 → 버퍼 수집 → (7일 경과 처리 → gsheet3 적재) → gsheet1 클리어 → 새 grp 업로드 → 시트2 L:M 복사
+    wait_for_smd_07 >> collect_to_buffer_task >> process_buffer_task >> clear_report_task >> upload_grp_task >> copy_lm_task

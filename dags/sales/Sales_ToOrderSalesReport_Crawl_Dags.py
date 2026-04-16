@@ -14,8 +14,10 @@ conf 키:
 """
 
 import logging
+import re
 from pathlib import Path
 
+import pandas as pd
 import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -24,8 +26,7 @@ from modules.extract.crawling_toorder_sales_report import (
     generate_date_range,
     run_crawling_date_range,
 )
-from modules.load.load_df_glob import move_download_files
-from modules.transform.utility.paths import DOWN_DIR, LOCAL_DB
+from modules.transform.utility.paths import ANALYTICS_DB, DOWN_DIR
 from modules.transform.utility.schedule import SMD_TOORDER_SALES_REPORT_TIME
 
 logger = logging.getLogger(__name__)
@@ -106,21 +107,91 @@ def crawl_reports(**context) -> str:
 
 def move_files(**context) -> str:
     """
-    다운로드 폴더의 종합보고서 파일을 LOCAL_DB/toorder_sales_report 로 이동한다.
+    다운로드 폴더의 종합보고서 파일(Sheet1)을 표준 포맷으로 변환해
+    ANALYTICS_DB/toorder_daily_sales/ 루트 아래에
+    toorder_daily_sales_YYYYMMDD.csv 형태로 저장한다.
+    같은 날짜 파일이 이미 있으면 덮어쓴다.
 
     대상 패턴: 종합보고서_채널별(일)매출보고서_*.xlsx
     """
-    dest_dir = str(LOCAL_DB / "toorder_sales_report")
-    logger.info("파일 이동 시작: %s → %s", str(DOWN_DIR), dest_dir)
+    pattern = "종합보고서_채널별(일)매출보고서_*.xlsx"
+    files = sorted(Path(DOWN_DIR).glob(pattern))
+    base_dest_dir = ANALYTICS_DB / "toorder_daily_sales"
+    base_dest_dir.mkdir(parents=True, exist_ok=True)
 
-    move_download_files(
-        patterns=["종합보고서_채널별(일)매출보고서_*.xlsx"],
-        dest_dir=dest_dir,
-        base_dir=str(DOWN_DIR),
-    )
+    if not files:
+        logger.warning("변환 대상 파일 없음: %s/%s", str(DOWN_DIR), pattern)
+        return f"변환 대상 없음: {DOWN_DIR}"
 
-    logger.info("파일 이동 완료")
-    return f"이동 대상 경로: {dest_dir}"
+    converted_count = 0
+    output_files = []
+
+    for src_path in files:
+        try:
+            raw = pd.read_excel(src_path, sheet_name=0, header=None)
+
+            # 행 구조: 0=리포트 타이틀, 1=기간, 2=실제 헤더, 3~데이터
+            date_text = str(raw.iat[1, 0]) if len(raw.index) > 1 else ""
+            m = re.search(r"(\d{4}-\d{2}-\d{2})", date_text)
+            order_date = m.group(1) if m else ""
+
+            header_row = raw.iloc[2].fillna("").astype(str).str.strip()
+            store_positions = [i for i, v in header_row.items() if v == "매장"]
+            if len(store_positions) < 2:
+                raise ValueError("'매장' 헤더 블록을 찾지 못했습니다")
+
+            start_idx, end_idx = store_positions[0], store_positions[1]
+            block = raw.iloc[3:, start_idx:end_idx].copy()
+            block.columns = header_row.iloc[start_idx:end_idx].tolist()
+            block = block.rename(columns={"매장": "매장명"})
+            block = block[block["매장명"].notna()].copy()
+            block["매장명"] = block["매장명"].astype(str).str.strip()
+
+            meta_cols = {"매장명", "매장 태그", "오픈일", "합 계", "합계"}
+            value_cols = [c for c in block.columns if c not in meta_cols]
+
+            long_df = block.melt(
+                id_vars=["매장명"],
+                value_vars=value_cols,
+                var_name="플랫폼명",
+                value_name="금액_raw",
+            )
+            long_df["매출액"] = pd.to_numeric(
+                long_df["금액_raw"], errors="coerce"
+            ).fillna(0)
+            long_df["플랫폼명"] = long_df["플랫폼명"].replace({"요기배달": "요기요"})
+
+            out_df = (
+                long_df.groupby(["매장명", "플랫폼명"], as_index=False)["매출액"]
+                .sum()
+                .assign(수집채널="토더", 주문일자=order_date)
+                [["수집채널", "주문일자", "매장명", "플랫폼명", "매출액"]]
+            )
+            out_df = out_df[out_df["매출액"] > 0].reset_index(drop=True)
+
+            ymd = order_date.replace("-", "") if order_date else src_path.stem[-8:]
+            output_path = base_dest_dir / f"toorder_daily_sales_{ymd}.csv"
+            if output_path.exists():
+                logger.info("기존 파일 덮어쓰기: %s", output_path)
+            out_df.to_csv(output_path, index=False, encoding="utf-8-sig")
+
+            src_path.unlink()
+
+            converted_count += 1
+            output_files.append(str(output_path))
+            logger.info(
+                "✅ 변환 완료: %s → %s (rows=%d)",
+                src_path.name,
+                output_path.name,
+                len(out_df),
+            )
+            logger.info("🗑️ 원본 삭제 완료: %s", src_path)
+        except Exception as exc:
+            logger.error("❌ 변환 실패: %s (%s)", src_path.name, exc)
+
+    context["ti"].xcom_push(key="converted_files", value=output_files)
+    logger.info("변환 완료: %d/%d", converted_count, len(files))
+    return f"변환 완료: {converted_count}/{len(files)} (저장 루트: {base_dest_dir})"
 
 
 # ============================================================

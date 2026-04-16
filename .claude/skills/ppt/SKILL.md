@@ -3,6 +3,7 @@ name: ppt
 description: 기획서/보고서/분석문서를 발표용 슬라이드로 변환. 1.html(애니메이션 웹 발표본)과 2_애니메이션없는_ppt.pptx(정적 공유용 PPT) 2개를 OneDrive PowerPoint 폴더에 저장. /ppt [문서경로 또는 내용] 형식으로 호출.
 argument-hint: [문서 경로 또는 내용]
 allowed-tools: [Read, Write, Bash]
+model: haiku
 ---
 
 ## 저장 경로

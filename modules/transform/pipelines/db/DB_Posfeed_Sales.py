@@ -150,6 +150,31 @@ def _click_download(driver: uc.Chrome, wait: WebDriverWait) -> None:
             time.sleep(3)
 
         wait.until(lambda d: "#/login" not in d.current_url)
+
+        # 강제 비밀번호 변경 페이지 감지 → "다음에 (30일간 보지않기)" 버튼 클릭 후 주문 페이지 재진입
+        if "#/admin/change-password" in driver.current_url:
+            logger.warning(f"비밀번호 변경 페이지 리다이렉트 감지 - 스킵 버튼 클릭 시도 | URL: {driver.current_url}")
+            _SKIP_SELECTORS = [
+                (By.XPATH, "//button[.//span[contains(normalize-space(),'다음에')]]"),
+                (By.XPATH, "//span[contains(normalize-space(),'다음에')]/parent::button"),
+                (By.XPATH, "//button[contains(normalize-space(),'다음에')]"),
+            ]
+            skip_clicked = False
+            for sel in _SKIP_SELECTORS:
+                try:
+                    skip_btn = WebDriverWait(driver, 5).until(EC.element_to_be_clickable(sel))
+                    driver.execute_script("arguments[0].click();", skip_btn)
+                    logger.info("'다음에 (30일간 보지않기)' 버튼 클릭 완료")
+                    skip_clicked = True
+                    time.sleep(2)
+                    break
+                except Exception:
+                    continue
+            if not skip_clicked:
+                logger.warning("스킵 버튼을 찾지 못했습니다 - ORDER_URL 직접 진입 시도")
+            driver.get(ORDER_URL)
+            time.sleep(4)
+
         time.sleep(2)
         logger.info(f"주문 목록 페이지 로드 완료 | URL: {driver.current_url}")
 
@@ -395,7 +420,30 @@ def move_to_storage(**context) -> str:
     today = datetime.now().strftime("%Y%m%d")
 
     # 엑셀 읽기 → 등록날짜 컬럼 추가 → UTF-8 CSV 저장
-    df = pd.read_excel(str(src), dtype=str)
+    # 파일 매직 바이트로 실제 포맷 판별 후 적절한 엔진 선택
+    with open(str(src), "rb") as _f:
+        _magic = _f.read(8)
+
+    if _magic[:4] == b'\xd0\xcf\x11\xe0':
+        # OLE2 복합 문서 형식 (xls)
+        df = pd.read_excel(str(src), dtype=str, engine="xlrd")
+        logger.info("엑셀 파일 엔진: xlrd (xls)")
+    elif _magic[:4] == b'PK\x03\x04':
+        # ZIP 기반 (xlsx)
+        df = pd.read_excel(str(src), dtype=str, engine="openpyxl")
+        logger.info("엑셀 파일 엔진: openpyxl (xlsx)")
+    elif _magic[:5] in (b'<?xml', b'<html', b'<HTML') or _magic.lstrip()[:1] == b'<':
+        # HTML 테이블로 내려온 경우
+        logger.warning("HTML 형식 파일 감지 - HTML 테이블로 파싱 시도")
+        dfs = pd.read_html(str(src), encoding="utf-8")
+        df = dfs[0].astype(str)
+    else:
+        # 최후 시도: openpyxl → xlrd 순으로 fallback
+        logger.warning(f"파일 매직 바이트 미확인({_magic[:8].hex()}) - openpyxl로 시도")
+        try:
+            df = pd.read_excel(str(src), dtype=str, engine="openpyxl")
+        except Exception:
+            df = pd.read_excel(str(src), dtype=str, engine="xlrd")
     df["등록날짜"] = yesterday
     dest = dest_dir / f"{src.stem}_{today}.csv"
     df.to_csv(str(dest), index=False, encoding="utf-8-sig")  # BOM 포함 → Excel 한글 깨짐 방지

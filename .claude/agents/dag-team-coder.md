@@ -97,6 +97,78 @@ Write 툴로 실제 파일을 저장합니다:
 - `schedule_interval=` → `schedule=` 사용
 - `datetime` 대신 `pendulum` 사용 (timezone 포함)
 
+## Selenium 크롤링 패턴 (IBSheet/팝업 사이트)
+
+OKPOS, Posfeed 등 IBSheet 기반 웹 포털 자동화 시 반드시 적용할 패턴.
+참조 구현: `modules/transform/pipelines/db/DB_OKPOS_Sales.py`
+
+### 핵심 규칙
+
+1. **Alert 선처리 필수** — IBSheet는 예고 없이 alert 발생. 모든 상호작용 전후에 `_dismiss_alert()` 호출
+   ```python
+   def _dismiss_alert(driver):
+       try:
+           alert = driver.switch_to.alert
+           text = alert.text
+           logger.warning(f"Alert dismiss: {text!r}")
+           alert.accept()
+           return text
+       except NoAlertPresentException:
+           return None
+   ```
+
+2. **IBSheet 팝업 클릭 → JS click 금지, ActionChains 필수**
+   ```python
+   # 틀림: driver.execute_script("arguments[0].click();", el)
+   # 맞음:
+   ActionChains(driver).move_to_element(el).click().perform()
+   ```
+   JS click은 IBSheet 네이티브 이벤트 핸들러를 트리거하지 않아 팝업이 닫히지 않음.
+
+3. **매장/항목 선택 후 매번 페이지 재로드** — IBSheet "Duplicate sheet_id" 오류 방지
+   ```python
+   driver.get(page_url)
+   time.sleep(2)
+   _dismiss_alert(driver)
+   ```
+
+4. **날짜 입력 — JS setValue + dispatchEvent** (calendar 팝업 방식보다 안정적)
+   ```python
+   driver.execute_script(
+       "arguments[0].value = arguments[1];"
+       "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
+       "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
+       input_el, "2026/04/07"  # YYYY/MM/DD 형식
+   )
+   ```
+
+5. **Excel 헤더 자동 감지** — OKPOS today 페이지는 헤더 행이 2개 (동일 행 중복)
+   ```python
+   def _read_okpos_excel(path):
+       preview = pd.read_excel(path, header=None, nrows=4, dtype=str)
+       header_row = 0
+       for i in range(min(4, len(preview))):
+           if str(preview.iloc[i, 0]).strip().upper() == "NO":
+               header_row = i  # 마지막 NO 행 = 실제 헤더
+       df = pd.read_excel(path, header=header_row, dtype=str)
+       df = df.replace("#NAME?", "", regex=False)
+       return df
+   ```
+
+6. **빈 데이터(매출 0원) 자동 skip** — 합계 행만 있는 경우 df.empty → continue
+   ```python
+   no_col = df.columns[0]
+   df = df[pd.to_numeric(df[no_col], errors="coerce").notna()]  # 합계 행 제거
+   if df.empty:
+       logger.warning("데이터 없음 (합계 행만 존재) → skip")
+       continue
+   ```
+
+7. **다운로드 경로 → `TEMP_DIR / "서비스명_download"`** 사용, 완료 후 변환·저장
+   - `ANALYTICS_DB` 하위에 임시 파일 두지 말 것
+
+8. **스크린샷 디버깅은 개발 중에만** — 배포 코드에서는 제거. 로그로만 디버그.
+
 ## 팀 핸드오프 (필수)
 파일 저장이 완료되면 **반드시** `dag-team-tester` 에이전트를 Task 툴로 호출합니다.
 

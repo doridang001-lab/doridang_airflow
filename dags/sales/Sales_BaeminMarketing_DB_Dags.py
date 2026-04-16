@@ -4,8 +4,9 @@
 baemin_marketing_*.csv 파일을 수집 → 전처리 → 파티션 CSV 저장하는
 수동 실행 전용 파이프라인.
 
-파티션 구조: ANALYTICS_DB/baemin_marketing/brand=X/store=Y/ym=Z/data.csv
+파티션 구조: ANALYTICS_DB/baemin_marketing/brand=X/store=Y/ym=Z/baemin_marketing_data.csv
 동일 날짜 중복 데이터는 collected_at 최신 1건만 유지 (idempotent).
+실행 이력: ANALYTICS_DB/baemin_marketing/log.parquet
 """
 
 import os
@@ -19,6 +20,7 @@ from modules.transform.pipelines.db.db_baemin_marketing import (
     load_baemin_marketing_files,
     transform_baemin_marketing,
     save_partitioned_csv,
+    write_baemin_log,
 )
 
 # ==================================================
@@ -54,4 +56,9 @@ with DAG(
         python_callable=save_partitioned_csv,
     )
 
-    load_task >> transform_task >> save_task
+    log_task = PythonOperator(
+        task_id='write_log',
+        python_callable=write_baemin_log,
+    )
+
+    load_task >> transform_task >> save_task >> log_task
