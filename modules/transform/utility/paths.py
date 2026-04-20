@@ -231,6 +231,25 @@ def resolve_mart_db() -> Path:
 	return Path.home() / "OneDrive - 주식회사 도리당" / "data" / "mart"
 
 
+def resolve_llm_output_dir() -> Path:
+	"""LLM 분류 결과 저장 경로.
+
+	우선순위:
+	1) 환경변수 `LLM_OUTPUT_DIR`
+	2) 컨테이너 마운트 경로 `/opt/airflow/onedrive_llm`
+	3) Windows OneDrive data/llm
+	"""
+	env_path = os.getenv("LLM_OUTPUT_DIR")
+	if env_path:
+		return Path(env_path)
+
+	container_mount = Path("/opt/airflow/onedrive_llm")
+	if container_mount.exists():
+		return container_mount
+
+	return Path("C:/Users/tjrrj") / "OneDrive - 주식회사 도리당" / "data" / "llm"
+
+
 def resolve_raw_okpos_sales() -> Path:
 	env_path = os.getenv("RAW_OKPOS_SALES")
 	if env_path:
@@ -266,5 +285,6 @@ POLICY_LOG_PATH = ANALYTICS_DB / "policy" / "log.parquet"
 POLICY_CONSOLIDATED_CSV = ANALYTICS_DB / "policy" / "policy_consolidated_latest.csv"
 REPORT_SALES_DB = resolve_report_sales_db()
 MART_DB = resolve_mart_db()
+LLM_OUTPUT_DIR = resolve_llm_output_dir()
 RAW_OKPOS_SALES = resolve_raw_okpos_sales()
 RAW_UNIONPOS_SALES = resolve_raw_unionpos_sales()

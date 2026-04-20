@@ -35,8 +35,7 @@ dag_id = Path(__file__).stem
 
 # None    → 어제 1일만 수집 (기본 스케줄 동작)
 # 기간 지정 → ("2026-04-01", "2026-04-19") 형식으로 입력하면 1일씩 순차 수집
-MANUAL_DATE_RANGE: tuple | None  = ("2026-01-01", "2026-02-28")
-
+MANUAL_DATE_RANGE: tuple | None = None
 _ALERT_EMAILS = ["a17019@kakao.com"]
 
 

@@ -62,12 +62,14 @@ x-airflow-common:
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
     PYTHONPATH: '/opt/airflow:/opt/airflow/dags:/opt/airflow/modules'
+    IS_DOCKER: 'true'
     # Force modules.transform.utility.paths to resolve to container mounts
     ONEDRIVE_DB: '/opt/airflow/Repository'
     COLLECT_DB: '/opt/airflow/Collect_Data'
     LOCAL_DB: '/opt/airflow/Local_DB'
     ANALYTICS_DB: '/opt/airflow/analytics'
     MART_DB: '/opt/airflow/onedrive_mart'
+    LLM_OUTPUT_DIR: '/opt/airflow/onedrive_llm'
     TEMP_DIR: '/opt/airflow/Local_DB/temp'
     PLAYWRIGHT_BROWSERS_PATH: '/ms-playwright'
     LOCAL_GPT_OSS_20B_ENDPOINT: 'http://host.docker.internal:11434/v1/chat/completions'
@@ -93,6 +95,7 @@ x-airflow-common:
     - "c:/Users/민준/OneDrive - 주식회사 도리당/Repository:/opt/airflow/Repository"
     - "c:/Users/민준/OneDrive - 주식회사 도리당/Collect_Data:/opt/airflow/Collect_Data"
     - "c:/Users/민준/OneDrive - 주식회사 도리당/data/mart:/opt/airflow/onedrive_mart"
+    - "c:/Users/tjrrj/OneDrive - 주식회사 도리당/data/llm:/opt/airflow/onedrive_llm"
     - "c:/Users/민준/OneDrive - 주식회사 도리당/data/analytics:/opt/airflow/analytics"
     - "c:/Local_DB:/opt/airflow/Local_DB"
     - "c:/Doridang:/opt/airflow/Doridang"
@@ -104,6 +107,8 @@ x-airflow-common:
     redis:
       condition: service_healthy
     postgres:
+      condition: service_healthy
+    doridang-postgres:
       condition: service_healthy
 
 services:
@@ -120,6 +125,23 @@ services:
       interval: 10s
       retries: 5
       start_period: 5s
+    restart: always
+
+  doridang-postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: ${DORIDANG_DB_USER:-doridang}
+      POSTGRES_PASSWORD: ${DORIDANG_DB_PASSWORD:-doridang}
+      POSTGRES_DB: ${DORIDANG_DB_NAME:-doridangdb}
+    ports:
+      - "${DORIDANG_DB_PORT_HOST:-5434}:5432"
+    volumes:
+      - doridang-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${DORIDANG_DB_USER:-doridang}"]
+      interval: 10s
+      retries: 10
+      start_period: 10s
     restart: always
 
   redis:
@@ -308,3 +330,4 @@ services:
 
 volumes:
   postgres-db-volume:
+  doridang-db-volume:

@@ -13,6 +13,7 @@ from modules.transform.pipelines.db.DB_ItemMaster import run
 import hashlib
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -23,7 +24,7 @@ import pandas as pd
 
 from modules.extract.extract_db import db_read_table as read_table
 from modules.load.load_postgre_db import postgre_db_save
-from modules.transform.utility.paths import MART_DB
+from modules.transform.utility.paths import MART_DB, LLM_OUTPUT_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,26 @@ FUZZY_THRESHOLD = 0.85  # 이 이상이면 LLM 없이 기존 분류 복사
 VALID_CATEGORIES = {"메인메뉴", "사이드", "음료", "기타"}
 _EMPTY_COLS = ["_pk", "brand", "item_name", "menu_name", "item_id",
                "ai_item_name", "ai_category", "classified_at", "model", "is_manual"]
+
+# Optional: process from CSV instead of parquet (file path or directory)
+ITEM_MASTER_SOURCE_CSV = os.getenv("ITEM_MASTER_SOURCE_CSV", "").strip()
+
+_NON_WORD_RE = re.compile(r"[^0-9A-Za-z가-힣ㄱ-ㅎㅏ-ㅣ\\s]+")
+_MULTI_SPACE_RE = re.compile(r"\\s+")
+
+
+def _clean_name(value) -> str:
+    if value is None:
+        return ""
+    # pandas NaN
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    text = _NON_WORD_RE.sub(" ", text)
+    text = _MULTI_SPACE_RE.sub(" ", text).strip()
+    return text
 
 
 # ──────────────────────────────────────────────
@@ -73,29 +94,63 @@ def _build_fewshot_examples(existing_df: pd.DataFrame, n: int = 6) -> str:
 
 
 def _build_system_prompt(fewshot: str) -> str:
-    examples_section = fewshot if fewshot else """- 입력: brand="도리당", item_name="도리당버거(단품)", menu_name="버거"
-  출력: {"ai_item_name": "도리당버거", "ai_category": "메인메뉴"}
-- 입력: brand="도리당", item_name="감튀L", menu_name="사이드"
+    examples_section = fewshot if fewshot else """- 입력: brand="도리당", item_name="도리당 닭도리탕", menu_name="도리당 닭도리탕 외 3건"
+  출력: {"ai_item_name": "도리당 닭도리탕", "ai_category": "메인메뉴"}
+- 입력: brand="도리당", item_name="1인 순살 닭도리탕 (밥포함)(1인분)", menu_name="도리당 닭도리탕 외 5건"
+  출력: {"ai_item_name": "순살 닭도리탕 1인", "ai_category": "메인메뉴"}
+- 입력: brand="도리당", item_name="[한우 순살 곱도리탕]", menu_name="[한우 순살 곱도리탕] 외 22건"
+    출력: {"ai_item_name": "한우 순살 곱도리탕", "ai_category": "메인메뉴"}
+- 입력: brand="도리당", item_name="감튀L", menu_name="사이드 외 2건"
   출력: {"ai_item_name": "감자튀김(L)", "ai_category": "사이드"}
-- 입력: brand="도리당", item_name="콜라(M)", menu_name="음료"
+- 입력: brand="도리당", item_name="[후.참] 꼬치오뎅", menu_name="도리당 닭도리탕 외 10건"
+  출력: {"ai_item_name": "꼬치오뎅", "ai_category": "사이드"}
+- 입력: brand="도리당", item_name="[후.참] 분모자", menu_name="도리당 닭도리탕 외 10건"
+  출력: {"ai_item_name": "분모자", "ai_category": "사이드"}
+- 입력: brand="도리당", item_name="흑미 공기밥", menu_name="도리당 닭도리탕 외 7건"
+  출력: {"ai_item_name": "흑미 공기밥", "ai_category": "사이드"}
+- 입력: brand="도리당", item_name="한우 대창 75g 추가", menu_name="도리당 닭도리탕 외 8건"
+  출력: {"ai_item_name": "한우 대창 75g 추가", "ai_category": "사이드"}
+- 입력: brand="도리당", item_name="치킨무 대신 파김치 주세요", menu_name="도리당 닭도리탕 외 12건"
+    출력: {"ai_item_name": "치킨무 대신 파김치", "ai_category": "사이드"}
+- 입력: brand="도리당", item_name="콜라(M)", menu_name="음료 외 2건"
   출력: {"ai_item_name": "콜라(M)", "ai_category": "음료"}
-- 입력: brand="도리당", item_name="소스추가", menu_name="추가"
+- 입력: brand="도리당", item_name="새로", menu_name="도리당 닭도리탕 외 8건"
+  출력: {"ai_item_name": "새로(소주)", "ai_category": "음료"}
+- 입력: brand="도리당", item_name="참이슬", menu_name="도리당 닭도리탕 외 8건"
+    출력: {"ai_item_name": "참이슬", "ai_category": "음료"}
+- 입력: brand="도리당", item_name="기본맛", menu_name="도리당 닭도리탕 외 3건"
+  출력: {"ai_item_name": "기본맛", "ai_category": "기타"}
+- 입력: brand="도리당", item_name="중간매운맛(신라면보다매운)", menu_name="도리당 닭도리탕 외 8건"
+    출력: {"ai_item_name": "중간매운맛", "ai_category": "기타"}
+- 입력: brand="도리당", item_name="국물많이(중간보다 위)", menu_name="도리당 닭도리탕 외 8건"
+    출력: {"ai_item_name": "국물많이", "ai_category": "기타"}
+- 입력: brand="도리당", item_name="기본 치킨무 빼주세요", menu_name="도리당 닭도리탕 외 3건"
+  출력: {"ai_item_name": "치킨무 빼기", "ai_category": "기타"}
+- 입력: brand="도리당", item_name="소스추가", menu_name="추가 외 1건"
   출력: {"ai_item_name": "소스 추가", "ai_category": "기타"}"""
 
     return f"""너는 한국 F&B 브랜드 메뉴 분류 전문가야.
 브랜드명(brand), 상품명(item_name), 메뉴그룹명(menu_name)을 보고 카테고리를 분류하고 표준화된 상품명을 제안해.
 
 [카테고리 정의]
-- 메인메뉴: 버거·치킨·덮밥·세트 등 식사의 중심이 되는 아이템
-- 사이드  : 감자튀김·코울슬로·샐러드·토핑·수프 등 곁들이 음식
-- 음료    : 콜라·사이다·주스·커피·음료·물 등 마시는 것
-- 기타    : 소스 추가·포장 용기·서비스 항목·식별 불가 항목
+- 메인메뉴: 버거·치킨·덮밥·탕·찌개·세트·1인분 세트 등 식사의 중심이 되는 아이템
+           예) 닭도리탕, 닭한마리, 곱도리탕, 묵은지도리탕, 한우순살곱도리탕, 누룽지닭한마리
+- 사이드  : 감자튀김·샐러드·공기밥·오뎅·떡류·토핑 추가 등 메인과 함께 먹는 곁들이 음식
+           예) 공기밥, 흑미공기밥, 꼬치오뎅, 분모자, 통가래떡, 대창추가, 야채추가
+- 음료    : 콜라·사이다·주스·커피·물 등 음료류 + 소주·맥주·막걸리·와인 등 주류 전체
+           예) 새로, 처음처럼, 참이슬, 진로, 카스, 하이트, 막걸리, 와인, 사케
+- 기타    : 맛 옵션(기본맛·매운맛·순한맛)·제거 요청(빼주세요)·배달비·포장 용기·식별 불가 항목
 
-[규칙]
-1. ai_item_name은 한국어로 간결하게 (불필요한 숫자코드·괄호 제거, 띄어쓰기 통일)
-2. 같은 item_name이라도 brand가 다르면 메뉴 의미가 다를 수 있으니 brand를 반드시 참고해
-3. 이름만으로 판단이 어려울 때는 menu_name을 추가로 참고해
-4. 응답은 반드시 JSON 배열로 입력 순서대로 출력 (설명 없이)
+[중요 규칙]
+1. menu_name은 배달앱 메뉴그룹명으로 "XX 외 N건" 형태가 많음 — 분류 참고용으로만 쓰고 item_name을 우선 분석해
+2. [후.참] 접두어는 후식/추가주문 항목을 의미 — 식재료·음식이면 사이드, 음료·주류이면 음료로 분류
+3. 다음 옵션성 문구는 기본적으로 기타로 분류: 기본맛/매운맛/순한맛/중간맛/국물많이/국물적게/빼주세요/변경/선택
+4. 다음 추가 토핑·곁들임은 기본적으로 사이드: 공기밥/오뎅/분모자/가래떡/대창 추가/치즈 추가/계란 추가/치킨무/파김치
+5. 주류 키워드(새로/참이슬/처음처럼/진로/카스/하이트/테라/막걸리/와인/사케)는 반드시 음료로 분류
+6. item_name에 탕/찌개/닭도리탕/곱도리탕/닭한마리 등 메인 키워드가 있으면 menu_name이 혼란스러워도 메인메뉴 우선
+7. ai_item_name은 한국어로 간결하게 (불필요한 숫자코드·괄호 제거, 띄어쓰기 통일, [후.참] 접두어 제거)
+8. 같은 item_name이라도 brand가 다르면 메뉴 의미가 다를 수 있으니 brand를 반드시 참고해
+9. 응답은 반드시 JSON 배열로 입력 순서대로 출력 (설명 없이)
    [{{"ai_item_name": "...", "ai_category": "..."}}, ...]
 
 [분류 예시]
@@ -232,6 +287,46 @@ def _classify_with_llm(df: pd.DataFrame, existing_df: pd.DataFrame) -> pd.DataFr
 # ──────────────────────────────────────────────
 def extract_unique_items() -> pd.DataFrame:
     """MART_DB unified_sales parquet 전체에서 unique (brand, menu_name, item_name) 추출."""
+    if ITEM_MASTER_SOURCE_CSV:
+        source_path = Path(ITEM_MASTER_SOURCE_CSV)
+        csv_files = sorted(source_path.glob("*.csv")) if source_path.is_dir() else [source_path]
+        if not csv_files:
+            logger.warning("CSV file not found: %s", source_path)
+            return pd.DataFrame(columns=["brand", "item_name", "menu_name", "item_id"])
+
+        dfs: list[pd.DataFrame] = []
+        for f in csv_files:
+            try:
+                df = pd.read_csv(f, dtype=str, encoding="utf-8-sig")
+            except Exception:
+                df = pd.read_csv(f, dtype=str)
+            dfs.append(df)
+
+        combined = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+        platform_col = "platform" if "platform" in combined.columns else ("플랫폼" if "플랫폼" in combined.columns else None)
+        menu_col = "menuename" if "menuename" in combined.columns else ("menu_name" if "menu_name" in combined.columns else None)
+        option_col = "option_item" if "option_item" in combined.columns else ("item_name" if "item_name" in combined.columns else None)
+
+        missing = [name for name, col in [("platform", platform_col), ("menuename", menu_col), ("option_item", option_col)] if col is None]
+        if missing:
+            logger.warning("CSV columns missing: %s (available=%s)", missing, list(combined.columns))
+            return pd.DataFrame(columns=["brand", "item_name", "menu_name", "item_id"])
+
+        combined = combined[[platform_col, menu_col, option_col]].copy()
+        combined[platform_col] = combined[platform_col].map(_clean_name)
+        combined[menu_col] = combined[menu_col].map(_clean_name)
+        combined[option_col] = combined[option_col].map(_clean_name)
+
+        combined = combined.rename(columns={platform_col: "brand", menu_col: "menu_name", option_col: "item_name"})
+
+        combined = combined[combined["item_name"].notna() & (combined["item_name"] != "")]
+        combined = combined[combined["brand"].notna() & (combined["brand"] != "")]
+        combined["item_id"] = ""
+        result = combined.drop_duplicates(subset=["brand", "menu_name", "item_name"], keep="first").reset_index(drop=True)
+        logger.info("unique item extracted from CSV: %d", len(result))
+        return result[["brand", "item_name", "menu_name", "item_id"]]
+
     parquet_dir = MART_DB / "unified_sales_grp"
     files = sorted(parquet_dir.glob("*.parquet"))
     if not files:
@@ -250,6 +345,9 @@ def extract_unique_items() -> pd.DataFrame:
         return pd.DataFrame(columns=["brand", "item_name", "menu_name", "item_id"])
 
     combined = pd.concat(dfs, ignore_index=True)
+    combined["brand"] = combined["brand"].map(_clean_name)
+    combined["menu_name"] = combined["menu_name"].map(_clean_name)
+    combined["item_name"] = combined["item_name"].map(_clean_name)
     combined = combined[combined["item_name"].notna() & (combined["item_name"] != "")]
 
     def mode_first(s):
@@ -322,11 +420,11 @@ def save_item_master(df: pd.DataFrame) -> dict:
 
 
 def _checkpoint_base_dir() -> Path:
-    return MART_DB / "item_master_checkpoints"
+    return LLM_OUTPUT_DIR / "item_master_checkpoints"
 
 
 def _save_checkpoints(df: pd.DataFrame, chunk_size: int = CHECKPOINT_SIZE) -> tuple[list[Path], Path]:
-    """분류 결과를 chunk_size 단위 parquet로 저장하고 경로 목록 반환."""
+    """분류 결과를 chunk_size 단위 CSV로 저장하고 경로 목록 반환."""
     if df.empty:
         return [], _checkpoint_base_dir()
 
@@ -336,8 +434,8 @@ def _save_checkpoints(df: pd.DataFrame, chunk_size: int = CHECKPOINT_SIZE) -> tu
     chunk_paths: list[Path] = []
     for idx, start in enumerate(range(0, len(df), chunk_size), start=1):
         chunk_df = df.iloc[start: start + chunk_size].copy()
-        chunk_path = run_dir / f"chunk_{idx:04d}.parquet"
-        chunk_df.to_parquet(chunk_path, index=False)
+        chunk_path = run_dir / f"chunk_{idx:04d}.csv"
+        chunk_df.to_csv(chunk_path, index=False, encoding="utf-8-sig")
         chunk_paths.append(chunk_path)
         logger.info("체크포인트 저장: %s (%d건)", chunk_path.name, len(chunk_df))
 
@@ -349,7 +447,7 @@ def _merge_checkpoints(chunk_paths: list[Path]) -> pd.DataFrame:
     if not chunk_paths:
         return pd.DataFrame(columns=_EMPTY_COLS)
 
-    chunk_dfs = [pd.read_parquet(path) for path in chunk_paths]
+    chunk_dfs = [pd.read_csv(path, encoding="utf-8-sig") for path in chunk_paths]
     merged = pd.concat(chunk_dfs, ignore_index=True)
     logger.info("체크포인트 통합 완료: %d건", len(merged))
     return merged[_EMPTY_COLS]
@@ -373,9 +471,9 @@ def _cleanup_checkpoints(chunk_paths: list[Path], run_dir: Path) -> None:
 def classify_and_save_with_checkpoints(items_df: pd.DataFrame, chunk_size: int = CHECKPOINT_SIZE) -> dict:
     """
     1) 전체 분류 수행
-    2) chunk_size 단위로 parquet 체크포인트 저장
-    3) 체크포인트 통합 후 DB 저장
-    4) 저장 성공 시 체크포인트 삭제
+    2) chunk_size 단위로 CSV 체크포인트 저장 (항상 보존)
+    3) 체크포인트 통합 후 DB 저장 시도
+    4) DB 저장 성공 시 체크포인트 삭제 / DB 연결 실패 시 CSV를 남기고 태스크 성공 처리
     """
     classified_df = classify_items(items_df)
     if classified_df.empty:
@@ -383,9 +481,19 @@ def classify_and_save_with_checkpoints(items_df: pd.DataFrame, chunk_size: int =
 
     chunk_paths, run_dir = _save_checkpoints(classified_df, chunk_size=chunk_size)
     merged_df = _merge_checkpoints(chunk_paths)
-    result = save_item_master(merged_df)
-    _cleanup_checkpoints(chunk_paths, run_dir)
-    return result
+
+    try:
+        result = save_item_master(merged_df)
+        _cleanup_checkpoints(chunk_paths, run_dir)
+        return result
+    except Exception as e:
+        logger.warning(
+            "DB 저장 실패 — CSV 체크포인트 보존 후 태스크 성공 처리.\n"
+            "  경로: %s\n  오류: %s",
+            run_dir,
+            e,
+        )
+        return {"inserted": 0, "duplicated": 0, "total": len(merged_df), "csv_fallback": str(run_dir)}
 
 
 def run() -> str:

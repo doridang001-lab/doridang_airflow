@@ -6,28 +6,50 @@ DB 설정 및 공통 설정 관리
 Airflow Docker 실행 시: host.docker.internal
 """
 import os
+from pathlib import Path
+from urllib.parse import quote_plus
 
 # 환경 변수로 Docker 여부 판단 (Airflow에서 설정)
-IS_DOCKER = os.getenv("IS_DOCKER", "false").lower() == "true"
+def _detect_docker() -> bool:
+    env = os.getenv("IS_DOCKER")
+    if env is not None:
+        return env.lower() == "true"
+    # Best-effort auto-detect when running inside a Linux container
+    return Path("/.dockerenv").exists()
+
+
+IS_DOCKER = _detect_docker()
 
 # DB 설정 (docker-compose에서 postgres 포트 5433 노출)
 DB_CONFIG = {
-    "user": "doridang",
-    "password": "doridang",
-    "host": "host.docker.internal" if IS_DOCKER else "127.0.0.1",
-    "port": "5434",  # separate business Postgres mapped to 5434
-    "database": "doridangdb",
+    "user": os.getenv("DORIDANG_DB_USER", "doridang"),
+    "password": os.getenv("DORIDANG_DB_PASSWORD", "doridang"),
+    "host": os.getenv("DORIDANG_DB_HOST", "doridang-postgres" if IS_DOCKER else "127.0.0.1"),
+    "port": os.getenv("DORIDANG_DB_PORT", "5432" if IS_DOCKER else "5434"),
+    "database": os.getenv("DORIDANG_DB_NAME", "doridangdb"),
 }
+
+
+def build_postgres_url(db_config: dict) -> str:
+    user = quote_plus(str(db_config["user"]))
+    password = quote_plus(str(db_config["password"]))
+    host = str(db_config["host"])
+    port = str(db_config["port"])
+    database = quote_plus(str(db_config["database"]))
+    return f"postgresql://{user}:{password}@{host}:{port}/{database}"
 
 
 def get_db_url():
     """Airflow용 DB 연결 문자열 (Docker 컨테이너 내부에서 실행)"""
-    return "postgresql://doridang:doridang@host.docker.internal:5434/doridangdb"
+    return build_postgres_url(DB_CONFIG)
 
 
 def nb_get_db_url():
     """Jupyter Notebook용 DB 연결 문자열 (로컬 실행)"""
-    return "postgresql://doridang:doridang@127.0.0.1:5434/doridangdb"
+    cfg = dict(DB_CONFIG)
+    cfg["host"] = "127.0.0.1"
+    cfg["port"] = os.getenv("DORIDANG_DB_PORT_LOCAL", "5434")
+    return build_postgres_url(cfg)
 
 
 # 채널 코드

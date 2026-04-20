@@ -44,6 +44,11 @@ def task_extract(**context):
 def task_classify_and_save(**context):
     df = extract_unique_items()
     result = classify_and_save_with_checkpoints(df, chunk_size=300)
+    if result.get("csv_fallback"):
+        return (
+            f"item_master: DB 저장 실패(CSV 보존) — 전체 {result['total']}건 | "
+            f"CSV 경로: {result['csv_fallback']}"
+        )
     return (
         f"item_master: 신규 {result['inserted']}건 저장, "
         f"중복 {result['duplicated']}건 스킵, 전체 {result['total']}건"
