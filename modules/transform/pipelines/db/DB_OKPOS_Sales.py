@@ -1189,11 +1189,11 @@ def save_to_raw(**context) -> str:
 
 
 def check_and_fill_missing_today(**context) -> str:
-    """today 다운로드 후 raw CSV에 누락된 매장/날짜 데이터를 재다운로드해서 채운다.
+    """today/receipt 저장 결과를 대조해서 누락분만 재다운로드해 채운다.
 
     save_to_raw 이후 실행:
-    1. sale_dates × STORES 전체 조합에서 okpos_order.csv가 비거나 없는 항목 탐지
-    2. 누락 항목을 Selenium으로 재다운로드 → save_to_raw와 동일한 방식으로 저장
+    - today는 있는데 receipt가 없는 (또는 반대) 조합을 찾아서, 없는 쪽만 재다운로드/저장
+    - 둘 다 없으면 수동 확인 대상으로만 남김 (자동 다운로드하지 않음)
     """
     from modules.load.load_onedrive import onedrive_csv_save
 
@@ -1201,81 +1201,157 @@ def check_and_fill_missing_today(**context) -> str:
     if not sale_dates:
         return "sale_dates 없음, 스킵"
 
-    missing_keys: list[tuple[str, dict]] = []
+    def _has_sale_date(csv_path: Path, sale_date: str) -> bool:
+        if not csv_path.exists():
+            return False
+        try:
+            df_check = pd.read_csv(csv_path, dtype=str, usecols=["sale_date"])
+            return not df_check[df_check["sale_date"].astype(str).str.strip() == sale_date].empty
+        except Exception:
+            return False
+
+    missing_today_keys: list[tuple[str, dict]] = []
+    missing_receipt_keys: list[tuple[str, dict]] = []
+    manual_check_keys: list[tuple[str, str]] = []
     for sale_date in sale_dates:
         ym = sale_date[:7]
         for store in STORES:
             store_short = store["name"].replace("도리당 ", "", 1)
-            csv_path = RAW_OKPOS_SALES / "brand=도리당" / f"store={store_short}" / f"ym={ym}" / "okpos_order.csv"
-            if not csv_path.exists():
-                missing_keys.append((sale_date, store))
-                continue
-            try:
-                df_check = pd.read_csv(csv_path, dtype=str, usecols=["sale_date"])
-                if df_check[df_check["sale_date"].str.strip() == sale_date].empty:
-                    missing_keys.append((sale_date, store))
-            except Exception:
-                missing_keys.append((sale_date, store))
 
-    if not missing_keys:
-        logger.info("today 누락 항목 없음")
+            today_csv = (
+                RAW_OKPOS_SALES
+                / "brand=도리당"
+                / f"store={store_short}"
+                / f"ym={ym}"
+                / "okpos_order.csv"
+            )
+            receipt_csv = (
+                RAW_OKPOS_SALES
+                / "brand=도리당"
+                / f"store={store_short}"
+                / f"ym={ym}"
+                / "okpos_order_item.csv"
+            )
+
+            has_today = _has_sale_date(today_csv, sale_date)
+            has_receipt = _has_sale_date(receipt_csv, sale_date)
+
+            # today는 있는데 receipt가 없는 경우 → receipt만 재다운로드
+            if has_today and not has_receipt:
+                missing_receipt_keys.append((sale_date, store))
+            # receipt는 있는데 today가 없는 경우 → today만 재다운로드
+            elif has_receipt and not has_today:
+                missing_today_keys.append((sale_date, store))
+            # 둘 다 없으면 자동 다운로드하지 않고, 수동 확인 리스트에만 남긴다.
+            elif (not has_today) and (not has_receipt):
+                manual_check_keys.append((sale_date, store["name"]))
+
+    if not missing_today_keys and not missing_receipt_keys:
+        if manual_check_keys:
+            logger.warning("today/receipt 둘 다 없는 항목(수동 확인 필요): %s", manual_check_keys)
+            return f"수동 확인 필요(둘 다 없음): {len(manual_check_keys)}건 | {manual_check_keys}"
+        logger.info("today/receipt 누락 항목 없음")
         return "누락 항목 없음"
 
-    logger.warning(f"today 누락 {len(missing_keys)}건 재다운로드 시작: {[(d, s['name']) for d, s in missing_keys]}")
+    if missing_today_keys:
+        logger.warning(
+            "today 누락 %d건 재다운로드 시작: %s",
+            len(missing_today_keys),
+            [(d, s["name"]) for d, s in missing_today_keys],
+        )
+    if missing_receipt_keys:
+        logger.warning(
+            "receipt 누락 %d건 재다운로드 시작: %s",
+            len(missing_receipt_keys),
+            [(d, s["name"]) for d, s in missing_receipt_keys],
+        )
+    if manual_check_keys:
+        logger.warning("today/receipt 둘 다 없는 항목(수동 확인 필요): %s", manual_check_keys)
 
-    download_dir = TEMP_DIR / "okpos_download_fill"
-    download_dir.mkdir(parents=True, exist_ok=True)
-    page_cfg = PAGE_TYPES["today"]
+    def _fill_page(page_type: str, pending_keys: list[tuple[str, dict]]) -> tuple[int, list[str]]:
+        if not pending_keys:
+            return 0, []
 
-    filled, failed = 0, []
+        download_dir = TEMP_DIR / f"okpos_download_fill_{page_type}"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        page_cfg = PAGE_TYPES[page_type]
+        csv_name = "okpos_order" if page_type == "today" else "okpos_order_item"
 
-    def _session(driver, wait, pending, results):
-        _login(driver, wait)
-        _setup_download_dir(driver, download_dir)
-        driver.get(page_cfg["url"])
-        import time as _time
-        _time.sleep(2)
-        for sale_date, store in pending:
-            key = f"{sale_date}__{store['name']}"
-            downloaded = _download_excel_for_store(
-                driver, wait, "today", page_cfg, sale_date, store, download_dir
-            )
-            if downloaded:
-                results[key] = str(downloaded)
+        def _session(driver, wait, pending, results):
+            _login(driver, wait)
+            _setup_download_dir(driver, download_dir)
+            driver.get(page_cfg["url"])
+            import time as _time
+            _time.sleep(2)
+            for sale_date, store in pending:
+                key = f"{sale_date}__{store['name']}"
+                downloaded = _download_excel_for_store(
+                    driver, wait, page_type, page_cfg, sale_date, store, download_dir
+                )
+                if downloaded:
+                    results[key] = str(downloaded)
 
-    results = _download_with_retry("today", missing_keys, download_dir, _session)
+        results = _download_with_retry(page_type, pending_keys, download_dir, _session)
 
-    for key, src_str in results.items():
-        if not src_str:
-            failed.append(key)
-            continue
-        src = Path(src_str)
-        if not src.exists():
-            failed.append(key)
-            continue
-        sale_date, store_name = key.split("__", 1)
-        store_short = store_name.replace("도리당 ", "", 1)
-        try:
-            df = _read_okpos_excel(str(src))
-            df, ym = _transform_okpos_df(df, store_name, sale_date)
-            if df.empty:
-                logger.warning(f"재다운로드 후 빈 데이터 (매출 없음): {key}")
-                src.unlink(missing_ok=True)
+        filled = 0
+        failed: list[str] = []
+        for key, src_str in results.items():
+            if not src_str:
+                failed.append(key)
                 continue
-            dest = RAW_OKPOS_SALES / "brand=도리당" / f"store={store_short}" / f"ym={ym}" / "okpos_order.csv"
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            result = onedrive_csv_save(df=df, file_path=str(dest), pk_col="_pk",
-                                       timestamp_col="collected_at", if_exists="append")
-            src.unlink(missing_ok=True)
-            filled += 1
-            logger.info(f"재저장 완료: {key} | 신규={result.get('inserted', 0)}")
-        except Exception:
-            logger.exception(f"재저장 실패: {key}")
-            failed.append(key)
+            src = Path(src_str)
+            if not src.exists():
+                failed.append(key)
+                continue
+            sale_date, store_name = key.split("__", 1)
+            store_short = store_name.replace("도리당 ", "", 1)
+            try:
+                df = _read_okpos_excel(str(src))
+                df, ym = _transform_okpos_df(df, store_name, sale_date)
+                if df.empty:
+                    logger.warning(f"재다운로드 후 빈 데이터 (매출 없음): {page_type} | {key}")
+                    src.unlink(missing_ok=True)
+                    continue
+                dest = (
+                    RAW_OKPOS_SALES
+                    / "brand=도리당"
+                    / f"store={store_short}"
+                    / f"ym={ym}"
+                    / f"{csv_name}.csv"
+                )
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                result = onedrive_csv_save(
+                    df=df,
+                    file_path=str(dest),
+                    pk_col="_pk",
+                    timestamp_col="collected_at",
+                    if_exists="append",
+                )
+                src.unlink(missing_ok=True)
+                filled += 1
+                logger.info(f"재저장 완료: {page_type} | {key} | 신규={result.get('inserted', 0)}")
+            except Exception:
+                logger.exception(f"재저장 실패: {page_type} | {key}")
+                failed.append(key)
 
-    msg = f"today 누락 채우기 완료: 성공={filled}, 실패={len(failed)}"
-    if failed:
-        msg += f" | 실패 목록: {failed}"
+        return filled, failed
+
+    filled_today, failed_today = _fill_page("today", missing_today_keys)
+    filled_receipt, failed_receipt = _fill_page("receipt", missing_receipt_keys)
+
+    msg = (
+        "today/receipt 누락 채우기 완료"
+        f" | today 성공={filled_today}, 실패={len(failed_today)}"
+        f" | receipt 성공={filled_receipt}, 실패={len(failed_receipt)}"
+    )
+    if manual_check_keys:
+        msg += f" | 수동 확인(둘 다 없음)={len(manual_check_keys)}"
+    if failed_today:
+        msg += f" | today 실패 목록: {failed_today}"
+    if failed_receipt:
+        msg += f" | receipt 실패 목록: {failed_receipt}"
+    if manual_check_keys:
+        msg += f" | 수동 확인 목록: {manual_check_keys}"
     logger.info(msg)
     return msg
 
