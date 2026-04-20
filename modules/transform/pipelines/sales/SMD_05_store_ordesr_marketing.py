@@ -4,7 +4,7 @@ io3의 범용 함수를 wrapper로 감싸서 사용
 """
 
 from pathlib import Path
-from modules.transform.utility.paths import COLLECT_DB, LOCAL_DB, TEMP_DIR
+from modules.transform.utility.paths import COLLECT_DB, LOCAL_DB, TEMP_DIR, MART_DB
 from modules.transform.utility.io import load_files, preprocess_df, save_to_csv, join_dataframes
 from modules.transform.utility.store_name_mapping import normalize_store_names
 import pandas as pd
@@ -1256,12 +1256,37 @@ def fin_save_to_csv(
         '별점_total',
         # ── 서비스 종합 ────────────────────────────────────────────
         'service_score_total', 'service_status', 'pre_service_status',
+        # ── 종합 위험도 ────────────────────────────────────────────
+        'total_score',
     ]
+    # total_score: 5개 지표 원점수 합산 (0~48점 만점)
+    _score_cols = ['score', 'fee_score_total', '쿠팡_광고효과_score_total',
+                   '배민_광고효과_score_total', 'service_score_total']
+    df['total_score'] = sum(df[c].fillna(0) for c in _score_cols if c in df.columns)
     missing_fc = [c for c in FINAL_COLUMNS if c not in df.columns]
     if missing_fc:
         print(f"[컬럼] ⚠️ FINAL_COLUMNS 중 없는 컬럼 {len(missing_fc)}개 (무시): {missing_fc}")
     df = df[[c for c in FINAL_COLUMNS if c in df.columns]]
     print(f"[컬럼] ✅ 최종 {len(df.columns)}개 컬럼 선택 (whitelist 적용)")
+
+    # ============================================================
+    # 폐점 매장 자동 필터링 (employee_store_snapshot_history.csv 기준)
+    # ============================================================
+    snapshot_path = MART_DB / 'closing_rate' / 'employee_store_snapshot_history.csv'
+    if snapshot_path.exists() and '매장명' in df.columns:
+        try:
+            snap = pd.read_csv(snapshot_path, encoding='utf-8-sig')
+            snap.columns = ['ym', '매장명', '실오픈일', '해지일', 'is_active', 'is_new', 'is_closed']
+            snap['매장명'] = normalize_store_names(snap['매장명'])
+            closed_stores = set(snap[snap['해지일'].notna()]['매장명'].unique())
+            before_closed = len(df)
+            df = df[~df['매장명'].isin(closed_stores)].reset_index(drop=True)
+            removed = before_closed - len(df)
+            print(f"[폐점 필터] {len(closed_stores)}개 폐점 매장 기준 → {removed:,}행 제거, 잔여 {len(df):,}행")
+        except Exception as e:
+            print(f"[폐점 필터] ⚠️ 스냅샷 읽기 실패, 필터 생략: {e}")
+    else:
+        print(f"[폐점 필터] 스냅샷 파일 없음 또는 매장명 컬럼 없음, 필터 생략")
 
     tmp_path = None
     try:

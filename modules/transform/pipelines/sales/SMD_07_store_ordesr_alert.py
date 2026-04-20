@@ -413,7 +413,7 @@ def filter_alerts(
             if 'order_daily' in alert_save.columns:
                 if pd.api.types.is_datetime64_any_dtype(alert_save['order_daily']):
                     alert_save['order_daily'] = alert_save['order_daily'].dt.strftime('%Y-%m-%d')
-            
+
             alert_save.to_csv(alerts_csv_path, index=False, encoding='utf-8-sig')
             print(f"[✅ CSV] 알림 대상 저장: {len(alert_save):,}건 → {alerts_csv_path.name}")
             

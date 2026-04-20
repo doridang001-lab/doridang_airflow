@@ -5,6 +5,7 @@ DAG 모니터링 파이프라인
 실패 판단 규칙을 적용하여 결과를 OneDrive에 저장합니다.
 """
 
+import io
 import logging
 from pathlib import Path
 
@@ -19,6 +20,33 @@ logger = logging.getLogger(__name__)
 # 히트맵 기준 시각 소스: 실제 실행 시각(start_date) 우선
 # 필요 시 "execution_date"로 변경 가능
 HEATMAP_TIME_SOURCE = "start_date"  # "start_date" | "execution_date"
+
+
+def _parse_payload_timestamp(value):
+    """XCom JSON payload에서 복원된 timestamp를 안전하게 파싱한다."""
+    if value is None:
+        return pd.NaT
+
+    if isinstance(value, pd.Timestamp):
+        return value
+
+    if isinstance(value, str):
+        text = value.strip()
+        if text == "" or text.lower() in {"nat", "none", "null"}:
+            return pd.NaT
+        if text.isdigit():
+            try:
+                return pd.to_datetime(int(text), unit="ms", utc=True, errors="coerce")
+            except Exception:
+                return pd.NaT
+        return pd.to_datetime(text, utc=True, errors="coerce")
+
+    if isinstance(value, (int, float)):
+        if pd.isna(value):
+            return pd.NaT
+        return pd.to_datetime(value, unit="ms", utc=True, errors="coerce")
+
+    return pd.to_datetime(value, utc=True, errors="coerce")
 
 
 def collect_dag_runs(**context) -> str:
@@ -160,8 +188,8 @@ def apply_failure_rules(**context) -> str:
     payload = ti.xcom_pull(task_ids="collect_dag_runs", key="dag_runs_and_tasks")
 
     target_date = payload["target_date"]
-    dag_runs_df = pd.read_json(payload["dag_runs"], orient="records")
-    task_instances_df = pd.read_json(payload["task_instances"], orient="records")
+    dag_runs_df = pd.read_json(io.StringIO(payload["dag_runs"]), orient="records", convert_dates=False)
+    task_instances_df = pd.read_json(io.StringIO(payload["task_instances"]), orient="records", convert_dates=False)
 
     results = []
 
@@ -189,8 +217,8 @@ def apply_failure_rules(**context) -> str:
 
         # duration 계산 (초)
         try:
-            start = pd.to_datetime(dr.get("start_date"))
-            end = pd.to_datetime(dr.get("end_date"))
+            start = _parse_payload_timestamp(dr.get("start_date"))
+            end = _parse_payload_timestamp(dr.get("end_date"))
             if pd.notna(start) and pd.notna(end):
                 duration_sec = (end - start).total_seconds()
             else:
@@ -207,11 +235,11 @@ def apply_failure_rules(**context) -> str:
 
             ts_val = dr.get(preferred_col)
             if pd.notna(ts_val):
-                ts = pd.to_datetime(str(ts_val), errors="coerce")
+                ts = _parse_payload_timestamp(ts_val)
             if pd.isna(ts):
                 ts_val = dr.get(fallback_col)
                 if pd.notna(ts_val):
-                    ts = pd.to_datetime(str(ts_val), errors="coerce")
+                    ts = _parse_payload_timestamp(ts_val)
 
             if pd.isna(ts):
                 raise ValueError("start_date/execution_date 모두 파싱 실패")
@@ -408,6 +436,7 @@ def _build_report_html(results_df: pd.DataFrame, target_date: str) -> str:
     heatmap_html = ""
     if not results_df.empty:
         STATUS_COLOR = {"OK": C_OK, "FAIL": C_FAIL, "WARN": C_WARN}
+        STATUS_MARKER = {"OK": "O", "FAIL": "F", "WARN": "W"}
 
         def _legend(color: str, label: str) -> str:
             return (
@@ -448,22 +477,35 @@ def _build_report_html(results_df: pd.DataFrame, target_date: str) -> str:
             f'<tr><th style="padding:6px 10px;background:{C_HEADER_BG};color:#fff;'
             f'text-align:left;min-width:200px;">DAG</th>{hour_headers}</tr>'
         )
+        def _safe_int(val, default: int = -1) -> int:
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                return default
+
         hourly_data_rows = ""
         for _, row in results_df.sort_values("dag_id").iterrows():
             dag_id_str = str(row["dag_id"])
             dag_label = dag_id_str if len(dag_id_str) <= 35 else dag_id_str[:33] + "…"
-            h_run = int(row.get("start_hour_kst", -1))
+            h_run = _safe_int(row.get("start_hour_kst"))
             status = row["status"]
             cells = ""
             for h in range(24):
                 if h == h_run and h_run >= 0:
                     bg = STATUS_COLOR.get(status, C_OK)
+                    marker = STATUS_MARKER.get(status, "?")
                     cells += (
-                        f'<td title="{status}" style="background:{bg};text-align:center;'
-                        f'font-size:11px;color:#fff;">●</td>'
+                        f'<td title="{status}" bgcolor="{bg}" '
+                        f'style="background:{bg};text-align:center;font-size:10px;'
+                        f'font-weight:bold;color:#111;border:1px solid #ffffff;'
+                        f'min-width:24px;height:18px;">{marker}</td>'
                     )
                 else:
-                    cells += f'<td style="background:{C_EMPTY};"></td>'
+                    cells += (
+                        f'<td title="미실행" bgcolor="{C_EMPTY}" '
+                        f'style="background:{C_EMPTY};text-align:center;font-size:10px;'
+                        f'color:#7f8c8d;border:1px solid #ffffff;min-width:24px;height:18px;">·</td>'
+                    )
             hourly_data_rows += (
                 f'<tr>{_dag_cell(dag_id_str, dag_label, status)}{cells}</tr>'
             )
@@ -486,45 +528,59 @@ def _build_report_html(results_df: pd.DataFrame, target_date: str) -> str:
         ])
 
         minute_sections = ""
-        for hour in active_hours:
-            hour_df = results_df[results_df["start_hour_kst"] == hour].sort_values("dag_id")
-            min_headers = "".join(
-                f'<th style="padding:4px 5px;background:{C_HEADER_BG};color:#fff;'
-                f'font-size:10px;text-align:center;min-width:38px;">{hour:02d}:{m:02d}</th>'
-                for m in MIN_SLOTS
+        if not active_hours:
+            minute_sections = (
+                '<p style="font-size:12px;color:#7f8c8d;">'
+                '실행 시각(start_date/execution_date) 정보가 없어 5분 히트맵을 생성하지 못했습니다.'
+                '</p>'
             )
-            header_row = (
-                f'<tr><th style="padding:6px 10px;background:{C_HEADER_BG};color:#fff;'
-                f'text-align:left;min-width:200px;">DAG</th>{min_headers}</tr>'
-            )
-            data_rows = ""
-            for _, row in hour_df.iterrows():
-                dag_id_str = str(row["dag_id"])
-                dag_label = dag_id_str if len(dag_id_str) <= 35 else dag_id_str[:33] + "…"
-                m_run = int(row.get("start_min_kst", -1))
-                status = row["status"]
-                cells = ""
-                for m in MIN_SLOTS:
-                    if m == m_run and m_run >= 0:
-                        bg = STATUS_COLOR.get(status, C_OK)
-                        cells += (
-                            f'<td title="{status}" style="background:{bg};text-align:center;'
-                            f'font-size:11px;color:#fff;">●</td>'
-                        )
-                    else:
-                        cells += f'<td style="background:{C_EMPTY};"></td>'
-                data_rows += (
-                    f'<tr>{_dag_cell(dag_id_str, dag_label, status)}{cells}</tr>'
+        else:
+            for hour in active_hours:
+                hour_df = results_df[results_df["start_hour_kst"] == hour].sort_values("dag_id")
+                min_headers = "".join(
+                    f'<th style="padding:4px 5px;background:{C_HEADER_BG};color:#fff;'
+                    f'font-size:10px;text-align:center;min-width:38px;">{hour:02d}:{m:02d}</th>'
+                    for m in MIN_SLOTS
                 )
-            minute_sections += (
-                f'<h4 style="color:#34495e;margin:20px 0 6px;">'
-                f'🕐 {hour:02d}시 실행 ({len(hour_df)}개 DAG)</h4>'
-                f'<div style="overflow-x:auto;">'
-                f'<table style="border-collapse:collapse;font-size:12px;">'
-                f'<thead>{header_row}</thead>'
-                f'<tbody>{data_rows}</tbody>'
-                f'</table></div>'
-            )
+                header_row = (
+                    f'<tr><th style="padding:6px 10px;background:{C_HEADER_BG};color:#fff;'
+                    f'text-align:left;min-width:200px;">DAG</th>{min_headers}</tr>'
+                )
+                data_rows = ""
+                for _, row in hour_df.iterrows():
+                    dag_id_str = str(row["dag_id"])
+                    dag_label = dag_id_str if len(dag_id_str) <= 35 else dag_id_str[:33] + "…"
+                    m_run = _safe_int(row.get("start_min_kst"))
+                    status = row["status"]
+                    cells = ""
+                    for m in MIN_SLOTS:
+                        if m == m_run and m_run >= 0:
+                            bg = STATUS_COLOR.get(status, C_OK)
+                            marker = STATUS_MARKER.get(status, "?")
+                            cells += (
+                                f'<td title="{status}" bgcolor="{bg}" '
+                                f'style="background:{bg};text-align:center;font-size:10px;'
+                                f'font-weight:bold;color:#111;border:1px solid #ffffff;'
+                                f'min-width:38px;height:18px;">{marker}</td>'
+                            )
+                        else:
+                            cells += (
+                                f'<td title="미실행" bgcolor="{C_EMPTY}" '
+                                f'style="background:{C_EMPTY};text-align:center;font-size:10px;'
+                                f'color:#7f8c8d;border:1px solid #ffffff;min-width:38px;height:18px;">·</td>'
+                            )
+                    data_rows += (
+                        f'<tr>{_dag_cell(dag_id_str, dag_label, status)}{cells}</tr>'
+                    )
+                minute_sections += (
+                    f'<h4 style="color:#34495e;margin:20px 0 6px;">'
+                    f'🕐 {hour:02d}시 실행 ({len(hour_df)}개 DAG)</h4>'
+                    f'<div style="overflow-x:auto;">'
+                    f'<table style="border-collapse:collapse;font-size:12px;">'
+                    f'<thead>{header_row}</thead>'
+                    f'<tbody>{data_rows}</tbody>'
+                    f'</table></div>'
+                )
 
         minute_heatmap = (
             f'<h3 style="color:#2c3e50;margin-top:36px;">⏱️ 5분 단위 실행 히트맵 (KST)</h3>'
@@ -573,7 +629,7 @@ def save_monitoring_results(**context) -> str:
     payload = ti.xcom_pull(task_ids="apply_failure_rules", key="monitoring_results")
 
     target_date = payload["target_date"]
-    results_df = pd.read_json(payload["results"], orient="records")
+    results_df = pd.read_json(io.StringIO(payload["results"]), orient="records", convert_dates=False)
 
     logger.info(f"save_monitoring_results 시작: target_date={target_date}")
 
@@ -612,7 +668,7 @@ def send_monitoring_alert_email(**context) -> str:
     payload = ti.xcom_pull(task_ids="apply_failure_rules", key="monitoring_results")
 
     target_date = payload["target_date"]
-    results_df = pd.read_json(payload["results"], orient="records")
+    results_df = pd.read_json(io.StringIO(payload["results"]), orient="records", convert_dates=False)
 
     fail_count = int((results_df["status"] == "FAIL").sum()) if not results_df.empty else 0
     warn_count = int((results_df["status"] == "WARN").sum()) if not results_df.empty else 0

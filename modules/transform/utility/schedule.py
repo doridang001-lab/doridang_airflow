@@ -13,7 +13,8 @@ SMD_VISIT_LOG        = "0 12 * * 1,3,5" # 매주 월,수,금 12:00 실행
 SMP_TOORDER_VOC_TIME = "30 9 * * *"     # 매일 09:30 실행
 SMP_FDAM_CS_TIME     = "5 9 * * *"      # 매일 09:05 실행
 
-SMP_DELIVERY_ALERT_TIME = "40 9 * * 1,2,3,4,5"  # 매주 월~금 09:40 실행
+SMP_DELIVERY_ALERT_TIME  = "40 9 * * 1,2,3,4,5"  # 매주 월~금 09:40 실행
+SMP_CLOSING_RATE_TIME    = "0 9 * * 1"             # 매주 월요일 09:00 실행
 SMP_DAG_MONITORING_TIME = "30 16 * * *"  # 매일 16:30 실행 (KST)
 SMP_POLICY_TIME  = "0 10 * * *"   # 매일 10:00 실행 (KST)
 SMP_CHICKEN_PRICE_TIME  = "10 9 * * *"   # 매일 09:10 실행 (KST)
@@ -35,6 +36,7 @@ DB_POSFEED_SALES_TIME        = "15 9 * * *"  # 매일 09:15 실행
 DB_POSFEED_SALES_DETAIL_TIME = "45 9 * * *"  # 매일 09:45 실행
 DB_OKPOS_SALES_TIME          = "35 9 * * *"  # 매일 09:35 실행
 DB_EASYPOS_SALES_TIME        = "50 9 * * *"  # 매일 09:50 실행
+DB_UNIONPOS_RECEIPT_TIME     = "55 9 * * *"  # 매일 09:55 실행
 
 SMD_TOORDER_SALES_REPORT_TIME = "0 9 * * *"  # 매일 09:00 실행
 

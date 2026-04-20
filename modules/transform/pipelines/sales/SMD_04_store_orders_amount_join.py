@@ -234,21 +234,25 @@ def load_reupload_toorder_review(**context):
     """
     스마트 토더 리뷰 로더
     - 업로드_temp + 원드라이브 + download 폴더 동시 glob 검색
-    - CSV 우선, 없으면 엑셀 로드
+    - CSV 우선, 없으면 엑셀 로드, 없으면 누적 raw parquet 합산
     """
-    upload_temp_path = Path('/opt/airflow/download/업로드_temp')
+    upload_temp_paths = [
+        Path('/opt/airflow/download/업로드_temp'),
+        LOCAL_DB / '업로드_temp',
+    ]
     download_path = Path('/opt/airflow/download')
     onedrive_path = COLLECT_DB / "영업관리부_수집"
-    
+
     # 1. CSV 파일 찾기
     csv_files = []
-    
-    if upload_temp_path.exists():
-        temp_csvs = list(upload_temp_path.glob('toorder_review_*.csv'))
-        if temp_csvs:
-            print(f"[업로드_temp] {len(temp_csvs)}개 CSV 발견")
-            csv_files.extend(temp_csvs)
-    
+
+    for upload_temp_path in upload_temp_paths:
+        if upload_temp_path.exists():
+            temp_csvs = list(upload_temp_path.glob('toorder_review_*.csv'))
+            if temp_csvs:
+                print(f"[업로드_temp] {upload_temp_path}에서 {len(temp_csvs)}개 CSV 발견")
+                csv_files.extend(temp_csvs)
+
     if onedrive_path.exists():
         onedrive_csvs = list(onedrive_path.glob('toorder_review_*.csv'))
         if onedrive_csvs:
@@ -301,13 +305,14 @@ def load_reupload_toorder_review(**context):
     
     # 2. CSV 없으면 엑셀 찾기
     excel_files = []
-    
-    if upload_temp_path.exists():
-        temp_excels = list(upload_temp_path.glob('toorder_review_doridang1_*.xlsx'))
-        if temp_excels:
-            print(f"[업로드_temp] {len(temp_excels)}개 엑셀 발견")
-            excel_files.extend(temp_excels)
-    
+
+    for upload_temp_path in upload_temp_paths:
+        if upload_temp_path.exists():
+            temp_excels = list(upload_temp_path.glob('toorder_review_doridang1_*.xlsx'))
+            if temp_excels:
+                print(f"[업로드_temp] {upload_temp_path}에서 {len(temp_excels)}개 엑셀 발견")
+                excel_files.extend(temp_excels)
+
     if download_path.exists():
         download_excels = list(download_path.glob('toorder_review_doridang1_*.xlsx'))
         if download_excels:
@@ -369,7 +374,31 @@ def load_reupload_toorder_review(**context):
         )
         return f"✅ {len(result_df):,}건 (엑셀 로드)"
     
-    # 3. 파일 없음
+    # 3. CSV/엑셀 없으면 temp의 누적 raw parquet 전체 합산
+    raw_parquets = sorted(TEMP_DIR.glob('toorder_review_raw_*.parquet'))
+    if raw_parquets:
+        print(f"[✅ 누적 parquet 사용] {len(raw_parquets)}개 파일 발견")
+        dfs = []
+        for rp in raw_parquets:
+            try:
+                df = pd.read_parquet(rp)
+                dfs.append(df)
+            except Exception as e:
+                print(f"   ⚠️ 건너뜀: {rp.name} - {e}")
+        if not dfs:
+            print(f"[❌ 에러] 유효한 parquet 없음")
+            context['task_instance'].xcom_push(key='toorder_review_path', value=None)
+            return "0건 (parquet 읽기 실패)"
+        result_df = pd.concat(dfs, ignore_index=True)
+        print(f"병합 완료: {len(result_df):,}행 (날짜 범위: {result_df['date'].min()} ~ {result_df['date'].max()})")
+        temp_dir = TEMP_DIR
+        temp_dir.mkdir(exist_ok=True, parents=True)
+        output_path = temp_dir / f"toorder_review_raw_{context['ds_nodash']}.parquet"
+        result_df.to_parquet(output_path, index=False, engine='pyarrow')
+        context['task_instance'].xcom_push(key='toorder_review_path', value=str(output_path))
+        return f"✅ {len(result_df):,}건 (누적 parquet 합산)"
+
+    # 4. 파일 없음
     print(f"[❌ 에러] 토더 리뷰 파일 없음")
     context['task_instance'].xcom_push(key='toorder_review_path', value=None)
     return "0건 (파일 없음)"

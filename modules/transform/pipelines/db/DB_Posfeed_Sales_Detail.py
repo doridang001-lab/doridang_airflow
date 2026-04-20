@@ -19,7 +19,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 from airflow.exceptions import AirflowSkipException
 
@@ -37,6 +37,10 @@ POSFEED_PW = "ehfl8877!!"
 LOGIN_URL   = "https://admin.posfeed.co.kr/#/login?redirect=%2Fdashboard"
 ORDER_DETAIL_URL = "https://admin.posfeed.co.kr/#/order/edit/{code}"
 HEADLESS_MODE = os.getenv("AIRFLOW_HOME") is not None
+
+# 장시간 실행 시 Chrome/driver 누적으로 크래시가 나는 케이스가 있어
+# 매 N개 매장마다 주기적으로 재시작해 안정성을 높인다. (0이면 비활성화)
+_RESTART_DRIVER_EVERY_STORES = 10
 
 # 수집 모드
 # "yesterday"        : posfeed_sales 최신 등록날짜 기준 자동 감지 (기본, 매일 스케줄 실행)
@@ -118,8 +122,29 @@ def _login(driver: uc.Chrome, wait: WebDriverWait) -> None:
     pw_input.send_keys(POSFEED_PW)
     pw_input.send_keys(Keys.RETURN)
     wait.until(lambda d: "#/login" not in d.current_url)
+    _dismiss_change_password_notice(driver)
     time.sleep(2)
     logger.info("Posfeed 로그인 완료 | URL: %s", driver.current_url)
+
+
+def _dismiss_change_password_notice(driver: uc.Chrome) -> None:
+    """비밀번호 변경 안내 페이지에서 '다음에 (30일간 보지않기)'를 클릭해 작업을 계속한다."""
+    try:
+        btn_wait = WebDriverWait(driver, 5)
+        btn = btn_wait.until(
+            EC.element_to_be_clickable(
+                (
+                    By.XPATH,
+                    "//button[.//span[contains(normalize-space(), '다음에')]]",
+                )
+            )
+        )
+        driver.execute_script("arguments[0].click();", btn)
+        time.sleep(0.7)
+        logger.info("비밀번호 변경 안내 팝업: '다음에 (30일간 보지않기)' 클릭 완료")
+    except Exception:
+        # 해당 안내가 없거나 이미 닫힌 경우는 정상 흐름으로 간주
+        pass
 
 
 # ============================================================
@@ -190,6 +215,40 @@ def _scrape_one_order(driver: uc.Chrome, wait: WebDriverWait, order_code: str) -
         })
 
     return result
+
+
+def _is_empty_detail_row(row: dict) -> bool:
+    """상세 행이 실질적으로 비어있는지 판별"""
+    return (
+        str(row.get("상품명", "")).strip() == ""
+        and str(row.get("수량", "")).strip() == ""
+        and str(row.get("단품가격", "")).strip() == ""
+        and str(row.get("합계", "")).strip() == ""
+    )
+
+
+def _is_driver_alive(driver: uc.Chrome) -> bool:
+    """WebDriver 세션 유효성 확인"""
+    try:
+        driver.execute_script("return 1")
+        return True
+    except Exception:
+        return False
+
+
+def _restart_driver_with_login(driver: uc.Chrome | None) -> tuple[uc.Chrome, WebDriverWait]:
+    """브라우저를 재생성하고 로그인까지 완료한 새 세션 반환"""
+    if driver is not None:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+    new_driver = _launch_browser()
+    new_wait = WebDriverWait(new_driver, 15)
+    _login(new_driver, new_wait)
+    logger.info("브라우저 재생성 및 재로그인 완료")
+    return new_driver, new_wait
 
 
 def _append_to_partition(rows: list[dict]) -> None:
@@ -360,6 +419,8 @@ def scrape_order_details(**context) -> str:
     total_failed = 0
     # 매장별 실패 코드 누적 (재시도용): {(brand, store): [code, ...]}
     all_failed: dict[tuple[str, str], list[str]] = {}
+    # 매장별 빈 상세(재수집 전용) 코드 누적
+    all_empty: dict[tuple[str, str], list[str]] = {}
 
     try:
         _login(driver, wait)
@@ -377,11 +438,24 @@ def scrape_order_details(**context) -> str:
             for i, code in enumerate(codes):
                 try:
                     rows = _scrape_one_order(driver, wait, code)
-                    if rows:
-                        for row in rows:
-                            row["brand"] = brand
-                            row["store"] = store
-                        results.extend(rows)
+                    if not rows:
+                        logger.warning("상세 수집 결과 없음 | 코드: %s", code)
+                        failed_codes.append(code)
+                        consecutive_failures += 1
+                        continue
+
+                    non_empty_rows = [r for r in rows if not _is_empty_detail_row(r)]
+                    if not non_empty_rows:
+                        logger.warning("빈 상세 감지 | 코드: %s | 최종 재수집 대상 추가", code)
+                        failed_codes.append(code)
+                        all_empty.setdefault((brand, store), []).append(code)
+                        consecutive_failures += 1
+                        continue
+
+                    for row in non_empty_rows:
+                        row["brand"] = brand
+                        row["store"] = store
+                    results.extend(non_empty_rows)
                     consecutive_failures = 0
                 except Exception as e:
                     logger.warning("실패 | 코드: %s | %s", code, e)
@@ -390,10 +464,28 @@ def scrape_order_details(**context) -> str:
                     if consecutive_failures >= 5:
                         logger.warning("연속 5건 실패 - 재로그인 시도")
                         try:
-                            _login(driver, wait)
+                            if not _is_driver_alive(driver):
+                                logger.warning("WebDriver 세션 비정상 감지 - 브라우저 재생성")
+                                driver, wait = _restart_driver_with_login(driver)
+                            else:
+                                _login(driver, wait)
                             consecutive_failures = 0
                         except Exception as login_err:
                             logger.error("재로그인 실패: %s", login_err)
+                            try:
+                                driver, wait = _restart_driver_with_login(driver)
+                                consecutive_failures = 0
+                            except Exception as restart_err:
+                                logger.error("브라우저 재생성 실패: %s", restart_err)
+
+                    # 개별 실패에서도 세션이 죽었으면 즉시 복구해 다음 코드 처리
+                    if isinstance(e, WebDriverException) or not _is_driver_alive(driver):
+                        logger.warning("WebDriver 연결 끊김 감지 - 즉시 재생성")
+                        try:
+                            driver, wait = _restart_driver_with_login(driver)
+                            consecutive_failures = 0
+                        except Exception as restart_err:
+                            logger.error("즉시 재생성 실패: %s", restart_err)
 
                 # 100건마다 중간 저장
                 if (i + 1) % 100 == 0 and results:
@@ -417,6 +509,19 @@ def scrape_order_details(**context) -> str:
                 logger.warning("실패 코드: %s", failed_codes[:10])
                 all_failed[(brand, store)] = failed_codes
 
+            # 장시간 동작 안정성을 위해 주기적으로 driver 재시작
+            if (
+                _RESTART_DRIVER_EVERY_STORES > 0
+                and done % _RESTART_DRIVER_EVERY_STORES == 0
+                and done < total_stores
+            ):
+                logger.info("주기적 WebDriver 재시작: %d/%d 매장 처리 완료", done, total_stores)
+                try:
+                    driver, wait = _restart_driver_with_login(driver)
+                except Exception as restart_err:
+                    # 재시작 실패 시에는 기존 driver로 계속 시도 (다음 실패에서 복구 가능)
+                    logger.warning("주기적 WebDriver 재시작 실패(계속 진행): %s", restart_err)
+
         # ── 전체 매장 완료 후 실패 코드 일괄 재시도 ──────────────────────────────
         if all_failed:
             retry_total = sum(len(v) for v in all_failed.values())
@@ -428,14 +533,30 @@ def scrape_order_details(**context) -> str:
                 for code in codes:
                     try:
                         rows = _scrape_one_order(driver, wait, code)
-                        if rows:
-                            for row in rows:
-                                row["brand"] = brand
-                                row["store"] = store
-                            results.extend(rows)
+                        if not rows:
+                            retry_failed += 1
+                            continue
+
+                        non_empty_rows = [r for r in rows if not _is_empty_detail_row(r)]
+                        if not non_empty_rows:
+                            retry_failed += 1
+                            all_empty.setdefault((brand, store), []).append(code)
+                            continue
+
+                        for row in non_empty_rows:
+                            row["brand"] = brand
+                            row["store"] = store
+                        results.extend(non_empty_rows)
+
                         retry_success += 1
                         total_success += 1
                         total_failed -= 1
+
+                        key = (brand, store)
+                        if key in all_empty:
+                            all_empty[key] = [c for c in all_empty[key] if c != code]
+                            if not all_empty[key]:
+                                del all_empty[key]
                     except Exception as e:
                         logger.warning("재시도 실패 | %s | %s | %s", store, code, e)
                         retry_failed += 1
@@ -443,10 +564,113 @@ def scrape_order_details(**context) -> str:
                     _append_to_partition(results)
             logger.info("재시도 완료 | 성공: %d / 실패: %d", retry_success, retry_failed)
 
+        # ── 마지막 단계: 빈 상세 행 전용 재수집 (항상 수행) ───────────────────────
+        if all_empty:
+            empty_total = sum(len(v) for v in all_empty.values())
+            logger.info("빈 상세 재수집 시작 | %d개 매장 / %d건", len(all_empty), empty_total)
+            empty_fixed = 0
+            empty_still = 0
+
+            for (brand, store), codes in all_empty.items():
+                results = []
+                # 중복 제거 + 순서 유지
+                unique_codes = list(dict.fromkeys(codes))
+
+                for code in unique_codes:
+                    recovered = False
+                    for _ in range(3):
+                        try:
+                            if not _is_driver_alive(driver):
+                                driver, wait = _restart_driver_with_login(driver)
+
+                            rows = _scrape_one_order(driver, wait, code)
+                            if not rows:
+                                continue
+
+                            non_empty_rows = [r for r in rows if not _is_empty_detail_row(r)]
+                            if not non_empty_rows:
+                                continue
+
+                            for row in non_empty_rows:
+                                row["brand"] = brand
+                                row["store"] = store
+                            results.extend(non_empty_rows)
+                            recovered = True
+                            break
+                        except Exception as e:
+                            logger.warning("빈 상세 재수집 실패(재시도) | %s | %s | %s", store, code, e)
+
+                    if recovered:
+                        empty_fixed += 1
+                        total_success += 1
+                        total_failed = max(0, total_failed - 1)
+                    else:
+                        empty_still += 1
+
+                if results:
+                    _append_to_partition(results)
+
+            logger.info("빈 상세 재수집 완료 | 복구: %d / 미복구: %d", empty_fixed, empty_still)
+
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception as e:
+            logger.warning("WebDriver 종료 중 예외(무시): %s", e)
         logger.info("WebDriver 종료")
 
     result = f"크롤링 완료 | 성공: {total_success}건 / 실패: {total_failed}건 | 모드: {COLLECT_MODE}"
     logger.info(result)
     return result
+
+
+def scrape_missing_order_details(**context) -> str:
+    """scrape_order_details 이후 결과를 기준으로, extract_order_codes에서 추출된 코드 중
+    미수집된 코드만 다시 수집해서 추가 저장한다."""
+    payload = context["ti"].xcom_pull(task_ids="extract_order_codes", key="order_codes")
+    if not payload:
+        raise ValueError("extract_order_codes XCom 'order_codes' 값이 없습니다.")
+
+    extracted_stores: list = payload["stores"]
+    extracted_total = sum(len(s["codes"]) for s in extracted_stores)
+    logger.info("미수집 재수집 체크 시작 | 추출 코드: %d건", extracted_total)
+
+    # extract_order_codes와 동일한 ym_filter 계산 로직 유지
+    df = _load_source_df()
+    mode_type, date_list = _parse_collect_mode()
+    if mode_type == "yesterday":
+        latest_date = df["?깅줉?좎쭨"].dropna().max()
+        ym_filter = str(latest_date)[:7] if latest_date else None
+    elif mode_type == "date_range" and len({d[:7] for d in date_list}) == 1:
+        ym_filter = date_list[0][:7]
+    else:
+        ym_filter = None
+
+    collected_set = _load_collected_set(ym_filter)
+    logger.info("현재까지 수집된 코드: %d건 (ym_filter=%s)", len(collected_set), ym_filter or "*")
+
+    missing_stores = []
+    missing_total = 0
+    for store_info in extracted_stores:
+        brand = store_info["brand"]
+        store = store_info["store"]
+        codes = store_info["codes"]
+        missing_codes = [c for c in codes if c not in collected_set]
+        if missing_codes:
+            missing_total += len(missing_codes)
+            missing_stores.append({"brand": brand, "store": store, "codes": missing_codes})
+
+    if not missing_stores:
+        raise AirflowSkipException("미수집 코드 없음 (추출 코드 모두 수집 완료)")
+
+    logger.warning("미수집 코드 재수집 시작 | 매장: %d개 | 코드: %d건", len(missing_stores), missing_total)
+
+    class _TiShim:
+        def __init__(self, shim_payload: dict):
+            self._payload = shim_payload
+
+        def xcom_pull(self, *args, **kwargs):
+            return self._payload
+
+    # 기존 scrape_order_details 로직을 그대로 재사용 (입력 stores만 missing으로 교체)
+    return scrape_order_details(ti=_TiShim({"stores": missing_stores}))

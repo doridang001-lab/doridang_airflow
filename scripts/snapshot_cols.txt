@@ -1,0 +1,7 @@
+ym
+매장명
+실오픈일
+해지일
+is_active
+is_new
+is_closed

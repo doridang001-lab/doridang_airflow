@@ -80,6 +80,11 @@ CHANNEL_RENAME = {
 }
 
 _DOWNLOAD_TIMEOUT = 30  # 초
+_LOGIN_WAIT_TIMEOUT = 20  # 초
+_LOGIN_MAX_ATTEMPTS = 2
+
+LOGIN_FAIL_URL_PATTERNS = ["/login", "/auth"]
+LOGIN_SUCCESS_URL_PATTERNS = ["/dashboard", "/stores-manage", "/sales-report"]
 
 
 # ============================================================
@@ -303,8 +308,33 @@ def _launch_browser():
 
 
 def _do_login(driver, account_id: str, password: str) -> None:
-    """ToOrder 로그인. 실패 시 RuntimeError"""
+    """ToOrder 로그인. 재시도 후에도 실패 시 RuntimeError"""
     logger.info("로그인 시도: %s", account_id)
+
+    last_error = ""
+    for attempt in range(1, _LOGIN_MAX_ATTEMPTS + 1):
+        logger.info("로그인 시도 %d/%d", attempt, _LOGIN_MAX_ATTEMPTS)
+        try:
+            _do_login_once(driver, account_id, password)
+            logger.info("로그인 성공 (attempt=%d, URL=%s)", attempt, driver.current_url)
+            return
+        except Exception as exc:
+            last_error = str(exc)
+            logger.warning("로그인 실패 (attempt=%d): %s", attempt, last_error)
+            _save_login_debug_artifacts(driver, attempt)
+
+            if attempt < _LOGIN_MAX_ATTEMPTS:
+                try:
+                    driver.delete_all_cookies()
+                except Exception:
+                    pass
+                time.sleep(1.0)
+
+    raise RuntimeError(f"로그인 실패 (재시도 {_LOGIN_MAX_ATTEMPTS}회): {last_error}")
+
+
+def _do_login_once(driver, account_id: str, password: str) -> None:
+    """ToOrder 로그인 1회 수행"""
     driver.get(LOGIN_URL)
 
     # React 앱 로드 대기
@@ -364,12 +394,86 @@ def _do_login(driver, account_id: str, password: str) -> None:
         pw_input.send_keys(Keys.RETURN)
         logger.info("Enter 제출")
 
-    time.sleep(3.0)
+    success, detail = _wait_login_result(driver, timeout_sec=_LOGIN_WAIT_TIMEOUT)
+    if not success:
+        raise RuntimeError(f"로그인 실패 ({detail})")
 
-    current_url = driver.current_url
-    if "/auth" in current_url and "/dashboard" not in current_url:
-        raise RuntimeError(f"로그인 실패 (URL: {current_url})")
-    logger.info("로그인 성공 (URL: %s)", current_url)
+
+def _wait_login_result(driver, timeout_sec: int) -> tuple[bool, str]:
+    """로그인 제출 후 성공/실패를 안정적으로 판정"""
+    deadline = time.time() + timeout_sec
+    last_url = ""
+
+    while time.time() < deadline:
+        current_url = driver.current_url
+        last_url = current_url
+
+        url_ok = any(pattern in current_url for pattern in LOGIN_SUCCESS_URL_PATTERNS)
+        url_fail = any(pattern in current_url for pattern in LOGIN_FAIL_URL_PATTERNS)
+
+        has_login_input = False
+        try:
+            has_login_input = bool(driver.execute_script(
+                "return !!document.querySelector('input[name=\"id\"], input[name=\"password\"]');"
+            ))
+        except Exception:
+            pass
+
+        if url_ok and not url_fail:
+            return True, f"URL 성공 패턴 감지: {current_url}"
+
+        if (not has_login_input) and (not url_fail):
+            return True, f"로그인 폼 비노출 + URL 전환 감지: {current_url}"
+
+        error_text = _extract_login_error_text(driver)
+        if error_text:
+            return False, f"로그인 오류 메시지: {error_text}"
+
+        time.sleep(0.5)
+
+    return False, f"타임아웃({timeout_sec}s), last_url={last_url}"
+
+
+def _extract_login_error_text(driver) -> str:
+    """로그인 화면의 오류 문구를 최대한 추출"""
+    selectors = [
+        "[role='alert']",
+        ".MuiAlert-message",
+        ".ant-message-notice-content",
+        ".toast-message",
+        ".error",
+    ]
+    for selector in selectors:
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, selector)
+            text = (el.text or "").strip()
+            if text:
+                return text
+        except Exception:
+            continue
+    return ""
+
+
+def _save_login_debug_artifacts(driver, attempt: int) -> None:
+    """로그인 실패 시점의 스크린샷/HTML 저장 (재발 시 원인 파악용)"""
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    debug_dir = TEMP_DIR / "toorder_login_debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    png_path = debug_dir / f"login_fail_attempt{attempt}_{ts}.png"
+    html_path = debug_dir / f"login_fail_attempt{attempt}_{ts}.html"
+
+    try:
+        driver.save_screenshot(str(png_path))
+        logger.info("로그인 실패 스크린샷 저장: %s", png_path)
+    except Exception as exc:
+        logger.warning("로그인 실패 스크린샷 저장 실패: %s", exc)
+
+    try:
+        html_path.write_text(driver.page_source, encoding="utf-8")
+        logger.info("로그인 실패 HTML 저장: %s", html_path)
+    except Exception as exc:
+        logger.warning("로그인 실패 HTML 저장 실패: %s", exc)
 
 
 def _human_type(element, text: str) -> None:

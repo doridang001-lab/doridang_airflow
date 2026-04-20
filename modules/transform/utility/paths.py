@@ -239,6 +239,13 @@ def resolve_raw_okpos_sales() -> Path:
 	return resolve_analytics_db() / "okpos_sales_raw"
 
 
+def resolve_raw_unionpos_sales() -> Path:
+	env_path = os.getenv("RAW_UNIONPOS_SALES")
+	if env_path:
+		return Path(env_path)
+	return resolve_analytics_db() / "unionpos_sales_raw"
+
+
 ONEDRIVE_DB = resolve_onedrive_db()
 COLLECT_DB = resolve_collect_db()
 LOCAL_DB = resolve_local_db()
@@ -260,3 +267,4 @@ POLICY_CONSOLIDATED_CSV = ANALYTICS_DB / "policy" / "policy_consolidated_latest.
 REPORT_SALES_DB = resolve_report_sales_db()
 MART_DB = resolve_mart_db()
 RAW_OKPOS_SALES = resolve_raw_okpos_sales()
+RAW_UNIONPOS_SALES = resolve_raw_unionpos_sales()

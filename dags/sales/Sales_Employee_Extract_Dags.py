@@ -26,6 +26,11 @@ EMPLOYEE_GSHEET_URL = "https://docs.google.com/spreadsheets/d/1a6-20U1-FYCQEfbOO
 EMPLOYEE_SHEET_NAME = None
 EMPLOYEE_CSV_PATH = LOCAL_DB / '영업관리부_DB' / 'sales_employee.csv'
 
+# 저장 컬럼 정의 — 새 컬럼 추가 시 이 리스트만 수정
+BASE_FIELDS = ['오픈순서', '호점', '매장명', '사업자번호', '점주명', '담당자',
+               '실오픈일', '상세주소', '광역', '시군구', '읍면동', 'email']
+PLATFORM_FIELDS = ['플랫폼', '계정ID', '계정PW', 'collected_at']
+
 
 def parse_address(address_str):
     """주소를 공백 기준으로 분리하여 광역/시군구/읍면동으로 파싱"""
@@ -155,9 +160,7 @@ def load_employee_from_gsheet(**context):
         '토더': ('토더ID', '토더PW'),
     }
     
-    base_columns = ['오픈순서', '호점', '매장명', '사업자번호', '점주명', '담당자', 
-                    '실오픈일', '상세주소', '광역', '시군구', '읍면동', 'email']
-    base_columns = [col for col in base_columns if col in df.columns]
+    base_columns = [col for col in BASE_FIELDS if col in df.columns]
     
     rows = []
     for _, row in df.iterrows():
@@ -183,11 +186,9 @@ def load_employee_from_gsheet(**context):
     
     
     
-    final_columns = ['오픈순서', '호점', '매장명', '사업자번호', '점주명', '담당자', 
-                     '실오픈일', '상세주소', '광역', '시군구', '읍면동', 
-                     '플랫폼', '계정ID', '계정PW', 'collected_at', 'email']
-    
-    df_final = df_final[[col for col in final_columns if col in df_final.columns]]
+    final_columns = [col for col in BASE_FIELDS + PLATFORM_FIELDS if col in df_final.columns]
+
+    df_final = df_final[final_columns]
     
     # 매장명 정규화 (중앙 매핑: store_name_mapping.py)
     df_final['매장명'] = normalize_store_names(df_final['매장명'])

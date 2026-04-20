@@ -194,6 +194,20 @@ def upload_alerts_to_gsheet(**context):
     print(f"\n[데이터] 행: {len(df):,}건, 열: {len(df.columns)}개")
     print(f"[컬럼] {', '.join(df.columns.tolist()[:10])}...")  # 처음 10개만 표시
 
+    # 담당자별 total_score 최고 매장만 유지 (최신 날짜 기준, 동점 포함)
+    if 'total_score' in df.columns and '담당자' in df.columns and '매장명' in df.columns:
+        df['total_score'] = pd.to_numeric(df['total_score'], errors='coerce').fillna(0)
+        df['order_daily'] = pd.to_datetime(df['order_daily'], errors='coerce')
+        latest_date = df['order_daily'].max()
+        latest = df[df['order_daily'] == latest_date]
+        latest_max = latest['total_score'] == latest.groupby('담당자')['total_score'].transform('max')
+        keep_stores = set(latest.loc[latest_max, '매장명'].unique())
+        before_cnt = len(df)
+        df = df[df['매장명'].isin(keep_stores)].reset_index(drop=True)
+        print(f"[grp 필터] 최신날짜({latest_date.date()}) 기준 담당자별 max 매장 {len(keep_stores)}개: {before_cnt:,} → {len(df):,}건")
+    else:
+        print(f"[grp 필터] 필요 컬럼 없음, 필터 생략")
+
     # ============================================================
     # 3.5️⃣ GSheet 업로드 컬럼 — CSV와 동일한 컬럼명 그대로 전체 업로드
     # ============================================================

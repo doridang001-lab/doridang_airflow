@@ -172,40 +172,27 @@ def _execute_append_unique(
     
     # 파일 저장 (명시적으로 flush)
     try:
-        # 기존 파일 삭제 (권한 문제 방지)
+        # 임시 파일에 쓴 뒤 rename으로 대체 → 기존 파일 소유자 무관하게 덮어쓰기 가능
+        # (rename은 파일 자체 권한이 아닌 디렉토리 쓰기 권한만 요구)
         import os
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            print(f"[DEBUG] 기존 파일 삭제 완료: {file_path}")
+        import tempfile
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(file_path) or ".",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(tmp_fd, 'w', encoding='utf-8-sig', newline='') as f:
+                combined_df.to_csv(f, index=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, file_path)  # 기존 파일 소유자와 무관하게 원자적 교체
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            raise
         
-        # 새로 저장 - 파일 핸들을 명시적으로 관리
-        with open(file_path, 'w', encoding='utf-8-sig', newline='') as f:
-            combined_df.to_csv(f, index=False)
-            f.flush()  # 버퍼를 디스크에 강제 쓰기
-            os.fsync(f.fileno())  # OS 버퍼도 디스크에 강제 쓰기
-        
-        print(f"[DEBUG] to_csv() 완료 및 fsync(): {file_path}")
-        
-        # 파일 시스템 동기화 강제
-        import time
-        time.sleep(2)
-        
-        # 저장 후 검증 - 새로운 프로세스처럼 파일 열기
-        if os.path.exists(file_path):
-            file_size = os.path.getsize(file_path)
-            print(f"[DEBUG] 파일 크기: {file_size} bytes")
-            
-            # 실제 저장된 내용 확인
-            with open(file_path, 'r', encoding='utf-8-sig') as f:
-                lines = f.readlines()
-                print(f"[DEBUG] 파일 실제 행 수 (readlines): {len(lines)}행")
-                if len(lines) > 0:
-                    print(f"[DEBUG] 첫 줄: {lines[0][:80]}")
-                if len(lines) > 1:
-                    print(f"[DEBUG] 둘째 줄: {lines[1][:80]}")
-        else:
-            print(f"[ERROR] 파일이 존재하지 않음: {file_path}")
-            
     except Exception as e:
         print(f"[ERROR] 파일 저장 실패: {e}")
         import traceback

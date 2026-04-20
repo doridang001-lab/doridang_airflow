@@ -26,6 +26,7 @@ from modules.transform.pipelines.db.DB_OKPOS_Sales import (
     download_today_stores,
     download_receipt_stores,
     save_to_raw,
+    check_and_fill_missing_today,
     write_log,
 )
 
@@ -33,6 +34,12 @@ logger = logging.getLogger(__name__)
 
 dag_id = Path(__file__).stem
 
+# ── 수집 날짜 범위 설정 ──────────────────────────────────────────────────────
+# None    → 어제 1일만 수집 (기본 스케줄 동작)
+# 기간 지정 → ("2026-03-01", "2026-03-02") 형식으로 입력하면 1일씩 순차 수집
+# 예) MANUAL_DATE_RANGE = ("2026-03-01", "2026-03-31")  # 3월 전체
+# MANUAL_DATE_RANGE: tuple | None = None
+MANUAL_DATE_RANGE = ("2026-01-01", "2026-03-31")  # 3월 전체
 _ALERT_EMAILS = ["a17019@kakao.com"]
 
 
@@ -88,16 +95,22 @@ with DAG(
     t1 = PythonOperator(
         task_id="resolve_dates",
         python_callable=resolve_sale_dates,
+        op_kwargs={"manual_date_range": MANUAL_DATE_RANGE},
     )
 
+    # Selenium 태스크: Python 레벨(3회) + Airflow 레벨(2회, 3분) 2계층 재시도
     t2 = PythonOperator(
         task_id="download_today",
         python_callable=download_today_stores,
+        retries=2,
+        retry_delay=timedelta(minutes=3),
     )
 
     t3 = PythonOperator(
         task_id="download_receipt",
         python_callable=download_receipt_stores,
+        retries=2,
+        retry_delay=timedelta(minutes=3),
     )
 
     t4 = PythonOperator(
@@ -106,8 +119,15 @@ with DAG(
     )
 
     t5 = PythonOperator(
+        task_id="check_and_fill_missing_today",
+        python_callable=check_and_fill_missing_today,
+        retries=1,
+        retry_delay=timedelta(minutes=3),
+    )
+
+    t6 = PythonOperator(
         task_id="write_log",
         python_callable=write_log,
     )
 
-    t1 >> t2 >> t3 >> t4 >> t5
+    t1 >> t2 >> t3 >> t4 >> t5 >> t6
