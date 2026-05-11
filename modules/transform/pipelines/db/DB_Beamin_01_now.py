@@ -54,13 +54,16 @@ def collect_now_stats(account_list: list[dict]) -> str:
 
             logger.info("로그인 성공: %s", account_id)
 
-            # 항상 대시보드로 명시적 이동 (로그인 리다이렉트 직후 React 미초기화 방지)
-            # page_load_timeout으로 Chrome hang 방지
-            try:
-                driver.set_page_load_timeout(45)
-                driver.get("https://self.baemin.com/")
-            except Exception as e:
-                logger.warning("대시보드 이동 중 타임아웃 (계속 진행): %s", e)
+            # 이미 self.baemin.com에 있으면 재로드 생략 (강제 reload → 메모리 부족 hang 방지)
+            # 그 외(orders/history 등)이면 명시적 이동
+            if "self.baemin.com" not in driver.current_url:
+                try:
+                    driver.set_page_load_timeout(45)
+                    driver.get("https://self.baemin.com/")
+                except Exception as e:
+                    logger.warning("대시보드 이동 중 타임아웃 (계속 진행): %s", e)
+            else:
+                time.sleep(2)  # 로그인 리다이렉트 직후 React 초기화 안정화
             if not wait_for_page(driver, "select[class*='ShopSelect']", timeout=60):
                 logger.warning("메인 대시보드 로드 실패: %s", account_id)
                 fail += 1
