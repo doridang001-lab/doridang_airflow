@@ -54,9 +54,10 @@ def collect_now_stats(account_list: list[dict]) -> str:
 
             logger.info("로그인 성공: %s", account_id)
 
-            # 항상 대시보드로 이동 (세션 복원 URL이 /orders/history 등일 수 있어 조건부 스킵 불가)
-            driver.get("https://self.baemin.com/")
-            if not wait_for_page(driver, "select[class*='ShopSelect']", timeout=30):
+            # 이미 대시보드에 있으면 재로드 생략 (세션 재사용 후 불필요한 full reload → OOM 크래시 방지)
+            if "self.baemin.com" not in driver.current_url:
+                driver.get("https://self.baemin.com/")
+            if not wait_for_page(driver, "select[class*='ShopSelect']", timeout=60):
                 logger.warning("메인 대시보드 로드 실패: %s", account_id)
                 fail += 1
                 continue
@@ -164,19 +165,22 @@ def _save_metrics_csv(stats: dict, brand: str, store: str) -> Path:
     """파티션 경로에 수집 지표 저장.
 
     경로: BAEMIN_METRICS_DB/brand={brand}/store={store}/ym={YYYY-MM}/baemin_now.csv
-    기존 파일이 있으면 append 후 collected_at 기준 중복 제거 (최신 유지).
+    같은 date(당일) 행이 있으면 최신 데이터로 덮어쓴다.
     """
-    ym = datetime.now().strftime("%Y-%m")
+    today = datetime.now().strftime("%Y-%m-%d")
+    ym = today[:7]  # "2026-05"
     out_dir = BAEMIN_METRICS_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "baemin_now.csv"
 
+    stats["date"] = today
     new_df = pd.DataFrame([stats])
 
     if out_path.exists():
         existing = pd.read_csv(out_path, dtype=str)
+        # 같은 date 행 제거 후 새 데이터 추가 (당일 재수집 시 최신으로 덮어쓰기)
+        existing = existing[existing.get("date", pd.Series(dtype=str)) != today]
         combined = pd.concat([existing, new_df.astype(str)], ignore_index=True)
-        combined = combined.drop_duplicates(subset=["collected_at"], keep="last")
         combined.to_csv(out_path, index=False, encoding="utf-8-sig")
     else:
         new_df.to_csv(out_path, index=False, encoding="utf-8-sig")

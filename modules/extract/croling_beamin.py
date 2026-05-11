@@ -308,6 +308,8 @@ def launch_browser(account_id: str):
     options.add_argument('--disable-background-networking')
     options.add_argument('--disable-sync')
     options.add_argument('--mute-audio')
+    options.add_argument('--renderer-process-limit=1')    # 렌더러 프로세스 1개 제한 (메모리)
+    options.add_argument('--js-flags=--max-old-space-size=256')  # JS 힙 256MB 제한
     w, h = random.choice(WINDOW_SIZES)
     options.add_argument(f'--window-size={w},{h}')
     options.add_argument('--lang=ko-KR')
@@ -904,7 +906,9 @@ def human_click(driver, element):
 def wait_for_page(driver, css_selector: str, timeout: int = 60) -> bool:
     """CSS 셀렉터 요소가 나타날 때까지 대기.
 
-    60초 초과 시 새로고침 후 1회 재시도. 반환: True=성공, False=실패.
+    타임아웃 시 새로고침 후 1회 재시도.
+    브라우저 크래시(WebDriverException) 시 False 반환.
+    반환: True=성공, False=실패.
     """
     for attempt in range(2):
         try:
@@ -915,8 +919,15 @@ def wait_for_page(driver, css_selector: str, timeout: int = 60) -> bool:
         except TimeoutException:
             if attempt == 0:
                 log(f"페이지 로드 {timeout}초 초과 → 새로고침 재시도")
-                driver.refresh()
-                time.sleep(random.uniform(3.0, 5.0))
+                try:
+                    driver.refresh()
+                    time.sleep(random.uniform(3.0, 5.0))
+                except WebDriverException as e:
+                    log(f"새로고침 중 브라우저 크래시: {e}")
+                    return False
+        except WebDriverException as e:
+            log(f"브라우저 연결 끊김 (attempt={attempt}): {e}")
+            return False
     return False
 
 
