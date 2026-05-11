@@ -335,7 +335,17 @@ def is_on_login_page(url: str) -> bool:
 
 
 def is_on_success_page(url: str) -> bool:
-    return any(pattern in url.lower() for pattern in LOGIN_SUCCESS_URL_PATTERNS)
+    """self.baemin.com HOST에 있을 때만 True.
+
+    returnUrl 파라미터에 self.baemin.com이 포함된 로그인 페이지
+    (biz-member.baemin.com/login?returnUrl=...self.baemin.com...)
+    를 성공 페이지로 오판하지 않도록 host를 직접 비교한다.
+    """
+    try:
+        from urllib.parse import urlparse
+        return urlparse(url).hostname == "self.baemin.com"
+    except Exception:
+        return False
 
 
 def login_baemin(driver, account_id: str, password: str) -> bool:

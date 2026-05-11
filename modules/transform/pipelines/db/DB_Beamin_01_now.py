@@ -54,9 +54,10 @@ def collect_now_stats(account_list: list[dict]) -> str:
 
             logger.info("로그인 성공: %s", account_id)
 
-            # 이미 self.baemin.com에 있으면 재로드 생략 (강제 reload → 메모리 부족 hang 방지)
-            # 그 외(orders/history 등)이면 명시적 이동
-            if "self.baemin.com" not in driver.current_url:
+            # 이미 self.baemin.com HOST에 있으면 재로드 생략 (강제 reload → 메모리 부족 hang 방지)
+            # returnUrl 파라미터에 self.baemin.com이 포함된 로그인 페이지와 구분하기 위해 urlparse 사용
+            from urllib.parse import urlparse as _urlparse
+            if _urlparse(driver.current_url).hostname != "self.baemin.com":
                 try:
                     driver.set_page_load_timeout(45)
                     driver.get("https://self.baemin.com/")
