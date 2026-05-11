@@ -77,7 +77,7 @@ def load_accounts(**context) -> str:
 
 def collect_now_stats(**context) -> str:
     import random, time
-    wait_sec = random.uniform(0, 300)   # 0~5분 랜덤 대기 (봇 탐지 방지)
+    wait_sec = random.uniform(0, 60)   # 0~1분 랜덤 대기 (봇 탐지 방지)
     logger.info("수집 시작 전 랜덤 대기: %.0f초", wait_sec)
     time.sleep(wait_sec)
 
