@@ -425,7 +425,7 @@ def login_baemin(driver, account_id: str, password: str) -> bool:
 RATIO_LABELS = {"조리시간준수율", "주문접수율", "최근재주문율"}
 
 _COLLECT_METRICS_JS = r"""
-(function() {
+return (function() {
     const LABELS = ['조리소요시간','주문접수시간','최근재주문율','조리시간준수율','주문접수율','최근별점'];
     const RATIO  = new Set(['조리시간준수율','주문접수율','최근재주문율']);
     const result = {};
@@ -433,12 +433,14 @@ _COLLECT_METRICS_JS = r"""
     // 실제 DOM 구조 기반:
     // .WooriShopNowItem-module__TKcC
     //   └── Flex[column]
-    //        ├── span[Typography] → label       (spans[0])
-    //        ├── Flex[row] → span[Typography]   (spans[1], value)
-    //        └── span[Typography] → rank        (spans[2], optional)
+    //        ├── span (label,  spans[0])
+    //        ├── Flex[row] → svg + span (value, spans[1])
+    //        └── span (rank,  spans[2], optional)
+    // ※ querySelectorAll('span[data-atelier-component]')은 execute_script 컨텍스트에서
+    //   null을 반환하는 버그가 있어 plain 'span' 셀렉터를 사용한다.
     const items = document.querySelectorAll('.WooriShopNowItem-module__TKcC');
     for (const item of items) {
-        const spans = item.querySelectorAll('span[data-atelier-component="Typography"]');
+        const spans = item.querySelectorAll('span');
         if (spans.length < 2) continue;
 
         const label = spans[0].textContent.trim();
@@ -785,42 +787,74 @@ def navigate_to_store(driver, store_id: str) -> bool:
 
 
 def select_store_by_id(driver, store_id: str) -> bool:
-    """드롭다운에서 store_id를 선택하고 WooriShopNowItem 로드를 기다린다.
+    """드롭다운에서 store_id를 선택하고 실제 전환을 확인한다.
 
-    React 앱 호환: nativeInputValueSetter + change 이벤트로 선택.
-    선택 후 .ShopSelect-module__j4Qm 텍스트로 실제 전환 확인.
+    React 앱 호환: nativeInputValueSetter + input/change 이벤트.
+    전환 미확인 시 Selenium Select 방식으로 1회 재시도.
     반환: True=성공, False=실패
     """
+    def _js_set(sel_el):
+        """React nativeInputValueSetter 방식으로 선택"""
+        driver.execute_script("""
+            var setter = Object.getOwnPropertyDescriptor(
+                window.HTMLSelectElement.prototype, 'value'
+            ).set;
+            setter.call(arguments[0], arguments[1]);
+            arguments[0].dispatchEvent(new Event('input',  {bubbles: true}));
+            arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
+        """, sel_el, str(store_id))
+
+    def _verify(wait_sec=5):
+        """select 요소의 현재 value 가 store_id와 일치하는지 확인"""
+        try:
+            sel_el = WebDriverWait(driver, wait_sec).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "select[class*='ShopSelect']")
+                )
+            )
+            actual = driver.execute_script("return arguments[0].value;", sel_el)
+            if str(actual) == str(store_id):
+                return True
+            # 보조: 텍스트 기반 확인 (.ShopSelect-module__j4Qm 에 store_id 포함)
+            try:
+                info = driver.find_element(By.CSS_SELECTOR, "[class*='ShopSelect-module__j4Qm']")
+                if str(store_id) in info.text:
+                    return True
+            except Exception:
+                pass
+            log(f"매장 전환 미확인 (expected={store_id}, actual={actual})")
+            return False
+        except Exception:
+            return False
+
     try:
         sel_elem = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located(
                 (By.CSS_SELECTOR, "select[class*='ShopSelect']")
             )
         )
-        # React의 onChange를 트리거하는 방식으로 선택
-        driver.execute_script(r"""
-            var setter = Object.getOwnPropertyDescriptor(
-                window.HTMLSelectElement.prototype, 'value'
-            ).set;
-            setter.call(arguments[0], arguments[1]);
-            arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
-        """, sel_elem, str(store_id))
 
-        # 전환 확인: .ShopSelect-module__j4Qm 에 store_id 포함 여부 (빠른 체크만)
-        try:
-            info_elem = WebDriverWait(driver, 5).until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, ".ShopSelect-module__j4Qm")
-                )
+        # 시도 1: JS nativeInputValueSetter
+        _js_set(sel_elem)
+        time.sleep(1.5)
+        if _verify():
+            return True
+
+        # 시도 2: Selenium Select (실제 DOM 클릭 방식)
+        log(f"JS 방식 전환 실패 → Selenium Select 재시도 ({store_id})")
+        sel_elem = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "select[class*='ShopSelect']")
             )
-            if str(store_id) not in info_elem.text:
-                log(f"매장 전환 미확인 (expected={store_id}, actual={info_elem.text})")
-                return False
-        except Exception:
-            pass   # 확인 실패 시 무시하고 계속
+        )
+        Select(sel_elem).select_by_value(str(store_id))
+        time.sleep(1.5)
+        if _verify():
+            return True
 
-        # 메트릭 데이터 로드는 호출 측(collect_now_stats)에서 time.sleep(20)으로 대기
-        return True
+        log(f"매장 선택 최종 실패 ({store_id})")
+        return False
+
     except Exception as e:
         log(f"매장 선택 실패 ({store_id}): {e}")
         return False
@@ -838,9 +872,7 @@ def wait_for_metrics_data(driver, timeout: int = 45) -> bool:
                             '조리시간준수율','주문접수율','최근별점'];
             const items = document.querySelectorAll('.WooriShopNowItem-module__TKcC');
             if (!items.length) return false;
-            const spans = items[0].querySelectorAll(
-                'span[data-atelier-component="Typography"]'
-            );
+            const spans = items[0].querySelectorAll('span');
             return spans.length >= 2
                 && LABELS.includes(spans[0].textContent.trim())
                 && spans[1].textContent.trim() !== '';
