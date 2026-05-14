@@ -13,12 +13,16 @@ TEST_MODE=True: 모든 이메일을 a17019@kakao.com 단독 수신으로 전환
 
 import importlib
 import os
+import logging
 from pathlib import Path
+from datetime import timedelta
 
 import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
+from modules.common.config import ADMIN_EMAIL
+from modules.transform.utility.mailer import send_email, text_to_html
 from modules.transform.utility.schedule import SMP_DELIVERY_ALERT_TIME
 
 # ============================================================
@@ -26,6 +30,64 @@ from modules.transform.utility.schedule import SMP_DELIVERY_ALERT_TIME
 #            False → 담당자 실 발송 + CC
 # ============================================================
 TEST_MODE = False
+
+# ============================================================
+# Failure alert
+# ============================================================
+logger = logging.getLogger(__name__)
+
+
+def _on_task_failure(context):
+    """
+    실패 즉시 알림 발송.
+    - 1회차 실패: 즉시 알림 (재시도 예정 안내)
+    - 최종 실패: 재시도 소진 후 추가 알림
+    """
+    try:
+        ti = context.get("ti") or context.get("task_instance")
+        task = context.get("task")
+        exc = context.get("exception")
+
+        try_number = getattr(ti, "try_number", None)
+        retries = getattr(task, "retries", None)
+        total_tries = (retries + 1) if isinstance(retries, int) else None
+
+        is_first_failure = (try_number == 1)
+        is_final_failure = (
+            (total_tries is not None)
+            and (try_number is not None)
+            and (try_number >= total_tries)
+        )
+        if not (is_first_failure or is_final_failure):
+            return
+
+        status = "FIRST FAIL (will retry)" if (is_first_failure and not is_final_failure) else "FINAL FAIL"
+        dag_name = getattr(ti, "dag_id", None) or context.get("dag").dag_id
+        task_name = getattr(ti, "task_id", None) or (task.task_id if task else "unknown_task")
+        run_id = context.get("run_id")
+        logical_date = context.get("logical_date") or context.get("execution_date")
+        log_url = getattr(ti, "log_url", None)
+
+        subject = f"[AIRFLOW][TOORDER_DELIVERY] {status}: {dag_name}.{task_name}"
+        body_text = "\n".join(
+            [
+                f"DAG: {dag_name}",
+                f"Task: {task_name}",
+                f"Run ID: {run_id}",
+                f"Logical date: {logical_date}",
+                f"Try: {try_number}/{total_tries or '?'}",
+                f"Log URL: {log_url}",
+                f"Exception: {repr(exc)}",
+            ]
+        )
+        send_email(
+            subject=subject,
+            html_content=text_to_html(body_text),
+            to_emails=ADMIN_EMAIL,
+            **context,
+        )
+    except Exception:
+        logger.exception("Failure alert callback failed")
 
 # ============================================================
 # 파이프라인 모듈 동적 임포트
@@ -52,10 +114,13 @@ with DAG(
     max_active_runs=1,
     tags=["strategy", "toorder", "delivery", "alert", "daily"],
     default_args={
-        "retries": 1,
-        "retry_delay": pendulum.duration(minutes=5),
+        "retries": 3,
+        "retry_delay": timedelta(minutes=3),
+        "retry_exponential_backoff": True,
+        "max_retry_delay": timedelta(minutes=30),
         "email_on_failure": False,
         "email_on_retry": False,
+        "on_failure_callback": _on_task_failure,
     },
 ) as dag:
 

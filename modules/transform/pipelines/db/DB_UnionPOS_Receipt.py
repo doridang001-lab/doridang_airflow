@@ -21,6 +21,7 @@ import pandas as pd
 from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeout
 
 from modules.transform.utility.paths import RAW_UNIONPOS_SALES
+from modules.transform.utility.playwright_launcher import launch_chromium
 
 logger = logging.getLogger(__name__)
 
@@ -152,12 +153,13 @@ def _parse_receipt_items_popup(
     onclick: str,
     receipt_no: str,
     sale_datetime: str,
-) -> list[dict]:
+) -> tuple[list[dict], str]:
     """
     expect_popup 대신 context.pages 기반 직접 감지.
     expect_popup 컨텍스트 매니저는 팝업 닫힘 시 메인 페이지를 죽이는 부작용이 있음.
     """
-    items = []
+    items: list[dict] = []
+    log_status: str = ""
 
     # onclick 실행 전 현재 페이지 집합 스냅샷
     pages_before = {id(p) for p in browser_context.pages}
@@ -166,7 +168,7 @@ def _parse_receipt_items_popup(
         page.evaluate(onclick)
     except Exception as e:
         logger.warning(f"onclick 실행 실패 (영수증={receipt_no}): {e}")
-        return items
+        return items, ""
 
     # 새 창이 열릴 시간 대기
     time.sleep(1.5)
@@ -181,6 +183,7 @@ def _parse_receipt_items_popup(
         try:
             popup_page.wait_for_selector("#receiptList tbody tr", timeout=15000)
             items = _extract_items(popup_page, receipt_no, sale_datetime)
+            log_status = _extract_receipt_log_status(popup_page)
         except Exception as e:
             logger.warning(f"상세품목 팝업 파싱 실패 (영수증={receipt_no}): {e}")
         finally:
@@ -193,6 +196,7 @@ def _parse_receipt_items_popup(
         try:
             page.wait_for_selector("#receiptList tbody tr", timeout=15000)
             items = _extract_items(page, receipt_no, sale_datetime)
+            log_status = _extract_receipt_log_status(page)
         except PlaywrightTimeout:
             logger.warning(f"상세품목 모달 타임아웃 (영수증={receipt_no})")
         finally:
@@ -206,7 +210,71 @@ def _parse_receipt_items_popup(
                 except Exception:
                     pass
 
-    return items
+    return items, log_status
+
+
+def _extract_receipt_log_status(page: Page) -> str:
+    """영수증 팝업 > '로그 정보' 탭에서 '상태' 값만 추출.
+
+    - 반환값: '|' 로 join 한 unique 상태값 (순서 유지)
+      예) '판매' 또는 '판매|취소'
+    """
+    try:
+        page.click("#receiptLogInfo", timeout=5000)
+    except Exception:
+        return ""
+
+    try:
+        page.wait_for_selector("#receiptLogList", timeout=10000)
+    except Exception:
+        return ""
+
+    statuses: list[str] = []
+    try:
+        for row in page.query_selector_all("#receiptLogList tbody tr"):
+            tds = row.query_selector_all("td")
+            # 상태 컬럼: 11번째(0-base index 10)
+            if len(tds) < 11:
+                continue
+            txt = (tds[10].inner_text() or "").strip().replace("\n", " ")
+            if txt:
+                statuses.append(txt)
+    except Exception:
+        return ""
+
+    if not statuses:
+        return ""
+
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for s in statuses:
+        if s in seen:
+            continue
+        seen.add(s)
+        uniq.append(s)
+    return "|".join(uniq)
+
+
+def _atomic_csv_write(file_path: Path, df: pd.DataFrame) -> None:
+    """Write CSV atomically (tempfile + rename) to reduce OneDrive/lock issues."""
+    import tempfile
+
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(file_path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8-sig", newline="") as f:
+            df.to_csv(f, index=False)
+            f.flush()
+            os.fsync(f.fileno())
+        if file_path.exists():
+            os.unlink(file_path)
+        os.rename(tmp_path, file_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
 
 
 def _extract_items(page: Page, receipt_no: str, sale_datetime: str) -> list[dict]:
@@ -313,7 +381,8 @@ def collect_and_save(**context) -> str:
     for attempt in range(1, _RETRY_MAX + 1):
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(
+                browser = launch_chromium(
+                    p,
                     headless=HEADLESS_MODE,
                     args=[
                         "--no-sandbox",
@@ -393,9 +462,13 @@ def _collect_session(
                 if not onclick:
                     logger.warning(f"onclick 없음: 영수증번호={rec['영수증번호']}")
                     continue
-                items = _parse_receipt_items_popup(
+                items, log_status = _parse_receipt_items_popup(
                     page, browser_context, onclick, rec["영수증번호"], rec["판매일시"]
                 )
+                rec["상태"] = log_status
+                if log_status:
+                    for it in items:
+                        it["상태"] = log_status
                 all_item_records.extend(items)
                 logger.info(f"  영수증 {rec['영수증번호']}: {len(items)}개 품목")
 
@@ -425,18 +498,51 @@ def _collect_session(
                          if r.get("매장명") == store_name or store_name == "unknown"]
             if list_rows:
                 list_df = pd.DataFrame(list_rows)
-                n = len(list_df.columns)
+                pk_cols = [c for c in list_df.columns if c != "상태"]
                 list_df["sale_date"]    = sale_date
                 list_df["ym"]           = ym
                 list_df["collected_at"] = now_str
-                list_df["_pk"] = list_df.iloc[:, :n].apply(
+                list_df["_pk"] = list_df[pk_cols].apply(
                     lambda row: hashlib.md5("|".join(row.astype(str)).encode()).hexdigest(), axis=1,
                 )
                 dest_list = base / "unionpos_receipt_list.csv"
-                result = onedrive_csv_save(
-                    df=list_df, file_path=str(dest_list),
-                    pk_col="_pk", timestamp_col="collected_at", if_exists="append",
-                )
+                # Upsert(상태 업데이트 포함): 기존 PK와 매칭되는 행은 '상태'만 갱신하고, 신규 PK만 append.
+                existing_df = pd.DataFrame()
+                if dest_list.exists() and dest_list.stat().st_size > 0:
+                    try:
+                        existing_df = pd.read_csv(dest_list, dtype=str, encoding="utf-8-sig")
+                    except Exception:
+                        existing_df = pd.read_csv(dest_list, dtype=str, encoding="utf-8")
+
+                existing_keys: set[str] = set()
+                if not existing_df.empty and "_pk" in existing_df.columns:
+                    existing_keys = set(existing_df["_pk"].astype(str))
+
+                incoming_keys = set(list_df["_pk"].astype(str))
+                inserted = len(incoming_keys - existing_keys) if existing_keys else len(incoming_keys)
+                duplicated = len(incoming_keys & existing_keys) if existing_keys else 0
+
+                if not existing_df.empty:
+                    if "상태" not in existing_df.columns:
+                        existing_df["상태"] = ""
+
+                    if "상태" in list_df.columns:
+                        status_map = dict(zip(list_df["_pk"].astype(str), list_df["상태"].astype(str)))
+                        new_status = existing_df["_pk"].astype(str).map(status_map)
+                        mask = new_status.notna() & (new_status.astype(str).str.strip() != "")
+                        existing_df.loc[mask, "상태"] = new_status[mask].astype(str)
+
+                    new_rows_df = list_df[~list_df["_pk"].astype(str).isin(existing_keys)]
+                    combined_df = pd.concat([existing_df, new_rows_df], ignore_index=True)
+                else:
+                    combined_df = list_df
+
+                # "상태" 컬럼을 우측 끝으로 이동
+                if "상태" in combined_df.columns:
+                    combined_df = combined_df[[c for c in combined_df.columns if c != "상태"] + ["상태"]]
+
+                _atomic_csv_write(dest_list, combined_df)
+                result = {"inserted": inserted, "duplicated": duplicated, "total": len(list_df)}
                 saved_files.append(str(dest_list))
                 logger.info(f"영수증목록 저장: {dest_list.name} | 신규={result.get('inserted', 0)}")
 
@@ -444,18 +550,51 @@ def _collect_session(
             item_rows = [r for r in all_item_records if r.get("영수증번호") in receipt_nos]
             if item_rows:
                 item_df = pd.DataFrame(item_rows)
-                n2 = len(item_df.columns)
+                pk_cols2 = [c for c in item_df.columns if c != "상태"]
                 item_df["sale_date"]    = sale_date
                 item_df["ym"]           = ym
                 item_df["collected_at"] = now_str
-                item_df["_pk"] = item_df.iloc[:, :n2].apply(
+                item_df["_pk"] = item_df[pk_cols2].apply(
                     lambda row: hashlib.md5("|".join(row.astype(str)).encode()).hexdigest(), axis=1,
                 )
                 dest_items = base / "unionpos_receipt_items.csv"
-                result2 = onedrive_csv_save(
-                    df=item_df, file_path=str(dest_items),
-                    pk_col="_pk", timestamp_col="collected_at", if_exists="append",
-                )
+                # Upsert(상태 업데이트 포함): 기존 PK와 매칭되는 행은 '상태'만 갱신하고, 신규 PK만 append.
+                existing_df2 = pd.DataFrame()
+                if dest_items.exists() and dest_items.stat().st_size > 0:
+                    try:
+                        existing_df2 = pd.read_csv(dest_items, dtype=str, encoding="utf-8-sig")
+                    except Exception:
+                        existing_df2 = pd.read_csv(dest_items, dtype=str, encoding="utf-8")
+
+                existing_keys2: set[str] = set()
+                if not existing_df2.empty and "_pk" in existing_df2.columns:
+                    existing_keys2 = set(existing_df2["_pk"].astype(str))
+
+                incoming_keys2 = set(item_df["_pk"].astype(str))
+                inserted2 = len(incoming_keys2 - existing_keys2) if existing_keys2 else len(incoming_keys2)
+                duplicated2 = len(incoming_keys2 & existing_keys2) if existing_keys2 else 0
+
+                if not existing_df2.empty:
+                    if "상태" not in existing_df2.columns:
+                        existing_df2["상태"] = ""
+
+                    if "상태" in item_df.columns:
+                        status_map2 = dict(zip(item_df["_pk"].astype(str), item_df["상태"].astype(str)))
+                        new_status2 = existing_df2["_pk"].astype(str).map(status_map2)
+                        mask2 = new_status2.notna() & (new_status2.astype(str).str.strip() != "")
+                        existing_df2.loc[mask2, "상태"] = new_status2[mask2].astype(str)
+
+                    new_rows_df2 = item_df[~item_df["_pk"].astype(str).isin(existing_keys2)]
+                    combined_df2 = pd.concat([existing_df2, new_rows_df2], ignore_index=True)
+                else:
+                    combined_df2 = item_df
+
+                # "상태" 컬럼을 우측 끝으로 이동
+                if "상태" in combined_df2.columns:
+                    combined_df2 = combined_df2[[c for c in combined_df2.columns if c != "상태"] + ["상태"]]
+
+                _atomic_csv_write(dest_items, combined_df2)
+                result2 = {"inserted": inserted2, "duplicated": duplicated2, "total": len(item_df)}
                 saved_files.append(str(dest_items))
                 logger.info(f"상세품목 저장: {dest_items.name} | 신규={result2.get('inserted', 0)}")
 

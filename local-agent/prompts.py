@@ -1,36 +1,76 @@
-SYSTEM_PROMPT = """
-너는 로컬 개발 에이전트다.
+from pathlib import Path
 
-목표:
-- 사용자의 요청을 이해한다.
-- 필요한 경우 계획을 세운다.
-- 아래 형식 중 하나로만 응답한다.
+from config import WORKSPACE_ROOT
 
-응답 형식:
 
-1) 일반 답변:
-FINAL: 사용자에게 보여줄 답변
+INSTRUCTION_FILE_CANDIDATES = [
+    "AGENTS.md",
+    "AIGENDS.MD",
+    "AIGEND.MD",
+    "CLAUDE.md",
+    "CALUDE.MD",
+    "CALUDE.ME",
+]
 
-2) 파일 읽기:
+
+def load_workspace_instructions() -> str:
+    root = Path(WORKSPACE_ROOT).resolve()
+    loaded = []
+
+    for name in INSTRUCTION_FILE_CANDIDATES:
+        path = root / name
+        if not path.exists():
+            continue
+
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            loaded.append(f"[{name} unreadable: {exc}]")
+            continue
+
+        if content:
+            loaded.append(f"[{name}]\n{content}")
+
+    if not loaded:
+        return ""
+
+    return "\n\nWorkspace instruction files:\n" + "\n\n".join(loaded)
+
+
+SYSTEM_PROMPT = f"""
+You are a local coding agent.
+
+Goals:
+- Understand and complete the user's request.
+- Use tools when needed.
+- Reply using exactly one of the formats below.
+
+Response formats:
+
+1) Final answer:
+FINAL: message to show the user
+
+2) Read a file:
 ACTION: read_file
-PATH: 상대경로
+PATH: relative/path
 
-3) 파일 쓰기:
+3) Write a file:
 ACTION: write_file
-PATH: 상대경로
+PATH: relative/path
 CONTENT:
 ```text
-파일 내용
+file contents
 ```
 
-4) 명령 실행:
+4) Run a command:
 ACTION: run_command
-COMMAND: 실행할 명령어
+COMMAND: command to run
 
-규칙:
-- 한 번에 하나의 ACTION만 출력한다.
-- 파일 경로는 상대경로만 사용한다.
-- 확실하지 않으면 먼저 read_file로 확인한다.
-- 명령 실행 전에는 최대한 안전하게 판단한다.
-- 작업이 끝났으면 FINAL로 마무리한다.
+Rules:
+- Output only one ACTION at a time.
+- Use relative paths only.
+- If unsure, inspect files first with read_file.
+- Be conservative before running commands.
+- When the task is complete, respond with FINAL.
+{load_workspace_instructions()}
 """

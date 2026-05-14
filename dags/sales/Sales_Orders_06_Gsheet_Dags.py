@@ -17,6 +17,7 @@ from pathlib import Path
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from modules.transform.utility.io import SMD_ORDERS_TIME
+from modules.transform.utility.store_name_mapping import normalize_store_names
 from airflow.sensors.external_task import ExternalTaskSensor
 from airflow.models import DagRun
 from airflow.models.baseoperator import chain
@@ -72,6 +73,28 @@ def _latest_successful_execution_date(dt, **context):
 
 from modules.transform.utility.paths import LOCAL_DB
 from modules.load.load_gsheet import save_to_gsheet
+from modules.transform.pipelines.sales.SMD_07_store_ordesr_alert import (
+    LLM_COLS,
+    add_llm_columns_latest_per_store,
+)
+
+
+def _append_llm_columns_for_main_gsheet(df: pd.DataFrame) -> pd.DataFrame:
+    print(f"\n[LLM] llm_* columns preparing before GSheet upload...")
+    try:
+        df = add_llm_columns_latest_per_store(df)
+    except Exception as e:
+        print(f"[warning] failed to build llm columns: {e}")
+
+    for col in LLM_COLS:
+        if col not in df.columns:
+            df[col] = ''
+
+    base_cols = [c for c in df.columns if c not in LLM_COLS]
+    llm_cols = [c for c in LLM_COLS if c in df.columns]
+    df = df[base_cols + llm_cols]
+    print(f"[LLM] prepared {len(llm_cols)} llm columns at the right end")
+    return df
 
 # ============================================================
 # 설정
@@ -161,6 +184,28 @@ def upload_alerts_to_gsheet(**context):
     # Infinity 변환 후 다시 NaN을 빈 문자열로
     df = df.fillna('')
 
+    # 매장명 정리/정규화 + 예외 처리
+    if '매장명' in df.columns:
+        df['매장명'] = (
+            df['매장명']
+            .astype(str)
+            .str.replace(r'\s+', ' ', regex=True)
+            .str.strip()
+        )
+
+        # 중앙 매핑(SSOT) 적용
+        df['매장명'] = normalize_store_names(df['매장명'])
+
+        # 업로드 대상에서 특정 매장 제거
+        before = len(df)
+        df = df[df['매장명'] != '장모님치킨 호계코오롱점'].copy()
+        removed = before - len(df)
+        if removed:
+            print(f"[매장명] 제외 처리: '장모님치킨 호계코오롱점' {removed:,}건 제거")
+
+        # 추가 alias 보정(공백/입력 흔들림 대비 후 최종 치환)
+        df.loc[df['매장명'] == '해운대 중동점', '매장명'] = '도리당 해운대중동점'
+
 
     # order_daily를 날짜 타입으로 정규화
     if 'order_daily' in df.columns:
@@ -194,20 +239,6 @@ def upload_alerts_to_gsheet(**context):
     print(f"\n[데이터] 행: {len(df):,}건, 열: {len(df.columns)}개")
     print(f"[컬럼] {', '.join(df.columns.tolist()[:10])}...")  # 처음 10개만 표시
 
-    # 담당자별 total_score 최고 매장만 유지 (최신 날짜 기준, 동점 포함)
-    if 'total_score' in df.columns and '담당자' in df.columns and '매장명' in df.columns:
-        df['total_score'] = pd.to_numeric(df['total_score'], errors='coerce').fillna(0)
-        df['order_daily'] = pd.to_datetime(df['order_daily'], errors='coerce')
-        latest_date = df['order_daily'].max()
-        latest = df[df['order_daily'] == latest_date]
-        latest_max = latest['total_score'] == latest.groupby('담당자')['total_score'].transform('max')
-        keep_stores = set(latest.loc[latest_max, '매장명'].unique())
-        before_cnt = len(df)
-        df = df[df['매장명'].isin(keep_stores)].reset_index(drop=True)
-        print(f"[grp 필터] 최신날짜({latest_date.date()}) 기준 담당자별 max 매장 {len(keep_stores)}개: {before_cnt:,} → {len(df):,}건")
-    else:
-        print(f"[grp 필터] 필요 컬럼 없음, 필터 생략")
-
     # ============================================================
     # 3.5️⃣ GSheet 업로드 컬럼 — CSV와 동일한 컬럼명 그대로 전체 업로드
     # ============================================================
@@ -229,6 +260,7 @@ def upload_alerts_to_gsheet(**context):
             ensure_ascii=False
         )
     df['전주상태'] = df.apply(_build_prev_status, axis=1)
+    df = _append_llm_columns_for_main_gsheet(df)
     print(f"[컬럼] ✅ 전주상태 JSON 컬럼 추가 (5개 지표 pre 컬럼 기반)")
 
     print(f"[컬럼] ✅ CSV 원본 컬럼명 그대로 {len(df.columns)}개 업로드 준비 완료")

@@ -8,6 +8,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.keys import Keys
+from selenium.common.exceptions import WebDriverException
 from webdriver_manager.chrome import ChromeDriverManager
 import pandas as pd
 import os
@@ -15,6 +16,35 @@ import glob
 import shutil
 import time
 import datetime as dt
+
+try:
+    from urllib3.exceptions import MaxRetryError  # type: ignore
+except Exception:  # pragma: no cover
+    MaxRetryError = Exception  # type: ignore[misc,assignment]
+
+
+def _safe_current_url(driver) -> str:
+    try:
+        return driver.current_url
+    except Exception:
+        return "<unavailable>"
+
+
+def _is_driver_disconnected_error(exc: BaseException) -> bool:
+    if isinstance(exc, (MaxRetryError, ConnectionRefusedError, BrokenPipeError)):
+        return True
+
+    msg = str(exc)
+    markers = [
+        "Selenium 드라이버 연결이 끊어졌습니다",
+        "Connection refused",
+        "Max retries exceeded with url: /session/",
+        "Failed to establish a new connection",
+        "chrome not reachable",
+        "disconnected:",
+        "invalid session id",
+    ]
+    return any(m in msg for m in markers)
 
 
 def _create_chrome_service_with_retry(max_attempts: int = 3, base_sleep_sec: int = 5) -> Service:
@@ -214,9 +244,12 @@ def login_relay_fms(driver, user_id: str, password: str, server_name: str = "도
 
         try:
             post_wait.until(lambda d: d.current_url != pre_url)
-            print(f"✅ URL 변경 확인: {driver.current_url}")
-        except Exception:
-            print(f"⚠️ URL 미변경, 현재: {driver.current_url}")
+            print(f"✅ URL 변경 확인: {_safe_current_url(driver)}")
+        except Exception as e:
+            if isinstance(e, WebDriverException) and _is_driver_disconnected_error(e):
+                raise RuntimeError("Selenium 드라이버 연결이 끊어졌습니다(로그인 직후).") from e
+
+            print(f"⚠️ URL 미변경, 현재: {_safe_current_url(driver)}")
             # ✅ Enter 키 폴백: 버튼 클릭이 안 먹혔을 경우
             print("  🔄 Enter 키로 로그인 재시도...")
             try:
@@ -235,6 +268,8 @@ def login_relay_fms(driver, user_id: str, password: str, server_name: str = "도
                         print(f"  ❗ 에러 메시지: {el.text}")
                     print(f"  ⚠️ Enter 키 후에도 URL 미변경: {driver.current_url}")
             except Exception as enter_err:
+                if isinstance(enter_err, WebDriverException) and _is_driver_disconnected_error(enter_err):
+                    raise RuntimeError("Selenium 드라이버 연결이 끊어졌습니다(Enter 재시도 중).") from enter_err
                 print(f"  ⚠️ Enter 키 재시도 실패: {enter_err}")
 
         wait_page_ready(driver, timeout=30)
@@ -556,24 +591,42 @@ def run_relay_cs_crawling(
         raise ValueError("download_dir 필수")
 
     os.makedirs(download_dir, exist_ok=True)
-    driver = None
+    last_error: Exception | None = None
 
-    try:
-        print("="*60)
-        print("🚀 Relay CS 크롤링 시작")
-        print("="*60)
+    for attempt in range(1, 3):
+        driver = None
+        try:
+            if attempt > 1:
+                sleep_sec = 5 * attempt
+                print(f"🔁 크롤링 재시도 {attempt}/2 (대기 {sleep_sec}s)")
+                time.sleep(sleep_sec)
 
-        driver = setup_chrome_driver(headless=headless, download_dir=download_dir)
-        login_relay_fms(driver, user_id, password, server_name, server_number, download_dir=download_dir)
-        navigate_to_cs_market(driver)
-        file_path = click_excel_download_and_get_file(driver, download_dir=download_dir, timeout=180)
+            print("=" * 60)
+            print("🚀 Relay CS 크롤링 시작")
+            print("=" * 60)
 
-        print("="*60)
-        print(f"🎉 크롤링 완료: {file_path}")
-        print("="*60)
-        return file_path
+            driver = setup_chrome_driver(headless=headless, download_dir=download_dir)
+            login_relay_fms(driver, user_id, password, server_name, server_number, download_dir=download_dir)
+            navigate_to_cs_market(driver)
+            file_path = click_excel_download_and_get_file(driver, download_dir=download_dir, timeout=180)
 
-    finally:
-        if driver:
-            driver.quit()
-            print("✅ 드라이버 종료")
+            print("=" * 60)
+            print(f"🎉 크롤링 완료: {file_path}")
+            print("=" * 60)
+            return file_path
+
+        except Exception as e:
+            last_error = e
+            if _is_driver_disconnected_error(e):
+                print(f"⚠️ Selenium 세션 종료/연결 끊김 감지: {e.__class__.__name__}")
+                continue
+            raise
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                print("✅ 드라이버 종료")
+
+    raise RuntimeError(f"Relay CS 크롤링 재시도(2회) 모두 실패: {last_error}") from last_error

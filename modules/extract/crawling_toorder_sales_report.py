@@ -13,6 +13,8 @@
 import logging
 import os
 import random
+import re
+import subprocess
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -20,10 +22,13 @@ from typing import Any, Dict, List
 
 import undetected_chromedriver as uc
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+
+from modules.transform.utility.selenium_uc import configure_uc_data_path
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +46,7 @@ HEADLESS_MODE = os.getenv("AIRFLOW_HOME") is not None
 
 LOGIN_URL = "https://ceo.toorder.co.kr/auth/login?returnTo=%2Fdashboard"
 SALES_REPORT_URL = "https://ceo.toorder.co.kr/dashboard/sales-report/orderkinds"
+SALES_REPORT_DATE_URL = "https://ceo.toorder.co.kr/dashboard/sales-report/orderkinds"
 LOGIN_FAIL_URL_PATTERNS = ["/login", "/auth"]
 LOGIN_SUCCESS_URL_PATTERNS = ["/dashboard"]
 
@@ -50,6 +56,7 @@ LOGIN_SUCCESS_URL_PATTERNS = ["/dashboard"]
 # ============================================================
 
 ORIG_FILENAME = "종합보고서_채널별(일)매출보고서.xlsx"
+ORIG_DATE_FILENAME = "종합보고서_일별매출보고서.xlsx"
 
 
 # ============================================================
@@ -72,13 +79,94 @@ def _random_delay(min_sec: float, max_sec: float) -> None:
 
 
 def _human_type(element, text: str) -> None:
-    """사람처럼 한 글자씩 타이핑 (봇 감지 우회)."""
-    element.clear()
+    """사람처럼 타이핑 (React input 호환: click → CTRL+A → DELETE → send_keys)."""
+    element.click()
     time.sleep(0.2)
+    element.send_keys(Keys.CONTROL + "a")
+    time.sleep(0.1)
+    element.send_keys(Keys.DELETE)
+    time.sleep(0.1)
     for char in text:
         element.send_keys(char)
         time.sleep(random.uniform(*TIMING["typing_char"]))
     time.sleep(0.3)
+
+
+def _react_set_value(driver, element, value: str) -> None:
+    """React 컨트롤드 인풋에 값을 주입한다 (native setter + input 이벤트 dispatch)."""
+    driver.execute_script(
+        """
+        const el = arguments[0];
+        const value = arguments[1];
+        const setter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value'
+        ).set;
+        setter.call(el, value);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        """,
+        element,
+        value,
+    )
+
+
+def _fill_react_input(driver, element, value: str, account_id: str, field_name: str) -> bool:
+    """
+    React 컨트롤드 인풋에 값을 입력한다.
+    1) ActionChains (W3C Actions API) - 가장 실제에 가까운 키보드 시뮬레이션
+    2) JS nativeInputValueSetter + input 이벤트 폴백
+    """
+    # ── 1차: ActionChains (OS 수준 키보드 이벤트, React synthetic event 트리거)
+    try:
+        ActionChains(driver).click(element).perform()
+        time.sleep(0.2)
+        ActionChains(driver).key_down(Keys.CONTROL).send_keys("a").key_up(Keys.CONTROL).perform()
+        time.sleep(0.1)
+        ActionChains(driver).send_keys(Keys.DELETE).perform()
+        time.sleep(0.1)
+        ActionChains(driver).send_keys(value).perform()
+        time.sleep(0.3)
+    except Exception as exc:
+        logger.warning("[%s] %s ActionChains 예외: %s", account_id, field_name, exc)
+
+    actual = driver.execute_script("return arguments[0].value;", element) or ""
+    if actual == value:
+        logger.debug("[%s] %s ActionChains OK", account_id, field_name)
+        return True
+
+    logger.warning(
+        "[%s] %s ActionChains 실패(len=%d), JS setter 폴백",
+        account_id, field_name, len(actual),
+    )
+
+    # ── 2차: JS nativeInputValueSetter 폴백
+    try:
+        _react_set_value(driver, element, value)
+        time.sleep(0.3)
+    except Exception as exc:
+        logger.error("[%s] %s JS setter 예외: %s", account_id, field_name, exc)
+        return False
+
+    actual2 = driver.execute_script("return arguments[0].value;", element) or ""
+    logger.info("[%s] %s 최종 DOM value: len=%d", account_id, field_name, len(actual2))
+    return actual2 == value
+
+
+def _save_login_debug(driver, account_id: str, tag: str) -> None:
+    """로그인 실패 디버그용 스크린샷/HTML 저장."""
+    try:
+        from modules.transform.utility.paths import ANALYTICS_DB
+        from datetime import datetime as _dt
+        debug_dir = ANALYTICS_DB / "ai_daily_collection" / "_debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+        png = debug_dir / f"{tag}_{ts}.png"
+        html = debug_dir / f"{tag}_{ts}.html"
+        driver.save_screenshot(str(png))
+        html.write_text(driver.page_source, encoding="utf-8")
+        logger.error("[%s] 디버그 저장: %s", account_id, png.name)
+    except Exception as exc:
+        logger.warning("[%s] 디버그 저장 실패: %s", account_id, exc)
 
 
 # ============================================================
@@ -111,7 +199,7 @@ def _launch_browser(account_id: str, download_dir: Path) -> uc.Chrome:
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--disable-web-resources")
+    options.add_argument("--window-size=1920,1080")
 
     prefs = {
         "download.default_directory": str(download_dir.absolute()),
@@ -126,7 +214,6 @@ def _launch_browser(account_id: str, download_dir: Path) -> uc.Chrome:
     # 설치된 Chrome 버전과 불일치할 수 있으므로, 명시적으로 지정한다.
     version_main: int | None = None
     try:
-        import subprocess
         result = subprocess.run(
             [chrome_bin, "--version"],
             capture_output=True, text=True, timeout=5
@@ -137,7 +224,26 @@ def _launch_browser(account_id: str, download_dir: Path) -> uc.Chrome:
     except Exception as e:
         logger.warning("[%s] Chrome 버전 감지 실패, version_main=None 사용: %s", account_id, e)
 
-    driver = uc.Chrome(options=options, version_main=version_main)
+    try:
+        configure_uc_data_path()
+        kwargs: Dict[str, Any] = {"options": options}
+        if version_main:
+            kwargs["version_main"] = version_main
+        driver = uc.Chrome(**kwargs)
+    except Exception as exc:
+        match = re.search(r"Current browser version is (\d+)", str(exc))
+        if not match:
+            raise
+        detected_version = int(match.group(1))
+        logger.warning(
+            "[%s] ChromeDriver 버전 불일치 감지, version_main=%s 로 재시도",
+            account_id,
+            detected_version,
+        )
+        configure_uc_data_path()
+        driver = uc.Chrome(options=options, version_main=detected_version)
+
+    driver.set_window_size(1920, 1080)
     logger.info("[%s] 브라우저 실행 완료", account_id)
     return driver
 
@@ -190,23 +296,41 @@ def _do_login(driver, account_id: str, password: str) -> bool:
             EC.presence_of_element_located((By.CSS_SELECTOR, "input[name='id']"))
         )
         wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[name='id']")))
-        _human_type(id_input, account_id)
     except TimeoutException:
         logger.error("[%s] ID 필드 타임아웃", account_id)
         return False
 
     try:
         pw_input = driver.find_element(By.CSS_SELECTOR, "input[name='password']")
-        _human_type(pw_input, password)
     except NoSuchElementException:
         logger.error("[%s] 비밀번호 필드 없음", account_id)
         return False
 
+    if not _fill_react_input(driver, id_input, account_id, account_id, "ID"):
+        logger.error("[%s] ID 입력 실패", account_id)
+        _save_login_debug(driver, account_id, "login_id_fail")
+        return False
+
+    if not _fill_react_input(driver, pw_input, password, account_id, "PW"):
+        logger.error("[%s] PW 입력 실패", account_id)
+        _save_login_debug(driver, account_id, "login_pw_fail")
+        return False
+
+    logger.info(
+        "[%s] 입력 검증 OK: id=%r, pw_len=%d",
+        account_id,
+        driver.execute_script("return arguments[0].value;", id_input),
+        len(driver.execute_script("return arguments[0].value;", pw_input) or ""),
+    )
+
     time.sleep(0.3)
     try:
         checkbox = driver.find_element(By.CSS_SELECTOR, "input[name='isCompany']")
-        driver.execute_script("arguments[0].click();", checkbox)
-        logger.debug("[%s] 기업회원 체크박스 클릭", account_id)
+        if not checkbox.is_selected():
+            driver.execute_script("arguments[0].click();", checkbox)
+            logger.info("[%s] 기업회원 체크박스 체크", account_id)
+        else:
+            logger.info("[%s] 기업회원 체크박스 이미 체크됨 (유지)", account_id)
     except Exception:
         pass
 
@@ -232,17 +356,34 @@ def _do_login(driver, account_id: str, password: str) -> bool:
         "arguments[0].scrollIntoView({block: 'center'});", submit_btn
     )
     time.sleep(0.3)
+
+    # submit 직전 DOM 값 최종 확인
+    pre_id = driver.execute_script("return document.querySelector(\"input[name='id']\").value;") or ""
+    pre_pw = driver.execute_script("return document.querySelector(\"input[name='password']\").value;") or ""
+    pre_company = driver.execute_script("return document.querySelector(\"input[name='isCompany']\").checked;")
+    logger.info(
+        "[%s] submit 직전: id=%r, pw_len=%d, isCompany=%s",
+        account_id, pre_id, len(pre_pw), pre_company,
+    )
+
     driver.execute_script("arguments[0].click();", submit_btn)
-    time.sleep(3.0)
+
+    # 고정 sleep 대신 dashboard URL로 전환될 때까지 대기 (최대 15초)
+    try:
+        WebDriverWait(driver, 15).until(EC.url_contains("/dashboard"))
+        time.sleep(1.0)
+    except TimeoutException:
+        pass  # 아래 URL 체크에서 최종 판정
 
     current_url = driver.current_url
-    success = "/dashboard" in current_url or not any(
+    success = "/dashboard" in current_url and not any(
         p in current_url for p in LOGIN_FAIL_URL_PATTERNS
     )
     if success:
         logger.info("[%s] 로그인 성공: %s", account_id, current_url)
     else:
-        logger.error("[%s] 로그인 실패: %s", account_id, current_url)
+        logger.error("[%s] 로그인 실패 (url=%s)", account_id, current_url)
+        _save_login_debug(driver, account_id, "login_fail")
     return success
 
 
@@ -505,6 +646,109 @@ def run_crawling_single_date(
     except Exception as exc:
         result["error"] = str(exc)
         logger.error("[%s] run_crawling_single_date 오류: %s", toorder_id, exc)
+
+    finally:
+        if driver:
+            try:
+                driver.quit()
+                logger.info("[%s] 브라우저 종료", toorder_id)
+            except Exception:
+                pass
+
+    return result
+
+
+def run_crawling_daily_date_page(
+    toorder_id: str,
+    toorder_pw: str,
+    target_date: str,
+    download_dir: Path,
+) -> Dict[str, Any]:
+    """
+    단일 날짜의 '일별매출보고서' 엑셀을 다운로드한다 (/date 페이지).
+
+    Returns:
+        {"success": bool, "file": str|None, "date": str, "error": str|None}
+    """
+    download_dir.mkdir(parents=True, exist_ok=True)
+    driver = None
+    result: Dict[str, Any] = {
+        "success": False,
+        "file": None,
+        "date": target_date,
+        "error": None,
+    }
+
+    try:
+        driver = _launch_browser(toorder_id, download_dir)
+
+        if not _do_login(driver, toorder_id, toorder_pw):
+            result["error"] = "로그인 실패"
+            return result
+
+        logger.info("[%s] 일별매출보고서 페이지 이동", toorder_id)
+        driver.get(SALES_REPORT_DATE_URL)
+        time.sleep(4.0)
+        if "sales-report/orderkinds" not in driver.current_url:
+            result["error"] = f"페이지 이동 실패: {driver.current_url}"
+            return result
+
+        if not _set_date_range(driver, toorder_id, target_date):
+            result["error"] = "날짜 설정 실패"
+            return result
+
+        existing_files = set(download_dir.glob("*"))
+
+        wait = WebDriverWait(driver, 15)
+        report_btn = wait.until(
+            EC.element_to_be_clickable(
+                (By.XPATH, "//button[contains(text(), '보고서 생성')]")
+            )
+        )
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});", report_btn
+        )
+        time.sleep(0.5)
+        driver.execute_script("arguments[0].click();", report_btn)
+        logger.info("[%s] 보고서 생성 클릭: %s", toorder_id, target_date)
+
+        downloaded_file = None
+        for _ in range(30):
+            time.sleep(1)
+            new_files = set(download_dir.glob("*")) - existing_files
+            completed = [
+                f for f in new_files
+                if not f.name.endswith(".crdownload") and f.is_file()
+            ]
+            if completed:
+                time.sleep(1)
+                downloaded_file = completed[0]
+                break
+
+        if not downloaded_file:
+            result["error"] = "다운로드 파일 없음"
+            return result
+
+        yymmdd = datetime.strptime(target_date, "%Y-%m-%d").strftime("%y%m%d")
+        new_name = f"{Path(ORIG_DATE_FILENAME).stem}_{yymmdd}{Path(ORIG_DATE_FILENAME).suffix}"
+        new_path = download_dir / new_name
+
+        if new_path.exists():
+            bak = new_path.with_name(
+                f"{new_path.stem}_bak_{datetime.now().strftime('%H%M%S')}{new_path.suffix}"
+            )
+            new_path.rename(bak)
+
+        downloaded_file.rename(new_path)
+        result["success"] = True
+        result["file"] = str(new_path)
+        logger.info("[%s] 다운로드 완료: %s", toorder_id, new_path.name)
+
+    except TimeoutException:
+        result["error"] = "보고서 생성 버튼 없음 (타임아웃)"
+    except Exception as exc:
+        result["error"] = str(exc)
+        logger.error("[%s] run_crawling_daily_date_page 오류: %s", toorder_id, exc)
 
     finally:
         if driver:

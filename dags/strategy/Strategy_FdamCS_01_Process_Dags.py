@@ -45,6 +45,12 @@ filename = os.path.basename(__file__)
 DOWNLOAD_DIR        = str(DOWN_DIR)
 CREDENTIALS_PATH    = "/opt/airflow/config/rare-ethos-483607-i5-45c9bec5b193.json"
 FALLBACK_CREDENTIALS_PATH = "/opt/airflow/config/glowing-palace-465904-h6-7f82df929812.json"
+# 진행상황(완료) 표기용 컨트롤 시트 (알림/Flow 업로드 중단 조건)
+STATUS_GSHEET_URL   = "https://docs.google.com/spreadsheets/d/1Ijbf7xTnp4A_VFuonfjCnIiAUN22mVidx0FS_cjfL9I/edit?usp=sharing"
+STATUS_GSHEET_DISPLAY_URL = "https://docs.google.com/spreadsheets/d/1Ijbf7xTnp4A_VFuonfjCnIiAUN22mVidx0FS_cjfL9I/edit?pli=1&gid=0#gid=0"
+STATUS_SHEET_NAME   = None  # None이면 첫 번째 시트 사용
+STATUS_TABLE_RANGE  = "A5:N"  # A5~N5가 DF 헤더 시작점
+STATUS_DONE_VALUE   = "완료"
 CS_GSHEET_URL       = "https://docs.google.com/spreadsheets/d/1DHbZX5jDkiZfe0SPr3eRinPXuSFomYm2AN-gMADoBkI/edit?gid=1488056813#gid=1488056813"
 CS_SHEET_NAME       = "시트1"
 RELAY_USER_ID       = "조민준"
@@ -645,6 +651,132 @@ def _credential_candidates() -> list[str]:
     return deduped
 
 
+def _pick_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    if df is None or df.empty:
+        return None
+    cols = list(df.columns)
+    for c in candidates:
+        if c in cols:
+            return c
+    compact_map = {re.sub(r"\s+", "", str(col)): col for col in cols}
+    for c in candidates:
+        key = re.sub(r"\s+", "", c)
+        if key in compact_map:
+            return compact_map[key]
+    return None
+
+
+def _read_gsheet_table(gc, url: str, sheet_name: str | None, a1_range: str) -> pd.DataFrame:
+    """
+    Google Sheet 특정 영역(A1 range)에서 DF 로드.
+    - 첫 행을 헤더로 사용
+    - 공백 행 제거
+    """
+    sh = gc.open_by_url(url)
+    ws = sh.worksheet(sheet_name) if sheet_name else sh.sheet1
+    values = ws.get(a1_range)
+    if not values or len(values) < 2:
+        return pd.DataFrame()
+
+    header = [str(h).strip() for h in values[0]]
+    rows = values[1:]
+    cleaned_rows = []
+    for r in rows:
+        row = list(r) + [''] * max(0, len(header) - len(r))
+        row = row[:len(header)]
+        if all(str(v).strip() == '' for v in row):
+            continue
+        cleaned_rows.append([str(v).strip() if v is not None else '' for v in row])
+    if not cleaned_rows:
+        return pd.DataFrame(columns=header)
+    return pd.DataFrame(cleaned_rows, columns=header)
+
+
+def _load_status_done_table_df() -> pd.DataFrame:
+    """
+    컨트롤 시트에서 (접수번호, 경로번호, 진행상황알림)만 추출.
+    실패 시 빈 DF 반환 (알림 로직은 기존대로 진행).
+    """
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    try:
+        scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        candidates = _credential_candidates()
+        if not candidates:
+            return pd.DataFrame()
+        creds = Credentials.from_service_account_file(candidates[0], scopes=scopes)
+        gc = gspread.authorize(creds)
+        df_raw = _read_gsheet_table(gc, STATUS_GSHEET_URL, STATUS_SHEET_NAME, STATUS_TABLE_RANGE)
+        if df_raw.empty:
+            return pd.DataFrame()
+
+        # 컨트롤 시트에서 CS 시트의 '접수번호'와 매칭될 키 컬럼 탐색.
+        # - 과거: '접수번호' 또는 '번호'가 실제 접수번호 역할
+        # - 현재(2026-04): '번호'는 단순 시퀀스이고 '경로번호'가 접수번호 역할
+        receipt_col = _pick_column(df_raw, ['접수번호', '경로번호', '경로 번호', '경로No', '경로 NO', '번호'])
+        route_col = _pick_column(df_raw, ['경로번호', '경로 번호', '경로No', '경로 NO'])
+        if route_col and receipt_col and route_col == receipt_col:
+            route_col = None
+        status_col = _pick_column(df_raw, ['진행상황알림', '진행상황 알림', '진행상태알림', '진행상태 알림'])
+
+        if not receipt_col or not status_col:
+            return pd.DataFrame()
+
+        keep_cols = [receipt_col, status_col] + ([route_col] if route_col else [])
+        df = df_raw[keep_cols].copy()
+        rename = {receipt_col: '접수번호', status_col: '진행상황알림'}
+        if route_col:
+            rename[route_col] = '경로번호'
+        df = df.rename(columns=rename)
+
+        for c in ['접수번호', '경로번호', '진행상황알림']:
+            if c in df.columns:
+                df[c] = df[c].astype(str).str.strip()
+
+        join_cols = ['접수번호'] + (['경로번호'] if '경로번호' in df.columns else [])
+        df = df.dropna(subset=['접수번호']).drop_duplicates(subset=join_cols, keep='last')
+        return df
+    except Exception as e:
+        print(f"[컨트롤시트] 진행상황알림 로드 실패(무시하고 진행): {e}")
+        return pd.DataFrame()
+
+
+def _exclude_done_rows(df_cs: pd.DataFrame, df_done: pd.DataFrame, label: str) -> pd.DataFrame:
+    """
+    컨트롤 시트 진행상황알림='완료'인 건은 알림/Flow 업로드 대상에서 제외.
+    - LEFT JOIN ON: (접수번호, 경로번호) 우선, 없으면 접수번호만
+    """
+    if df_cs is None or df_cs.empty or df_done is None or df_done.empty:
+        return df_cs
+
+    receipt_col = _pick_column(df_cs, ['접수번호'])
+    if not receipt_col:
+        return df_cs
+
+    df_work = df_cs.copy()
+    if receipt_col != '접수번호':
+        df_work = df_work.rename(columns={receipt_col: '접수번호'})
+    df_work['접수번호'] = df_work['접수번호'].astype(str).str.strip()
+
+    join_cols = ['접수번호']
+    if '경로번호' in df_done.columns:
+        route_col = _pick_column(df_work, ['경로번호'])
+        if route_col:
+            if route_col != '경로번호':
+                df_work = df_work.rename(columns={route_col: '경로번호'})
+            df_work['경로번호'] = df_work['경로번호'].astype(str).str.strip()
+            join_cols.append('경로번호')
+
+    merged = df_work.merge(df_done[join_cols + ['진행상황알림']], on=join_cols, how='left')
+    done_mask = merged['진행상황알림'].astype(str).str.strip().eq(STATUS_DONE_VALUE)
+    excluded = int(done_mask.sum())
+    if excluded:
+        print(f"[{label}] 진행상황알림='{STATUS_DONE_VALUE}' 제외: {excluded}건")
+    merged = merged[~done_mask].copy()
+    return merged.drop(columns=['진행상황알림'], errors='ignore')
+
+
 def upload_df_to_gsheet(df: pd.DataFrame, label: str = "") -> str:
     print(f"  [구글시트] {label} append 시작: {len(df)}건")
 
@@ -1024,6 +1156,15 @@ def _build_overdue_email_html(df: pd.DataFrame, today_str: str) -> str:
                         </td>
                     </tr>
 
+                    <tr>
+                        <td style="padding:20px 30px 0 30px;">
+                            <a href="{STATUS_GSHEET_DISPLAY_URL}" target="_blank" rel="noopener noreferrer"
+                               style="display:inline-block;padding:12px 18px;background:#1a73e8;color:#ffffff;text-decoration:none;border-radius:6px;font-size:13px;font-weight:bold;">
+                                [진행상황상세(Gsheet)]
+                            </a>
+                        </td>
+                    </tr>
+
                     <!-- 데이터 테이블 -->
                     <tr>
                         <td style="padding:20px 30px;">
@@ -1256,9 +1397,15 @@ def send_overdue_cs_alert(**context):
     today_str = now_kst.to_date_string()
     print(f"[CS지연알림] 기준일(수집일, KST): {today_str}")
 
+    dag_run = context.get('dag_run')
+    run_id = getattr(dag_run, 'run_id', '') if dag_run else ''
+    is_task_test = 'temporary_run' in str(run_id)
+    dry_run = bool(is_task_test)
+    if dry_run:
+        print(f"[CS지연알림] DRY RUN (airflow tasks test) → 이메일 발송은 스킵합니다. run_id={run_id}")
+
     # 스케줄러 재기동 시, 어제(또는 과거) 미실행 스케줄이 즉시 실행될 수 있음.
     # 운영 요구사항: 당일 09:10 스케줄 건만 발송 대상으로 처리.
-    dag_run = context.get('dag_run')
     data_interval_end = context.get('data_interval_end')
     if dag_run and dag_run.run_type == 'scheduled' and data_interval_end is not None:
         end_kst = data_interval_end.in_timezone("Asia/Seoul")
@@ -1327,6 +1474,10 @@ def send_overdue_cs_alert(**context):
     df_open = df_today[cond_not_done].copy()
     print(f"[CS지연알림] 미완료 데이터: {len(df_open)}건")
 
+    # 진행상황알림="완료" (컨트롤 시트)인 건은 처리완료로 간주 → 알림 대상 제외
+    df_done = _load_status_done_table_df()
+    df_open = _exclude_done_rows(df_open, df_done, label="CS지연알림")
+
     if df_open.empty:
         print("[CS지연알림] 미완료 건 없음 → 발송 생략")
         return "미완료 건 없음"
@@ -1361,17 +1512,20 @@ def send_overdue_cs_alert(**context):
     subject = f"[도리당 CS] 처리 지연 알림 - {len(df_alert)}건 | {today_str}"
     html    = _build_overdue_email_html(df_alert, today_str)
 
-    try:
-        _send_cs_alert_email(
-            subject=subject,
-            html_content=html,
-            to_emails=to_list,
-            cc_emails=cc_list,
-        )
-        print(f"[CS지연알림] ✅ 지연 알림 발송 성공 ({len(df_alert)}건)")
-    except Exception as e:
-        print(f"[CS지연알림] ❌ 지연 알림 발송 실패: {e}")
-        raise
+    if dry_run:
+        print(f"[CS지연알림] DRY RUN → 지연 알림 이메일 발송 스킵 ({len(df_alert)}건)")
+    else:
+        try:
+            _send_cs_alert_email(
+                subject=subject,
+                html_content=html,
+                to_emails=to_list,
+                cc_emails=cc_list,
+            )
+            print(f"[CS지연알림] ✅ 지연 알림 발송 성공 ({len(df_alert)}건)")
+        except Exception as e:
+            print(f"[CS지연알림] ❌ 지연 알림 발송 실패: {e}")
+            raise
 
     # ── 7. 비공개메모 누락/형식불일치 알림 ──────────────────────
     if '비공개메모' not in df_open.columns:
@@ -1400,19 +1554,23 @@ def send_overdue_cs_alert(**context):
     memo_subject = f"[도리당 CS] 비공개메모 입력 요청 - {len(df_memo_alert)}건 | {today_str}"
     memo_html    = _build_memo_alert_email_html(df_memo_alert, today_str)
 
-    try:
-        _send_cs_alert_email(
-            subject=memo_subject,
-            html_content=memo_html,
-            to_emails=to_list,
-            cc_emails=cc_list,
-        )
-        print(f"[CS지연알림] ✅ 메모 알림 발송 성공 ({len(df_memo_alert)}건)")
-    except Exception as e:
-        print(f"[CS지연알림] ❌ 메모 알림 발송 실패: {e}")
-        raise
+    if dry_run:
+        print(f"[CS지연알림] DRY RUN → 메모 알림 이메일 발송 스킵 ({len(df_memo_alert)}건)")
+    else:
+        try:
+            _send_cs_alert_email(
+                subject=memo_subject,
+                html_content=memo_html,
+                to_emails=to_list,
+                cc_emails=cc_list,
+            )
+            print(f"[CS지연알림] ✅ 메모 알림 발송 성공 ({len(df_memo_alert)}건)")
+        except Exception as e:
+            print(f"[CS지연알림] ❌ 메모 알림 발송 실패: {e}")
+            raise
 
-    return f"발송 완료 지연={len(df_alert)}건 | 메모알림={len(df_memo_alert)}건"
+    status_prefix = "DRY RUN" if dry_run else "발송 완료"
+    return f"{status_prefix} 지연={len(df_alert)}건 | 메모알림={len(df_memo_alert)}건"
 
 
 # ============================================================

@@ -21,15 +21,19 @@ import hashlib
 import logging
 import os
 import re
+import subprocess
+import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-from playwright.sync_api import sync_playwright, Frame, Page
+from playwright.sync_api import sync_playwright, Frame, Page, TimeoutError as PlaywrightTimeoutError
+from playwright._impl._errors import TargetClosedError
 
-from modules.transform.utility.paths import ANALYTICS_DB, TEMP_DIR
+from modules.transform.utility.paths import ANALYTICS_DB, DOWN_DIR, TEMP_DIR
 from modules.load.load_onedrive import onedrive_csv_save
+from modules.transform.utility.playwright_launcher import launch_chromium
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +65,18 @@ _AD_POPUP_CLOSE = "mainframe_childframe_placeAdPopup_titlebar_closebutton"
 _MENU_SALES_BRIEF = "mainframe_childframe_form_divTop_img_TA_top_menu2"   # 영업속보
 _BTN_YESTERDAY    = "mainframe_childframe_form_divMain_divWork_divSalesDate_btnBeforeDay"
 _BTN_SEARCH       = "mainframe_childframe_form_divMain_divMainNavi_divCommonBtn_btnCommSearch"
+
+# 일자별매출조회 — grdLeft 사이드 메뉴 gridrow_2
+_GRDLEFT_DAILY_INQUIRY = (
+    "mainframe_childframe_form_divLeftMenu_divLeftMainList_grdLeft_body_"
+    "gridrow_2_cell_2_0_controltreeTextBoxElement"
+)
+_DAILY_INQUIRY_READY_SELECTORS = [
+    "[id*='grdSalePerDay'][id*='body']",
+    "[id*='divMainNavi'][id*='btnCommSearch']",
+    "[id*='btnCommSearch']",
+    "[id*='btnCommExcel']",
+]
 _BTN_YESTERDAY_SELECTORS = [
     f"#{_BTN_YESTERDAY}",
     "[id$='btnBeforeDay']",
@@ -75,8 +91,18 @@ _BTN_SEARCH_SELECTORS = [
     "xpath=//*[contains(@id,'btnCommSearch')]",
     "xpath=//*[contains(normalize-space(.),'조회') and contains(@id,'btn')]",
 ]
+_BTN_EXCEL_SELECTORS = [
+    "[id$='btnCommExcel']",
+    "[id*='btnCommExcel']",
+    "xpath=//*[contains(@id,'btnCommExcel')]",
+    "xpath=//*[contains(normalize-space(.),'엑셀') and (contains(@id,'btn') or contains(@id,'Excel'))]",
+]
 _DATE_INPUT_SELECTORS = [
-    # Nexacro date component input
+    # mskSales: NexacroN 마스크 날짜 입력 — 가장 신뢰도 높은 선택자
+    "[id*='divSalesDate'][id*='mskSales'][id$='_input']",
+    "[id*='mskSales'][id$='_input']",
+    "xpath=//*[contains(@id,'mskSales') and substring(@id, string-length(@id) - 5) = '_input']",
+    # 구버전 fallback
     "[id*='SalesDate'][id$='_input']",
     "[id*='SaleDate'][id$='_input']",
     "[id*='divSalesDate'] [id$='_input']",
@@ -124,10 +150,56 @@ _POPUP_CLOSE_BTN    = "mainframe_childframe_popupBill_titlebar_closebutton"
 _MAIN_GRID_PREFIX   = "mainframe_childframe_form_divMain_divWork_grdSalePerDayList_body_"
 _DETAIL_GRID_PREFIX = "mainframe_childframe_popupBill_form_grdDetailList_body_"
 
+# 엑셀 다운로드 / 수동 일별합계 경로
+EASYPOS_SALES_DOWNLOAD_DIR       = TEMP_DIR / "easypos_sales_download"
+EASYPOS_MANUAL_TOTALS_CSV        = ANALYTICS_DB / "easypos_sales_raw" / "_manual_daily_totals.csv"
+EASYPOS_MANUAL_ARCHIVE_DIR       = DOWN_DIR / "업로드_temp"
+EASYPOS_MANUAL_TOTALS_FALLBACK_CSV = EASYPOS_MANUAL_ARCHIVE_DIR / "easypos_manual_daily_totals.csv"
+
 
 # ============================================================
 # 내부 유틸
 # ============================================================
+
+def _playwright_auto_install_enabled() -> bool:
+    value = os.getenv("PLAYWRIGHT_AUTO_INSTALL")
+    if value is None:
+        return os.getenv("AIRFLOW_HOME") is not None or os.getenv("IS_DOCKER", "").strip() in {
+            "1", "true", "True", "YES", "yes",
+        }
+    return value.strip() in {"1", "true", "True", "YES", "yes"}
+
+
+def _ensure_playwright_chromium_installed() -> None:
+    if not _playwright_auto_install_enabled():
+        raise RuntimeError(
+            "Playwright Chromium 브라우저 실행 파일이 없습니다. "
+            "컨테이너에서 `python -m playwright install chromium` 을 실행하거나 "
+            "`PLAYWRIGHT_AUTO_INSTALL=1` 로 자동 설치를 활성화하세요."
+        )
+    logger.warning("Playwright 브라우저가 없어서 chromium 설치를 시도합니다..")
+    proc = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        raise RuntimeError(
+            "Playwright chromium 설치가 실패했습니다. "
+            "스토리지/권한/PLAYWRIGHT_BROWSERS_PATH 설정을 확인하세요.\n"
+            f"stdout:\n{stdout[-2000:]}\n\nstderr:\n{stderr[-2000:]}"
+        )
+
+
+def _is_page_closed(page: "Page | None") -> bool:
+    try:
+        return page is None or page.is_closed()
+    except Exception:
+        return True
+
 
 def _get_main_frame(page: Page) -> Frame:
     """NexacroN main 프레임 반환 — 모든 UI 요소가 name='main' 프레임 안에 있음"""
@@ -367,6 +439,85 @@ def _set_sale_date_inputs(mf: Frame, sale_date: str) -> bool:
     return filled > 0
 
 
+def _set_sale_date_inputs_v2(mf: Frame, sale_date: str, page: "Page | None" = None) -> bool:
+    """날짜 입력 v2 — mskSales 마스크 입력 우선, YYYYMMDD 형식으로 keyboard.type() 사용.
+    NexacroN mskSales는 fill()/el.type() 으로 내부 상태가 갱신되지 않아
+    클릭 후 Ctrl+A → page.keyboard.type() 방식으로 우회한다.
+    """
+    def _digits(v) -> str:
+        return re.sub(r"\D", "", str(v or ""))
+
+    def _read_value(el) -> str:
+        try:
+            return (el.evaluate("el => el.value") or "").strip()
+        except Exception:
+            return ""
+
+    def _matches(el) -> bool:
+        return _digits(_read_value(el)) == _digits(sale_date)
+
+    date_no_dash = _digits(sale_date)
+    filled = 0
+    seen_ids: set[str] = set()
+
+    for sel in _DATE_INPUT_SELECTORS:
+        try:
+            els = mf.query_selector_all(sel)
+        except Exception:
+            continue
+        for el in els:
+            el_id = el.get_attribute("id") or ""
+            if el_id and el_id in seen_ids:
+                continue
+            if el_id:
+                seen_ids.add(el_id)
+            try:
+                try:
+                    el.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                el.click()
+                time.sleep(0.2)
+
+                if _matches(el):
+                    logger.info("날짜 이미 일치: id=%s sel=%s value=%r", el_id, sel, _read_value(el))
+                    filled += 1
+                    continue
+
+                if page:
+                    page.keyboard.press("Control+a")
+                    time.sleep(0.1)
+                    page.keyboard.type(date_no_dash)
+                    time.sleep(0.2)
+                    page.keyboard.press("Tab")
+                else:
+                    el.press("Control+a")
+                    time.sleep(0.1)
+                    el.type(date_no_dash)
+                    time.sleep(0.2)
+                    el.press("Tab")
+                time.sleep(0.3)
+
+                if _matches(el):
+                    logger.info("날짜 입력 성공: id=%s sel=%s value=%r", el_id, sel, _read_value(el))
+                    filled += 1
+                    continue
+
+                # fallback: fill + enter
+                for _ in range(10):
+                    if _matches(el):
+                        logger.info("날짜 입력 성공(폴백): id=%s", el_id)
+                        filled += 1
+                        break
+                    time.sleep(0.2)
+            except Exception:
+                continue
+            if filled >= 2:
+                return True
+
+    return filled > 0
+
+
 def _pw_text(mf: Frame, element_id: str) -> str:
     """NexacroN 셀 텍스트 추출"""
     try:
@@ -374,6 +525,17 @@ def _pw_text(mf: Frame, element_id: str) -> str:
         if el is None:
             return ""
         return (el.inner_text() or "").strip()
+    except Exception:
+        return ""
+
+
+def _pw_input_value(mf: Frame, element_id: str) -> str:
+    """NexacroN input value 추출 (el.value 기반)"""
+    try:
+        el = mf.query_selector(f"#{element_id}")
+        if el is None:
+            return ""
+        return (el.evaluate("el => el.value") or "").strip()
     except Exception:
         return ""
 
@@ -483,12 +645,176 @@ def _click_handle(
 
 
 def _parse_amount(text: str) -> int:
-    """'35,800' → 35800, 빈값/비숫자 → 0"""
+    """'35,800' → 35800, '30500.0' → 30500, 빈값/비숫자 → 0"""
     cleaned = re.sub(r"[,\s]", "", str(text))
     try:
-        return int(cleaned)
+        return int(float(cleaned))
     except (ValueError, TypeError):
         return 0
+
+
+def _cleanup_download_dir(download_dir: Path, pattern: str = "*") -> None:
+    download_dir.mkdir(parents=True, exist_ok=True)
+    for p in download_dir.glob(pattern):
+        if p.is_file():
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _normalize_sale_date(value) -> str:
+    """다양한 형식의 날짜 값을 YYYY-MM-DD로 정규화"""
+    try:
+        text = str(value or "").strip()
+        # YYYYMMDD → YYYY-MM-DD
+        if re.fullmatch(r"\d{8}", text):
+            return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+        m = re.match(r"(\d{4})-(\d{2})-(\d{2})", text)
+        return m.group(0) if m else text
+    except Exception:
+        text = str(value or "").strip()
+        m = re.match(r"(\d{4})-(\d{2})-(\d{2})", text)
+        return m.group(0) if m else text
+
+
+def _load_manual_daily_totals() -> dict[str, int]:
+    """DOWN_DIR에서 수동 다운로드한 일자별 매출내역 Excel 로드 → {sale_date: total_sales}"""
+    rows: list[dict] = []
+    for path in sorted(DOWN_DIR.glob("일자별 매출내역_수동다운_*.xlsx")):
+        try:
+            df = pd.read_excel(path, sheet_name=0, dtype=str, engine="openpyxl")
+        except Exception as e:
+            logger.warning("EasyPOS 수동다운 로드 실패: %s | %s", path, e)
+            continue
+
+        if "매출일자" not in df.columns or "총매출" not in df.columns:
+            logger.warning("EasyPOS 수동다운 형식 불일치(매출일자/총매출 없음): %s", path)
+            continue
+
+        mtime = datetime.fromtimestamp(path.stat().st_mtime).isoformat()
+        for _, r in df.iterrows():
+            sale_date = _normalize_sale_date(r.get("매출일자"))
+            total_sales = _parse_amount(r.get("총매출"))
+            if not sale_date or sale_date.lower() == "nan" or sale_date == "합계":
+                continue
+            rows.append({
+                "sale_date": sale_date,
+                "total_sales": total_sales,
+                "source_file": path.name,
+                "source_mtime": mtime,
+            })
+
+    if not rows:
+        return {}
+
+    merged = pd.DataFrame(rows)
+    merged = merged.sort_values(["sale_date", "source_mtime", "source_file"])
+    merged = merged.drop_duplicates(subset=["sale_date"], keep="last").copy()
+    merged["updated_at"] = datetime.utcnow().isoformat()
+
+    target_path = EASYPOS_MANUAL_TOTALS_CSV
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        merged.to_csv(target_path, index=False, encoding="utf-8-sig")
+    except Exception as e:
+        target_path = EASYPOS_MANUAL_TOTALS_FALLBACK_CSV
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        merged.to_csv(target_path, index=False, encoding="utf-8-sig")
+        logger.warning("EasyPOS 수동 누적 저장 경로 폴백: %s", e)
+    logger.info("EasyPOS 수동 일자별 매출 누적 갱신: %s (%d일)", target_path, len(merged))
+    return dict(zip(merged["sale_date"], merged["total_sales"]))
+
+
+def _download_daily_totals_auto(page: Page, sale_date: str, download_dir: Path) -> "Path | None":
+    """조회 후 엑셀 버튼 클릭 → 일별합계 Excel 자동 다운로드.
+    Returns 저장된 파일 경로, 실패 시 None.
+    """
+    mf = _get_main_frame(page)
+    excel_btn, excel_sel = _find_first_selector(mf, _BTN_EXCEL_SELECTORS)
+    if excel_btn is None:
+        logger.warning("EasyPOS 엑셀 버튼 미발견 (selectors=%s)", _BTN_EXCEL_SELECTORS)
+        return None
+
+    download_dir.mkdir(parents=True, exist_ok=True)
+    save_path = download_dir / f"daily_totals_{sale_date}.xlsx"
+
+    try:
+        with page.expect_download(timeout=30_000) as dl_info:
+            _click_handle(page, excel_btn, f"엑셀 다운로드({excel_sel})", prefer_mouse=True)
+        dl_info.value.save_as(str(save_path))
+        logger.info("EasyPOS 엑셀 다운로드 완료: %s", save_path)
+        return save_path
+    except Exception as e:
+        logger.warning("EasyPOS 엑셀 다운로드 실패: %s", e)
+        return None
+
+
+def _parse_auto_daily_total(xlsx_path: Path, sale_date: str) -> "int | None":
+    """자동 다운로드 Excel에서 sale_date의 총매출 파싱.
+    매출일자 열 우선 → 합계 행 fallback.
+    """
+    try:
+        df = pd.read_excel(xlsx_path, sheet_name=0, dtype=str, engine="openpyxl")
+    except Exception as e:
+        logger.warning("EasyPOS 자동다운 로드 실패: %s | %s", xlsx_path, e)
+        return None
+
+    if "매출일자" not in df.columns or "총매출" not in df.columns:
+        logger.warning("EasyPOS 자동다운 열 불일치: %s cols=%s", xlsx_path, list(df.columns))
+        return None
+
+    norm = _normalize_sale_date(sale_date)
+    for _, r in df.iterrows():
+        if _normalize_sale_date(r.get("매출일자")) == norm:
+            return _parse_amount(r.get("총매출"))
+
+    for _, r in df.iterrows():
+        if str(r.get("매출일자", "")).strip() in ("합계", "소계", "Total", "total"):
+            return _parse_amount(r.get("총매출"))
+
+    logger.warning("EasyPOS 자동다운 날짜 %s 미발견: %s", sale_date, xlsx_path)
+    return None
+
+
+def _upsert_daily_total_csv(sale_date: str, total: int, source: str) -> None:
+    """자동 다운로드 일별합계를 _manual_daily_totals.csv에 누적 저장(upsert).
+    당일(오늘) 데이터는 매출이 진행 중이므로 저장하지 않는다.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    if sale_date >= today:
+        logger.info("일별합계 CSV 저장 스킵 (당일 이후): %s", sale_date)
+        return
+    target = EASYPOS_MANUAL_TOTALS_CSV
+    now_str = datetime.utcnow().isoformat()
+    new_row = {
+        "sale_date": sale_date,
+        "total_sales": total,
+        "source_file": source,
+        "source_mtime": now_str,
+        "updated_at": now_str,
+    }
+
+    if target.exists():
+        try:
+            existing = pd.read_csv(target, dtype=str)
+        except Exception:
+            existing = pd.DataFrame()
+    else:
+        existing = pd.DataFrame()
+
+    new_df = pd.DataFrame([new_row])
+    if not existing.empty and "sale_date" in existing.columns:
+        merged = pd.concat([existing[existing["sale_date"] != sale_date], new_df], ignore_index=True)
+    else:
+        merged = new_df
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        merged.to_csv(target, index=False, encoding="utf-8-sig")
+        logger.info("일별합계 CSV 갱신: %s ← %s=%d", target, sale_date, total)
+    except Exception as e:
+        logger.warning("일별합계 CSV 저장 실패: %s", e)
 
 
 def _login(page: Page) -> Frame:
@@ -546,6 +872,140 @@ def _login(page: Page) -> Frame:
     return mf
 
 
+def _navigate_to_daily_totals_inquiry(page: Page, mf: Frame) -> Frame:
+    """영업속보 탭 → 일자별매출조회(단일클릭) → 일자별 매출내역(더블클릭) → 화면 로드.
+
+    메뉴 구조 (grdLeft gridrow 인덱스 기준):
+      gridrow_2: "일자별매출조회"  → 단일클릭으로 하위 항목 펼침
+      gridrow_3: "일자별 매출내역" → 더블클릭으로 실제 조회 화면 오픈
+    """
+    # ① 상단 영업속보 탭 클릭 → grdLeft 좌측 메뉴 로드
+    mf = _get_main_frame(page)
+    tab_el = mf.query_selector(f"#{_MENU_SALES_BRIEF}")
+    if tab_el is None:
+        raise RuntimeError("영업속보 탭 요소를 찾을 수 없음")
+    tab_box = tab_el.bounding_box()
+    if tab_box:
+        page.mouse.click(tab_box["x"] + tab_box["width"] / 2, tab_box["y"] + tab_box["height"] / 2)
+    else:
+        tab_el.click()
+    logger.info("영업속보 탭 클릭 (일자별매출조회 진입 전)")
+    time.sleep(1.5)
+    try:
+        _get_main_frame(page).wait_for_selector("[id*='grdLeft_body_gridrow_']", timeout=8_000)
+    except Exception:
+        logger.warning("grdLeft 로드 타임아웃 — 계속 진행")
+
+    def _find_row(text_candidates: list[str]):
+        mf2 = _get_main_frame(page)
+        for el in mf2.query_selector_all("[id*='grdLeft_body_gridrow_']"):
+            if (el.inner_text() or "").strip() in text_candidates:
+                return el
+        return None
+
+    for attempt in range(1, 4):
+        # ② "일자별매출조회" 단일클릭 → 하위메뉴(일자별 매출내역) 펼치기
+        inquiry_el = _find_row(["일자별매출조회", "일자별 매출조회"])
+        if inquiry_el is None:
+            inquiry_el = _get_main_frame(page).query_selector(f"#{_GRDLEFT_DAILY_INQUIRY}")
+        if inquiry_el is not None:
+            _click_handle(page, inquiry_el, "일자별매출조회 단일클릭", prefer_mouse=True)
+            logger.info("일자별매출조회 단일클릭 (attempt=%d/3)", attempt)
+            time.sleep(1.2)
+        else:
+            logger.warning("일자별매출조회 항목 미발견 (attempt=%d/3)", attempt)
+            time.sleep(1.5)
+            continue
+
+        # ③ "일자별 매출내역" 더블클릭 → 조회 화면 오픈
+        detail_el = _find_row(["일자별 매출내역", "일자별매출내역"])
+        if detail_el is not None:
+            box = detail_el.bounding_box()
+            if box:
+                cx = box["x"] + box["width"] / 2
+                cy = box["y"] + box["height"] / 2
+                page.mouse.click(cx, cy)
+                time.sleep(0.3)
+                page.mouse.click(cx, cy, click_count=2)
+                logger.info("일자별 매출내역 더블클릭 @ (%.0f, %.0f)", cx, cy)
+            try:
+                mf = _get_main_frame(page)
+                _wait_for_any_selector(mf, _DAILY_INQUIRY_READY_SELECTORS, timeout_ms=WAIT_TIMEOUT)
+                logger.info("일자별매출조회 화면 로드 성공")
+                return _get_main_frame(page)
+            except Exception as e:
+                logger.warning("일자별매출조회 화면 대기 실패 (attempt=%d/3): %s", attempt, e)
+                time.sleep(2.0)
+        else:
+            logger.warning("일자별 매출내역 항목 미발견 (attempt=%d/3)", attempt)
+            time.sleep(1.5)
+
+    raise RuntimeError("일자별 매출내역 메뉴를 찾을 수 없음")
+
+
+def _download_and_save_daily_totals(page: Page, download_dir: Path) -> dict[str, int]:
+    """일자별매출조회 화면에서 조회 → 엑셀 다운로드 → 파싱 → CSV upsert.
+    최근 7일 데이터를 일괄 수집한다. {sale_date: total_sales} 반환.
+    """
+    mf = _get_main_frame(page)
+
+    # 조회 버튼 클릭
+    s_btn, s_sel = _find_first_selector(mf, _BTN_SEARCH_SELECTORS)
+    if s_btn:
+        _click_handle(page, s_btn, f"일자별매출조회 조회({s_sel})", prefer_mouse=True)
+        time.sleep(3.0)
+    else:
+        logger.warning("일자별매출조회 조회 버튼 미발견")
+
+    mf = _get_main_frame(page)
+    excel_btn, excel_sel = _find_first_selector(mf, _BTN_EXCEL_SELECTORS)
+    if excel_btn is None:
+        logger.warning("일자별매출조회 엑셀 버튼 미발견")
+        return {}
+
+    download_dir.mkdir(parents=True, exist_ok=True)
+    save_path = download_dir / "daily_totals_inquiry.xlsx"
+
+    try:
+        with page.expect_download(timeout=30_000) as dl_info:
+            _click_handle(page, excel_btn, f"일자별매출조회 엑셀({excel_sel})", prefer_mouse=True)
+        dl_info.value.save_as(str(save_path))
+        logger.info("일자별매출조회 엑셀 다운로드 완료: %s (%.1f KB)",
+                    save_path, save_path.stat().st_size / 1024)
+    except Exception as e:
+        logger.warning("일자별매출조회 엑셀 다운로드 실패: %s", e)
+        return {}
+
+    # Excel 파싱
+    try:
+        df = pd.read_excel(save_path, sheet_name=0, dtype=str, engine="openpyxl")
+    except Exception as e:
+        logger.warning("일자별매출조회 Excel 읽기 실패: %s", e)
+        return {}
+
+    logger.info("일자별매출조회 Excel 컬럼: %s", list(df.columns))
+
+    # 컬럼명 매핑 (실제 다운로드 파일에 따라 조정 가능)
+    date_col  = next((c for c in df.columns if "일자" in c or "날짜" in c or "date" in c.lower()), None)
+    total_col = next((c for c in df.columns if "매출" in c and ("합계" in c or "총" in c or "금액" in c)), None)
+    if date_col is None or total_col is None:
+        logger.warning("일자별매출조회 컬럼 매핑 실패: date_col=%s total_col=%s cols=%s",
+                       date_col, total_col, list(df.columns))
+        return {}
+
+    result: dict[str, int] = {}
+    for _, r in df.iterrows():
+        sale_date = _normalize_sale_date(r.get(date_col))
+        if not sale_date or sale_date in ("합계", "소계", "nan"):
+            continue
+        total = _parse_amount(r.get(total_col))
+        result[sale_date] = total
+        _upsert_daily_total_csv(sale_date, total, save_path.name)
+
+    logger.info("일자별매출조회 파싱 완료: %d일치 데이터", len(result))
+    return result
+
+
 def _navigate_to_daily_sales(page: Page, mf: Frame) -> Frame:
     """영업속보 → 당일매출내역 메뉴 클릭
 
@@ -574,7 +1034,7 @@ def _navigate_to_daily_sales(page: Page, mf: Frame) -> Frame:
     time.sleep(1.5)
     try:
         mf.wait_for_selector("[id*='grdLeft_body_gridrow_']", timeout=8_000)
-    except Exception:
+    except PlaywrightTimeoutError:
         logger.warning("grdLeft 메뉴 항목 로드 타임아웃 — 계속 진행")
 
     # 이미 당일매출 화면이면 통과
@@ -824,6 +1284,8 @@ def _collect_all_receipts(page: Page, mf: Frame, sale_date: str) -> list:
 
             mf = _get_main_frame(page)
 
+        except TargetClosedError:
+            raise
         except Exception:
             logger.exception(f"  [row {row_idx}] 영수증 수집 실패 — 다음 행으로 계속")
             # 열린 팝업 닫기 시도
@@ -841,89 +1303,136 @@ def _collect_all_receipts(page: Page, mf: Frame, sale_date: str) -> list:
 # Task 함수
 # ============================================================
 
-def resolve_sale_dates(**context) -> str:
-    """실행 날짜 결정 (conf['sale_date'] 또는 어제)"""
+def resolve_sale_dates(dag_date_from=None, dag_date_to=None, **context) -> str:
+    """실행 날짜 결정.
+    우선순위: conf(date_from/date_to) > conf(sale_date) > dag 상수 > 어제
+    결과는 XCom key='sale_dates' (list)로 push.
+    """
     conf = context.get("dag_run").conf or {}
-    sale_date = conf.get("sale_date")
+    date_from = conf.get("date_from") or dag_date_from
+    date_to   = conf.get("date_to")   or dag_date_to
 
-    if sale_date:
+    if date_from and date_to:
         try:
-            datetime.strptime(sale_date, "%Y-%m-%d")
+            d_from = datetime.strptime(date_from, "%Y-%m-%d")
+            d_to   = datetime.strptime(date_to,   "%Y-%m-%d")
         except ValueError as e:
             raise ValueError(f"날짜 형식 오류 (YYYY-MM-DD 필요): {e}")
-        logger.info(f"conf override → {sale_date}")
+        if d_from > d_to:
+            raise ValueError(f"date_from({date_from})이 date_to({date_to})보다 큽니다")
+        delta = (d_to - d_from).days + 1
+        sale_dates = [(d_from + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(delta)]
+        logger.info(f"날짜 범위 사용 → {date_from} ~ {date_to} ({delta}일)")
+    elif conf.get("sale_date"):
+        try:
+            datetime.strptime(conf["sale_date"], "%Y-%m-%d")
+        except ValueError as e:
+            raise ValueError(f"날짜 형식 오류 (YYYY-MM-DD 필요): {e}")
+        sale_dates = [conf["sale_date"]]
+        logger.info(f"conf sale_date override → {conf['sale_date']}")
     else:
-        sale_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        logger.info(f"어제 날짜 사용 → {sale_date}")
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        sale_dates = [yesterday]
+        logger.info(f"어제 날짜 사용 → {yesterday}")
 
-    context["ti"].xcom_push(key="sale_date", value=sale_date)
-    return f"날짜 결정 완료: {sale_date}"
+    context["ti"].xcom_push(key="sale_dates", value=sale_dates)
+    return f"날짜 결정 완료: {sale_dates}"
+
+
+_NEXACRO_INIT_SCRIPT = """
+(function() {
+    var _origGetById = Document.prototype.getElementById;
+    Document.prototype.getElementById = function(id) {
+        var el = _origGetById.call(this, id);
+        if (!el && id === 'loadingImg') {
+            return {
+                style: {display: 'block'},
+                id: 'loadingImg',
+                setAttribute: function() {},
+                removeAttribute: function() {}
+            };
+        }
+        return el;
+    };
+    Object.defineProperty(navigator, 'webdriver', {get: function() { return undefined; }});
+    Object.defineProperty(document, 'hidden', {get: function() { return false; }});
+    Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
+    document.addEventListener('visibilitychange', function(e) { e.stopImmediatePropagation(); }, true);
+})();
+"""
 
 
 def collect_receipts(**context) -> str:
     """EasyPOS 영수증 수집 → TEMP_DIR parquet 저장 (Playwright)"""
-    sale_date = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_date")
-    if not sale_date:
-        raise ValueError("sale_date XCom 값이 없습니다.")
+    sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates")
+    if not sale_dates:
+        raise ValueError("sale_dates XCom 값이 없습니다.")
+
+    manual_totals = _load_manual_daily_totals()
+    auto_totals: dict[str, int] = {}
+    _cleanup_download_dir(EASYPOS_SALES_DOWNLOAD_DIR, "daily_totals_*.xlsx")
+
+    launch_kwargs = dict(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--window-size=1920,1080",
+        ],
+    )
+    context_opts = dict(
+        viewport={"width": 1920, "height": 1080},
+        accept_downloads=True,
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+    )
+
+    all_rows = []
 
     with sync_playwright() as p:
-        # headless=True로 실행 (test_easypos_final.py에서 네비게이션 정상 확인)
-        # Document.prototype.getElementById 패치로 NexacroN 초기화 오류 해결됨
-
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--window-size=1920,1080",
-            ],
-        )
-        context_opts = dict(
-            viewport={"width": 1920, "height": 1080},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-        )
+        browser = launch_chromium(p, headless=launch_kwargs["headless"], args=launch_kwargs["args"])
         bctx = browser.new_context(**context_opts)
-        # NexacroN 초기화 핵심 픽스:
-        # easypos.xadl.js:319 → window.document.getElementById('loadingImg').style.display="none"
-        # Playwright에서 loadingImg 요소가 없어 null.style → application_onload 크래시
-        # → nexacro.getApplication() undefined → 모든 메뉴 클릭 이벤트 무반응
-        bctx.add_init_script("""
-            (function() {
-                // NexacroN 핵심 픽스: getElementById('loadingImg') null-safe 패치
-                // easypos.xadl.js:319 → application_onload이 loadingImg를 직접 찾음
-                // Playwright DOM에는 loadingImg가 없어 null.style → TypeError → nexacro 초기화 실패
-                // DOM을 건드리지 않고 prototype을 패치해 null-safe 가짜 객체 반환
-                var _origGetById = Document.prototype.getElementById;
-                Document.prototype.getElementById = function(id) {
-                    var el = _origGetById.call(this, id);
-                    if (!el && id === 'loadingImg') {
-                        return {
-                            style: {display: 'block'},
-                            id: 'loadingImg',
-                            setAttribute: function() {},
-                            removeAttribute: function() {}
-                        };
-                    }
-                    return el;
-                };
-                // webdriver / visibility 마스킹
-                Object.defineProperty(navigator, 'webdriver', {get: function() { return undefined; }});
-                Object.defineProperty(document, 'hidden', {get: function() { return false; }});
-                Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
-                document.addEventListener('visibilitychange', function(e) { e.stopImmediatePropagation(); }, true);
-            })();
-        """)
+        bctx.add_init_script(_NEXACRO_INIT_SCRIPT)
         page = bctx.new_page()
+
+        def _reopen_session(target_date: str):
+            nonlocal browser, bctx, page
+            try:
+                browser.close()
+            except Exception:
+                pass
+            browser2 = launch_chromium(p, headless=launch_kwargs["headless"], args=launch_kwargs["args"])
+            bctx2 = browser2.new_context(**context_opts)
+            bctx2.add_init_script(_NEXACRO_INIT_SCRIPT)
+            page2 = bctx2.new_page()
+            _mf = _login(page2)
+            _mf = _navigate_to_daily_sales(page2, _mf)
+            _select_yesterday_and_search(page2, _mf, target_date)
+            logger.info("EasyPOS 세션 재오픈 완료: %s", target_date)
+            return browser2, bctx2, page2
+
         try:
             mf = _login(page)
+
+            # ── STEP 1: 일자별매출조회 → 엑셀 다운로드 → CSV 저장 (최근 7일 일괄)
+            try:
+                mf = _navigate_to_daily_totals_inquiry(page, mf)
+                fetched = _download_and_save_daily_totals(page, EASYPOS_SALES_DOWNLOAD_DIR)
+                auto_totals.update(fetched)
+                logger.info("일자별합계 수집 완료: %d일치 (%s)", len(fetched), list(fetched.keys()))
+            except Exception as e:
+                logger.warning("일자별합계 수집 실패(계속 진행): %s", e)
+                if DEBUG_MODE:
+                    _debug_dump(page, "daily_inquiry_failed")
+
+            # ── STEP 2: 당일매출내역 → 영수증 수집
             try:
                 mf = _navigate_to_daily_sales(page, mf)
-                mf = _select_yesterday_and_search(page, mf, sale_date)
+                mf = _select_yesterday_and_search(page, mf, sale_dates[0])
             except Exception as e:
                 _debug_dump(page, "navigation_failed")
                 logger.exception("당일매출내역 화면 진입 실패: %s", e)
@@ -933,17 +1442,76 @@ def collect_receipts(**context) -> str:
                 context["ti"].xcom_push(key="parquet_path", value=None)
                 return f"스킵: 당일매출내역 화면 진입 실패 ({e})"
 
-            rows = _collect_all_receipts(page, mf, sale_date)
+            for idx, sale_date in enumerate(sale_dates):
+                if idx > 0:
+                    if _is_page_closed(page):
+                        logger.warning("이전 날짜 처리 후 페이지 닫힘, 재세션 오픈: %s", sale_date)
+                        browser, bctx, page = _reopen_session(sale_date)
+                        mf = _get_main_frame(page)
+                    else:
+                        mf = _get_main_frame(page)
+                        if not _set_sale_date_inputs_v2(mf, sale_date, page=page):
+                            if not _is_page_closed(page):
+                                _debug_dump(page, f"date_set_failed_{sale_date}")
+                            logger.warning("sale_date 변경 실패, 재세션: %s", sale_date)
+                            browser, bctx, page = _reopen_session(sale_date)
+                            mf = _get_main_frame(page)
+                        time.sleep(0.5)
+                        mf = _get_main_frame(page)
+                        s_btn, s_sel = _find_first_selector(mf, _BTN_SEARCH_SELECTORS)
+                        if s_btn is not None:
+                            _click_handle(page, s_btn, f"조회({s_sel}, {sale_date})", prefer_mouse=True)
+                            time.sleep(2.5)
+                        mf = _get_main_frame(page)
+
+                logger.info("수집 시작: %s (%d/%d)", sale_date, idx + 1, len(sale_dates))
+
+                ref_total = auto_totals.get(sale_date) or manual_totals.get(sale_date)
+                ref_source = "auto" if sale_date in auto_totals else ("manual" if sale_date in manual_totals else None)
+
+                MAX_RETRY = 3
+                for retry in range(1, MAX_RETRY + 1):
+                    rows = _collect_all_receipts(page, mf, sale_date)
+                    clicked_total = sum(_parse_amount(r.get("line_amount", 0)) for r in rows)
+
+                    if ref_total is None:
+                        break  # 비교 기준 없으면 그냥 진행
+
+                    diff = clicked_total - ref_total
+                    logger.info(
+                        "EasyPOS 합계 비교(%s) [%d/%d]: %s | clicked=%s | ref=%s | diff=%s",
+                        ref_source, retry, MAX_RETRY, sale_date, clicked_total, ref_total, diff,
+                    )
+                    if diff == 0:
+                        break
+
+                    if retry < MAX_RETRY:
+                        logger.warning("합계 불일치 — 재수집 시도 %d/%d: %s", retry, MAX_RETRY, sale_date)
+                        time.sleep(2.0)
+                        mf = _get_main_frame(page)
+                    else:
+                        raise RuntimeError(
+                            f"EasyPOS 총매출 불일치({ref_source}): {sale_date} "
+                            f"(clicked={clicked_total}, ref={ref_total}, diff={diff}) "
+                            f"— {MAX_RETRY}회 재시도 후에도 불일치"
+                        )
+
+                all_rows.extend(rows)
+                logger.info("수집 완료: %s → %d건", sale_date, len(rows))
+
         finally:
-            browser.close()
+            try:
+                browser.close()
+            except Exception:
+                pass
             logger.info("Playwright 브라우저 종료")
 
-    if not rows:
-        logger.warning(f"{sale_date} 수집 결과 없음 — 빈 DataFrame")
-        context["ti"].xcom_push(key="parquet_path", value=None)
+    if not all_rows:
+        logger.warning("수집 결과 없음 — 빈 DataFrame (dates=%s)", sale_dates)
+        context["ti"].xcom_push(key="saved_paths", value=[])
         return "수집 완료: 0건 (데이터 없음)"
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(all_rows)
     df["collected_at"] = datetime.utcnow().isoformat()
     df["_pk"] = df.apply(
         lambda r: hashlib.md5(
@@ -952,38 +1520,226 @@ def collect_receipts(**context) -> str:
         axis=1,
     )
 
-    TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    parquet_path = TEMP_DIR / f"easypos_receipts_{sale_date}.parquet"
-    df.to_parquet(parquet_path, index=False)
+    total_inserted = 0
+    saved_paths = []
+    for ym, ym_df in df.groupby(df["sale_date"].str[:7]):
+        out_path = ANALYTICS_DB / "easypos_sales_raw" / f"ym={ym}" / "receipts.csv"
+        result = onedrive_csv_save(df=ym_df, file_path=str(out_path), pk_col="_pk")
+        inserted   = result.get("inserted", 0)
+        duplicated = result.get("duplicated", 0)
+        total_inserted += inserted
+        saved_paths.append(str(out_path))
+        logger.info("OneDrive 저장: %s | 신규=%d, 중복=%d", out_path, inserted, duplicated)
 
-    context["ti"].xcom_push(key="parquet_path", value=str(parquet_path))
-    logger.info(f"parquet 저장: {parquet_path} ({len(df)}행)")
-    return f"수집 완료: {len(df)}건"
+    context["ti"].xcom_push(key="saved_paths", value=saved_paths)
+    return f"수집/저장 완료: {len(df)}건 | {len(saved_paths)}개 파티션 | 총 신규={total_inserted}건"
+
+
+def _check_missing_dates(ref_map: dict[str, int]) -> tuple[list[str], list[str]]:
+    """receipts.csv 확인 → (truly_missing, mismatched) 반환.
+    - truly_missing: actual==0인 날짜 (재수집 필요)
+    - mismatched: actual>0이지만 ref와 다른 날짜 (경고만, 재수집 X)
+    """
+    truly_missing: list[str] = []
+    mismatched: list[str] = []
+    for sale_date, ref_total in sorted(ref_map.items()):
+        ym = sale_date[:7]
+        receipts_path = ANALYTICS_DB / "easypos_sales_raw" / f"ym={ym}" / "receipts.csv"
+        if not receipts_path.exists():
+            logger.warning("누락검증: %s 영수증 파일 없음 (ref=%d)", sale_date, ref_total)
+            truly_missing.append(sale_date)
+            continue
+        try:
+            rdf = pd.read_csv(receipts_path, dtype=str)
+        except Exception as e:
+            logger.warning("누락검증: %s CSV 읽기 실패 (%s)", sale_date, e)
+            truly_missing.append(sale_date)
+            continue
+        day_rows = rdf[rdf["sale_date"] == sale_date] if "sale_date" in rdf.columns else pd.DataFrame()
+        actual = int(day_rows["line_amount"].apply(_parse_amount).sum()) if "line_amount" in day_rows.columns else 0
+        if actual == 0:
+            logger.warning("누락검증 빈 날짜: %s (ref=%d) → 재수집 대상", sale_date, ref_total)
+            truly_missing.append(sale_date)
+        elif actual != ref_total:
+            logger.warning("누락검증 불일치(경고): %s | actual=%d ref=%d diff=%d", sale_date, actual, ref_total, actual - ref_total)
+            mismatched.append(sale_date)
+        else:
+            logger.info("누락검증 일치: %s | total=%d", sale_date, actual)
+    return truly_missing, mismatched
+
+
+def _recollect_dates(missing_dates: list[str]) -> int:
+    """누락 날짜를 Playwright로 재수집 → OneDrive 저장. 저장된 총 건수 반환."""
+    launch_kwargs = dict(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage",
+              "--disable-blink-features=AutomationControlled", "--window-size=1920,1080"],
+    )
+    context_opts = dict(
+        viewport={"width": 1920, "height": 1080},
+        accept_downloads=True,
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+    )
+    total_inserted = 0
+    all_rows: list[dict] = []
+
+    with sync_playwright() as p:
+        browser = launch_chromium(p, headless=launch_kwargs["headless"], args=launch_kwargs["args"])
+        bctx = browser.new_context(**context_opts)
+        bctx.add_init_script(_NEXACRO_INIT_SCRIPT)
+        page = bctx.new_page()
+        try:
+            mf = _login(page)
+            mf = _navigate_to_daily_sales(page, mf)
+            mf = _select_yesterday_and_search(page, mf, missing_dates[0])
+
+            for idx, sale_date in enumerate(missing_dates):
+                try:
+                    if idx > 0:
+                        mf = _get_main_frame(page)
+                        if not _set_sale_date_inputs_v2(mf, sale_date, page=page):
+                            logger.warning("재수집 날짜 입력 실패: %s", sale_date)
+                        time.sleep(0.5)
+                        mf = _get_main_frame(page)
+                        s_btn, s_sel = _find_first_selector(mf, _BTN_SEARCH_SELECTORS)
+                        if s_btn:
+                            _click_handle(page, s_btn, f"재수집 조회({sale_date})", prefer_mouse=True)
+                            time.sleep(2.5)
+                        mf = _get_main_frame(page)
+
+                    logger.info("누락 재수집: %s (%d/%d)", sale_date, idx + 1, len(missing_dates))
+                    rows = _collect_all_receipts(page, mf, sale_date)
+                    logger.info("재수집 완료: %s → %d건", sale_date, len(rows))
+                    all_rows.extend(rows)
+                except TargetClosedError:
+                    logger.warning("브라우저 컨텍스트 종료 감지 (%s) → 재시작 후 재시도", sale_date)
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    browser = launch_chromium(p, headless=launch_kwargs["headless"], args=launch_kwargs["args"])
+                    bctx = browser.new_context(**context_opts)
+                    bctx.add_init_script(_NEXACRO_INIT_SCRIPT)
+                    page = bctx.new_page()
+                    mf = _login(page)
+                    mf = _navigate_to_daily_sales(page, mf)
+                    mf = _select_yesterday_and_search(page, mf, sale_date)
+                    logger.info("누락 재수집(재시작 후 재시도): %s (%d/%d)", sale_date, idx + 1, len(missing_dates))
+                    rows = _collect_all_receipts(page, mf, sale_date)
+                    logger.info("재수집 완료: %s → %d건", sale_date, len(rows))
+                    all_rows.extend(rows)
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    if not all_rows:
+        return 0
+
+    df = pd.DataFrame(all_rows)
+    df["collected_at"] = datetime.utcnow().isoformat()
+    df["_pk"] = df.apply(
+        lambda r: hashlib.md5(
+            f"{r['sale_date']}{r['receipt_no']}{r['menu_name']}".encode()
+        ).hexdigest(),
+        axis=1,
+    )
+    for ym, ym_df in df.groupby(df["sale_date"].str[:7]):
+        out_path = ANALYTICS_DB / "easypos_sales_raw" / f"ym={ym}" / "receipts.csv"
+        result = onedrive_csv_save(df=ym_df, file_path=str(out_path), pk_col="_pk")
+        inserted = result.get("inserted", 0)
+        total_inserted += inserted
+        logger.info("재수집 저장: %s | 신규=%d", out_path, inserted)
+    return total_inserted
+
+
+def verify_missing(**context) -> str:
+    """_manual_daily_totals.csv 전체 기준으로 누락/불일치 날짜 탐지 → 자동 재수집.
+    재수집 후에도 불일치면 RuntimeError → 이메일 알림.
+    """
+    if not EASYPOS_MANUAL_TOTALS_CSV.exists():
+        logger.warning("일별합계 CSV 없음 — 누락 검증 스킵: %s", EASYPOS_MANUAL_TOTALS_CSV)
+        return "스킵 (일별합계 CSV 없음)"
+
+    try:
+        ref_df = pd.read_csv(EASYPOS_MANUAL_TOTALS_CSV, dtype=str)
+    except Exception as e:
+        return f"스킵 (CSV 로드 실패: {e})"
+
+    # manual totals 에 있는 전체 기간을 검증하되, 당일(오늘)은 매출 진행 중이므로 제외
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    ref_map: dict[str, int] = {}
+    if "sale_date" in ref_df.columns and "total_sales" in ref_df.columns:
+        for _, r in ref_df.iterrows():
+            sale_date = str(r["sale_date"]).strip()
+            total = _parse_amount(r["total_sales"])
+            if sale_date and total > 0 and sale_date < today:
+                ref_map[sale_date] = total
+
+    if not ref_map:
+        return "스킵 (검증 대상 없음 — 당일 제외)"
+
+    logger.info("누락검증 대상: %d일치 (manual totals 전체, 당일 %s 제외)", len(ref_map), today)
+
+    # 1차 검증
+    truly_missing, mismatched = _check_missing_dates(ref_map)
+
+    # 빈 날짜 + 불일치 날짜 모두 재수집 대상
+    to_recollect = sorted(set(truly_missing + mismatched))
+
+    if not to_recollect:
+        return f"누락 없음: {len(ref_map)}일 모두 일치"
+
+    logger.warning("재수집 대상 %d건 (빈=%d, 불일치=%d): %s",
+                   len(to_recollect), len(truly_missing), len(mismatched), to_recollect)
+
+    # 재수집 최대 2회 시도 — 2회 후에도 없으면 휴일로 간주, 알람 없이 종료
+    MAX_RECOLLECT = 2
+    remaining = to_recollect
+    last_still_missing: list[str] = []
+    last_still_mismatched: list[str] = []
+    total_inserted = 0
+
+    for attempt in range(1, MAX_RECOLLECT + 1):
+        inserted = _recollect_dates(remaining)
+        total_inserted += inserted
+        logger.info("재수집 %d/%d 완료: 신규=%d건", attempt, MAX_RECOLLECT, inserted)
+
+        last_still_missing, last_still_mismatched = _check_missing_dates(
+            {d: ref_map[d] for d in remaining}
+        )
+
+        if not last_still_missing:
+            msg = f"재수집 완료: {len(to_recollect)}일 → 신규={total_inserted}건"
+            if last_still_mismatched:
+                logger.warning("재수집 후에도 합계 불일치(경고): %s", last_still_mismatched)
+                msg += f" | 불일치 경고 {len(last_still_mismatched)}건: {last_still_mismatched}"
+            return msg
+
+        if attempt < MAX_RECOLLECT:
+            logger.warning("재수집 %d/%d 후에도 누락 %d건: %s — 재시도",
+                           attempt, MAX_RECOLLECT, len(last_still_missing), last_still_missing)
+            remaining = last_still_missing
+
+    # 2회 재수집 후에도 데이터 없음 → 휴일로 간주, 알람 없이 정상 종료
+    logger.warning(
+        "EasyPOS 재수집 %d회 후에도 데이터 없음 %d건: %s — 휴일로 간주, 알람 없이 종료",
+        MAX_RECOLLECT, len(last_still_missing), last_still_missing,
+    )
+    return (
+        f"휴일 추정 (재수집 {MAX_RECOLLECT}회 후 데이터 없음 {len(last_still_missing)}건): "
+        f"{last_still_missing}"
+    )
 
 
 def save_to_raw(**context) -> str:
-    """parquet → OneDrive CSV 저장"""
-    parquet_path = context["ti"].xcom_pull(task_ids="collect_receipts", key="parquet_path")
-    if not parquet_path:
-        logger.warning("parquet_path 없음 — save_to_raw 스킵")
-        return "스킵 (데이터 없음)"
-
-    df = pd.read_parquet(parquet_path)
-    if df.empty:
-        return "스킵 (빈 DataFrame)"
-
-    sale_date = str(df["sale_date"].iloc[0])
-    ym = sale_date[:7]  # YYYY-MM
-
-    out_path = ANALYTICS_DB / "easypos_sales_raw" / f"ym={ym}" / "receipts.csv"
-
-    result = onedrive_csv_save(
-        df=df,
-        file_path=str(out_path),
-        pk_col="_pk",
-    )
-
-    inserted   = result.get("inserted", 0)
-    duplicated = result.get("duplicated", 0)
-    logger.info(f"OneDrive 저장 완료: {out_path} | 신규={inserted}, 중복={duplicated}")
-    return f"저장 완료: {out_path.name} | 신규={inserted}건"
+    """collect_receipts에서 OneDrive 저장까지 완료 — pass-through"""
+    saved_paths = context["ti"].xcom_pull(task_ids="collect_receipts", key="saved_paths") or []
+    if not saved_paths:
+        return "스킵 (데이터 없음 또는 수집 실패)"
+    return f"저장 완료 (collect_receipts에서 처리): {len(saved_paths)}개 파티션"

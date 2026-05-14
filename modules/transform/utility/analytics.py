@@ -11,9 +11,10 @@ def read_analytics_partition(
     brand: str | None = None,
     store: str | None = None,
     ym: str | None = None,
+    filename: str = "data.csv",
 ) -> pd.DataFrame:
     """
-    Hive-style 파티션(brand=/store=/ym=/data.csv)을 glob으로 수집해 DataFrame 반환.
+    Hive-style 파티션(brand=/store=/ym=/filename)을 glob으로 수집해 DataFrame 반환.
     brand/store/ym 생략 시 해당 레벨 전체 포함.
     경로에서 brand=, store=, ym= 값을 파싱해 컬럼으로 자동 추가.
 
@@ -22,6 +23,7 @@ def read_analytics_partition(
         brand: brand= 파티션 값. None이면 전체
         store: store= 파티션 값. None이면 전체
         ym: ym= 파티션 값 (예: "2026-03"). None이면 전체
+        filename: 파티션 내 파일명 (기본 "data.csv")
 
     Returns:
         brand, store, ym 컬럼이 포함된 DataFrame
@@ -32,7 +34,7 @@ def read_analytics_partition(
     brand_pat = f"brand={brand}" if brand else "brand=*"
     store_pat = f"store={store}" if store else "store=*"
     ym_pat = f"ym={ym}" if ym else "ym=*"
-    pattern = f"{brand_pat}/{store_pat}/{ym_pat}/data.csv"
+    pattern = f"{brand_pat}/{store_pat}/{ym_pat}/{filename}"
 
     files = sorted(root.glob(pattern))
     if not files:

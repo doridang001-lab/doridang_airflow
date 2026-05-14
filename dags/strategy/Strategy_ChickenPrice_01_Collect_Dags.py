@@ -17,6 +17,7 @@ import pendulum
 from pathlib import Path
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.utils.trigger_rule import TriggerRule
 from modules.transform.utility.schedule import SMP_CHICKEN_PRICE_TIME
 
 # 모듈 경로 설정
@@ -52,7 +53,7 @@ with DAG(
     default_args={
         "retries": 1,
         "retry_delay": pendulum.duration(minutes=5),
-        "email_on_failure": False,
+        "email_on_failure": True, # 실제 운영에서는 True로 설정하고 알림 이메일 주소 구성 필요
     },
 ) as dag:
 
@@ -78,12 +79,14 @@ with DAG(
         task_id="validate_poultry_price",
         python_callable=validate_price,
         op_kwargs={"task_id": "extract_poultry_price"},
+        trigger_rule=TriggerRule.ALL_DONE,
     )
 
     t_validate_chicken = PythonOperator(
         task_id="validate_chicken_price",
         python_callable=validate_price,
         op_kwargs={"task_id": "extract_chicken_price"},
+        trigger_rule=TriggerRule.ALL_DONE,
     )
 
     # --------------------------------------------------------
@@ -93,6 +96,7 @@ with DAG(
     t_merge = PythonOperator(
         task_id="merge_results",
         python_callable=merge_results,
+        trigger_rule=TriggerRule.ALL_DONE,
     )
 
     # --------------------------------------------------------
@@ -102,6 +106,7 @@ with DAG(
     t_save = PythonOperator(
         task_id="save_results",
         python_callable=save_results,
+        trigger_rule=TriggerRule.ALL_DONE,
     )
 
     # --------------------------------------------------------
@@ -111,6 +116,7 @@ with DAG(
     t_notify = PythonOperator(
         task_id="send_notification",
         python_callable=send_notification,
+        trigger_rule=TriggerRule.ALL_DONE,
     )
 
     # --------------------------------------------------------

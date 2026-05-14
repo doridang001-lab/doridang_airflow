@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 # 설정
 # ============================================================
 
-TOORDER_ID = "doridang1"
-TOORDER_PW = "ehfl0109!!"
+TOORDER_ID = "doridang15"
+TOORDER_PW = "ehfl5233!"
 
 
 # ============================================================

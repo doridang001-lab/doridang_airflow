@@ -20,6 +20,31 @@ from modules.transform.utility.io import load_files
 
 logger = logging.getLogger(__name__)
 
+BAEMIN_MARKETING_DATE_COL_CANDIDATES = [
+    "\ub0a0\uc9dc",  # 날짜
+    "?좎쭨",  # (깨진 인코딩으로 저장된 경우 fallback)
+]
+
+
+def _first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _normalize_date_col_as_midnight_ampm(df: pd.DataFrame, col: str) -> None:
+    """
+    날짜 컬럼을 'YYYY-MM-DD 12:00:00 AM' 형태로 정규화한다.
+    - 기존에 datetime/문자열이 섞여 있어도 같은 날짜는 동일 값이 되도록 한다.
+    """
+    if col not in df.columns:
+        return
+    # pandas가 혼합 포맷을 엄격하게 추론하면 'YYYY-MM-DD'를 NaT로 만들 수 있어 mixed 사용
+    dt = pd.to_datetime(df[col], errors="coerce", format="mixed").dt.floor("D")
+    # drop_duplicates 키로 쓰기 위해 날짜를 "자정 + AM/PM"으로 고정
+    df[col] = dt.dt.strftime("%Y-%m-%d %I:%M:%S %p")
+
 
 # ============================================================
 # 내부 유틸리티
@@ -173,6 +198,10 @@ def transform_baemin_marketing(**context):
         return "0건 (데이터 없음)"
 
     df = pd.read_parquet(parquet_path)
+    date_col = _first_existing_column(df, BAEMIN_MARKETING_DATE_COL_CANDIDATES)
+    if date_col and date_col != "날짜":
+        df = df.rename(columns={date_col: "날짜"})
+        date_col = "날짜"
     print(f"[로드] {len(df):,}행 × {len(df.columns)}컬럼")
 
     print(f"[컬럼 목록] {list(df.columns)}")
@@ -188,9 +217,9 @@ def transform_baemin_marketing(**context):
         print("[경고] 'collected_at' 컬럼이 없습니다.")
 
     # 2. 날짜 null 제거 (baemin_marketing CSV 컬럼명: '날짜')
-    if '날짜' in df.columns:
+    if date_col and date_col in df.columns:
         before = len(df)
-        df = df[df['날짜'].notna()]
+        df = df[df[date_col].notna()]
         removed = before - len(df)
         if removed:
             print(f"[경고] 날짜 null 행 제거: {removed:,}건")
@@ -205,12 +234,13 @@ def transform_baemin_marketing(**context):
     # 3. datetime 변환
     if 'collected_at' in df.columns:
         df['collected_at'] = pd.to_datetime(df['collected_at'], errors='coerce')
-    if '날짜' in df.columns:
-        df['날짜'] = pd.to_datetime(df['날짜'], errors='coerce')
+    if date_col and date_col in df.columns:
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce', format='mixed')
 
     # 4. ym 컬럼 (날짜 기준)
-    if '날짜' in df.columns:
-        df['ym'] = df['날짜'].dt.strftime('%Y-%m')
+    if date_col and date_col in df.columns:
+        df['ym'] = df[date_col].dt.strftime('%Y-%m')
+        _normalize_date_col_as_midnight_ampm(df, date_col)
 
     # 5. store 컬럼 (지점명만 추출: 괄호 태그 제거 + 마지막 토큰)
     if 'store_name' in df.columns:
@@ -294,6 +324,19 @@ def save_partitioned_csv(**context):
                     group = pd.concat([legacy_df, group], ignore_index=True)
             elif not legacy_df.empty:
                 group = pd.concat([legacy_df, group], ignore_index=True)
+
+            # 컬럼 정규화: 날짜/파티션 키(brand/store/ym)
+            date_col = _first_existing_column(group, BAEMIN_MARKETING_DATE_COL_CANDIDATES)
+            if date_col and date_col != "날짜":
+                group = group.rename(columns={date_col: "날짜"})
+                date_col = "날짜"
+            if date_col == "날짜":
+                _normalize_date_col_as_midnight_ampm(group, "날짜")
+
+            # 파일 내 store/ym/brand 값은 파티션 기준으로 통일 (구형 데이터 혼재 방지)
+            group["brand"] = brand
+            group["store"] = store
+            group["ym"] = ym
 
             # 중복 제거 (store_id + 날짜 기준, collected_at 최신 유지)
             dedup_cols = [c for c in ['store_id', '날짜'] if c in group.columns]

@@ -361,7 +361,17 @@ def filter_alerts(
                 print(f"[경고] {st_col} 컬럼 없음")
     
     alert_targets = df_target[alert_mask].copy()
-    
+
+    # ⭐ 담당자별 total_score max인 매장만 선별 (동점 포함)
+    if len(alert_targets) > 0 and 'total_score' in alert_targets.columns:
+        alert_targets['total_score'] = pd.to_numeric(alert_targets['total_score'], errors='coerce').fillna(0)
+        max_score_per_manager = alert_targets.groupby('담당자')['total_score'].transform('max')
+        before_count = len(alert_targets)
+        alert_targets = alert_targets[alert_targets['total_score'] >= max_score_per_manager].copy()
+        print(f"[필터링] 담당자별 max total_score 선별: {before_count}건 → {len(alert_targets)}건")
+    else:
+        print(f"[필터링] total_score 컬럼 없음 → 기존 필터 결과 유지")
+
     print(f"[필터링] 알람 대상: {len(alert_targets):,}건")
     
     if len(alert_targets) > 0:
@@ -388,7 +398,18 @@ def filter_alerts(
     # 추가 전처리가 필요하다면 여기서 수행
     
     alert_targets_processed = alert_targets.copy()
-    
+
+    # LLM 컬럼 추가 (알림 대상 중 매장별 최신일 1건에만)
+    if len(alert_targets_processed) > 0:
+        print(f"\n[LLM] 알림 대상 {len(alert_targets_processed)}건 중 매장별 최신일 1건만 LLM 컬럼 생성 시작...")
+        try:
+            alert_targets_processed = add_llm_columns_latest_per_store(alert_targets_processed)
+            print(f"[LLM] LLM 컬럼 생성 완료")
+        except Exception as e:
+            print(f"[경고] LLM 컬럼 생성 실패 (기존 데이터로 진행): {e}")
+            import traceback
+            print(f"[상세 오류]\n{traceback.format_exc()}")
+
     # ============================================================
     # 9. 알림 대상 CSV 저장: sales_daily_orders_alerts_grp.csv
     # ============================================================
@@ -1723,20 +1744,7 @@ def send_alert_email(**context):
         return f"알람 대상 0건 (기준일: {target_date_str})"
 
     print(f"[알람] 알람 대상: {len(alert_df):,}건 (기준일: {target_date_str})")
-    
-    # LLM 진단 결과 로드
-    llm_diagnoses = {}
-    llm_path = LOCAL_DB / 'temp' / 'llm_diagnoses.json'
-    
-    if llm_path.exists():
-        try:
-            import json
-            with open(llm_path, 'r', encoding='utf-8') as f:
-                llm_diagnoses = json.load(f)
-            print(f"[알림] LLM 진단 결과 로드: {len(llm_diagnoses)}개 매장")
-        except Exception as e:
-            print(f"[경고] LLM 진단 결과 로드 실패: {e}")
-    
+
     # email 컬럼 확인
     if 'email' not in alert_df.columns:
         print(f"[경고] email 컬럼 없음 - 이메일 발송 불가")
@@ -2260,88 +2268,6 @@ def send_alert_email(**context):
                                 </tr>
 """
             
-            # LLM 진단 결과 추가
-            store_name = row['매장명']
-            llm_diagnosis = llm_diagnoses.get(store_name, {})
-            
-            if llm_diagnosis:
-                if 'message' in llm_diagnosis:
-                    # 특이사항 없음
-                    html += f"""
-                                <!-- LLM 진단 -->
-                                <tr>
-                                    <td style="padding: 15px; border-top: 1px solid #eee; background: #f0f8ff;">
-                                        <p style="margin: 0 0 8px 0; font-size: 13px; font-weight: 600; color: #2c3e50;">🤖 AI 진단</p>
-                                        <p style="margin: 0; font-size: 12px; color: #666;">✅ {llm_diagnosis['message']}</p>
-                                    </td>
-                                </tr>
-"""
-                else:
-                    # 진단 결과 있음
-                    html += """
-                                <!-- LLM 진단 -->
-                                <tr>
-                                    <td style="padding: 15px; border-top: 1px solid #eee; background: #f0f8ff;">
-                                        <p style="margin: 0 0 12px 0; font-size: 13px; font-weight: 600; color: #2c3e50;">🤖 AI 진단 및 제안</p>
-"""
-                    
-                    # 주요 문제 (primary)
-                    if llm_diagnosis.get('primary'):
-                        primary = llm_diagnosis['primary']
-                        category = primary.get('icon', '📊')
-                        problem = primary.get('problem', '')
-                        suggestion = primary.get('suggestion', '')
-                        
-                        html += f"""
-                                        <div style="margin-bottom: 10px; padding: 12px; background: white; border-left: 4px solid #e74c3c; border-radius: 4px;">
-                                            <p style="margin: 0 0 6px 0; font-size: 12px; font-weight: 600; color: #e74c3c;">{category} 주요 문제</p>
-                                            <p style="margin: 0 0 8px 0; font-size: 11px; color: #555; line-height: 1.5;">{problem}</p>
-                                            <p style="margin: 0; font-size: 11px; color: #27ae60; line-height: 1.5;"><strong>💡 제안:</strong> {suggestion}</p>
-                                        </div>
-"""
-                    
-                    # 부가 문제 (secondary)
-                    if llm_diagnosis.get('secondary'):
-                        secondary = llm_diagnosis['secondary']
-                        category = secondary.get('icon', '📊')
-                        problem = secondary.get('problem', '')
-                        suggestion = secondary.get('suggestion', '')
-                        
-                        html += f"""
-                                        <div style="margin-bottom: 10px; padding: 12px; background: white; border-left: 4px solid #f39c12; border-radius: 4px;">
-                                            <p style="margin: 0 0 6px 0; font-size: 12px; font-weight: 600; color: #f39c12;">{category} 부가 문제</p>
-                                            <p style="margin: 0 0 8px 0; font-size: 11px; color: #555; line-height: 1.5;">{problem}</p>
-                                            <p style="margin: 0; font-size: 11px; color: #27ae60; line-height: 1.5;"><strong>💡 제안:</strong> {suggestion}</p>
-                                        </div>
-"""
-                    
-                    # 관찰 사항 (observations)
-                    if llm_diagnosis.get('observations') and len(llm_diagnosis['observations']) > 0:
-                        html += """
-                                        <div style="padding: 12px; background: white; border-left: 4px solid #95a5a6; border-radius: 4px;">
-                                            <p style="margin: 0 0 8px 0; font-size: 12px; font-weight: 600; color: #95a5a6;">📋 추가 관찰 사항</p>
-"""
-                        for obs in llm_diagnosis['observations']:
-                            obs_icon = obs.get('icon', '📊')
-                            obs_problem = obs.get('problem', '')
-                            obs_suggestion = obs.get('suggestion', '')
-                            
-                            html += f"""
-                                            <div style="margin-bottom: 6px; padding-left: 8px; border-left: 2px solid #ddd;">
-                                                <p style="margin: 0 0 4px 0; font-size: 10px; color: #666;">{obs_icon} {obs_problem}</p>
-                                                <p style="margin: 0; font-size: 10px; color: #27ae60;">→ {obs_suggestion}</p>
-                                            </div>
-"""
-                        
-                        html += """
-                                        </div>
-"""
-                    
-                    html += """
-                                    </td>
-                                </tr>
-"""
-            
             # 상태 요약
             html += f"""
                                 <!-- 4가지 카테고리 상태 -->
@@ -2422,3 +2348,767 @@ def send_alert_email(**context):
     print(f"{'='*60}\n")
     
     return f"알람 이메일 발송 완료: 성공 {email_count}명, 실패 {skipped_count}명, 기준일: {target_date_str}"
+
+
+# ============================================================
+# LLM 조언 GSheet 업로드
+# ============================================================
+
+LLM_GSHEET_URL = "https://docs.google.com/spreadsheets/d/1JJSPLuqAgSSVaXQjZUwdBug-IyBouwUlsXHZiE20VZU/edit"
+LLM_SHEET_NAME = "LLM조언"
+
+LLM_COLS = [
+    'llm_issue_summary',
+    'llm_amount',
+    'llm_fee',
+    'llm_baemin',
+    'llm_coupang',
+    'llm_성실영업지표',
+    'llm_action_summary',
+    'llm_created_at',
+]
+
+
+def upload_llm_to_gsheet(**context):
+    """
+    메일 발송 대상(최신일 기준 alert 매장)에만 LLM 조언 생성 후 GSheet 업로드
+
+    업로드 시트: LLM_GSHEET_URL / 탭: LLM조언
+    primary_key: ['매장명', 'order_daily'] → append_unique (중복 방지)
+    """
+    from modules.transform.utility.paths import LOCAL_DB
+    from modules.transform.utility.gsheet import save_to_gsheet
+
+    print(f"\n{'='*60}")
+    print(f"[LLM GSheet] 업로드 시작")
+
+    alerts_csv_path = LOCAL_DB / '영업관리부_DB' / 'sales_daily_orders_alerts_grp.csv'
+
+    if not alerts_csv_path.exists():
+        print(f"[LLM GSheet] 알림 CSV 없음: {alerts_csv_path}")
+        return "알림 CSV 없음"
+
+    alert_df = pd.read_csv(alerts_csv_path, encoding='utf-8-sig')
+    print(f"[LLM GSheet] 알림 대상 로드: {len(alert_df)}건")
+
+    if len(alert_df) == 0:
+        print("[LLM GSheet] 알림 대상 0건 → 업로드 생략")
+        return "알림 대상 0건"
+
+    # LLM 컬럼 생성 (매장별 최신일 1건만)
+    print(f"[LLM GSheet] LLM 컬럼 생성 중... (매장별 최신일 1건)")
+    try:
+        alert_df = add_llm_columns_latest_per_store(alert_df)
+    except Exception as e:
+        print(f"[LLM GSheet] LLM 생성 실패: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return f"LLM 생성 실패: {e}"
+
+    # 업로드할 컬럼: 키 2개 + LLM 11개
+    upload_cols = ['매장명', 'order_daily'] + LLM_COLS
+    upload_df = alert_df[[c for c in upload_cols if c in alert_df.columns]].copy()
+
+    print(f"[LLM GSheet] 업로드 {len(upload_df)}건 → {LLM_SHEET_NAME}")
+
+    # append_unique는 (1) 기존 헤더에 없는 컬럼을 드랍하고, (2) 중복 키는 업데이트하지 않음.
+    # LLM 컬럼이 확실히 반영되도록 overwrite로 전체 갱신한다.
+    result = save_to_gsheet(
+        df=upload_df,
+        sheet_name=LLM_SHEET_NAME,
+        mode='overwrite',
+        url=LLM_GSHEET_URL,
+    )
+
+    print(f"[LLM GSheet] 완료: {result}")
+    print(f"{'='*60}\n")
+    return f"LLM GSheet 업로드 완료: {result}"
+
+
+# ============================================================
+# LLM 컬럼 생성 — 프롬프트 & 데이터 매핑 (컬럼별 쌍으로 배치)
+# 프롬프트 수정 시 바로 아래 _data_for_* 에서 연결 컬럼 확인/수정 가능
+# ============================================================
+
+SYS_PROMPT_LLM = """당신은 닭도리탕 프랜차이즈 본사 영업관리 전문 AI입니다.
+배달 플랫폼(배민/쿠팡이츠) 기반 매장 데이터를 보고 본사 담당자가 매장주에게 바로 전달할 수 있는
+실무형 진단과 실행 지시를 작성합니다.
+
+규칙:
+- 답변은 반드시 한국어로 작성하세요.
+- 불필요한 인사말, 부연 설명 없이 요청된 형식만 출력하세요.
+- 추상적인 표현(관리 필요, 신경 써야 함, 개선 필요, 점검 필요)을 쓰지 마세요.
+- 숫자 변화와 상태를 근거로 원인 1개와 실행 액션 1~2개를 명확히 적으세요.
+- 실행 액션은 매장주가 오늘 바로 할 수 있는 행동으로 쓰세요.
+- 닭도리탕 배달 매장에 맞는 표현을 우선 사용하세요: 대표메뉴/사이드 구성, 메뉴명·썸네일, 할인/쿠폰, 광고 on/off, 운영시간, 접수속도, 조리시간, 리뷰응대.
+- 주어진 데이터에 없는 사실은 지어내지 마세요.
+- 주어진 데이터에 없는 수치 목표, 예산, 추가 매출 추정, 주문 증가 예상치를 임의로 만들지 마세요.
+- 쿠팡이츠 입점, 새 툴 도입, 시스템 구축, KPI 설계처럼 즉시 실행이 어려운 본사형 표현은 쓰지 마세요.
+- 데이터가 비어 있거나 부족하면 임의 제안 대신 '데이터 부족으로 ○○ 확인 필요'처럼 부족한 항목을 먼저 적으세요.
+- 결과는 1~2문장으로 짧고 단정하게 쓰세요.
+- 가능하면 '매장주는 … 하세요', '본사는 … 확인하세요'처럼 실행 주체를 드러내세요."""
+
+
+# ── llm_main_issue ──────────────────────────────────────────────
+PROMPT_LLM_MAIN_ISSUE = """다음은 닭도리탕 배달 매장 운영 현황 데이터입니다.
+
+매장명: {store_name}
+종합점수: {total_score}점
+매출 상태: {status} (전주: {pre_status})
+수수료 상태: {fee_status} (전주: {pre_fee_status})
+배민 광고효과 상태: {baemin_ad_status}
+쿠팡 광고효과 상태: {coupang_ad_status}
+성실영업 상태: {service_status}
+
+위 데이터를 바탕으로 이 매장의 가장 시급한 문제를 한 문장으로 요약하세요.
+규칙:
+- 가장 나쁜 1개 이슈만 고르세요.
+- '매출 하락', '광고효율 저하'처럼 추상 명사만 쓰지 말고 원인이 드러나게 쓰세요.
+- 18~32자 이내로 짧게 쓰세요.
+- 예시: 배민 주문 감소로 최근7일 매출 급락 / 성실영업 지표 저하로 재주문 방어 실패
+형식: 핵심 이슈 요약 문장만 출력"""
+
+def _data_for_main_issue(row):
+    return {
+        'store_name':        _vs(row, '매장명'),
+        'total_score':       int(_v(row, 'total_score', 0)),
+        'status':            _vs(row, 'status'),
+        'pre_status':        _vs(row, 'pre_status'),
+        'fee_status':        _vs(row, 'fee_status'),
+        'pre_fee_status':    _vs(row, 'pre_fee_status'),
+        'baemin_ad_status':  _vs(row, '배민_광고효과_status'),
+        'coupang_ad_status': _vs(row, '쿠팡_광고효과_status'),
+        'service_status':    _vs(row, 'service_status'),
+    }
+
+
+# ── llm_summary_1 · 매출 현황 ────────────────────────────────────
+PROMPT_LLM_SUMMARY_1 = """다음은 매장의 매출 데이터입니다.
+
+기준일 매출: {total_amount:,}원 / 주문수: {total_order_count}건 / 객단가(ARPU): {arpu:,}원
+최근7일 합계: {sum_7d_recent:,}원 vs 직전7일: {sum_7d_prev:,}원
+14일MA: {ma_14:,}원 / 28일MA: {ma_28:,}원 / 2주평균: {current_avg_2week:,}원
+당월누적: {amt_curr_mtd:,}원 vs 전월동기: {amt_prev_mtd:,}원
+매출상태: {status} / 주간점수: {score_7d_total}점
+
+이 매장의 매출 현황을 2문장으로 요약하세요.
+규칙:
+- 첫 문장은 최근7일 vs 직전7일 또는 당월누적 vs 전월동기 중 더 큰 변화를 숫자로 요약하세요.
+- 둘째 문장은 주문수·객단가를 근거로 매출이 주문 감소형인지 객단가 저하형인지 판단하세요.
+- '감소했습니다'에서 끝내지 말고 무엇이 핵심인지 적으세요.
+형식: 요약 문장만 출력"""
+
+def _data_for_summary_1(row):
+    return {
+        'total_amount':      int(_v(row, 'total_amount', 0)),
+        'total_order_count': int(_v(row, 'total_order_count', 0)),
+        'arpu':              int(_v(row, 'ARPU', 0)),
+        'sum_7d_recent':     int(_v(row, 'sum_7d_recent', 0)),
+        'sum_7d_prev':       int(_v(row, 'sum_7d_prev', 0)),
+        'ma_14':             int(_v(row, 'ma_14', 0)),
+        'ma_28':             int(_v(row, 'ma_28', 0)),
+        'current_avg_2week': int(_v(row, 'current_avg_2week', 0)),
+        'amt_curr_mtd':      int(_v(row, 'amt_curr_mtd', 0)),
+        'amt_prev_mtd':      int(_v(row, 'amt_prev_mtd', 0)),
+        'status':            _vs(row, 'status'),
+        'score_7d_total':    int(_v(row, 'score_7d_total', 0)),
+    }
+
+
+# ── llm_summary_2 · 광고 현황 ────────────────────────────────────
+PROMPT_LLM_SUMMARY_2 = """다음은 매장의 광고 운영 데이터입니다.
+
+[배민 광고효과]
+광고효과: {bm_ad_eff:.2f} / MA14: {bm_ma14:.2f} / MA28: {bm_ma28:.2f}
+최근7일평균: {bm_avg_7d_recent:.2f} / 직전7일평균: {bm_avg_7d_prev:.2f}
+광고효과 상태: {bm_ad_status}
+
+[쿠팡 광고효과]
+광고효과: {cp_ad_eff:.2f} / MA14: {cp_ma14:.2f} / MA28: {cp_ma28:.2f}
+최근7일평균: {cp_avg_7d_recent:.2f} / 직전7일평균: {cp_avg_7d_prev:.2f}
+광고효과 상태: {cp_ad_status}
+
+[배민 광고 원데이터]
+주문금액: {bm_order_amt:,}원 / 광고지출: {bm_ad_spend:,}원
+노출수: {bm_impression:,} / 클릭수: {bm_click:,} / 주문수: {bm_order_cnt}건
+
+[쿠팡 광고 원데이터]
+광고매출: {cp_ad_revenue:,}원 / 광고비용: {cp_ad_cost:,}원
+광고노출수: {cp_ad_imp:,} / 광고클릭수: {cp_ad_click:,} / 광고주문수: {cp_ad_order}건
+
+이 매장의 광고 현황을 2문장으로 요약하세요.
+형식: 요약 문장만 출력 (다른 설명 없이)"""
+
+def _data_for_summary_2(row):
+    return {
+        # 배민 광고효과 지표
+        'bm_ad_eff':         float(_v(row, '배민_광고효과', 0)),
+        'bm_ma14':           float(_v(row, '배민_광고효과_MA14', 0)),
+        'bm_ma28':           float(_v(row, '배민_광고효과_MA28', 0)),
+        'bm_avg_7d_recent':  float(_v(row, '배민_광고효과_avg_7d_recent', 0)),
+        'bm_avg_7d_prev':    float(_v(row, '배민_광고효과_avg_7d_prev', 0)),
+        'bm_ad_status':      _vs(row, '배민_광고효과_status'),
+        # 쿠팡 광고효과 지표
+        'cp_ad_eff':         float(_v(row, '쿠팡_광고효과', 0)),
+        'cp_ma14':           float(_v(row, '쿠팡_광고효과_MA14', 0)),
+        'cp_ma28':           float(_v(row, '쿠팡_광고효과_MA28', 0)),
+        'cp_avg_7d_recent':  float(_v(row, '쿠팡_광고효과_avg_7d_recent', 0)),
+        'cp_avg_7d_prev':    float(_v(row, '쿠팡_광고효과_avg_7d_prev', 0)),
+        'cp_ad_status':      _vs(row, '쿠팡_광고효과_status'),
+        # 배민 원데이터
+        'bm_order_amt':      int(_v(row, '주문금액', 0)),
+        'bm_ad_spend':       int(_v(row, '광고지출', 0)),
+        'bm_impression':     int(_v(row, '노출수', 0)),
+        'bm_click':          int(_v(row, '클릭수', 0)),
+        'bm_order_cnt':      int(_v(row, '주문수', 0)),
+        # 쿠팡 원데이터
+        'cp_ad_revenue':     int(_v(row, '광고매출', 0)),
+        'cp_ad_cost':        int(_v(row, '광고비용', 0)),
+        'cp_ad_imp':         int(_v(row, '광고노출수', 0)),
+        'cp_ad_click':       int(_v(row, '광고클릭수', 0)),
+        'cp_ad_order':       int(_v(row, '광고주문수', 0)),
+    }
+
+
+# ── llm_summary_3 · 수수료/성실영업 현황 ─────────────────────────
+PROMPT_LLM_SUMMARY_3 = """다음은 매장의 수수료 및 성실영업 데이터입니다.
+
+[수수료율]
+수수료율: {fee_ratio:.2f}% / MA14: {fee_ma14:.2f}% / MA28: {fee_ma28:.2f}%
+최근7일평균: {fee_avg_7d_recent:.2f}% / 직전7일평균: {fee_avg_7d_prev:.2f}%
+당월수수료율: {fee_curr_mtd:.4f} / 전월동기: {fee_prev_mtd:.4f}
+수수료 상태: {fee_status}
+
+[성실영업]
+주문접수시간: {accept_time} / 주문접수율: {accept_rate}
+조리소요시간: {cooking_time} / 조리시간준수율: {cooking_rate}
+최근재주문율: {reorder_rate} / 최근별점: {rating}
+영업임시중지 변경: {pause_change} / 운영시간 변경: {hours_change} / 휴무일 변경: {holiday_change}
+성실영업 상태: {service_status}
+
+이 매장의 수수료 및 성실영업 현황을 2문장으로 요약하세요.
+형식: 요약 문장만 출력 (다른 설명 없이)"""
+
+def _data_for_summary_3(row):
+    return {
+        # 수수료율 지표
+        'fee_ratio':         float(_v(row, 'fee_ratio', 0)),
+        'fee_ma14':          float(_v(row, 'fee_ratio_MA14', 0)),
+        'fee_ma28':          float(_v(row, 'fee_ratio_MA28', 0)),
+        'fee_avg_7d_recent': float(_v(row, 'avg_7d_recent', 0)),
+        'fee_avg_7d_prev':   float(_v(row, 'avg_7d_prev', 0)),
+        'fee_curr_mtd':      float(_v(row, 'fee_ratio_mtd_curr_month', 0)),
+        'fee_prev_mtd':      float(_v(row, 'fee_ratio_mtd_prev_month_same_day', 0)),
+        'fee_status':        _vs(row, 'fee_status'),
+        # 성실영업 지표
+        'accept_time':       _vs(row, '주문접수시간'),
+        'accept_rate':       _vs(row, '주문접수율'),
+        'cooking_time':      _vs(row, '조리소요시간'),
+        'cooking_rate':      _vs(row, '조리시간준수율'),
+        'reorder_rate':      _vs(row, '최근재주문율'),
+        'rating':            _vs(row, '최근별점'),
+        'pause_change':      _vs(row, '영업임시중지 변경'),
+        'hours_change':      _vs(row, '운영시간 변경'),
+        'holiday_change':    _vs(row, '휴무일 변경'),
+        'service_status':    _vs(row, 'service_status'),
+    }
+
+
+# ── llm_reason_1 · 매출 원인 판단 ────────────────────────────────
+PROMPT_LLM_REASON_1 = """다음은 매장의 매출 관련 상세 데이터입니다.
+
+최근7일 합계: {sum_7d_recent:,}원 / 직전7일 합계: {sum_7d_prev:,}원
+전체 주문수: {total_order_cnt}건 (배민: {bm_order_cnt}건 / 쿠팡: {cp_order_cnt}건)
+객단가(ARPU): {arpu:,}원
+배민 매출: {bm_amount:,}원 / 쿠팡 매출: {cp_amount:,}원
+매출 상태: {status} / 종합점수: {score}점 / 주간점수: {score_7d_total}점
+
+매출 이상의 가장 유력한 원인을 2문장으로 분석하세요.
+형식: 원인 분석 문장만 출력 (다른 설명 없이)"""
+
+def _data_for_reason_1(row):
+    return {
+        'sum_7d_recent':   int(_v(row, 'sum_7d_recent', 0)),
+        'sum_7d_prev':     int(_v(row, 'sum_7d_prev', 0)),
+        'total_order_cnt': int(_v(row, 'total_order_count', 0)),
+        'bm_order_cnt':    int(_v(row, 'total_order_count_배민', 0)),
+        'cp_order_cnt':    int(_v(row, 'total_order_count_쿠팡', 0)),
+        'arpu':            int(_v(row, 'ARPU', 0)),
+        'bm_amount':       int(_v(row, 'total_amount_배민', 0)),
+        'cp_amount':       int(_v(row, 'total_amount_쿠팡', 0)),
+        'status':          _vs(row, 'status'),
+        'score':           int(_v(row, 'score', 0)),
+        'score_7d_total':  int(_v(row, 'score_7d_total', 0)),
+    }
+
+
+# ── llm_reason_2 · 광고 원인 판단 (데이터 = summary_2 동일) ──────
+PROMPT_LLM_REASON_2 = """다음은 매장의 광고 상세 데이터입니다.
+
+[배민 광고]
+광고효과: {bm_ad_eff:.2f} / 최근7일평균: {bm_avg_7d_recent:.2f} / 직전7일평균: {bm_avg_7d_prev:.2f}
+상태: {bm_ad_status}
+노출수: {bm_impression:,} / 클릭수: {bm_click:,} / 주문수: {bm_order_cnt}건
+주문금액: {bm_order_amt:,}원 / 광고지출: {bm_ad_spend:,}원
+
+[쿠팡 광고]
+광고효과: {cp_ad_eff:.2f} / 최근7일평균: {cp_avg_7d_recent:.2f} / 직전7일평균: {cp_avg_7d_prev:.2f}
+상태: {cp_ad_status}
+광고노출수: {cp_ad_imp:,} / 광고클릭수: {cp_ad_click:,} / 광고주문수: {cp_ad_order}건
+광고매출: {cp_ad_revenue:,}원 / 광고비용: {cp_ad_cost:,}원
+
+광고 이상의 가장 유력한 원인을 2문장으로 분석하세요.
+형식: 원인 분석 문장만 출력 (다른 설명 없이)"""
+
+def _data_for_reason_2(row):
+    return _data_for_summary_2(row)   # 광고 데이터 재사용, 프롬프트만 다름
+
+
+# ── llm_reason_3 · 운영/비용 원인 판단 (데이터 = summary_3 동일) ──
+PROMPT_LLM_REASON_3 = """다음은 매장의 수수료 및 성실영업 상세 데이터입니다.
+
+[수수료]
+수수료율: {fee_ratio:.2f}% / MA14: {fee_ma14:.2f}% / MA28: {fee_ma28:.2f}%
+최근7일평균: {fee_avg_7d_recent:.2f}% / 직전7일평균: {fee_avg_7d_prev:.2f}%
+수수료 상태: {fee_status}
+
+[성실영업]
+주문접수율: {accept_rate} / 주문접수시간: {accept_time}
+조리시간준수율: {cooking_rate} / 조리소요시간: {cooking_time}
+최근재주문율: {reorder_rate} / 최근별점: {rating}
+운영시간 변경: {hours_change} / 영업임시중지 변경: {pause_change} / 휴무일 변경: {holiday_change}
+성실영업 상태: {service_status}
+
+수수료 또는 성실영업 이상의 가장 유력한 원인을 2문장으로 분석하세요.
+형식: 원인 분석 문장만 출력 (다른 설명 없이)"""
+
+def _data_for_reason_3(row):
+    return _data_for_summary_3(row)   # 수수료/성실 데이터 재사용, 프롬프트만 다름
+
+
+# ── llm_action_1 · 매출 개선 액션 ────────────────────────────────
+PROMPT_LLM_ACTION_1 = """다음은 닭도리탕 배달 매장의 매출 현황입니다.
+
+최근7일 합계: {sum_7d_recent:,}원 / 직전7일 합계: {sum_7d_prev:,}원
+전체 주문수: {total_order_cnt}건 / 객단가(ARPU): {arpu:,}원
+배민 매출: {bm_amount:,}원 / 쿠팡 매출: {cp_amount:,}원
+배민 주문수: {bm_order_cnt}건 / 쿠팡 주문수: {cp_order_cnt}건
+
+담당자가 매장주에게 즉시 안내할 수 있는 매출 개선 액션을 2문장으로 제안하세요.
+규칙:
+- 액션은 오늘 바로 가능한 행동만 제안하세요.
+- 첫 문장은 데이터 해석에 따른 우선 과제 1개를 쓰세요.
+- 둘째 문장은 실행 방법을 구체적으로 쓰세요.
+- 닭도리탕 배달 매장에 맞게 대표메뉴 노출, 사이드/세트 보강, 할인/쿠폰, 배민/쿠팡 채널 집중 중 필요한 것을 선택하세요.
+- '매출을 올리세요', '마케팅을 강화하세요' 같은 추상 문장은 금지입니다.
+- 없는 숫자 목표나 기대 매출을 계산해서 쓰지 마세요.
+- 예시 톤: 배민 주문 비중이 높으니 배민 대표메뉴 1~2개를 상단 고정하고 사이드 세트 구성을 같이 노출하세요.
+형식: 액션 제안 문장만 출력"""
+
+def _data_for_action_1(row):
+    return {
+        'sum_7d_recent':   int(_v(row, 'sum_7d_recent', 0)),
+        'sum_7d_prev':     int(_v(row, 'sum_7d_prev', 0)),
+        'total_order_cnt': int(_v(row, 'total_order_count', 0)),
+        'arpu':            int(_v(row, 'ARPU', 0)),
+        'bm_amount':       int(_v(row, 'total_amount_배민', 0)),
+        'cp_amount':       int(_v(row, 'total_amount_쿠팡', 0)),
+        'bm_order_cnt':    int(_v(row, 'total_order_count_배민', 0)),
+        'cp_order_cnt':    int(_v(row, 'total_order_count_쿠팡', 0)),
+    }
+
+
+# ── llm_action_2 · 광고 개선 액션 ────────────────────────────────
+PROMPT_LLM_ACTION_2 = """다음은 닭도리탕 배달 매장의 광고 현황입니다.
+
+배민 광고효과 상태: {bm_ad_status}
+쿠팡 광고효과 상태: {cp_ad_status}
+배민 노출수: {bm_impression:,} / 클릭수: {bm_click:,} / 주문수: {bm_order_cnt}건
+쿠팡 광고노출수: {cp_ad_imp:,} / 클릭수: {cp_ad_click:,} / 주문수: {cp_ad_order}건
+
+담당자가 매장주에게 즉시 안내할 수 있는 광고 개선 액션을 2문장으로 제안하세요.
+규칙:
+- 노출→클릭→주문 중 어디가 막혔는지 판단해서 그 단계만 겨냥한 액션을 쓰세요.
+- 노출은 높은데 클릭이 낮으면 메뉴명/썸네일/대표메뉴 노출을, 클릭은 있는데 주문이 낮으면 가격·쿠폰·세트구성 점검을 우선 제안하세요.
+- 배민과 쿠팡 중 수치가 더 나쁜 채널을 콕 집어 말하세요.
+- '광고를 늘리세요'처럼 예산 확대만 말하지 마세요.
+- 예산 금액, CTR 목표치, 전환 목표치처럼 데이터에 없는 숫자를 임의 제시하지 마세요.
+형식: 액션 제안 문장만 출력"""
+
+def _data_for_action_2(row):
+    return {
+        'bm_ad_status':  _vs(row, '배민_광고효과_status'),
+        'cp_ad_status':  _vs(row, '쿠팡_광고효과_status'),
+        'bm_impression': int(_v(row, '노출수', 0)),
+        'bm_click':      int(_v(row, '클릭수', 0)),
+        'bm_order_cnt':  int(_v(row, '주문수', 0)),
+        'cp_ad_imp':     int(_v(row, '광고노출수', 0)),
+        'cp_ad_click':   int(_v(row, '광고클릭수', 0)),
+        'cp_ad_order':   int(_v(row, '광고주문수', 0)),
+    }
+
+
+# ── llm_action_3 · 운영 개선 액션 ────────────────────────────────
+PROMPT_LLM_ACTION_3 = """다음은 닭도리탕 배달 매장의 성실영업 현황입니다.
+
+주문접수율: {accept_rate} / 조리시간준수율: {cooking_rate}
+최근별점: {rating} / 최근재주문율: {reorder_rate}
+운영시간 변경: {hours_change} / 영업임시중지 변경: {pause_change} / 휴무일 변경: {holiday_change}
+주문접수시간: {accept_time} / 조리소요시간: {cooking_time}
+
+담당자가 매장주에게 즉시 안내할 수 있는 운영 개선 액션을 2문장으로 제안하세요.
+규칙:
+- 주문접수율, 조리시간준수율, 별점, 재주문율 중 가장 약한 1개를 중심으로 쓰세요.
+- 조리/접수 문제가 있으면 피크시간 인력·준비 공정·일시중지 사용 기준처럼 운영 행동으로 제안하세요.
+- 별점/재주문율 문제가 있으면 리뷰응답, 포장상태, 대표메뉴 품질 편차 점검처럼 현장 행동으로 제안하세요.
+- '서비스를 개선하세요' 같은 추상 문장은 금지입니다.
+- POS 연동, 툴 도입, 프로세스 구축, KPI 설정처럼 본사 문서형 문장은 금지입니다.
+형식: 액션 제안 문장만 출력"""
+
+def _data_for_action_3(row):
+    return {
+        'accept_rate':    _vs(row, '주문접수율'),
+        'cooking_rate':   _vs(row, '조리시간준수율'),
+        'rating':         _vs(row, '최근별점'),
+        'reorder_rate':   _vs(row, '최근재주문율'),
+        'hours_change':   _vs(row, '운영시간 변경'),
+        'pause_change':   _vs(row, '영업임시중지 변경'),
+        'holiday_change': _vs(row, '휴무일 변경'),
+        'accept_time':    _vs(row, '주문접수시간'),
+        'cooking_time':   _vs(row, '조리소요시간'),
+    }
+
+
+# ── llm_amount · 매출 의견 ────────────────────────────────────────
+PROMPT_LLM_AMOUNT = """다음은 닭도리탕 배달 매장의 매출 점수 관련 데이터입니다.
+
+기준일: {order_daily}
+매출 상태: {status} / 전주 상태: {pre_status}
+매출 합산점수(score): {score}점 = 추세점수(score_trend) {score_trend} + 최근7일점수(score_7d_total) {score_7d_total} + 당월누적점수(score_4week_total) {score_4week_total}
+매출 핵심 컬럼: total_order_count {total_order_count}건 / total_amount {total_amount:,}원 / ARPU {arpu:,}원
+점수 매칭:
+- score_trend: ma_14 {ma_14:,}원 vs ma_28 {ma_28:,}원 비교 결과
+- score_7d_total: sum_7d_recent {sum_7d_recent:,}원 vs sum_7d_prev {sum_7d_prev:,}원 비교 결과
+- score_4week_total: amt_curr_mtd {amt_curr_mtd:,}원 vs amt_prev_mtd {amt_prev_mtd:,}원 비교 결과
+최근7일 합계: {sum_7d_recent:,}원 / 직전7일 합계: {sum_7d_prev:,}원
+당월누적: {amt_curr_mtd:,}원 / 전월동기: {amt_prev_mtd:,}원
+
+이 컬럼은 매출에 대한 의견만 적는 칸입니다.
+규칙:
+- 반드시 "현상황: ... 근거: ..." 형식으로 1문장만 작성하세요.
+- 현상황에는 현재 매출 상태를 짧게 판단해서 쓰세요.
+- 근거에는 반드시 total_order_count, total_amount, ARPU와 score, score_trend, score_7d_total, score_4week_total 중 어떤 계산 항목이 나빴는지와 그에 대응하는 실제 비교값(ma_14 vs ma_28, 최근7일 vs 직전7일, 당월누적 vs 전월동기)을 함께 넣으세요.
+- 주문수 감소형인지 객단가 저하형인지 구분해서 쓰세요.
+- 다른 영역(수수료, 광고, 성실영업) 이야기는 쓰지 마세요.
+형식: 현상황: ... 근거: ..."""
+
+
+# ── llm_fee · 수수료 의견 ─────────────────────────────────────────
+PROMPT_LLM_FEE = """다음은 닭도리탕 배달 매장의 수수료 점수 관련 데이터입니다.
+
+기준일: {order_daily}
+수수료 상태: {fee_status} / 전주 상태: {pre_fee_status}
+수수료 합산점수(fee_score_total): {fee_score_total}점
+세부점수: 추세 {fee_trand_score} / 최근7일 {fee_avg_7d_score} / 당월누적 {fee_month_score}
+수수료 핵심 컬럼: 수수료율 {fee_ratio_pct:.2f}% / 수수료율_배민 {fee_ratio_bm:.2f}% / 수수료율_쿠팡 {fee_ratio_cp:.2f}% / fee_ratio {fee_ratio:.4f}
+수수료율: {fee_ratio:.4f} / MA14: {fee_ma14:.4f} / MA28: {fee_ma28:.4f}
+최근7일평균: {fee_avg_7d_recent:.2f}% / 직전7일평균: {fee_avg_7d_prev:.2f}%
+당월수수료율: {fee_curr_mtd:.4f} / 전월동기: {fee_prev_mtd:.4f}
+
+이 컬럼은 수수료에 대한 의견만 적는 칸입니다.
+규칙:
+- 반드시 "현상황: ... 근거: ..." 형식으로 1문장만 작성하세요.
+- 현상황에는 현재 수수료 부담 상태를 짧게 판단해서 쓰세요.
+- 근거에는 반드시 수수료율, 수수료율_배민, 수수료율_쿠팡, fee_ratio와 fee_score_total만이 아니라 fee_trand_score, fee_avg_7d_score, fee_month_score 중 어떤 항목이 점수를 올렸는지 넣으세요.
+- 광고, 매출, 성실영업 이야기는 쓰지 마세요.
+형식: 현상황: ... 근거: ..."""
+
+
+# ── llm_baemin · 배민 광고 의견 ───────────────────────────────────
+PROMPT_LLM_BAEMIN = """다음은 닭도리탕 배달 매장의 배민 광고효과 관련 데이터입니다.
+
+기준일: {order_daily}
+배민 광고효과 상태: {bm_ad_status}
+배민 광고효과 합산점수(배민_광고효과_score_total): {bm_score_total}점
+세부점수: 추세 {bm_trand_score} / 최근7일 {bm_avg_7d_score} / 당월누적 {bm_month_score}
+배민 핵심 컬럼: 광고지출 {bm_ad_spend:,}원 / 노출수 {bm_impression:,} / 클릭수 {bm_click:,} / 주문수 {bm_order_cnt}건 / 주문금액 {bm_order_amt:,}원 / 광고효과 {bm_ad_eff:.4f}
+광고효과: {bm_ad_eff:.4f} / MA14: {bm_ma14:.4f} / MA28: {bm_ma28:.4f}
+최근7일평균: {bm_avg_7d_recent:.4f} / 직전7일평균: {bm_avg_7d_prev:.4f}
+
+이 컬럼은 배민 광고에 대한 의견만 적는 칸입니다.
+규칙:
+- 반드시 "현상황: ... 근거: ..." 형식으로 1문장만 작성하세요.
+- 현상황에는 현재 배민 광고효율 상태를 짧게 판단해서 쓰세요.
+- 근거에는 반드시 광고지출, 노출수, 클릭수, 주문수, 주문금액, 광고효과와 배민_광고효과_score_total만이 아니라 배민_광고효과_trand_score, 배민_광고효과_avg_7d_score, 배민_광고효과_month_score 중 어떤 항목이 나쁜지와 노출/클릭/주문 중 약한 구간을 같이 쓰세요.
+- 쿠팡, 매출, 수수료, 성실영업 이야기는 쓰지 마세요.
+형식: 현상황: ... 근거: ..."""
+
+
+# ── llm_coupang · 쿠팡 광고 의견 ──────────────────────────────────
+PROMPT_LLM_COUPANG = """다음은 닭도리탕 배달 매장의 쿠팡이츠 광고효과 관련 데이터입니다.
+
+기준일: {order_daily}
+쿠팡 광고효과 상태: {cp_ad_status}
+쿠팡 광고효과 합산점수(쿠팡_광고효과_score_total): {cp_score_total}점
+세부점수: 추세 {cp_trand_score} / 최근7일 {cp_avg_7d_score} / 당월누적 {cp_month_score}
+쿠팡 핵심 컬럼: 광고비용 {cp_ad_cost:,}원 / 신규고객 {cp_new_customer} / 광고주문수 {cp_ad_order}건 / 광고매출 {cp_ad_revenue:,}원 / 전체매출 {cp_total_sales:,}원 / 광고클릭수 {cp_ad_click:,} / 광고노출수 {cp_ad_imp:,}
+광고효과: {cp_ad_eff:.4f} / MA14: {cp_ma14:.4f} / MA28: {cp_ma28:.4f}
+최근7일평균: {cp_avg_7d_recent:.4f} / 직전7일평균: {cp_avg_7d_prev:.4f}
+
+이 컬럼은 쿠팡 광고에 대한 의견만 적는 칸입니다.
+규칙:
+- 반드시 "현상황: ... 근거: ..." 형식으로 1문장만 작성하세요.
+- 현상황에는 현재 쿠팡 광고효율 상태를 짧게 판단해서 쓰세요.
+- 근거에는 반드시 광고비용, 신규고객, 광고주문수, 광고매출, 전체매출, 광고클릭수, 광고노출수와 쿠팡_광고효과_score_total만이 아니라 쿠팡_광고효과_trand_score, 쿠팡_광고효과_avg_7d_score, 쿠팡_광고효과_month_score 중 어떤 항목이 나쁜지와 클릭/노출/주문 구간을 같이 쓰세요.
+- 배민, 매출, 수수료, 성실영업 이야기는 쓰지 마세요.
+형식: 현상황: ... 근거: ..."""
+
+
+# ── llm_성실영업지표 · 운영 의견 ─────────────────────────────────
+PROMPT_LLM_SERVICE = """다음은 닭도리탕 배달 매장의 성실영업지표 관련 데이터입니다.
+
+기준일: {order_daily}
+성실영업 상태: {service_status}
+성실영업 합산점수(service_score_total): {service_score_total}점
+세부점수: 조리 {cooking_total} / 접수 {accept_total} / 재주문 {reorder_total} / 별점 {rating_total}
+성실지표 핵심 컬럼: 조리소요시간 {cooking_time} / 조리소요시간_순위비율 {cooking_time_rank} / 주문접수시간 {accept_time} / 주문접수시간_순위비율 {accept_time_rank} / 조리시간준수율 {cooking_rate} / 조리시간준수율_순위비율 {cooking_rate_rank} / 주문접수율 {accept_rate} / 주문접수율_순위비율 {accept_rate_rank} / 최근재주문율 {reorder_rate} / 최근별점 {rating} / 전체_주문수 {all_order_count}
+주문접수시간: {accept_time} / 주문접수율: {accept_rate}
+조리소요시간: {cooking_time} / 조리소요시간_순위비율: {cooking_time_rank}
+주문접수시간_순위비율: {accept_time_rank}
+조리시간준수율: {cooking_rate} / 조리시간준수율_순위비율: {cooking_rate_rank}
+주문접수율_순위비율: {accept_rate_rank}
+최근재주문율: {reorder_rate} / 최근별점: {rating}
+영업임시중지 변경: {pause_change} / 운영시간 변경: {hours_change} / 휴무일 변경: {holiday_change}
+
+이 컬럼은 성실영업지표에 대한 의견만 적는 칸입니다.
+규칙:
+- 반드시 "현상황: ... 근거: ..." 형식으로 1문장만 작성하세요.
+- 현상황에는 현재 운영 리스크를 짧게 판단해서 쓰세요.
+- 근거에는 반드시 조리소요시간, 조리소요시간_순위비율, 주문접수시간, 주문접수시간_순위비율, 조리시간준수율, 조리시간준수율_순위비율, 주문접수율, 주문접수율_순위비율, 최근재주문율, 최근별점, 전체_주문수와 service_score_total, 조리시간_total, 접수시간_total, 재주문율_total, 별점_total 중 어떤 항목이 가장 점수를 끌어올렸는지를 같이 쓰세요.
+- 매출, 광고, 수수료 이야기는 쓰지 마세요.
+형식: 현상황: ... 근거: ..."""
+
+
+# ── llm_action_summary · 액션 요약 ───────────────────────────────
+PROMPT_LLM_ACTION_SUMMARY = """다음은 닭도리탕 배달 매장의 핵심 상태 요약입니다.
+
+매출 상태: {status}
+수수료 상태: {fee_status}
+배민 광고효과 상태: {bm_ad_status}
+쿠팡 광고효과 상태: {cp_ad_status}
+성실영업 상태: {service_status}
+총점(total_score): {total_score}점 = 매출 {amount_score} + 수수료 {fee_score_total} + 배민광고 {bm_score_total} + 쿠팡광고 {cp_score_total} + 성실영업 {service_score_total}
+
+매출: 최근7일 {sum_7d_recent:,}원 / 직전7일 {sum_7d_prev:,}원 / 주문수 {total_order_count}건 / 객단가 {arpu:,}원
+배민 주문수 {bm_order_cnt}건 / 쿠팡 주문수 {cp_order_cnt}건
+조리소요시간 {cooking_time} / 주문접수시간 {accept_time} / 주문접수율 {accept_rate}
+
+이 컬럼은 매장주에게 바로 전달할 액션 요약 1개를 적는 칸입니다.
+규칙:
+- 가장 시급한 영역 1개만 골라 반드시 "현상황: ... 근거: ... 액션: ..." 형식으로 1문장만 작성하세요.
+- 근거에는 total_score와 가장 높은 세부 합산점수 1개를 넣으세요.
+- 액션은 오늘 바로 할 행동 1개만 쓰세요.
+- 없는 숫자 목표나 예산은 쓰지 마세요.
+형식: 현상황: ... 근거: ... 액션: ..."""
+
+
+def _data_for_amount(row):
+    base = _data_for_summary_1(row)
+    base['order_daily'] = _vs(row, 'order_daily')
+    base['pre_status'] = _vs(row, 'pre_status')
+    base['score'] = int(_v(row, 'score', 0))
+    base['score_trend'] = int(_v(row, 'score_trend', 0))
+    base['score_7d_total'] = int(_v(row, 'score_7d_total', 0))
+    base['score_4week_total'] = int(_v(row, 'score_4week_total', 0))
+    base['settlement_amount'] = int(_v(row, 'settlement_amount', 0))
+    base['bm_amount'] = int(_v(row, 'total_amount_배민', 0))
+    base['cp_amount'] = int(_v(row, 'total_amount_쿠팡', 0))
+    base['bm_order_cnt'] = int(_v(row, 'total_order_count_배민', 0))
+    base['cp_order_cnt'] = int(_v(row, 'total_order_count_쿠팡', 0))
+    base['prev_day_amount'] = int(_v(row, '전일_매출', 0))
+    base['prev_week_amount'] = int(_v(row, '전주_매출', 0))
+    base['day_change_rate'] = _vs(row, '전일대비_증감률')
+    base['week_change_rate'] = _vs(row, '전주대비_증감률')
+    return base
+
+
+def _data_for_fee(row):
+    base = _data_for_summary_3(row)
+    base['order_daily'] = _vs(row, 'order_daily')
+    base['pre_fee_status'] = _vs(row, 'pre_fee_status')
+    base['fee_score_total'] = int(_v(row, 'fee_score_total', 0))
+    base['fee_trand_score'] = int(_v(row, 'fee_trand_score', 0))
+    base['fee_avg_7d_score'] = int(_v(row, 'fee_avg_7d_score', 0))
+    base['fee_month_score'] = int(_v(row, 'fee_month_score', 0))
+    base['fee_ratio_pct'] = float(_v(row, '수수료율', 0))
+    base['fee_ratio_bm'] = float(_v(row, '수수료율_배민', 0))
+    base['fee_ratio_cp'] = float(_v(row, '수수료율_쿠팡', 0))
+    return base
+
+
+def _data_for_baemin(row):
+    base = _data_for_summary_2(row)
+    base['order_daily'] = _vs(row, 'order_daily')
+    base['bm_score_total'] = int(_v(row, '배민_광고효과_score_total', 0))
+    base['bm_trand_score'] = int(_v(row, '배민_광고효과_trand_score', 0))
+    base['bm_avg_7d_score'] = int(_v(row, '배민_광고효과_avg_7d_score', 0))
+    base['bm_month_score'] = int(_v(row, '배민_광고효과_month_score', 0))
+    return base
+
+
+def _data_for_coupang(row):
+    base = _data_for_summary_2(row)
+    base['order_daily'] = _vs(row, 'order_daily')
+    base['cp_score_total'] = int(_v(row, '쿠팡_광고효과_score_total', 0))
+    base['cp_trand_score'] = int(_v(row, '쿠팡_광고효과_trand_score', 0))
+    base['cp_avg_7d_score'] = int(_v(row, '쿠팡_광고효과_avg_7d_score', 0))
+    base['cp_month_score'] = int(_v(row, '쿠팡_광고효과_month_score', 0))
+    base['cp_new_customer'] = int(_v(row, '신규고객', 0))
+    base['cp_total_sales'] = int(_v(row, '전체매출', 0))
+    return base
+
+
+def _data_for_service(row):
+    base = _data_for_summary_3(row)
+    base['order_daily'] = _vs(row, 'order_daily')
+    base['service_score_total'] = int(_v(row, 'service_score_total', 0))
+    base['cooking_total'] = int(_v(row, '조리시간_total', 0))
+    base['accept_total'] = int(_v(row, '접수시간_total', 0))
+    base['reorder_total'] = int(_v(row, '재주문율_total', 0))
+    base['rating_total'] = int(_v(row, '별점_total', 0))
+    base['all_order_count'] = int(_v(row, '전체_주문수', 0))
+    base['cooking_time_rank'] = _vs(row, '조리소요시간_순위비율')
+    base['accept_time_rank'] = _vs(row, '주문접수시간_순위비율')
+    base['cooking_rate_rank'] = _vs(row, '조리시간준수율_순위비율')
+    base['accept_rate_rank'] = _vs(row, '주문접수율_순위비율')
+    return base
+
+
+def _data_for_action_summary(row):
+    return {
+        'status': _vs(row, 'status'),
+        'fee_status': _vs(row, 'fee_status'),
+        'bm_ad_status': _vs(row, '배민_광고효과_status'),
+        'cp_ad_status': _vs(row, '쿠팡_광고효과_status'),
+        'service_status': _vs(row, 'service_status'),
+        'total_score': int(_v(row, 'total_score', 0)),
+        'amount_score': int(_v(row, 'score', 0)),
+        'fee_score_total': int(_v(row, 'fee_score_total', 0)),
+        'bm_score_total': int(_v(row, '배민_광고효과_score_total', 0)),
+        'cp_score_total': int(_v(row, '쿠팡_광고효과_score_total', 0)),
+        'service_score_total': int(_v(row, 'service_score_total', 0)),
+        'sum_7d_recent': int(_v(row, 'sum_7d_recent', 0)),
+        'sum_7d_prev': int(_v(row, 'sum_7d_prev', 0)),
+        'total_order_count': int(_v(row, 'total_order_count', 0)),
+        'arpu': int(_v(row, 'ARPU', 0)),
+        'bm_order_cnt': int(_v(row, 'total_order_count_배민', 0)),
+        'cp_order_cnt': int(_v(row, 'total_order_count_쿠팡', 0)),
+        'cooking_time': _vs(row, '조리소요시간'),
+        'accept_time': _vs(row, '주문접수시간'),
+        'accept_rate': _vs(row, '주문접수율'),
+    }
+
+
+# ============================================================
+# LLM 컬럼 추가 함수
+# ============================================================
+
+def add_llm_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    DataFrame 우측에 의미형 LLM 컬럼 추가
+
+    추가 컬럼:
+        llm_amount, llm_fee, llm_baemin, llm_coupang,
+        llm_성실영업지표, llm_action_summary, llm_created_at
+
+    각 컬럼의 프롬프트/데이터 매핑은 위 PROMPT_LLM_* / _data_for_* 쌍을 수정하세요.
+    """
+    from modules.transform.utility.qwen_client import query_qwen
+
+    result_df = df.copy()
+
+    for col in LLM_COLS:
+        result_df[col] = ''
+
+    created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    total_rows = len(result_df)
+    indices = list(result_df.index)
+
+    for idx, row in result_df.iterrows():
+        store = row.get('매장명', '?')
+        print(f"[LLM] {store} 처리 중... ({indices.index(idx) + 1}/{total_rows})")
+
+        prompts_and_cols = [
+            (PROMPT_LLM_MAIN_ISSUE.format(**_data_for_main_issue(row)),          'llm_issue_summary'),
+            (PROMPT_LLM_AMOUNT.format(**_data_for_amount(row)),                  'llm_amount'),
+            (PROMPT_LLM_FEE.format(**_data_for_fee(row)),                        'llm_fee'),
+            (PROMPT_LLM_BAEMIN.format(**_data_for_baemin(row)),                  'llm_baemin'),
+            (PROMPT_LLM_COUPANG.format(**_data_for_coupang(row)),                'llm_coupang'),
+            (PROMPT_LLM_SERVICE.format(**_data_for_service(row)),                'llm_성실영업지표'),
+            (PROMPT_LLM_ACTION_SUMMARY.format(**_data_for_action_summary(row)),  'llm_action_summary'),
+        ]
+
+        for prompt, col_name in prompts_and_cols:
+            try:
+                result_df.at[idx, col_name] = query_qwen(prompt, system_prompt=SYS_PROMPT_LLM)
+            except Exception as e:
+                print(f"[LLM] {store} / {col_name} 실패: {e}")
+                result_df.at[idx, col_name] = ''
+
+        result_df.at[idx, 'llm_created_at'] = created_at
+
+    print(f"[LLM] 완료: {total_rows}개 매장 처리")
+    return result_df
+
+
+def add_llm_columns_latest_per_store(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    비용/시간 이슈 방지:
+    - 전체 행에 LLM을 붙이지 않고 '매장별 order_daily 최대값' 1행에만 LLM 컬럼을 생성한다.
+    - 반환 DataFrame은 입력과 동일한 행을 유지하되, 최신 1행에만 llm_* 컬럼이 채워진다.
+    """
+    if df is None or len(df) == 0:
+        return df
+
+    store_col = '매장명'
+    date_col = 'order_daily'
+    llm_cols = list(LLM_COLS)
+
+    # 키 컬럼이 없으면 기존 방식(전체 행)으로 fallback
+    if store_col not in df.columns or date_col not in df.columns:
+        return add_llm_columns(df)
+
+    work = df.copy()
+
+    # merge 키를 안정적으로 만들기 위해 날짜를 YYYY-MM-DD 문자열로 표준화
+    work['_llm_date_key'] = pd.to_datetime(work[date_col], errors='coerce').dt.strftime('%Y-%m-%d')
+    # 날짜 파싱 실패(NaT)는 원본 문자열로 보존
+    work['_llm_date_key'] = work['_llm_date_key'].fillna(work[date_col].astype(str).str.strip())
+
+    # 매장별 최신 날짜 1행 선택
+    _dt = pd.to_datetime(work['_llm_date_key'], errors='coerce').fillna(pd.Timestamp.min)
+    idx = _dt.groupby(work[store_col].astype(str)).idxmax()
+    latest = work.loc[idx].copy()
+
+    # 최신행에만 LLM 생성
+    latest_with_llm = add_llm_columns(latest.drop(columns=[c for c in ['_llm_date_key'] if c in latest.columns]))
+    latest_with_llm['_llm_date_key'] = latest['_llm_date_key'].values
+
+    # 전체 DF에는 기본값(빈값) 생성 후 최신행만 업데이트
+    for c in llm_cols:
+        if c not in work.columns:
+            work[c] = ''
+
+    key_cols = [store_col, '_llm_date_key']
+    merge_cols = key_cols + [c for c in llm_cols if c in latest_with_llm.columns]
+    patch_df = latest_with_llm[merge_cols].copy()
+
+    out = work.merge(patch_df, on=key_cols, how='left', suffixes=('', '_new'))
+    for c in llm_cols:
+        new_c = f"{c}_new"
+        if new_c in out.columns:
+            out[c] = out[new_c].fillna(out[c])
+            out.drop(columns=[new_c], inplace=True)
+
+    out.drop(columns=['_llm_date_key'], inplace=True)
+    return out

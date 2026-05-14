@@ -225,6 +225,7 @@ with DAG(
         op_kwargs={
             'patterns': [
                 'baemin_ad_change_history_*.csv',
+                'baemin_change_history_*.csv',
                 'baemin_marketing_*.csv',
                 'coupangeats_cmg_*.csv'
             ],

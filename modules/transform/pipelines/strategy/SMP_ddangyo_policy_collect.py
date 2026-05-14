@@ -203,6 +203,7 @@ def login_and_collect_notices(**context) -> List[Dict[str, Any]]:
         List[Dict]: [{"bord_ser_no": str, "category": str, "title": str, "policy_date": str}, ...]
     """
     from playwright.sync_api import sync_playwright
+    from modules.transform.utility.playwright_launcher import launch_chromium
 
     logger.info("=" * 60)
     logger.info("[1단계] 땡겨요 로그인 및 공지 목록 수집 시작")
@@ -215,7 +216,11 @@ def login_and_collect_notices(**context) -> List[Dict[str, Any]]:
     notices = []
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(
+            pw,
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
         page = browser.new_page()
 
         try:
@@ -281,6 +286,7 @@ def collect_notice_bodies(**context) -> List[Dict[str, Any]]:
         List[Dict]: notice_list 각 항목에 'content' 필드 추가
     """
     from playwright.sync_api import sync_playwright
+    from modules.transform.utility.playwright_launcher import launch_chromium
 
     logger.info("=" * 60)
     logger.info("[2단계] 공지 본문 수집 시작")
@@ -303,7 +309,11 @@ def collect_notice_bodies(**context) -> List[Dict[str, Any]]:
     notices_with_content = []
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = launch_chromium(
+            pw,
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
         page = browser.new_page()
 
         try:

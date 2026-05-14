@@ -30,6 +30,7 @@
    - 누락된 데이터 보정 시 사용
 """
 
+import logging
 import pendulum
 import os
 from datetime import timedelta
@@ -69,8 +70,6 @@ from modules.transform.pipelines.sales.SMD_04_store_orders_amount_join import (
     preprocess_add_main_left_join_df,
     
     # ⭐ 담당자 점수 계산 및 조인
-    calculate_manager_scores,
-    left_join_manager_scores,
     
     # CSV 저장
     fin_save_to_csv
@@ -79,6 +78,25 @@ from modules.transform.pipelines.sales.SMD_04_store_orders_amount_join import (
 
 from modules.load.load_df_glob import cleanup_collected_csvs, move_download_files, upload_final_csv
 from modules.transform.utility.paths import LOCAL_DB, COLLECT_DB, DOWN_DIR
+
+logger = logging.getLogger(__name__)
+FINAL_REVIEW_CLEANUP_TARGETS = [
+    Path(r"E:\down\toorder_review_doridang15_2026-05-13.xlsx"),
+]
+
+
+def cleanup_final_review_xlsx(**context):
+    del context
+    results = []
+    for target_path in FINAL_REVIEW_CLEANUP_TARGETS:
+        if target_path.exists():
+            target_path.unlink()
+            logger.info("final cleanup: %s deleted", target_path)
+            results.append(f"{target_path}=deleted")
+        else:
+            logger.info("final cleanup: %s not found", target_path)
+            results.append(f"{target_path}=not found")
+    return "; ".join(results)
 
 
 # ============================================================
@@ -252,49 +270,14 @@ with DAG(
     )
     
     # ============================================================
-    # 5️⃣ 담당자별 점수 계산
-    # ============================================================
-    calculate_manager_scores_task = PythonOperator(
-        task_id='calculate_manager_scores',
-        python_callable=calculate_manager_scores,
-        op_kwargs={
-            'input_task_id': 'preprocess_add_main_left_join',
-            'input_xcom_key': 'final_preprocessed_path',
-            'output_xcom_key': 'manager_scores_path'
-        }
-    )
-    
-    # ============================================================
-    # 6️⃣ 담당자 점수 조인
-    # ============================================================
-    left_join_manager_scores_task = PythonOperator(
-        task_id='left_join_manager_scores',
-        python_callable=left_join_manager_scores,
-        op_kwargs={
-            'left_task': {
-                'task_id': 'preprocess_add_main_left_join',
-                'xcom_key': 'final_preprocessed_path'
-            },
-            'right_task': {
-                'task_id': 'calculate_manager_scores',
-                'xcom_key': 'manager_scores_path'
-            },
-            'left_on': ['order_daily', '담당자'],
-            'right_on': ['order_daily', '담당자'],
-            'how': 'left',
-            'output_xcom_key': 'final_preprocessed_with_scores_path'
-        }
-    )
-    
-    # ============================================================
-    # 7️⃣ CSV 저장
+    # 5️⃣ CSV 저장
     # ============================================================
     fin_save_to_csv_task = PythonOperator(
         task_id='fin_save_to_csv',
         python_callable=fin_save_to_csv,
         op_kwargs={
-            'input_task_id': 'left_join_manager_scores',
-            'input_xcom_key': 'final_preprocessed_with_scores_path',
+            'input_task_id': 'preprocess_add_main_left_join',
+            'input_xcom_key': 'final_preprocessed_path',
             'output_filename': 'sales_daily_orders_upload.csv',
             'output_subdir': '영업관리부_DB',
             'dedup_key': ['order_daily', '매장명']
@@ -331,6 +314,11 @@ with DAG(
             'dest_dir': str(DOWN_DIR / '업로드_temp')  # ✅ 동적 경로 사용
         }
     )
+
+    cleanup_final_review_xlsx_task = PythonOperator(
+        task_id='cleanup_final_review_xlsx',
+        python_callable=cleanup_final_review_xlsx,
+    )
     
     # ============================================================
     # Task 의존성 정의
@@ -354,17 +342,12 @@ with DAG(
     # 5. 최종 전처리
     left_join_orders_now_toorder_history_task >> preprocess_add_main_task
 
-    # 6. 담당자 점수 계산 (전처리 완료 후)
-    preprocess_add_main_task >> calculate_manager_scores_task
+    # 6. CSV 저장
+    preprocess_add_main_task >> fin_save_to_csv_task
 
-    # 7. 담당자 점수 조인 (전처리 + 담당자 점수 둘 다 필요)
-    [preprocess_add_main_task, calculate_manager_scores_task] >> left_join_manager_scores_task
-
-    # 8. CSV 저장
-    left_join_manager_scores_task >> fin_save_to_csv_task
-
-    # 9. 정리 및 업로드 (병렬)
+    # 7. 정리 및 업로드 (병렬)
     fin_save_to_csv_task >> [cleanup_task, upload_task]
+    [cleanup_task, upload_task] >> cleanup_final_review_xlsx_task
 
 
 # ============================================================

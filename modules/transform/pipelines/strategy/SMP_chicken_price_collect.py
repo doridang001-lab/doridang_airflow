@@ -57,6 +57,7 @@ def _launch_headless_browser():
     AIRFLOW_HOME 환경변수가 있으면 headless, 없으면 표시 모드 (로컬 디버깅용)
     """
     import undetected_chromedriver as uc
+    from modules.transform.utility.selenium_uc import configure_uc_data_path
 
     headless = os.getenv("AIRFLOW_HOME") is not None
 
@@ -76,16 +77,166 @@ def _launch_headless_browser():
         return opts
 
     try:
+        configure_uc_data_path()
         driver = uc.Chrome(options=_make_options())
     except Exception as e:
         # Chrome 버전 불일치 시 새 옵션으로 버전 자동 감지 재시도
         version_match = re.search(r"Current browser version is (\d+)", str(e))
         if version_match:
             ver = int(version_match.group(1))
+            configure_uc_data_path()
             driver = uc.Chrome(options=_make_options(), version_main=ver)
         else:
             raise
     return driver
+
+
+def _fetch_chicken_page_source_via_http(url: str) -> tuple[str | None, str | None]:
+    """chicken.or.kr 페이지를 HTTP로 먼저 시도해 HTML을 가져온다.
+
+    Selenium이 죽거나(로컬 포트 connection refused) 차단되는 케이스가 있어
+    가능한 경우 HTTP 파싱을 우선 사용한다.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    session = _build_session()
+
+    # 컨테이너/런타임에 따라 시스템 CA 번들이 없어서 SSL 검증이 실패하는 케이스가 있음.
+    # 1) certifi CA 번들을 우선 사용
+    # 2) 그래도 실패하면(수집 목적 한정) SSL 검증을 끄고 재시도
+    verify_opt: str | bool = True
+    try:
+        import certifi  # type: ignore
+
+        verify_opt = certifi.where()
+    except Exception:
+        verify_opt = True
+
+    try:
+        response = session.get(url, headers=headers, timeout=15, verify=verify_opt)
+    except requests.exceptions.SSLError as e:
+        logger.warning(f"[chicken.or.kr] SSL 검증 실패 → verify=False 재시도: {e}")
+        try:
+            import urllib3
+
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except Exception:
+            pass
+        response = session.get(url, headers=headers, timeout=15, verify=False)
+    if not response.ok:
+        return None, None
+    response.encoding = response.apparent_encoding
+
+    html = response.text
+    if "sub_priceTable" not in html:
+        return None, None
+
+    return html, url
+
+
+_CHICKEN_PRICE_DATE_RE = re.compile(r"(\d{4})[./-](\d{1,2})[./-](\d{1,2})")
+
+
+def _normalize_ymd(raw: str) -> str | None:
+    """HTML 텍스트에서 YYYY-MM-DD를 뽑아 정규화. 실패 시 None."""
+    m = _CHICKEN_PRICE_DATE_RE.search(raw)
+    if not m:
+        return None
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if not (1 <= mo <= 12 and 1 <= d <= 31):
+        return None
+    return f"{y:04d}-{mo:02d}-{d:02d}"
+
+
+def _parse_chicken_price_from_html(page_source: str, used_url: str) -> dict:
+    """chicken.or.kr HTML에서 table.sub_priceTable을 파싱해 결과 dict를 만든다."""
+    source_site = "chicken.or.kr"
+    soup = BeautifulSoup(page_source, "html.parser")
+    table = soup.select_one("div.sub_priceTableWrap table.sub_priceTable") or soup.select_one("table.sub_priceTable")
+    if table is None:
+        raise ValueError("table.sub_priceTable 를 찾을 수 없습니다.")
+
+    # thead 에 colspan/rowspan 이 섞여 있어 `thead th` 텍스트 순서로 인덱스를 잡으면
+    # tbody 컬럼 인덱스와 어긋날 수 있음.
+    # tbody 기준 고정 컬럼 인덱스를 사용한다:
+    # 0=일자, 1=요일, 2=대, 3=중, 4=소, 5=병아리, 6=종계노계
+    item_size = "대"
+    price_col_idx = 2
+
+    candidate_rows = table.select("tbody tr")
+    if not candidate_rows:
+        # 일부 페이지는 tbody 없이 tr이 바로 내려올 수 있음
+        candidate_rows = [tr for tr in table.select("tr") if tr.find_parent("thead") is None]
+
+    rows: list[tuple[str, int, str]] = []
+    for tr in candidate_rows:
+        cells = tr.find_all(["th", "td"], recursive=False)
+        if not cells:
+            continue
+
+        base_date = _normalize_ymd(cells[0].get_text(strip=True))
+        if not base_date:
+            continue
+
+        cell_texts = [c.get_text(strip=True) for c in cells]
+        if price_col_idx >= len(cell_texts):
+            continue
+
+        raw_value = cell_texts[price_col_idx]
+        price_today = _parse_int(raw_value)
+        if price_today <= 0:
+            continue
+
+        rows.append((base_date, price_today, raw_value))
+
+    if not rows:
+        raise ValueError("가격 데이터 행이 없습니다.")
+
+    rows.sort(key=lambda x: x[0], reverse=True)
+    base_date, price_today, raw_value = rows[0]
+    price_prev_day = rows[1][1] if len(rows) >= 2 else None
+
+    result = {
+        "success": True,
+        "source_site": source_site,
+        "source_url": used_url,
+        "base_date": base_date,
+        "item_size": item_size,
+        "price_today": price_today,
+        "price_prev_day": price_prev_day,
+        "price_prev_month": None,
+        "price_prev_year": None,
+        "raw_value": raw_value,
+        "error_message": None,
+    }
+    logger.info(f"[{source_site}] 수집 완료: 기준일={base_date}, 금일={price_today:,}원")
+    return result
+
+
+def _context_year(**context) -> int:
+    """Airflow context 에서 논리 날짜의 year 를 우선 사용 (백필/과거 실행 지원)."""
+    for key in ("logical_date", "data_interval_end", "execution_date"):
+        dt = context.get(key)
+        if dt is None:
+            continue
+        try:
+            return dt.in_timezone("Asia/Seoul").year  # pendulum.DateTime
+        except Exception:
+            try:
+                return dt.year
+            except Exception:
+                pass
+    return datetime.now().year
 
 
 def _normalize_date(raw: str) -> str:
@@ -198,12 +349,13 @@ def extract_chicken_price(**context) -> dict:
 
     URL 정책: 현재 연도 → 이전 연도 순으로 시도 (404 자동 폴백)
     """
+    from selenium.common.exceptions import TimeoutException
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
 
     source_site = "chicken.or.kr"
-    current_year = datetime.now().year
+    current_year = _context_year(**context)
     candidate_urls = [
         f"https://chicken.or.kr/ch_price/price_{current_year}.php",
         f"https://chicken.or.kr/ch_price/price_{current_year - 1}.php",
@@ -211,66 +363,85 @@ def extract_chicken_price(**context) -> dict:
 
     driver = None
     try:
-        driver = _launch_headless_browser()
-        page_source = None
-        used_url = None
+        last_error: Exception | None = None
 
+        # 1) HTTP 우선 시도
+        # NOTE: 일부 페이지는 JS로 tbody를 채워서 HTTP 응답이 스켈레톤일 수 있음 (파싱 실패 시 Selenium 폴백)
+        for url in candidate_urls:
+            try:
+                http_html, http_used_url = _fetch_chicken_page_source_via_http(url)
+                if not http_html:
+                    continue
+
+                try:
+                    result = _parse_chicken_price_from_html(http_html, http_used_url or url)
+                    logger.info(f"[{source_site}] HTTP 수집 성공: {url}")
+                    context["ti"].xcom_push(key="chicken_price_result", value=result)
+                    return result
+                except Exception as e:
+                    # 페이지가 JS로 데이터를 채우는 구조일 수 있어 Selenium으로 폴백
+                    last_error = e
+                    logger.warning(f"[{source_site}] HTTP 파싱 실패 → Selenium 폴백 ({url}): {e}")
+                    continue
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[{source_site}] HTTP 접근 실패 ({url}): {e}")
+                continue
+
+        # 2) Selenium 폴백
+        driver = _launch_headless_browser()
         for url in candidate_urls:
             try:
                 driver.get(url)
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "table.sub_priceTable"))
-                )
-                page_source = driver.page_source
-                used_url = url
-                logger.info(f"[{source_site}] 페이지 로드 성공: {url}")
-                break
+                page_source = None
+                try:
+                    WebDriverWait(driver, 15).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "table.sub_priceTable"))
+                    )
+                    # 데이터가 JS로 채워지는 경우를 위해 날짜 패턴이 나타날 때까지 조금 더 대기
+                    WebDriverWait(driver, 15).until(
+                        lambda d: _CHICKEN_PRICE_DATE_RE.search(d.page_source or "") is not None
+                    )
+                    page_source = driver.page_source
+                except TimeoutException:
+                    # 일부 케이스에서 table 이 iframe 안에 있을 수 있어 프레임을 순회하며 탐색
+                    for iframe in driver.find_elements(By.CSS_SELECTOR, "iframe"):
+                        driver.switch_to.frame(iframe)
+                        try:
+                            WebDriverWait(driver, 8).until(
+                                EC.presence_of_element_located((By.CSS_SELECTOR, "table.sub_priceTable"))
+                            )
+                            WebDriverWait(driver, 8).until(
+                                lambda d: _CHICKEN_PRICE_DATE_RE.search(d.page_source or "") is not None
+                            )
+                            page_source = driver.page_source
+                            break
+                        finally:
+                            driver.switch_to.default_content()
+                    if page_source is None:
+                        raise
+
+                result = _parse_chicken_price_from_html(page_source, url)
+                logger.info(f"[{source_site}] Selenium 수집 성공: {url}")
+                context["ti"].xcom_push(key="chicken_price_result", value=result)
+                return result
             except Exception as e:
-                logger.warning(f"[{source_site}] URL 접근 실패 ({url}): {e}")
+                last_error = e
+                logger.warning(f"[{source_site}] Selenium 접근/파싱 실패 ({url}): {e}")
+
+                # 드라이버가 죽으면(localhost 포트 connection refused 등) 다음 시도에서 재생성
+                err = str(e)
+                if "Connection refused" in err or "Failed to establish a new connection" in err or "Max retries exceeded" in err:
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                    driver = _launch_headless_browser()
                 continue
 
-        if page_source is None:
-            raise ValueError(f"유효한 URL 없음: {candidate_urls}")
-
-        soup = BeautifulSoup(page_source, "html.parser")
-        table = soup.select_one("table.sub_priceTable")
-        if table is None:
-            raise ValueError("table.sub_priceTable 를 찾을 수 없습니다.")
-
-        tbody_rows = table.select("tbody tr")
-        if not tbody_rows:
-            raise ValueError("tbody 행이 없습니다.")
-
-        # 첫 번째 행: 최신 데이터
-        first_row_tds = tbody_rows[0].find_all("td")
-        if len(first_row_tds) < 3:
-            raise ValueError(f"첫 번째 행 td 수 부족: {len(first_row_tds)}")
-
-        base_date = first_row_tds[0].get_text(strip=True)   # YYYY-MM-DD
-        raw_value = first_row_tds[2].get_text(strip=True)   # 대 시세
-        price_today = _parse_int(raw_value)
-
-        # 두 번째 행: 전일 데이터
-        price_prev_day = None
-        if len(tbody_rows) >= 2:
-            prev_row_tds = tbody_rows[1].find_all("td")
-            if len(prev_row_tds) >= 3:
-                price_prev_day = _parse_int(prev_row_tds[2].get_text(strip=True))
-
-        result = {
-            "success": True,
-            "source_site": source_site,
-            "source_url": used_url,
-            "base_date": base_date,
-            "item_size": "대",
-            "price_today": price_today,
-            "price_prev_day": price_prev_day,
-            "price_prev_month": None,
-            "price_prev_year": None,
-            "raw_value": raw_value,
-            "error_message": None,
-        }
-        logger.info(f"[{source_site}] 수집 완료: 기준일={base_date}, 금일={price_today:,}원")
+        if last_error is not None:
+            raise last_error
+        raise ValueError(f"유효한 URL 없음: {candidate_urls}")
 
     except Exception as e:
         logger.error(f"[{source_site}] 수집 실패: {e}")
@@ -378,8 +549,20 @@ def save_results(**context) -> None:
     """병합 결과를 CHICKEN_PRICE_CSV_PATH에 누적 저장"""
     ti = context["ti"]
     json_str = ti.xcom_pull(task_ids="merge_results")
+    if not json_str:
+        logger.warning("[save_results] merge_results 결과가 없습니다. (저장 스킵)")
+        return
 
     df_new = pd.read_json(StringIO(json_str), orient="records")
+    if df_new.empty:
+        logger.warning("[save_results] 저장할 데이터가 없습니다 (빈 결과).")
+        return
+
+    required_cols = {"source_site", "base_date", "collected_at"}
+    missing = required_cols - set(df_new.columns)
+    if missing:
+        logger.warning(f"[save_results] 저장 스킵: 필수 컬럼 누락 {sorted(missing)}")
+        return
 
     CHICKEN_PRICE_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -390,12 +573,24 @@ def save_results(**context) -> None:
         df_all = df_new.copy()
 
     # 중복 제거: source_site + base_date + collected_at 날짜 기준
+    # collected_at 포맷이 섞여 있어도(초 포함/미포함 등) 예외 없이 처리
+    collected_raw = df_all["collected_at"].astype(str)
+    collected_dt = pd.to_datetime(collected_raw, errors="coerce", cache=False)
+    collected_date = collected_dt.dt.strftime("%Y-%m-%d")
+    if collected_date.isna().any():
+        fallback_date = collected_raw.str.extract(r"(\d{4}-\d{2}-\d{2})", expand=False)
+        collected_date = collected_date.fillna(fallback_date)
+    invalid_count = int(collected_date.isna().sum())
+    if invalid_count:
+        logger.warning(f"[save_results] collected_at 파싱 실패 {invalid_count}건: 'unknown'로 처리합니다.")
+        collected_date = collected_date.fillna("unknown")
+
     df_all["_dedup_key"] = (
         df_all["source_site"].astype(str)
         + "_"
         + df_all["base_date"].astype(str)
         + "_"
-        + pd.to_datetime(df_all["collected_at"]).dt.date.astype(str)
+        + collected_date.astype(str)
     )
     df_all = (
         df_all
@@ -550,8 +745,17 @@ def send_notification(**context) -> None:
     """육계 시세 일일 알림 이메일 발송 (이동평균 포함)"""
     ti = context["ti"]
     json_str = ti.xcom_pull(task_ids="merge_results")
+    if json_str:
+        results = pd.read_json(StringIO(json_str), orient="records").to_dict(orient="records")
+    else:
+        results = []
 
-    results = pd.read_json(StringIO(json_str), orient="records").to_dict(orient="records")
+    dag = context.get("dag")
+    email_on_failure = False
+    try:
+        email_on_failure = bool(getattr(dag, "default_args", {}).get("email_on_failure", False))
+    except Exception:
+        email_on_failure = False
 
     # 이동평균 계산
     ma_info: dict = {}
@@ -572,15 +776,20 @@ def send_notification(**context) -> None:
         (r.get("base_date") for r in results if r.get("success")),
         datetime.now().strftime("%Y-%m-%d"),
     )
-    any_failure = any(not r.get("success", False) for r in results)
+    any_failure = (not results) or any(not r.get("success", False) for r in results)
 
     html_content = _build_email_html(results, ma_info, base_date, any_failure)
-    subject = f"🐔 [大 계육시세] {base_date}"
+    subject_prefix = "⚠️" if any_failure else "🐔"
+    subject = f"{subject_prefix} [大 계육시세] {base_date}"
+
+    pm_emails = ["a17019@kakao.com"]
+    all_emails = ["a17019@kakao.com", "siw22222@kakao.com", "simjeong01@kakao.com", "simjeong00@kakao.com"]
+    to_emails = all_emails if email_on_failure else pm_emails
 
     send_email(
         subject=subject,
         html_content=html_content,
-        to_emails=["a17019@kakao.com" , "siw22222@kakao.com", "simjeong01@kakao.com", "simjeong00@kakao.com"],
+        to_emails=to_emails,
         **context,
     )
     logger.info(f"[send_notification] 알림 발송 완료: {subject}")

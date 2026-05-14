@@ -10,7 +10,7 @@ pandas
 pyarrow
 sqlalchemy
 psycopg2-binary
-playwright
+playwright==1.57.0
 nest_asyncio
 pyperclip
 selenium
@@ -20,3 +20,4 @@ curl_cffi
 python-dotenv
 ollama
 tqdm
+Pillow==10.4.0

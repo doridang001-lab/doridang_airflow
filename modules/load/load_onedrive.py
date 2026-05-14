@@ -185,7 +185,10 @@ def _execute_append_unique(
                 combined_df.to_csv(f, index=False)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, file_path)  # 기존 파일 소유자와 무관하게 원자적 교체
+            # 기존 파일을 먼저 삭제한 뒤 rename (소유자가 달라도 디렉토리 쓰기 권한만 필요)
+            if os.path.exists(file_path):
+                os.unlink(file_path)
+            os.rename(tmp_path, file_path)
         except Exception:
             try:
                 os.unlink(tmp_path)

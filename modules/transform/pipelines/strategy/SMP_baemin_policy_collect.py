@@ -374,9 +374,11 @@ def _fetch_html(url: str, wait_selector: str | None = None) -> str:
     # requests 실패 또는 CSR 셸인 경우 브라우저 렌더링 폴백
     try:
         from playwright.sync_api import sync_playwright
+        from modules.transform.utility.playwright_launcher import launch_chromium
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(
+            browser = launch_chromium(
+                p,
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage"],
             )

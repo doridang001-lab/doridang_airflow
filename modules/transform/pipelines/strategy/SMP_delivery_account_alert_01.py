@@ -26,6 +26,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+from modules.transform.utility.selenium_uc import configure_uc_data_path
 from modules.transform.utility.mailer import send_email, text_to_html
 from modules.transform.utility.paths import DOWN_DIR, LOCAL_DB, MART_DB, ONEDRIVE_DB, TEMP_DIR
 
@@ -34,8 +35,14 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # 상수
 # ============================================================
-TOORDER_ID = "doridang1"
-TOORDER_PW = "ehfl0109!!"
+# NOTE: Airflow Variable을 사용하면 컨테이너 재시작 없이도 값 변경이 가능하므로,
+# 런타임에 resolve 하는 헬퍼를 사용한다.
+_TOORDER_ID_DEFAULT = "doridang15"
+_TARGET_STORES_RAW = (
+    os.getenv("TOORDER_TARGET_STORES")
+    or os.getenv("TOORDER_TARGET_STORE")
+    or "송파삼전점"
+)
 LOGIN_URL = "https://ceo.toorder.co.kr/auth/login?returnTo=%2Fdashboard"
 DELIVERY_URL = (
     "https://ceo.toorder.co.kr/dashboard/stores-manage/"
@@ -87,6 +94,18 @@ LOGIN_FAIL_URL_PATTERNS = ["/login", "/auth"]
 LOGIN_SUCCESS_URL_PATTERNS = ["/dashboard", "/stores-manage", "/sales-report"]
 
 
+def _is_webdriver_connection_refused(exc: Exception) -> bool:
+    msg = str(exc) or ""
+    needles = [
+        "Failed to establish a new connection",
+        "Connection refused",
+        "Max retries exceeded with url",
+        "HTTPConnectionPool(host='localhost'",
+        "NewConnectionError",
+    ]
+    return any(n in msg for n in needles)
+
+
 # ============================================================
 # Public Task 함수
 # ============================================================
@@ -97,20 +116,47 @@ def crawl_delivery_account_excel(**context) -> str:
     XCom key: "excel_path"
     """
     ti = context["task_instance"]
-    driver = None
-    try:
-        driver = _launch_browser()
-        _do_login(driver, TOORDER_ID, TOORDER_PW)
-        excel_path = _download_delivery_excel(driver)
-        ti.xcom_push(key="excel_path", value=str(excel_path))
-        logger.info("크롤링 완료: %s", excel_path)
-        return str(excel_path)
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+
+    toorder_id = _resolve_toorder_id()
+    toorder_pw = _resolve_toorder_pw(toorder_id)
+    if not toorder_pw:
+        raise RuntimeError(
+            "ToOrder 비밀번호가 비어있습니다. "
+            "환경변수 `TOORDER_DELIVERY_ACCOUNT_PW` 또는 "
+            f"`TOORDER_PW_{toorder_id.upper()}`(권장) 또는 `TOORDER_PW` 를 설정해주세요."
+        )
+
+    last_error: Exception | None = None
+    max_session_attempts = 3
+    for session_attempt in range(1, max_session_attempts + 1):
+        driver = None
+        try:
+            driver = _launch_browser()
+            _do_login(driver, toorder_id, toorder_pw)
+            excel_path = _download_delivery_excel(driver)
+            ti.xcom_push(key="excel_path", value=str(excel_path))
+            logger.info("크롤링 완료: %s", excel_path)
+            return str(excel_path)
+        except Exception as exc:
+            last_error = exc
+            if _is_webdriver_connection_refused(exc) and session_attempt < max_session_attempts:
+                logger.warning(
+                    "WebDriver 연결이 끊어져 브라우저를 재시작합니다 (attempt=%d/%d): %s",
+                    session_attempt,
+                    max_session_attempts,
+                    exc,
+                )
+                time.sleep(1.0)
+                continue
+            raise
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+    raise RuntimeError(f"브라우저 세션 재시도 실패({max_session_attempts}회): {last_error}")
 
 
 def load_and_filter_alerts(**context) -> str:
@@ -125,6 +171,7 @@ def load_and_filter_alerts(**context) -> str:
 
     df = _read_and_flatten_excel(excel_path)
     df = _remove_test_stores(df)
+    df = _filter_target_stores(df)
     df = _filter_alert_rows(df)
     df = _join_sales_employee(df)
     df["updated_at"] = dt.date.today().isoformat()
@@ -289,6 +336,7 @@ def _launch_browser():
 
     chrome_version = _get_chrome_version()
     try:
+        configure_uc_data_path()
         kwargs = {"options": _make_options()}
         if chrome_version:
             kwargs["version_main"] = chrome_version
@@ -301,6 +349,7 @@ def _launch_browser():
         if match:
             detected = int(match.group(1))
             logger.warning("버전 불일치 → %s 으로 재시도", detected)
+            configure_uc_data_path()
             driver = uc.Chrome(options=_make_options(), version_main=detected)
             logger.info("브라우저 실행 성공 (재시도)")
             return driver
@@ -315,11 +364,17 @@ def _do_login(driver, account_id: str, password: str) -> None:
     for attempt in range(1, _LOGIN_MAX_ATTEMPTS + 1):
         logger.info("로그인 시도 %d/%d", attempt, _LOGIN_MAX_ATTEMPTS)
         try:
-            _do_login_once(driver, account_id, password)
+            # 계정유형(기업회원) 토글로 인해 동일한 "아이디/비밀번호 오류"가 뜨는 케이스가 있어
+            # 1회차: 기업회원 체크, 2회차: 기업회원 해제 로 자동 전환한다.
+            is_company = (attempt % 2 == 1)
+            _do_login_once(driver, account_id, password, is_company=is_company)
             logger.info("로그인 성공 (attempt=%d, URL=%s)", attempt, driver.current_url)
             return
         except Exception as exc:
             last_error = str(exc)
+            if _is_webdriver_connection_refused(exc):
+                logger.warning("WebDriver 연결이 끊어져 로그인 재시도를 중단합니다: %s", last_error)
+                raise
             logger.warning("로그인 실패 (attempt=%d): %s", attempt, last_error)
             _save_login_debug_artifacts(driver, attempt)
 
@@ -333,7 +388,7 @@ def _do_login(driver, account_id: str, password: str) -> None:
     raise RuntimeError(f"로그인 실패 (재시도 {_LOGIN_MAX_ATTEMPTS}회): {last_error}")
 
 
-def _do_login_once(driver, account_id: str, password: str) -> None:
+def _do_login_once(driver, account_id: str, password: str, *, is_company: bool) -> None:
     """ToOrder 로그인 1회 수행"""
     driver.get(LOGIN_URL)
 
@@ -367,8 +422,14 @@ def _do_login_once(driver, account_id: str, password: str) -> None:
     time.sleep(0.3)
     try:
         checkbox = driver.find_element(By.CSS_SELECTOR, "input[name='isCompany']")
-        driver.execute_script("arguments[0].click();", checkbox)
-        logger.info("기업회원 체크")
+        # 원하는 상태로 맞추기 (토글 방식)
+        try:
+            checked = bool(driver.execute_script("return !!arguments[0].checked;", checkbox))
+        except Exception:
+            checked = checkbox.is_selected()
+        if checked != is_company:
+            driver.execute_script("arguments[0].click();", checkbox)
+        logger.info("기업회원 %s", "체크" if is_company else "해제")
     except Exception:
         pass
 
@@ -486,6 +547,83 @@ def _human_type(element, text: str) -> None:
     time.sleep(0.3)
 
 
+def _resolve_toorder_pw(account_id: str) -> str:
+    """
+    ToOrder 비밀번호 환경변수 해석.
+    우선순위:
+      1) TOORDER_DELIVERY_ACCOUNT_PW / TOORDER_DELIVERY_PW
+      2) TOORDER_PW_{ACCOUNT_ID_UPPER}
+      2-1) (Airflow Variable) 위 키들
+      3) TOORDER_PW (레거시/공용)
+    """
+    pw = os.getenv("TOORDER_DELIVERY_ACCOUNT_PW") or os.getenv("TOORDER_DELIVERY_PW")
+    if pw:
+        return pw
+
+    key = f"TOORDER_PW_{str(account_id).upper()}"
+    pw = os.getenv(key)
+    if pw:
+        return pw
+
+    # Airflow Variable fallback (재시작 없이 UI에서 즉시 반영 가능)
+    for var_key in ("TOORDER_DELIVERY_ACCOUNT_PW", "TOORDER_DELIVERY_PW", key):
+        pw = _get_airflow_variable(var_key)
+        if pw:
+            return pw
+
+    legacy = os.getenv("TOORDER_PW")
+    if legacy:
+        if str(account_id) not in ("doridang1", "doridang01"):
+            logger.warning(
+                "비밀번호가 레거시 `TOORDER_PW`에서 로드되었습니다. "
+                "계정(%s)에 맞는지 확인해주세요. (권장: %s)",
+                account_id,
+                key,
+            )
+        return legacy
+
+    legacy_var = _get_airflow_variable("TOORDER_PW")
+    if legacy_var:
+        if str(account_id) not in ("doridang1", "doridang01"):
+            logger.warning(
+                "비밀번호가 레거시 Airflow Variable `TOORDER_PW`에서 로드되었습니다. "
+                "계정(%s)에 맞는지 확인해주세요. (권장: %s)",
+                account_id,
+                key,
+            )
+        return legacy_var
+
+    return ""
+
+
+def _get_airflow_variable(key: str) -> str:
+    try:
+        from airflow.models import Variable
+        val = Variable.get(key, default_var=None)
+        return (val or "").strip()
+    except Exception:
+        return ""
+
+
+def _resolve_toorder_id() -> str:
+    """
+    ToOrder 계정 ID 해석.
+    우선순위:
+      1) (env) TOORDER_DELIVERY_ACCOUNT_ID / TOORDER_DELIVERY_ID
+      2) (Airflow Variable) TOORDER_DELIVERY_ACCOUNT_ID / TOORDER_DELIVERY_ID
+      3) default
+    """
+    env_id = os.getenv("TOORDER_DELIVERY_ACCOUNT_ID") or os.getenv("TOORDER_DELIVERY_ID")
+    if env_id and env_id.strip():
+        return env_id.strip()
+
+    var_id = _get_airflow_variable("TOORDER_DELIVERY_ACCOUNT_ID") or _get_airflow_variable("TOORDER_DELIVERY_ID")
+    if var_id and var_id.strip():
+        return var_id.strip()
+
+    return _TOORDER_ID_DEFAULT
+
+
 def _download_delivery_excel(driver) -> Path:
     """
     배달 계정 관리 페이지 이동 → 내보내기 → Excel 다운로드 대기.
@@ -597,6 +735,56 @@ def _remove_test_stores(df: pd.DataFrame) -> pd.DataFrame:
     return df[~mask].copy()
 
 
+def _filter_target_stores(df: pd.DataFrame) -> pd.DataFrame:
+    """특정 매장만 대상으로 제한 (기본: 도리당 송파삼전점)."""
+    raw = str(_TARGET_STORES_RAW or "").strip()
+    if not raw:
+        return df
+
+    targets = [s.strip() for s in raw.split(",") if s.strip()]
+    if not targets:
+        return df
+
+    store_col = _resolve_store_col(df)
+    if not store_col:
+        logger.warning("매장명 컬럼을 찾지 못해 타겟 매장 필터 생략 (columns=%s)", list(df.columns)[:60])
+        return df
+
+    norm_targets = {_normalize_store_name(t) for t in targets}
+    store_norm = df[store_col].map(_normalize_store_name)
+    mask = store_norm.isin(norm_targets)
+
+    # 완전 일치가 0개면 포함(부분일치)로 한번 더 시도
+    if not mask.any():
+        def _contains_any(v: str) -> bool:
+            if not v:
+                return False
+            return any((t in v) or (v in t) for t in norm_targets)
+
+        mask = store_norm.fillna("").astype(str).map(_contains_any)
+
+    if not mask.any():
+        existing = (
+            df[store_col]
+            .dropna()
+            .astype(str)
+            .map(lambda s: s.strip())
+            .drop_duplicates()
+            .tolist()
+        )
+        logger.warning(
+            "타겟 매장 매칭 0개 (targets=%s, store_col=%s). 현재 매장 샘플=%s",
+            targets,
+            store_col,
+            existing[:20],
+        )
+        return df
+
+    filtered = df[mask].copy()
+    logger.info("타겟 매장 필터 적용: %d / %d 행 (targets=%s)", len(filtered), len(df), targets)
+    return filtered
+
+
 def _filter_alert_rows(df: pd.DataFrame) -> pd.DataFrame:
     """ALERT_CON 조건에 해당하는 행 필터링"""
     existing_status_cols = [c for c in STATUS_COLS if c in df.columns]
@@ -617,9 +805,24 @@ def _filter_alert_rows(df: pd.DataFrame) -> pd.DataFrame:
 def _normalize_store_name(name: str) -> str:
     """'도리당 청라점' / '청라점' 모두 → '청라점'으로 통일"""
     import re
-    s = str(name).strip()
-    s = re.sub(r'^도리당\s*', '', s)
+    s = str(name or "").strip()
+    s = re.sub(r'\(.*?\)', '', s)           # 괄호 내용 제거
+    s = re.sub(r'\s+', '', s)               # 공백 제거
+    s = re.sub(r'^도리당', '', s)           # 프랜차이즈 접두 제거
+    if s.endswith("점"):
+        s = s[:-1]
     return s
+
+
+def _resolve_store_col(df: pd.DataFrame) -> str | None:
+    """평탄화/rename 이후에도 매장명 컬럼명이 흔들릴 수 있어 유연하게 탐색."""
+    if "매장명" in df.columns:
+        return "매장명"
+    candidates = [c for c in df.columns if "매장명" in str(c)]
+    if candidates:
+        # 가장 짧은 컬럼명 우선(보통 base 컬럼)
+        return sorted(candidates, key=lambda x: len(str(x)))[0]
+    return None
 
 
 def _join_sales_employee(df: pd.DataFrame) -> pd.DataFrame:

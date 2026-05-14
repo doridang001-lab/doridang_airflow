@@ -1,10 +1,12 @@
-MODEL_NAME = "qwen2.5:14b"   # 설치된 모델: gpt-oss:20b / qwen2.5:14b / qwen2.5:7b
+from pathlib import Path
+
+
+MODEL_NAME = "qwen2.5:14b"
 OLLAMA_URL = "http://localhost:11434"
 
-# 에이전트가 접근 가능한 루트 경로
-WORKSPACE_ROOT = r"C:\Users\민준\workspace"
+# Use the repository root that contains local-agent/.
+WORKSPACE_ROOT = str(Path(__file__).resolve().parent.parent)
 
-# 위험 명령 차단 목록
 BLOCKED_COMMANDS = [
     "rm -rf",
     "del /f /s /q",

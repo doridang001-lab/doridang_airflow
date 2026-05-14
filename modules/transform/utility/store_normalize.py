@@ -21,11 +21,19 @@ STORE_NAME_MAP: dict[str, str] = {
     "도리당 충주봉방점":       "도리당 충주역점",
     "도리당 파주운정점":       "도리당 운정점",
     "도리당 인천간석점":       "도리당 인천간석중앙점",
+    "도리당 간석중앙점":       "도리당 인천간석중앙점",
+    "나홀로 간석중앙점":       "나홀로 인천간석중앙점",
+    "도리당 서울역삼점":       "도리당 역삼점",
+    "해운대 중동점":           "도리당 해운대중동점",
+    "도리당 성정점":           "도리당 천안성정점",
+    "나홀로 대신점":           "나홀로 부산대신점",
+    "해운대중동점":            "도리당 해운대중동점",
     # ---- 신규 변경은 여기에만 추가 ----
 }
 
-_PREFIX_RE = re.compile(r"^도리당\s*")
-_SPACE_RE  = re.compile(r"\s+")
+_PREFIX_RE        = re.compile(r"^도리당\s*")
+_SPACE_RE         = re.compile(r"\s+")
+_BRAND_PREFIX_RE  = re.compile(r"^(도리당|나홀로)\s+")
 
 
 def _build_expanded_map(base: dict) -> dict:
@@ -57,6 +65,15 @@ def normalize_for_join(series: pd.Series) -> pd.Series:
     return normalize(series).map(
         lambda s: _SPACE_RE.sub("", _PREFIX_RE.sub("", str(s)).strip())
     )
+
+
+def strip_brand(series: pd.Series) -> pd.Series:
+    """매장명에서 브랜드 접두어('도리당 ', '나홀로 ') 제거 → 지점명만 반환.
+
+    예: "도리당 역삼점"     → "역삼점"
+        "나홀로 간석중앙점" → "간석중앙점"
+    """
+    return series.map(lambda s: _BRAND_PREFIX_RE.sub("", str(s)).strip())
 
 
 # 하위 호환 alias

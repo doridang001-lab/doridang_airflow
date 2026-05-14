@@ -31,8 +31,8 @@ pipeline_module = importlib.import_module(pipeline_module_path)
 run_toorder_voc_crawling = pipeline_module.run_toorder_voc_crawling
 DOWNLOAD_DIR = pipeline_module.DOWNLOAD_DIR
 
-TOORDER_ID = "doridang1"
-TOORDER_PW = "ehfl0109!!"
+TOORDER_ID = "doridang15"
+TOORDER_PW = "ehfl5233!"
 
 
 # ============================================================

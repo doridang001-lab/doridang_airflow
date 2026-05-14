@@ -72,6 +72,8 @@ x-airflow-common:
     LLM_OUTPUT_DIR: '/opt/airflow/onedrive_llm'
     TEMP_DIR: '/opt/airflow/Local_DB/temp'
     PLAYWRIGHT_BROWSERS_PATH: '/ms-playwright'
+    PLAYWRIGHT_AUTO_INSTALL: '1'
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
     LOCAL_GPT_OSS_20B_ENDPOINT: 'http://host.docker.internal:11434/v1/chat/completions'
     LOCAL_GPT_OSS_20B_MODEL: 'gpt-oss:20b'
     # yamllint disable rule:line-length
@@ -79,6 +81,7 @@ x-airflow-common:
     # See https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/check-health.html#scheduler-health-check-server
     # yamllint enable rule:line-length
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__SCHEDULER__ALLOW_TRIGGER_IN_FUTURE: 'true'
     # WARNING: Use _PIP_ADDITIONAL_REQUIREMENTS option ONLY for a quick checks
     # for other purpose (development, test and especially production usage) build/extend Airflow image.
     # _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:--r /opt/airflow/requirements.txt}
@@ -95,7 +98,7 @@ x-airflow-common:
     - "c:/Users/민준/OneDrive - 주식회사 도리당/Repository:/opt/airflow/Repository"
     - "c:/Users/민준/OneDrive - 주식회사 도리당/Collect_Data:/opt/airflow/Collect_Data"
     - "c:/Users/민준/OneDrive - 주식회사 도리당/data/mart:/opt/airflow/onedrive_mart"
-    - "c:/Users/tjrrj/OneDrive - 주식회사 도리당/data/llm:/opt/airflow/onedrive_llm"
+    - "c:/Users/민준/OneDrive - 주식회사 도리당/data/llm:/opt/airflow/onedrive_llm"
     - "c:/Users/민준/OneDrive - 주식회사 도리당/data/analytics:/opt/airflow/analytics"
     - "c:/Local_DB:/opt/airflow/Local_DB"
     - "c:/Doridang:/opt/airflow/Doridang"

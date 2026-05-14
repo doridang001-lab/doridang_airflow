@@ -4,12 +4,16 @@ io3의 범용 함수를 wrapper로 감싸서 사용
 """
 
 from pathlib import Path
-from modules.transform.utility.paths import COLLECT_DB, LOCAL_DB, TEMP_DIR, MART_DB
+from modules.transform.utility.paths import COLLECT_DB, DOWN_DIR, LOCAL_DB, TEMP_DIR, MART_DB
 from modules.transform.utility.io import load_files, preprocess_df, save_to_csv, join_dataframes
 from modules.transform.utility.store_name_mapping import normalize_store_names
 import pandas as pd
 import datetime as dt
 import numpy as np
+from modules.transform.pipelines.sales.SMD_07_store_ordesr_alert import (
+    LLM_COLS,
+    add_llm_columns_latest_per_store,
+)
 
 
 # ============================================================
@@ -90,15 +94,36 @@ def parse_mixed_date(date_series, dayfirst=False):
     return result
 
 
+def _append_llm_columns_for_csv(df: pd.DataFrame) -> pd.DataFrame:
+    print(f"\n[LLM] CSV 저장 전 llm_* 컬럼 생성 시작...")
+    try:
+        df = add_llm_columns_latest_per_store(df)
+    except Exception as e:
+        print(f"[경고] LLM 컬럼 생성 실패: {e}")
+
+    for col in LLM_COLS:
+        if col not in df.columns:
+            df[col] = ''
+
+    base_cols = [c for c in df.columns if c not in LLM_COLS]
+    llm_cols = [c for c in LLM_COLS if c in df.columns]
+    df = df[base_cols + llm_cols]
+    print(f"[LLM] llm_* {len(llm_cols)}개 컬럼 준비 완료")
+    return df
+
+
 
 # baemin_ad_change_history / 변경이력 수집
 def load_beamin_ad_change_history_df(**context):
     """변경이력 수집"""
     return load_files(
-        patterns=['baemin_ad_change_history_*.csv'], # 토더 리뷰 파일 패턴
+        patterns=[
+            'baemin_ad_change_history_*.csv',
+            'baemin_change_history_*.csv',
+        ],
         search_paths=[
-            Path('/opt/airflow/download/업로드_temp'), # 업로드 임시 폴더
-            Path('/opt/airflow/download'), # 일반 다운로드 폴더
+            DOWN_DIR / "업로드_temp",  # 업로드 임시 폴더 (Windows: E:/down/업로드_temp, Container: /opt/airflow/download/업로드_temp)
+            DOWN_DIR,  # 일반 다운로드 폴더
             COLLECT_DB / "영업관리부_수집", # 수집 DB 폴더
             COLLECT_DB, # 루트에 있는 경우도 커버
         ],
@@ -111,9 +136,34 @@ def load_beamin_ad_change_history_df(**context):
 def transform_beamin_ad_change_history_df(df):
     df = df.copy()
 
+    # 최신 수집분 우선 정렬용 (겹치는 과거/최신 파일이 있을 때 최신 기준으로 덮어쓰기)
+    # - 수집일시가 있으면 최우선 사용
+    # - 없으면 파일명에 포함된 YYYYMMDD(예: *_20260420.csv)로 fallback
+    df["_collected_at_parsed"] = pd.NaT
+    if "수집일시" in df.columns:
+        try:
+            df["_collected_at_parsed"] = pd.to_datetime(df["수집일시"], errors="coerce")
+        except Exception:
+            df["_collected_at_parsed"] = pd.NaT
+
+    df["_source_file_dt"] = pd.NaT
+    if "_source_file" in df.columns:
+        try:
+            file_dates = df["_source_file"].astype(str).str.extract(r"(\d{8})(?:\D*\.(?:csv|xlsx|xls))?$", expand=False)
+            df["_source_file_dt"] = pd.to_datetime(file_dates, format="%Y%m%d", errors="coerce")
+        except Exception:
+            df["_source_file_dt"] = pd.NaT
+
     # ⭐ 날짜 파싱을 먼저 수행 (Excel 직렬값·문자열 혼재 → 통일)
     # drop_duplicates 전에 파싱해야 동일 이벤트가 다른 포맷으로 기록된 경우에도 중복 제거 가능
     df["변경시간_parsed"] = parse_mixed_date(df["변경시간"])
+
+    # 최신 기준으로 정렬 후 dedup (과거 0, 최신 10 -> 10)
+    df = df.sort_values(
+        by=["변경시간_parsed", "store_id", "_collected_at_parsed", "_source_file_dt"],
+        ascending=True,
+        na_position="first",
+    )
 
     # 파싱된 datetime 기준으로 중복 제거
     df = df.drop_duplicates(subset=["변경시간_parsed", "store_id"], keep="last")
@@ -121,32 +171,87 @@ def transform_beamin_ad_change_history_df(df):
     df["수집주별"] = df["변경시간_parsed"].dt.to_period("W")
     df["platform"] = "배민"
 
-    df2 = df.groupby(["store_id", "매장명", "수집주별", "platform"]).agg(
-        변경전_희망가_최소 = ("변경전_희망가","min"),
-        변경전_희망가_최대 = ("변경전_희망가","max"),
-        변경전_희망가_평균 = ("변경전_희망가","mean"),
-        변경후_희망가_최소 = ("변경후_희망가","min"),
-        변경후_희망가_최대 = ("변경후_희망가","max"),
-        변경후_희망가_평균 = ("변경후_희망가","mean")
-    ).reset_index()
+    # join 키 (일자 + 매장)
+    df["join_date"] = df["변경시간_parsed"].dt.to_period("D").dt.to_timestamp()
+    if "매장명" in df.columns:
+        df["store_names"] = df["매장명"].astype(str).str.split(" ").str[-2:].str.join(" ")
+    else:
+        df["store_names"] = ""
 
-    df = df[['수집일시', '매장명', "platform",'store_id','캠페인정보', '변경시간','수집주별']]
-    df = pd.merge(df, df2, on=['store_id', '매장명', '수집주별', "platform"], how='left')
+    # ------------------------------------------------------------
+    # 1) 광고 캠페인 변경이력 (희망가) 스키마 처리
+    # ------------------------------------------------------------
+    ad_cols_present = ("변경전_희망가" in df.columns) and ("변경후_희망가" in df.columns)
+    ad_out = None
+    if ad_cols_present:
+        df2 = df.groupby(["store_id", "매장명", "수집주별", "platform"]).agg(
+            변경전_희망가_최소=("변경전_희망가", "min"),
+            변경전_희망가_최대=("변경전_희망가", "max"),
+            변경전_희망가_평균=("변경전_희망가", "mean"),
+            변경후_희망가_최소=("변경후_희망가", "min"),
+            변경후_희망가_최대=("변경후_희망가", "max"),
+            변경후_희망가_평균=("변경후_희망가", "mean"),
+        ).reset_index()
 
-    df["변경시간_parsed"] = parse_mixed_date(df["변경시간"])
-    df["join_date"] = df["변경시간_parsed"].dt.to_period("D")
-    df["join_date"] = df["join_date"].dt.to_timestamp()
-    df["store_names"] = df["매장명"].str.split(" ").str[-2:].str.join(" ")
+        base_cols = [c for c in ["수집일시", "매장명", "platform", "store_id", "캠페인정보", "변경시간", "수집주별", "join_date", "store_names"] if c in df.columns]
+        ad_out = df[base_cols].copy()
+        ad_out = pd.merge(ad_out, df2, on=["store_id", "매장명", "수집주별", "platform"], how="left")
 
-    df = df[['join_date', 'store_names', 'store_id', '캠페인정보', '변경시간', '수집주별', '변경전_희망가_최소',
-        '변경전_희망가_최대', '변경전_희망가_평균', '변경후_희망가_최소', '변경후_희망가_최대', '변경후_희망가_평균',
-        ]]
+        keep_cols = [c for c in [
+            "join_date", "store_names", "store_id", "캠페인정보", "변경시간", "수집주별",
+            "변경전_희망가_최소", "변경전_희망가_최대", "변경전_희망가_평균",
+            "변경후_희망가_최소", "변경후_희망가_최대", "변경후_희망가_평균",
+        ] if c in ad_out.columns]
+        ad_out = ad_out[keep_cols]
 
-    # ⭐ 같은 날짜+매장에 여러 변경이력이 있을 경우 최신 1건만 유지 (JOIN 시 fan-out 방지)
-    df = df.sort_values('변경시간', ascending=True)
-    df = df.drop_duplicates(subset=['join_date', 'store_names'], keep='last')
+        # ⭐ 같은 날짜+매장에 여러 변경이력이 있을 경우 최신 1건만 유지 (JOIN 시 fan-out 방지)
+        ad_out = ad_out.sort_values(["join_date", "store_names", "_collected_at_parsed", "_source_file_dt"], ascending=True)
+        ad_out = ad_out.drop_duplicates(subset=["join_date", "store_names"], keep="last")
 
-    return df
+    # ------------------------------------------------------------
+    # 2) 운영 변경이력(영업임시중지/운영시간/휴무일) 스키마 처리
+    # ------------------------------------------------------------
+    ops_out = None
+    if "대분류" in df.columns:
+        ops = df[["join_date", "store_names", "store_id", "대분류", "_collected_at_parsed", "_source_file_dt"]].copy()
+        ops["영업임시중지 변경"] = ops["대분류"].astype(str).str.contains("임시중지", na=False).astype(int)
+        ops["운영시간 변경"] = (ops["대분류"].astype(str) == "운영시간 변경").astype(int)
+        ops["휴무일 변경"] = (ops["대분류"].astype(str) == "휴무일 변경").astype(int)
+
+        ops = ops.sort_values(["join_date", "store_names", "_collected_at_parsed", "_source_file_dt"], ascending=True)
+        ops_out = ops.groupby(["join_date", "store_names"], as_index=False).agg(
+            store_id=("store_id", "first"),
+            영업임시중지_변경=("영업임시중지 변경", "max"),
+            운영시간_변경=("운영시간 변경", "max"),
+            휴무일_변경=("휴무일 변경", "max"),
+        )
+        ops_out.rename(
+            columns={
+                "영업임시중지_변경": "영업임시중지 변경",
+                "운영시간_변경": "운영시간 변경",
+                "휴무일_변경": "휴무일 변경",
+            },
+            inplace=True,
+        )
+
+    # ------------------------------------------------------------
+    # 3) 결과 결합 (둘 다 있으면 merge)
+    # ------------------------------------------------------------
+    if ad_out is None and ops_out is None:
+        # 최소 join 키라도 반환
+        out = df[["join_date", "store_names", "store_id"]].drop_duplicates().copy()
+    elif ad_out is None:
+        out = ops_out
+    elif ops_out is None:
+        out = ad_out
+    else:
+        out = pd.merge(ad_out, ops_out, on=["join_date", "store_names"], how="outer", suffixes=("", "_ops"))
+        # store_id는 ad_out을 우선, 없으면 ops쪽으로 채움
+        if "store_id_ops" in out.columns:
+            out["store_id"] = out["store_id"].fillna(out["store_id_ops"])
+            out.drop(columns=["store_id_ops"], inplace=True)
+
+    return out.drop(columns=[c for c in ["_collected_at_parsed", "_source_file_dt"] if c in out.columns])
 
 
 def preprocess_beamin_ad_change_history_df(**context):
@@ -166,8 +271,8 @@ def baemin_marketing_store_click_df(**context):
     return load_files(
         patterns=['baemin_marketing_*.csv'], 
         search_paths=[
-            Path('/opt/airflow/download/업로드_temp'), 
-            Path('/opt/airflow/download'), # 일반 다운로드 폴더
+            DOWN_DIR / "업로드_temp",
+            DOWN_DIR,  # 일반 다운로드 폴더
             COLLECT_DB / "영업관리부_수집", # 수집 DB 폴더
             COLLECT_DB, # 루트에 있는 경우도 커버
         ],
@@ -217,8 +322,8 @@ def coupangeats_cmg_df(**context):
     return load_files(
         patterns=['coupangeats_cmg_*.csv'], 
         search_paths=[
-            Path('/opt/airflow/download/업로드_temp'), 
-            Path('/opt/airflow/download'), # 일반 다운로드 폴더
+            DOWN_DIR / "업로드_temp",
+            DOWN_DIR,  # 일반 다운로드 폴더
             COLLECT_DB / "영업관리부_수집", # 수집 DB 폴더
             COLLECT_DB, # 루트에 있는 경우도 커버
         ],
@@ -231,10 +336,33 @@ def coupangeats_cmg_df(**context):
 def transform_coupangeats_cmg_df(df):
     # 전처리 시작
     coupang_df = df.copy()
-    coupang_df = coupang_df.drop_duplicates(subset=["조회일자", "매장명"], keep="last")
+
+    # 최신 수집 파일 우선 정렬용 (파일명이 기간을 포함: *_20260406-20260419.csv 또는 *_20260406.csv)
+    coupang_df["_source_file_end_dt"] = pd.NaT
+    if "_source_file" in coupang_df.columns:
+        try:
+            end_dates = (
+                coupang_df["_source_file"]
+                .astype(str)
+                .str.extract(r"(?:(?:\d{8})-(\d{8})|(\d{8}))(?:\D*\.(?:csv|xlsx|xls))?$")
+            )
+            # 그룹1(기간 end)이 우선, 없으면 그룹2(단일 날짜)
+            end_date_str = end_dates[0].fillna(end_dates[1])
+            coupang_df["_source_file_end_dt"] = pd.to_datetime(end_date_str, format="%Y%m%d", errors="coerce")
+        except Exception:
+            coupang_df["_source_file_end_dt"] = pd.NaT
     
     # ⭐ Excel 직렬값 처리를 포함한 날짜 변환
     coupang_df["조회일자_parsed"] = parse_mixed_date(coupang_df["조회일자"])
+
+    # 최신 기준으로 정렬 후 dedup (과거 0, 최신 10 -> 10)
+    coupang_df = coupang_df.sort_values(
+        by=["조회일자_parsed", "매장명", "_source_file_end_dt"],
+        ascending=True,
+        na_position="first",
+    )
+    coupang_df = coupang_df.drop_duplicates(subset=["조회일자_parsed", "매장명"], keep="last")
+
     coupang_df["조회일자"] = coupang_df["조회일자_parsed"].dt.to_period("D")
 
     # 쿠팡 광고
@@ -243,7 +371,6 @@ def transform_coupangeats_cmg_df(df):
     coupang_df["platform"] = "쿠팡이츠"
     coupang_df = coupang_df[['조회일자', 'store_names','platform', '광고비율', '광고비용', '신규고객',
         '광고주문수', '광고매출', '전체매출', '광고클릭수', '광고노출수']]
-    coupang_df
     return coupang_df
 
 def preprocess_coupangeats_cmg_df(**context):
@@ -548,6 +675,49 @@ def transform_fin_df(df):
         print(f"[transform_fin_df] 중복 제거: {before_dedup - after_dedup:,}건 (order_daily+매장명 기준)")
         df = df.sort_values(['매장명', 'order_daily']).reset_index(drop=True)
 
+    # ============================================================
+    # 1.0. 결측 컬럼(전일/전주동요일) 보정
+    # - 업스트림 스키마 변경/누락 시에도 DAG가 죽지 않도록 안전장치
+    # - 중복 제거 이후의 정렬된 DF를 기준으로 shift 계산
+    # ============================================================
+    def _ensure_shifted_cols(group_key: str, mapping: dict[str, tuple[str, int]]) -> None:
+        missing = [dst for dst in mapping.keys() if dst not in df.columns]
+        if not missing:
+            return
+
+        if group_key not in df.columns:
+            print(f"[WARNING][transform_fin_df] '{group_key}' 컬럼이 없어 전일/전주동요일 컬럼을 생성할 수 없습니다.")
+            for dst in missing:
+                df[dst] = np.nan
+            return
+
+        grp = df.groupby(group_key, sort=False)
+        for dst, (src, shift_n) in mapping.items():
+            if dst in df.columns:
+                continue
+            if src in df.columns:
+                df[dst] = grp[src].shift(shift_n)
+                print(f"[INFO][transform_fin_df] 누락 컬럼 생성: {dst} <= {src}.shift({shift_n})")
+            else:
+                df[dst] = np.nan
+                print(f"[WARNING][transform_fin_df] '{src}' 컬럼이 없어 '{dst}'를 NaN으로 생성합니다.")
+
+    _ensure_shifted_cols(
+        group_key="매장명",
+        mapping={
+            # 전일 (t-1)
+            "전일_매장매출": ("total_amount", 1),
+            "전일_매장정산금액": ("settlement_amount", 1),
+            "전일_매장매출_배민": ("total_amount_배민", 1),
+            "전일_매장정산금액_배민": ("settlement_amount_배민", 1),
+            # 전주동요일 (t-7)
+            "전주동요일_매장매출": ("total_amount", 7),
+            "전주동요일_매장정산금액": ("settlement_amount", 7),
+            "전주동요일_매장매출_배민": ("total_amount_배민", 7),
+            "전주동요일_매장정산금액_배민": ("settlement_amount_배민", 7),
+        },
+    )
+
     df['weekday'] = df['order_daily'].dt.dayofweek
     df['_order_month'] = df['order_daily'].dt.to_period('M')
     df['_order_day'] = df['order_daily'].dt.day
@@ -574,25 +744,25 @@ def transform_fin_df(df):
     # 전일_수수료율 (인라인 보정)
     df["전일_수수료율"] = (
         (df["전일_매장매출"] - (df["전일_매장정산금액"] - df["전일_매장매출"] * ad_ratio_baemin))
-        / df["전일_매장매출"] * 100
+        / df["전일_매장매출"].replace(0, np.nan) * 100
     ).round(2)
 
     # 전일_수수료율_배민 (인라인 보정)
     df["전일_수수료율_배민"] = (
         (df["전일_매장매출_배민"] - (df["전일_매장정산금액_배민"] - df["전일_매장매출_배민"] * ad_ratio_baemin))
-        / df["전일_매장매출_배민"] * 100
+        / df["전일_매장매출_배민"].replace(0, np.nan) * 100
     ).round(2)
 
     # 전주동요일_수수료율 (인라인 보정)
     df["전주동요일_수수료율"] = (
         (df["전주동요일_매장매출"] - (df["전주동요일_매장정산금액"] - df["전주동요일_매장매출"] * ad_ratio_baemin))
-        / df["전주동요일_매장매출"] * 100
+        / df["전주동요일_매장매출"].replace(0, np.nan) * 100
     ).round(2)
 
     # 전주동요일_수수료율_배민 (인라인 보정)
     df["전주동요일_수수료율_배민"] = (
         (df["전주동요일_매장매출_배민"] - (df["전주동요일_매장정산금액_배민"] - df["전주동요일_매장매출_배민"] * ad_ratio_baemin))
-        / df["전주동요일_매장매출_배민"] * 100
+        / df["전주동요일_매장매출_배민"].replace(0, np.nan) * 100
     ).round(2)
 
     # 전일대비_수수료율증감
@@ -1086,7 +1256,7 @@ def fin_save_to_csv(
         valid_cols = [c for c in dedup_cols if c in df.columns]
         if valid_cols:
             before = len(df)
-            df.drop_duplicates(subset=valid_cols, keep='first', inplace=True)
+            df.drop_duplicates(subset=valid_cols, keep='last', inplace=True)
             after = len(df)
             if before - after > 0:
                 print(f"\n[중복 제거] {valid_cols} 기준: {before - after:,}건 제거")
@@ -1177,6 +1347,8 @@ def fin_save_to_csv(
     # ============================================================
     # 최종 컬럼 whitelist — 원하는 컬럼만, 원하는 순서로
     # ============================================================
+    df = _append_llm_columns_for_csv(df)
+
     FINAL_COLUMNS = [
         # ── 기본 식별/집계 ─────────────────────────────────────────
         'order_daily', '매장명', '담당자', 'email',
@@ -1258,6 +1430,7 @@ def fin_save_to_csv(
         'service_score_total', 'service_status', 'pre_service_status',
         # ── 종합 위험도 ────────────────────────────────────────────
         'total_score',
+        *LLM_COLS,
     ]
     # total_score: 5개 지표 원점수 합산 (0~48점 만점)
     _score_cols = ['score', 'fee_score_total', '쿠팡_광고효과_score_total',

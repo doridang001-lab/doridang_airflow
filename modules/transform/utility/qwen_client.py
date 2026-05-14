@@ -1,5 +1,5 @@
 """
-로컬 Ollama qwen 클라이언트 래퍼
+로컬 Ollama LLM 클라이언트 래퍼 (gpt-oss 메인)
 """
 import json
 import logging
@@ -7,32 +7,50 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-OLLAMA_HOST = "http://host.docker.internal:11434"
-LLM_MODEL_CANDIDATES = ["qwen2.5:7b", "qwen2.5:latest", "qwen2.5", "gemma2:2b"]
+OLLAMA_HOST_CANDIDATES = [
+    "http://host.docker.internal:11434",  # Docker 컨테이너 내부 → 호스트
+    "http://localhost:11434",             # Windows/WSL 직접 실행
+    "http://127.0.0.1:11434",            # localhost 대체
+]
+LLM_MODEL_CANDIDATES = [
+    "gpt-oss:20b",
+    "gpt-oss:latest",
+    "gpt-oss",
+    "qwen2.5:7b",
+    "qwen2.5:latest",
+    "qwen2.5",
+    "gemma2:2b",
+]
 
 
 def get_ollama_client():
-    """Ollama 클라이언트 반환 (모델 자동 선택)"""
+    """Ollama 클라이언트 반환 (호스트 자동 탐색 + 모델 자동 선택)"""
     try:
         import ollama
     except ImportError:
         raise ImportError("ollama 패키지 필요: pip install ollama")
 
-    try:
-        client = ollama.Client(host=OLLAMA_HOST)
-        models = client.list()
-        model_names = [m["model"] for m in models.get("models", [])]
+    last_error = None
+    for host in OLLAMA_HOST_CANDIDATES:
+        try:
+            client = ollama.Client(host=host)
+            models = client.list()
+            model_names = [m["model"] for m in models.get("models", [])]
 
-        for candidate in LLM_MODEL_CANDIDATES:
-            if any(candidate in m for m in model_names):
-                logger.info(f"✅ Ollama 연결 성공: {candidate}")
-                return client, candidate
+            for candidate in LLM_MODEL_CANDIDATES:
+                if any(candidate in m for m in model_names):
+                    logger.info(f"✅ Ollama 연결 성공: {host} / 모델: {candidate}")
+                    return client, candidate
 
-        raise Exception(f"사용 가능한 Ollama 모델 없음. 설치된 모델: {model_names}")
+            last_error = Exception(f"사용 가능한 Ollama 모델 없음. 설치된 모델: {model_names}")
+            break  # 연결은 됐으나 모델이 없는 경우 더 이상 다른 host 시도 불필요
+        except Exception as e:
+            logger.debug(f"Ollama 연결 시도 실패: {host} → {e}")
+            last_error = e
+            continue
 
-    except Exception as e:
-        logger.error(f"❌ Ollama 연결 실패: {e}")
-        raise
+    logger.error(f"❌ Ollama 연결 실패 (모든 호스트 시도): {last_error}")
+    raise last_error
 
 
 def query_qwen(prompt: str, system_prompt: Optional[str] = None) -> str:
@@ -59,11 +77,31 @@ def query_qwen(prompt: str, system_prompt: Optional[str] = None) -> str:
 
     try:
         response = client.chat(model=model_name, messages=messages, stream=False)
-        result = response.get("message", {}).get("content", "")
-        logger.debug(f"qwen 응답 길이: {len(result)}")
-        return result
+
+        # ollama 라이브러리 버전에 따라 dict 또는 객체로 반환됨
+        if hasattr(response, "message"):
+            msg = response.message
+            content = getattr(msg, "content", "") or ""
+            # gpt-oss 등 reasoning 모델: content가 빈 경우 thinking/reasoning fallback
+            if not content.strip():
+                content = (
+                    getattr(msg, "thinking", "")
+                    or getattr(msg, "reasoning", "")
+                    or ""
+                )
+        else:
+            msg = response.get("message", {})
+            content = msg.get("content", "") or ""
+            if not content.strip():
+                content = msg.get("thinking", "") or msg.get("reasoning", "") or ""
+
+        if not content.strip():
+            logger.warning(f"[LLM] {model_name} 응답이 비어 있습니다. 원본: {str(response)[:200]}")
+
+        logger.debug(f"LLM 응답 길이: {len(content)}")
+        return content
     except Exception as e:
-        logger.error(f"qwen 쿼리 실패: {e}")
+        logger.error(f"LLM 쿼리 실패: {e}")
         raise
 
 

@@ -40,6 +40,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
+from modules.transform.utility.selenium_uc import configure_uc_data_path
+
 
 # ============================================================================
 # 상수 - 환경
@@ -173,6 +175,7 @@ def launch_browser(account_id: str):
 
     chrome_version = get_chrome_version()
     try:
+        configure_uc_data_path()
         if chrome_version:
             driver = uc.Chrome(options=options, version_main=chrome_version)
         else:
@@ -787,8 +790,8 @@ def run_toorder_voc_crawling(
 if __name__ == "__main__":
     test_df = pd.DataFrame([{
         "channel": "toorder",
-        "id": "doridang1",
-        "pw": "ehfl0109!!",
+        "id": "doridang15",
+        "pw": "ehfl5233!",
     }])
 
     result = run_toorder_voc_crawling(

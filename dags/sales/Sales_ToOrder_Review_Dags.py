@@ -26,8 +26,8 @@ from modules.extract.croling_toorder_review import run_toorder_review_crawling
 filename = os.path.basename(__file__)
 
 # 설정 - 투오더 계정 정보
-TOORDER_ID = "doridang1"
-TOORDER_PW = "ehfl0109!!"
+TOORDER_ID = "doridang15"
+TOORDER_PW = "ehfl5233!"
 
 
 # ============================================================

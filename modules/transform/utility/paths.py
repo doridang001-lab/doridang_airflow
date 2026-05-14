@@ -236,18 +236,22 @@ def resolve_llm_output_dir() -> Path:
 
 	우선순위:
 	1) 환경변수 `LLM_OUTPUT_DIR`
-	2) 컨테이너 마운트 경로 `/opt/airflow/onedrive_llm`
-	3) Windows OneDrive data/llm
+	2) Windows 로컬 OneDrive 경로
+	3) 컨테이너 마운트 경로 `/opt/airflow/onedrive_llm`
+	4) Fallback
 	"""
 	env_path = os.getenv("LLM_OUTPUT_DIR")
 	if env_path:
 		return Path(env_path)
 
+	if platform.system() == "Windows":
+		return Path.home() / "OneDrive - 주식회사 도리당" / "data" / "llm"
+
 	container_mount = Path("/opt/airflow/onedrive_llm")
 	if container_mount.exists():
 		return container_mount
 
-	return Path("C:/Users/tjrrj") / "OneDrive - 주식회사 도리당" / "data" / "llm"
+	return Path.home() / "OneDrive - 주식회사 도리당" / "data" / "llm"
 
 
 def resolve_raw_okpos_sales() -> Path:
@@ -286,5 +290,20 @@ POLICY_CONSOLIDATED_CSV = ANALYTICS_DB / "policy" / "policy_consolidated_latest.
 REPORT_SALES_DB = resolve_report_sales_db()
 MART_DB = resolve_mart_db()
 LLM_OUTPUT_DIR = resolve_llm_output_dir()
+ITEM_MASTER_CHECKPOINT_DIR = ANALYTICS_DB / "item_master_checkpoints"
 RAW_OKPOS_SALES = resolve_raw_okpos_sales()
 RAW_UNIONPOS_SALES = resolve_raw_unionpos_sales()
+FIN_PRODUCT_CSV_PATH = ANALYTICS_DB / "fin_product" / "fin_product_grp.csv"
+FIN_PRODUCT_REVIEW_CSV_PATH = ANALYTICS_DB / "fin_product" / "fin_product_review.csv"
+FIN_PRODUCT_ALIAS_CSV_PATH = ANALYTICS_DB / "fin_product" / "fin_product_alias.csv"
+POSFEED_WHITELIST_CSV_PATH = ANALYTICS_DB / "fin_product" / "fin_product_posfeed_whitelist.csv"
+
+STORE_SALES_TARGET_DIR = ANALYTICS_DB / "store_sales_target"
+STORE_SALES_TARGET_CSV = STORE_SALES_TARGET_DIR / "target.csv"
+STORE_SALES_DAILY_ACTUALS_CSV = STORE_SALES_TARGET_DIR / "daily_actuals.csv"
+STORE_SALES_ANALYSIS_CSV = STORE_SALES_TARGET_DIR / "sales_analysis.csv"
+
+BAEMIN_ORDERS_DETAIL_DB      = ANALYTICS_DB / "baemin_macro"
+BAEMIN_METRICS_DB            = BAEMIN_ORDERS_DETAIL_DB / "metrics_now"
+BAEMIN_OUR_STORE_CLICKS_DB   = BAEMIN_ORDERS_DETAIL_DB / "metrics_our_store_clicks"
+BAEMIN_SHOP_CHANGE_DB        = BAEMIN_ORDERS_DETAIL_DB / "shop_change"

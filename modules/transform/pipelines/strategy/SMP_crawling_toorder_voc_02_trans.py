@@ -764,30 +764,6 @@ def _attach_manager_name(df: pd.DataFrame, overwrite_existing: bool = True) -> p
 
 
 def _reset_sheet_and_upload(df: pd.DataFrame, cfg: dict):
-    from google.oauth2.service_account import Credentials
-    import gspread
-
-    try:
-        creds = Credentials.from_service_account_file(
-            DEFAULT_CREDENTIALS_PATH,
-            scopes=['https://www.googleapis.com/auth/spreadsheets']
-        )
-        gc = gspread.authorize(creds)
-        spreadsheet_id = cfg['url'].split('/d/')[1].split('/')[0]
-        sh = gc.open_by_key(spreadsheet_id)
-
-        try:
-            ws = sh.worksheet(cfg['sheet_name'])
-        except gspread.exceptions.WorksheetNotFound:
-            ws = sh.add_worksheet(title=cfg['sheet_name'], rows=100, cols=50)
-
-        ws.clear()
-        ws.resize(rows=len(df) + 10, cols=len(df.columns))
-        print(f"[{cfg['label']}] 시트 리셋 완료")
-
-    except Exception as e:
-        print(f"[{cfg['label']}] 시트 리셋 실패 (업로드 계속): {e}")
-
     result = save_to_gsheet(
         df=df,
         sheet_name=cfg['sheet_name'],

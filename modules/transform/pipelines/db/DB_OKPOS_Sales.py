@@ -15,9 +15,10 @@ import os
 import re
 import shutil
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
+from zipfile import BadZipFile
 
 import pandas as pd
 
@@ -28,7 +29,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
-from modules.transform.utility.paths import ANALYTICS_DB, RAW_OKPOS_SALES, TEMP_DIR
+from modules.transform.utility.paths import ANALYTICS_DB, ONEDRIVE_DB, RAW_OKPOS_SALES, TEMP_DIR
+from modules.transform.utility.selenium_uc import configure_uc_data_path
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +45,6 @@ STORES = [
     {"name": "도리당 동두천지행점", "shopCd": "RL2725"},
     {"name": "도리당 삼송점",       "shopCd": "UE6850"},
     {"name": "도리당 평택비전점",    "shopCd": "UW4935"},
-    {"name": "도리당 광주상무점",    "shopCd": "XK8828"},
     {"name": "도리당 송파삼전점",    "shopCd": "LQ9726"},
 ]
 
@@ -58,6 +59,16 @@ PAGE_TYPES = {
         "date_input_id": "saleDate",
         "excel_js": "exportReceiptDetailExcel()",
     },
+    # 일자별 종합매출 (실매출 기준의 공식 집계 리포트)
+    "daily": {
+        "url": "https://my.okpos.co.kr/asp/sales/v2/daily",
+        # daily는 기간 조회: startDate/endDate 두 입력을 각각 세팅
+        "start_date_input_id": "startDate",
+        "end_date_input_id": "endDate",
+        # 매장 펼침(상세 펼침) 체크박스
+        "shop_open_checkbox_id": "shopOpen",
+        "excel_js": "exportSheet()",
+    },
 }
 
 DOWNLOAD_TIMEOUT = 120
@@ -69,8 +80,326 @@ HEADLESS_MODE    = os.getenv("AIRFLOW_HOME") is not None
 # 내부 유틸
 # ============================================================
 
+def _to_int_series(series: pd.Series) -> pd.Series:
+    """문자열 금액 컬럼을 int 시리즈로 변환 (빈값/NaN/콤마 등 방어)."""
+    try:
+        s = series.fillna("").astype(str).str.replace(",", "", regex=False).str.strip()
+    except Exception:
+        s = series
+    return pd.to_numeric(s, errors="coerce").fillna(0).astype(int)
+
+def _no_data_marker_path(store_short: str, ym: str, csv_stem: str) -> Path:
+    """'해당 날짜는 매출 데이터 없음'을 기록하는 마커 파일 경로.
+
+    - csv_stem 예: okpos_order, okpos_order_item
+    - 저장 위치: RAW_OKPOS_SALES/brand=도리당/store=.../ym=YYYY-MM/.no_data__{csv_stem}.txt
+    """
+    return (
+        RAW_OKPOS_SALES
+        / "brand=도리당"
+        / f"store={store_short}"
+        / f"ym={ym}"
+        / f".no_data__{csv_stem}.txt"
+    )
+
+
+def _read_no_data_dates(marker_path: Path) -> set[str]:
+    if not marker_path.exists() or marker_path.stat().st_size == 0:
+        return set()
+    out: set[str] = set()
+    try:
+        for line in marker_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = (line or "").strip()
+            if not line:
+                continue
+            # 포맷: YYYY-MM-DD \t reason \t recorded_at
+            out.add(line.split("\t", 1)[0].strip())
+    except Exception:
+        return set()
+    return out
+
+
+def _mark_no_data(store_short: str, ym: str, csv_stem: str, sale_date: str, reason: str) -> None:
+    """sale_date를 'NO_DATA'로 마킹하여 이후 재다운로드/누락체크에서 제외되게 한다."""
+    marker_path = _no_data_marker_path(store_short, ym, csv_stem)
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _read_no_data_dates(marker_path)
+    if sale_date in existing:
+        return
+    now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{sale_date}\t{reason}\t{now_ts}\n"
+    try:
+        marker_path.write_text(
+            (marker_path.read_text(encoding="utf-8", errors="ignore") if marker_path.exists() else "") + line,
+            encoding="utf-8",
+        )
+    except Exception:
+        # 마커는 보조 기능이므로 실패해도 파이프라인은 진행
+        logger.warning(f"NO_DATA 마커 기록 실패(무시): {marker_path}")
+
+
+def _unmark_no_data(store_short: str, ym: str, csv_stem: str, sale_date: str) -> None:
+    """NO_DATA 마커에서 특정 sale_date를 제거(재수집/재검증 시 사용)."""
+    marker_path = _no_data_marker_path(store_short, ym, csv_stem)
+    if not marker_path.exists() or marker_path.stat().st_size == 0:
+        return
+    try:
+        lines = marker_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        kept: list[str] = []
+        removed = 0
+        for line in lines:
+            raw = (line or "").strip()
+            if not raw:
+                continue
+            d = raw.split("\t", 1)[0].strip()
+            if d == sale_date:
+                removed += 1
+                continue
+            kept.append(line)
+        if removed:
+            marker_path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+            logger.info("NO_DATA 마커 제거: %s | %s (%d줄)", marker_path, sale_date, removed)
+    except Exception as e:
+        logger.warning("NO_DATA 마커 제거 실패(무시): %s | %s", marker_path, e)
+
+
+def _is_likely_okpos_report(df: pd.DataFrame) -> bool:
+    """OKPOS 리포트로 보이는지(헤더 추정이 맞는지) 대략 판단.
+
+    헤더가 엉뚱하면 NO/영수증번호/실매출액 같은 키 컬럼이 거의 없다.
+    """
+    try:
+        cols = {str(c).strip() for c in df.columns}
+    except Exception:
+        return False
+    key_cols = {
+        "NO",
+        "No",
+        "결제시각",
+        "결제시간",
+        "영수증번호",
+        "상품명",
+        "수량",
+        "총매출액",
+        "실매출액",
+        "가액",
+        "부가세",
+    }
+    return len(cols & key_cols) >= 2
+
+
+_STORE_OPEN_DATE_CACHE: dict[str, date] | None = None
+_STORE_OPEN_DATE_MISS_LOGGED: set[str] = set()
+
+
+def _load_store_open_dates() -> dict[str, date]:
+    """sales_employee.csv(OneDrive Repository) 기준 매장 실오픈일 매핑을 로드한다.
+
+    - 파일 위치: ONEDRIVE_DB / sales_employee.csv
+    - 같은 매장이 플랫폼별로 여러 줄이면, 가장 빠른(최소) 실오픈일을 사용
+    """
+    global _STORE_OPEN_DATE_CACHE
+    if _STORE_OPEN_DATE_CACHE is not None:
+        return _STORE_OPEN_DATE_CACHE
+
+    path = ONEDRIVE_DB / "sales_employee.csv"
+    if not path.exists() or path.stat().st_size == 0:
+        _STORE_OPEN_DATE_CACHE = {}
+        logger.warning(f"sales_employee.csv 없음 → 오픈일 필터 비활성: {path}")
+        return _STORE_OPEN_DATE_CACHE
+
+    try:
+        df = pd.read_csv(path, encoding="utf-8-sig", dtype=str)
+    except Exception:
+        df = pd.read_csv(path, encoding="cp949", dtype=str)
+
+    if "매장명" not in df.columns or "실오픈일" not in df.columns:
+        _STORE_OPEN_DATE_CACHE = {}
+        logger.warning(f"sales_employee.csv 컬럼 부족 → 오픈일 필터 비활성: columns={list(df.columns)}")
+        return _STORE_OPEN_DATE_CACHE
+
+    df["매장명"] = df["매장명"].astype(str).str.strip()
+    open_dt = pd.to_datetime(df["실오픈일"], errors="coerce").dt.date
+    df = df.assign(_open=open_dt)
+    df = df.dropna(subset=["_open"])
+
+    mapping: dict[str, date] = {}
+    for store_name, g in df.groupby("매장명", dropna=True):
+        d = g["_open"].min()
+        if pd.isna(d):
+            continue
+        mapping[str(store_name).strip()] = d
+
+    _STORE_OPEN_DATE_CACHE = mapping
+    logger.info(f"매장 실오픈일 로드: {len(mapping)}개 (source={path})")
+    return mapping
+
+
+def _store_open_date(store_name: str) -> date | None:
+    store_name = (store_name or "").strip()
+    if not store_name:
+        return None
+    mapping = _load_store_open_dates()
+
+    # 1) exact match
+    d = mapping.get(store_name)
+    if d is not None:
+        return d
+
+    # 2) 브랜드 접두어 제거(예: '도리당 송파삼전점' vs '송파삼전점')
+    for prefix in ("도리당", "도리당 "):
+        if store_name.startswith(prefix):
+            stripped = store_name[len(prefix):].strip()
+            if stripped:
+                d2 = mapping.get(stripped)
+                if d2 is not None:
+                    return d2
+
+    # 띄어쓰기/특수문자 차이 정도만 완화
+    compact = store_name.replace(" ", "")
+    for k, v in mapping.items():
+        kk = str(k).replace(" ", "")
+        if kk == compact:
+            return v
+        # prefix 제거 후 비교도 허용
+        for prefix in ("도리당",):
+            c2 = compact
+            if c2.startswith(prefix):
+                c2 = c2[len(prefix):].strip()
+            if kk == c2:
+                return v
+
+    if store_name not in _STORE_OPEN_DATE_MISS_LOGGED:
+        _STORE_OPEN_DATE_MISS_LOGGED.add(store_name)
+        logger.warning(f"실오픈일 매칭 실패(필터 미적용): {store_name}")
+    return None
+
+
+def _should_collect(store_name: str, sale_date: str) -> bool:
+    """sale_date(YYYY-MM-DD)가 해당 매장 실오픈일보다 이전이면 수집 제외."""
+    try:
+        d = datetime.strptime(sale_date, "%Y-%m-%d").date()
+    except Exception:
+        return True
+    od = _store_open_date(store_name)
+    if od is None:
+        return True
+    return d >= od
+
+
+def prune_preopen_data(**context) -> str:
+    """매장 실오픈일 이전에 잘못 저장된 데이터를 정리한다.
+
+    - 목적: 이미 적재된 pre-open 날짜가 '존재'로 인식되어 스킵되거나, 분석에 섞이는 문제 방지
+    - 동작: RAW_OKPOS_SALES 하위의 okpos_{daily,order,order_item}.csv에서 sale_date < open_date 행 제거
+    - 기준 날짜 범위: resolve_dates XCom sale_dates가 포함하는 ym 파티션만 스캔
+    """
+    sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates")
+    if not sale_dates:
+        raise ValueError("sale_dates XCom 값이 없습니다.")
+
+    yms = sorted({sd[:7] for sd in sale_dates if isinstance(sd, str) and len(sd) >= 7})
+    if not yms:
+        return "preopen 정리: 대상 ym 없음 (스킵)"
+
+    csv_stems = ["okpos_daily", "okpos_order", "okpos_order_item"]
+    cleaned_files = 0
+    removed_rows = 0
+
+    for store in STORES:
+        store_name = store["name"]
+        od = _store_open_date(store_name)
+        if od is None:
+            continue
+        store_short = store_name.replace("도리당 ", "", 1)
+        for ym in yms:
+            base = RAW_OKPOS_SALES / "brand=도리당" / f"store={store_short}" / f"ym={ym}"
+            for stem in csv_stems:
+                p = base / f"{stem}.csv"
+                if not p.exists() or p.stat().st_size == 0:
+                    continue
+                try:
+                    df = pd.read_csv(p, dtype=str, encoding="utf-8-sig")
+                except Exception:
+                    df = pd.read_csv(p, dtype=str)
+                if df.empty or "sale_date" not in df.columns:
+                    continue
+                s = pd.to_datetime(df["sale_date"].astype(str).str.strip(), errors="coerce").dt.date
+                keep = (s.isna()) | (s >= od)
+                before = len(df)
+                df2 = df[keep].copy()
+                dropped = before - len(df2)
+                if dropped <= 0:
+                    continue
+                if df2.empty:
+                    # 파일 자체가 pre-open만 있었다면 삭제
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        # 삭제 실패 시 빈 파일로 대체
+                        df2.to_csv(p, index=False, encoding="utf-8-sig")
+                else:
+                    df2.to_csv(p, index=False, encoding="utf-8-sig")
+                cleaned_files += 1
+                removed_rows += dropped
+    logger.warning(f"preopen 정리 완료: files={cleaned_files}, removed_rows={removed_rows}")
+    return f"preopen 정리 완료: files={cleaned_files}, removed_rows={removed_rows}"
+
+
+def purge_okpos_daily(**context) -> str:
+    """`okpos_daily.csv`를 전부 삭제(또는 기간/ym 범위만)해서 재적재가 가능하게 만든다.
+
+    안전장치:
+    - 기본 동작은 스킵
+    - dag_run.conf.purge_okpos_daily=true 또는 env OKPOS_PURGE_OKPOS_DAILY=1 일 때만 수행
+
+    범위:
+    - 기본: brand=도리당 하위 모든 store/ym의 okpos_daily.csv 삭제
+    - 옵션: dag_run.conf.purge_scope='resolved_ym'이면 resolve_dates의 ym만 삭제
+    """
+    conf = context.get("dag_run").conf or {}
+    enabled = bool(conf.get("purge_okpos_daily") or os.getenv("OKPOS_PURGE_OKPOS_DAILY", ""))
+    if not enabled:
+        return "purge okpos_daily: disabled (skip)"
+
+    scope = str(conf.get("purge_scope") or os.getenv("OKPOS_PURGE_SCOPE", "") or "all").strip().lower()
+    yms: set[str] = set()
+    if scope == "resolved_ym":
+        sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates") or []
+        yms = {sd[:7] for sd in sale_dates if isinstance(sd, str) and len(sd) >= 7}
+
+    deleted = 0
+    base = RAW_OKPOS_SALES / "brand=도리당"
+    if not base.exists():
+        return f"purge okpos_daily: base not found ({base})"
+
+    # store=*/ym=*/okpos_daily.csv 스캔
+    for store_dir in base.glob("store=*"):
+        if not store_dir.is_dir():
+            continue
+        for ym_dir in store_dir.glob("ym=*"):
+            if not ym_dir.is_dir():
+                continue
+            ym = ym_dir.name.replace("ym=", "", 1)
+            if yms and ym not in yms:
+                continue
+            p = ym_dir / "okpos_daily.csv"
+            if p.exists():
+                try:
+                    p.unlink()
+                    deleted += 1
+                except Exception:
+                    logger.warning(f"okpos_daily 삭제 실패(무시): {p}")
+
+    logger.warning(f"purge okpos_daily 완료: deleted_files={deleted} scope={scope}")
+    return f"purge okpos_daily 완료: deleted_files={deleted} scope={scope}"
+
+
 def _get_chrome_version() -> int | None:
+    import platform
     import subprocess
+
+    # Linux/WSL
     candidates = [
         ["google-chrome", "--version"],
         ["google-chrome-stable", "--version"],
@@ -80,11 +409,43 @@ def _get_chrome_version() -> int | None:
     for cmd in candidates:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-            match = re.search(r"(\d+)\.", result.stdout.strip())
+            match = re.search(r"(\d+)\.", (result.stdout or "").strip())
             if match:
                 return int(match.group(1))
         except Exception:
             continue
+
+    # Windows: Chrome 실행/출력이 막혀도 파일 버전은 읽을 수 있음
+    if platform.system() == "Windows":
+        exe_candidates: list[str] = []
+        env_bin = os.getenv("CHROME_BIN")
+        if env_bin:
+            exe_candidates.append(env_bin)
+        exe_candidates += [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            str(Path.home() / r"AppData\Local\Google\Chrome\Application\chrome.exe"),
+        ]
+
+        for exe in exe_candidates:
+            try:
+                p = Path(exe)
+                if not p.exists():
+                    continue
+                escaped = str(p).replace("'", "''")
+                ps = f"(Get-Item '{escaped}').VersionInfo.ProductVersion"
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                match = re.search(r"(\d+)\.", (result.stdout or "").strip())
+                if match:
+                    return int(match.group(1))
+            except Exception:
+                continue
+
     return None
 
 
@@ -92,18 +453,35 @@ def _launch_browser(download_dir: Path) -> uc.Chrome:
     """다운로드 경로가 설정된 Chrome 브라우저 실행"""
     download_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"브라우저 실행 (headless={HEADLESS_MODE}, download_dir={download_dir})")
+    configure_uc_data_path()
 
     def _make_options() -> uc.ChromeOptions:
+        import platform
         options = uc.ChromeOptions()
         chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/google-chrome")
-        if Path(chrome_bin).exists():
+        if platform.system() == "Windows":
+            win_default = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+            if chrome_bin == "/usr/bin/google-chrome" and Path(win_default).exists():
+                chrome_bin = win_default
+        if chrome_bin and Path(chrome_bin).exists():
             options.binary_location = chrome_bin
         if HEADLESS_MODE:
             options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
+        options.add_argument("--renderer-process-limit=1")
+        options.add_argument("--disable-features=site-per-process")
+        options.add_argument("--disk-cache-size=1")
+        options.add_argument("--media-cache-size=1")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        options.add_argument("--disable-background-networking")
+        options.add_argument("--disable-extensions")
         options.add_argument("--window-size=1920,1080")
+        if platform.system() == "Windows":
+            options.add_argument("--disable-crash-reporter")
+            options.add_argument("--disable-features=Crashpad")
         return options
 
     # 동시 실행 시 chromedriver 패치 충돌 방지: 인스턴스별 고유 복사본 사용
@@ -120,6 +498,13 @@ def _launch_browser(download_dir: Path) -> uc.Chrome:
     chrome_version = _get_chrome_version()
     try:
         kwargs = {"options": _make_options()}
+        try:
+            import platform
+
+            if platform.system() == "Windows":
+                kwargs["use_subprocess"] = True
+        except Exception:
+            pass
         if chrome_version:
             kwargs["version_main"] = chrome_version
         if unique_driver_path:
@@ -134,6 +519,13 @@ def _launch_browser(download_dir: Path) -> uc.Chrome:
             detected = int(match.group(1))
             logger.warning(f"버전 불일치 → {detected} 으로 재시도")
             kwargs2 = {"options": _make_options(), "version_main": detected}
+            try:
+                import platform
+
+                if platform.system() == "Windows":
+                    kwargs2["use_subprocess"] = True
+            except Exception:
+                pass
             if unique_driver_path:
                 kwargs2["driver_executable_path"] = unique_driver_path
             driver = uc.Chrome(**kwargs2)
@@ -177,6 +569,7 @@ def _is_transient_connection_error(exc: Exception) -> bool:
                 "connection refused",
                 "failed to establish",
                 "max retries exceeded",
+                "invalid session id",
             )
         )
     # urllib3 ProtocolError이 WebDriverException 안에 체인된 경우
@@ -198,12 +591,20 @@ def _is_driver_alive(driver: uc.Chrome) -> bool:
 def _filter_missing_keys(sale_dates: list, csv_name: str) -> list:
     """sale_dates × STORES 중 csv_name.csv에 해당 날짜 데이터가 없는 (date, store) 조합만 반환."""
     missing = []
+    marker_cache: dict[Path, set[str]] = {}
     for sale_date in sale_dates:
         ym = sale_date[:7]
         for store in STORES:
+            if not _should_collect(store["name"], sale_date):
+                continue
             store_short = store["name"].replace("도리당 ", "", 1)
             csv_path = (RAW_OKPOS_SALES / "brand=도리당"
                         / f"store={store_short}" / f"ym={ym}" / f"{csv_name}.csv")
+            marker_path = _no_data_marker_path(store_short, ym, csv_name)
+            if marker_path not in marker_cache:
+                marker_cache[marker_path] = _read_no_data_dates(marker_path)
+            if sale_date in marker_cache[marker_path]:
+                continue
             if not csv_path.exists():
                 missing.append((sale_date, store))
                 continue
@@ -221,13 +622,15 @@ def _download_with_retry(
     sale_dates: list,
     download_dir: Path,
     session_fn: Callable,
+    current_key: list | None = None,
 ) -> dict:
     """
-    브라우저 세션 기반 다운로드를 최대 _BROWSER_RETRY_MAX 회 재시도.
+    브라우저 세션 기반 다운로드를 최대 max_attempts 회 재시도.
 
     - 연결 끊김(RemoteDisconnected / ProtocolError) 계열만 재시도
     - 성공한 key는 results에 기록 → 재시도 시 스킵
-    - 지수 백오프: 5s, 15s (base * 3^(attempt-1))
+    - per-key 크래시 횟수 추적 → MAX_CRASH_PER_KEY 초과 시 NO_DATA 처리
+    - max_attempts = max(_BROWSER_RETRY_MAX, pending수 + buffer) → 대용량 백필 대응
     - session_fn(driver, wait, pending_keys, results) → None (results를 in-place 갱신)
     """
     # sale_dates가 이미 (date, store) 튜플 목록이면 그대로 사용 (pre-filtered)
@@ -240,11 +643,22 @@ def _download_with_retry(
             for store in STORES
         ]
     results: dict = {}
-    last_exc: Exception | None = None
+    crash_counts: dict[str, int] = {}
+    MAX_CRASH_PER_KEY = int(os.getenv("OKPOS_MAX_CRASHES_PER_KEY", "3"))
+    max_attempts = max(_BROWSER_RETRY_MAX, len(all_keys) + _BROWSER_RETRY_MAX)
 
-    for attempt in range(1, _BROWSER_RETRY_MAX + 1):
+    for attempt in range(1, max_attempts + 1):
+        # 크래시 한도 초과 key → 이번 세션에서 스킵 (results에 넣지 않음 → 미수집으로 남아 RuntimeError → Airflow retry)
+        crash_skip = {key for key, cnt in crash_counts.items() if cnt >= MAX_CRASH_PER_KEY}
+        if crash_skip:
+            logger.warning(
+                f"[{page_type}] Chrome 크래시 {MAX_CRASH_PER_KEY}회 초과 key {len(crash_skip)}건 → "
+                f"이번 세션 스킵 (Airflow retry 대상): {', '.join(sorted(crash_skip))}"
+            )
+
         pending = [(sd, st) for sd, st in all_keys
-                   if f"{sd}__{st['name']}" not in results]
+                   if f"{sd}__{st['name']}" not in results
+                   and f"{sd}__{st['name']}" not in crash_skip]
         if not pending:
             break
 
@@ -255,37 +669,48 @@ def _download_with_retry(
         if not _is_driver_alive(driver):
             logger.warning(
                 f"[{page_type}] 브라우저 실행 직후 세션 죽음 "
-                f"(attempt {attempt}/{_BROWSER_RETRY_MAX}) → 재기동"
+                f"(attempt {attempt}/{max_attempts}) → 재기동"
             )
             try:
                 driver.quit()
             except Exception:
                 pass
-            if attempt < _BROWSER_RETRY_MAX:
+            if attempt < max_attempts:
                 time.sleep(5)
                 continue
             raise RuntimeError(
                 f"[{page_type}] 브라우저가 계속 즉시 종료됩니다. "
-                f"최대 재시도({_BROWSER_RETRY_MAX}) 초과."
+                f"최대 재시도({max_attempts}) 초과."
             )
 
         wait = WebDriverWait(driver, WAIT_TIMEOUT)
         try:
             session_fn(driver, wait, pending, results)
         except Exception as exc:
-            if _is_transient_connection_error(exc) and attempt < _BROWSER_RETRY_MAX:
-                wait_sec = _BROWSER_RETRY_BASE_WAIT * (3 ** (attempt - 1))
-                logger.warning(
-                    f"[{page_type}] WebDriver 연결 끊김 "
-                    f"(attempt {attempt}/{_BROWSER_RETRY_MAX}) → {wait_sec}초 후 재시도: {exc}"
-                )
-                time.sleep(wait_sec)
-                last_exc = exc
-            else:
-                if _is_transient_connection_error(exc):
-                    logger.error(
-                        f"[{page_type}] 최대 재시도 횟수({_BROWSER_RETRY_MAX}) 초과. 포기합니다."
+            if _is_transient_connection_error(exc):
+                # 현재 처리 중이던 key의 크래시 카운트 증가
+                if current_key is not None and current_key[0]:
+                    k = current_key[0]
+                    crash_counts[k] = crash_counts.get(k, 0) + 1
+                    logger.warning(
+                        f"[{page_type}] {k} 크래시 누적 "
+                        f"{crash_counts[k]}/{MAX_CRASH_PER_KEY}"
                     )
+                    current_key[0] = None
+
+                if attempt < max_attempts:
+                    wait_sec = min(_BROWSER_RETRY_BASE_WAIT * (3 ** (min(attempt, 4) - 1)), 45)
+                    logger.warning(
+                        f"[{page_type}] WebDriver 연결 끊김 "
+                        f"(attempt {attempt}/{max_attempts}) → {wait_sec}초 후 재시도: {exc}"
+                    )
+                    time.sleep(wait_sec)
+                else:
+                    logger.error(
+                        f"[{page_type}] 최대 재시도 횟수({max_attempts}) 초과. 나머지는 미수집 처리."
+                    )
+                    break
+            else:
                 raise
         finally:
             try:
@@ -656,6 +1081,13 @@ def _wait_for_download(directory: Path, existing_files: set, timeout: int = DOWN
     stable_poll_sec = 0.5
     last_sizes: dict[Path, tuple[int, float]] = {}
 
+    # 파일/partial이 no_activity_sec 내 하나도 나타나지 않으면 조기 종료.
+    # 데이터가 없는 날짜/매장은 JS 클릭 후 아무것도 다운로드되지 않으므로
+    # 전체 timeout을 기다리지 않고 빠르게 "데이터 없음"을 감지한다.
+    no_activity_sec = float(os.getenv("OKPOS_DOWNLOAD_NO_ACTIVITY_SEC", "30"))
+    no_activity_deadline = time.time() + no_activity_sec
+    first_activity_seen = False
+
     while time.time() < end_time:
         try:
             current = {p for p in directory.iterdir() if p.is_file() and not _is_partial(p)}
@@ -664,6 +1096,12 @@ def _wait_for_download(directory: Path, existing_files: set, timeout: int = DOWN
 
         new_files = current - existing_files
         partials = list(directory.glob("*.crdownload")) + list(directory.glob("*.part")) + list(directory.glob("*.tmp"))
+
+        if not first_activity_seen:
+            if new_files or partials:
+                first_activity_seen = True
+            elif time.time() > no_activity_deadline:
+                return None
 
         if new_files:
             latest = sorted(new_files, key=lambda f: f.stat().st_mtime, reverse=True)[0]
@@ -684,30 +1122,124 @@ def _wait_for_download(directory: Path, existing_files: set, timeout: int = DOWN
     return None
 
 
+def _wait_for_download(
+    directory: Path,
+    existing_files: set,
+    timeout: int = DOWNLOAD_TIMEOUT,
+    expected_suffixes: set[str] | None = None,
+    filename_predicate: Callable[[Path], bool] | None = None,
+) -> Path | None:
+    """Filtered download waiter used by sales/product flows."""
+    end_time = time.time() + timeout
+    expected_suffixes_normalized = {s.lower() for s in expected_suffixes} if expected_suffixes else None
+    blocked_suffixes = {".html", ".htm", ".png", ".jpg", ".jpeg", ".svg", ".webp"}
+    blocked_names = {"downloads.html", "download.html"}
+
+    def _is_partial(p: Path) -> bool:
+        return p.suffix.lower() in {".crdownload", ".tmp", ".part"}
+
+    def _is_candidate(p: Path) -> bool:
+        suffix = p.suffix.lower()
+        if _is_partial(p):
+            return False
+        if p.name.lower() in blocked_names or suffix in blocked_suffixes:
+            return False
+        if expected_suffixes_normalized and suffix not in expected_suffixes_normalized:
+            return False
+        if filename_predicate and not filename_predicate(p):
+            return False
+        return True
+
+    stable_window_sec = float(os.getenv("OKPOS_DOWNLOAD_STABLE_WINDOW_SEC", "1.5"))
+    stable_poll_sec = 0.5
+    last_sizes: dict[Path, tuple[int, float]] = {}
+    no_activity_sec = float(os.getenv("OKPOS_DOWNLOAD_NO_ACTIVITY_SEC", "30"))
+    no_activity_deadline = time.time() + no_activity_sec
+    first_activity_seen = False
+
+    while time.time() < end_time:
+        try:
+            current_all = {p for p in directory.iterdir() if p.is_file()}
+        except FileNotFoundError:
+            current_all = set()
+
+        current = {p for p in current_all if _is_candidate(p)}
+        new_any_files = current_all - existing_files
+        new_files = current - existing_files
+        partials = list(directory.glob("*.crdownload")) + list(directory.glob("*.part")) + list(directory.glob("*.tmp"))
+
+        if not first_activity_seen:
+            if new_any_files or partials:
+                first_activity_seen = True
+            elif time.time() > no_activity_deadline:
+                return None
+
+        if new_files:
+            latest = sorted(new_files, key=lambda f: f.stat().st_mtime, reverse=True)[0]
+            try:
+                size = latest.stat().st_size
+            except FileNotFoundError:
+                time.sleep(stable_poll_sec)
+                continue
+
+            prev = last_sizes.get(latest)
+            now = time.time()
+            if prev is not None and prev[0] == size and (now - prev[1]) >= stable_window_sec and not partials:
+                return latest
+            last_sizes[latest] = (size, prev[1] if (prev and prev[0] == size) else now)
+
+        time.sleep(stable_poll_sec)
+    return None
+
+
 def _click_search_btn(driver: uc.Chrome, wait: WebDriverWait) -> None:
-    """조회 버튼 클릭 (여러 셀렉터 순서대로 시도)"""
-    _SEARCH_SELECTORS = [
+    """조회 버튼 클릭.
+
+    IBSheet 기반 OKPOS 페이지에서 XPATH text()/contains(@onclick,...) 스캔은
+    전체 DOM 순회를 유발해 Chrome OOM을 일으킨다.
+    → CSS/ID 셀렉터(빠름) 먼저, 실패 시 JS querySelectorAll(안전) 로 클릭.
+    → 세션 연결 오류는 즉시 re-raise (브라우저 재생성 로직에 위임).
+    """
+    # 1단계: CSS/ID 셀렉터 (DOM 전체 스캔 없음, 빠름)
+    _FAST_SELECTORS = [
         (By.ID, "searchBtn"),
         (By.CSS_SELECTOR, "button.btn-search"),
         (By.CSS_SELECTOR, "a.btn-search"),
-        (By.XPATH, "//button[contains(@class,'btn') and (contains(text(),'조회') or contains(text(),'검색'))]"),
-        (By.XPATH, "//a[contains(@class,'btn') and (contains(text(),'조회') or contains(text(),'검색'))]"),
-        (By.XPATH, "//input[@type='button' and (contains(@value,'조회') or contains(@value,'검색'))]"),
-        (By.XPATH, "//button[contains(@onclick,'search') or contains(@onclick,'Search')]"),
+        (By.CSS_SELECTOR, "input[type='button'][value='조회'], input[type='button'][value='검색']"),
     ]
-    for sel in _SEARCH_SELECTORS:
+    for sel in _FAST_SELECTORS:
         try:
-            btn = WebDriverWait(driver, 3).until(EC.element_to_be_clickable(sel))
+            btn = WebDriverWait(driver, 2).until(EC.element_to_be_clickable(sel))
             logger.info(f"조회 버튼 발견: {sel}")
             driver.execute_script("arguments[0].click();", btn)
             return
-        except (TimeoutException, Exception):
+        except Exception as _e:
+            if _is_transient_connection_error(_e):
+                raise
             continue
 
-    # 찾지 못한 경우 현재 버튼 목록 로깅
-    btns = [(b.tag_name, b.get_attribute("id"), b.get_attribute("class"), b.text.strip())
-            for b in driver.find_elements(By.XPATH, "//button|//a[contains(@class,'btn')]|//input[@type='button']")]
-    logger.error(f"조회 버튼을 찾을 수 없음 | 버튼 목록: {btns[:20]}")
+    # 2단계: JS querySelectorAll (브라우저 내부 실행 → Chrome 안전, 빠름)
+    try:
+        clicked = driver.execute_script("""
+            var els = Array.from(
+                document.querySelectorAll('button, a, input[type=button], input[type=submit]')
+            );
+            var btn = els.find(function(b) {
+                var t = (b.textContent || b.value || '').trim();
+                return t === '조회' || t === '검색' || t.indexOf('조회') === 0;
+            });
+            if (btn) { btn.click(); return true; }
+            return false;
+        """)
+        if clicked:
+            logger.info("조회 버튼 클릭 성공 (JS)")
+            return
+        logger.error("조회 버튼을 찾을 수 없음 (JS에서도 미발견)")
+    except Exception as _js_err:
+        if _is_transient_connection_error(_js_err):
+            raise
+        logger.error(f"조회 버튼 JS 탐색 실패: {_js_err}")
+
     raise TimeoutException("조회 버튼을 찾을 수 없습니다.")
 
 
@@ -741,7 +1273,13 @@ def _download_excel_for_store(
 
             # ── 1. 날짜 선택 ─────────────────────────────────────────────────
             logger.info(f"{attempt_tag} 날짜 선택 시작")
-            _select_date_tui(driver, wait, sale_date, page_cfg["date_input_id"])
+            # daily는 기간 조회(start/end)로 동작
+            if "start_date_input_id" in page_cfg and "end_date_input_id" in page_cfg:
+                _select_date_tui(driver, wait, sale_date, page_cfg["start_date_input_id"])
+                _dismiss_alert(driver)
+                _select_date_tui(driver, wait, sale_date, page_cfg["end_date_input_id"])
+            else:
+                _select_date_tui(driver, wait, sale_date, page_cfg["date_input_id"])
             _dismiss_alert(driver)
             logger.info(f"{attempt_tag} 날짜 선택 완료")
 
@@ -752,6 +1290,19 @@ def _download_excel_for_store(
                 logger.error(f"{attempt_tag} 매장 선택 실패 → skip")
                 return None
             logger.info(f"{attempt_tag} 매장 선택 완료")
+
+            # ── 2.5 매장 펼침(옵션) ──────────────────────────────────────────
+            if "shop_open_checkbox_id" in page_cfg:
+                try:
+                    cb = driver.find_element(By.ID, page_cfg["shop_open_checkbox_id"])
+                    # ensure checked
+                    checked = driver.execute_script("return arguments[0].checked === true;", cb)
+                    if not checked:
+                        driver.execute_script("arguments[0].click();", cb)
+                        time.sleep(0.2)
+                except Exception:
+                    # 없어도 진행
+                    pass
 
             # ── 3. 조회 버튼 클릭 ────────────────────────────────────────────
             logger.info(f"{attempt_tag} 조회 버튼 클릭")
@@ -784,11 +1335,13 @@ def _download_excel_for_store(
             logger.info(f"{attempt_tag} 조회 완료")
 
             # ── 4. 엑셀 다운로드 ─────────────────────────────────────────────
-            existing = (
-                set(download_dir.glob("*.xlsx"))
-                | set(download_dir.glob("*.xls"))
-                | set(download_dir.glob("*.csv"))
-            )
+            # partial(.crdownload/.tmp/.part) 제외한 모든 파일을 existing에 포함.
+            # 특정 확장자만 나열하면 .png 등 예상 외 포맷이 누락되어 이전 매장의
+            # 파일을 다음 매장 다운로드 결과로 오인하는 버그가 발생한다.
+            existing = {
+                p for p in download_dir.iterdir()
+                if p.is_file() and p.suffix.lower() not in {".crdownload", ".tmp", ".part"}
+            }
             logger.info(f"{attempt_tag} 엑셀 다운로드 JS 실행: {page_cfg['excel_js']}")
             _dismiss_alert(driver)
             driver.execute_script(page_cfg["excel_js"])
@@ -843,6 +1396,12 @@ def _download_excel_for_store(
 
             logger.exception(f"{attempt_tag} 다운로드 최종 실패 (상세 traceback)")
             _dismiss_alert(driver)
+            # TimeoutException 최종 실패 → 휴무/미등록/빈결과 등 "데이터 없음"으로 추정.
+            # 연결 오류(_is_transient_connection_error)는 위에서 raise로 브라우저 재시도에 위임되므로
+            # 여기까지 도달하면 "OKPOS 페이지 조작 자체는 됐으나 결과 없음" 케이스다.
+            if isinstance(exc, TimeoutException):
+                logger.warning(f"{attempt_tag} 타임아웃 최종 실패({exc}) → NO_DATA 표시 (재시도 불필요)")
+                return "__NO_DATA__"
             return None
 
 
@@ -904,9 +1463,14 @@ def download_today_stores(**context) -> str:
     if not sale_dates:
         raise ValueError("sale_dates XCom 값이 없습니다.")
 
+    conf = context.get("dag_run").conf or {}
+    force = bool(conf.get("force_redownload") or conf.get("force_redownload_today") or os.getenv("OKPOS_FORCE_REDOWNLOAD_TODAY", ""))
+
     download_dir = TEMP_DIR / "okpos_download"
     download_dir.mkdir(parents=True, exist_ok=True)
     page_cfg = PAGE_TYPES["today"]
+
+    _current_key: list[str | None] = [None]
 
     def _session(driver, wait, pending, results):
         _login(driver, wait)
@@ -915,25 +1479,34 @@ def download_today_stores(**context) -> str:
         time.sleep(2)
         for sale_date, store in pending:
             key = f"{sale_date}__{store['name']}"
+            _current_key[0] = key
             downloaded = _download_excel_for_store(
                 driver, wait, "today", page_cfg, sale_date, store, download_dir
             )
-            if downloaded:
+            _current_key[0] = None
+            if downloaded == "__NO_DATA__":
+                results[key] = "__NO_DATA__"
+            elif downloaded:
                 results[key] = str(downloaded)
 
     # 이미 수집된 (날짜, 매장) 조합 제외 → 누락분만 다운로드
-    pending_keys = _filter_missing_keys(sale_dates, "okpos_order")
+    if force:
+        pending_keys = [(sd, st) for sd in sale_dates for st in STORES if _should_collect(st["name"], sd)]
+        logger.warning(f"today 강제 재다운로드 모드: {len(pending_keys)}건")
+    else:
+        pending_keys = _filter_missing_keys(sale_dates, "okpos_order")
     if not pending_keys:
         logger.info("today: 모든 날짜/매장 데이터 이미 수집됨, 스킵")
         context["ti"].xcom_push(key="today_files", value={})
         return "today 다운로드: 전체 이미 수집됨 (스킵)"
     logger.info(f"today 누락 {len(pending_keys)}건 다운로드 시작")
 
-    results = _download_with_retry("today", pending_keys, download_dir, _session)
+    results = _download_with_retry("today", pending_keys, download_dir, _session, current_key=_current_key)
 
-    success = sum(1 for v in results.values() if v)
+    success = sum(1 for v in results.values() if v and v != "__NO_DATA__")
+    no_data = sum(1 for v in results.values() if v == "__NO_DATA__")
     context["ti"].xcom_push(key="today_files", value=results)
-    logger.info(f"today 다운로드 완료: {success}/{len(results)}건")
+    logger.info(f"today 다운로드 완료: {success}/{len(results)}건 (데이터없음: {no_data}건)")
     missing = [k for k, v in results.items() if not v]
     if missing:
         preview = ", ".join(missing[:10])
@@ -951,9 +1524,14 @@ def download_receipt_stores(**context) -> str:
     if not sale_dates:
         raise ValueError("sale_dates XCom 값이 없습니다.")
 
+    conf = context.get("dag_run").conf or {}
+    force = bool(conf.get("force_redownload") or conf.get("force_redownload_receipt") or os.getenv("OKPOS_FORCE_REDOWNLOAD_RECEIPT", ""))
+
     download_dir = TEMP_DIR / "okpos_download"
     download_dir.mkdir(parents=True, exist_ok=True)
     page_cfg = PAGE_TYPES["receipt"]
+
+    _current_key: list[str | None] = [None]
 
     def _session(driver, wait, pending, results):
         _login(driver, wait)
@@ -962,25 +1540,34 @@ def download_receipt_stores(**context) -> str:
         time.sleep(2)
         for sale_date, store in pending:
             key = f"{sale_date}__{store['name']}"
+            _current_key[0] = key
             downloaded = _download_excel_for_store(
                 driver, wait, "receipt", page_cfg, sale_date, store, download_dir
             )
-            if downloaded:
+            _current_key[0] = None
+            if downloaded == "__NO_DATA__":
+                results[key] = "__NO_DATA__"
+            elif downloaded:
                 results[key] = str(downloaded)
 
     # 이미 수집된 (날짜, 매장) 조합 제외 → 누락분만 다운로드
-    pending_keys = _filter_missing_keys(sale_dates, "okpos_order_item")
+    if force:
+        pending_keys = [(sd, st) for sd in sale_dates for st in STORES if _should_collect(st["name"], sd)]
+        logger.warning(f"receipt 강제 재다운로드 모드: {len(pending_keys)}건")
+    else:
+        pending_keys = _filter_missing_keys(sale_dates, "okpos_order_item")
     if not pending_keys:
         logger.info("receipt: 모든 날짜/매장 데이터 이미 수집됨, 스킵")
         context["ti"].xcom_push(key="receipt_files", value={})
         return "receipt 다운로드: 전체 이미 수집됨 (스킵)"
     logger.info(f"receipt 누락 {len(pending_keys)}건 다운로드 시작")
 
-    results = _download_with_retry("receipt", pending_keys, download_dir, _session)
+    results = _download_with_retry("receipt", pending_keys, download_dir, _session, current_key=_current_key)
 
-    success = sum(1 for v in results.values() if v)
+    success = sum(1 for v in results.values() if v and v != "__NO_DATA__")
+    no_data = sum(1 for v in results.values() if v == "__NO_DATA__")
     context["ti"].xcom_push(key="receipt_files", value=results)
-    logger.info(f"receipt 다운로드 완료: {success}/{len(results)}건")
+    logger.info(f"receipt 다운로드 완료: {success}/{len(results)}건 (데이터없음: {no_data}건)")
     missing = [k for k, v in results.items() if not v]
     if missing:
         preview = ", ".join(missing[:10])
@@ -990,6 +1577,88 @@ def download_receipt_stores(**context) -> str:
             "필요 시 OKPOS_STORE_RETRY_MAX/OKPOS_STORE_RETRY_WAIT 환경변수로 store-level 재시도 횟수를 조정하세요."
         )
     return f"receipt 다운로드: {success}/{len(results)}건 성공"
+
+
+def download_daily_stores(**context) -> str:
+    """daily(일자별 종합매출) 페이지 매장별 엑셀 다운로드.
+
+    - startDate/endDate를 동일 sale_date로 설정해 '1일치'로 다운로드한다.
+    - 이미 수집된 날짜/매장 조합은 스킵한다(누락분만 다운로드).
+    """
+    sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates")
+    if not sale_dates:
+        raise ValueError("sale_dates XCom 값이 없습니다.")
+
+    conf = context.get("dag_run").conf or {}
+    force = bool(conf.get("force_redownload") or conf.get("force_redownload_daily") or os.getenv("OKPOS_FORCE_REDOWNLOAD_DAILY", ""))
+
+    download_dir = TEMP_DIR / "okpos_download"
+    download_dir.mkdir(parents=True, exist_ok=True)
+    page_cfg = PAGE_TYPES["daily"]
+
+    _current_key: list[str | None] = [None]
+
+    def _session(driver, wait, pending, results):
+        _login(driver, wait)
+        _setup_download_dir(driver, download_dir)
+        driver.get(page_cfg["url"])
+        time.sleep(2)
+        for sale_date, store in pending:
+            key = f"{sale_date}__{store['name']}"
+            _current_key[0] = key
+            downloaded = _download_excel_for_store(
+                driver, wait, "daily", page_cfg, sale_date, store, download_dir
+            )
+            _current_key[0] = None
+            if downloaded == "__NO_DATA__":
+                results[key] = "__NO_DATA__"
+            elif downloaded:
+                results[key] = str(downloaded)
+
+    if force:
+        pending_keys = [(sd, st) for sd in sale_dates for st in STORES if _should_collect(st["name"], sd)]
+        logger.warning(f"daily 강제 재다운로드 모드: {len(pending_keys)}건")
+    else:
+        pending_keys = _filter_missing_keys(sale_dates, "okpos_daily")
+    if not pending_keys:
+        logger.info("daily: 모든 날짜/매장 데이터 이미 수집됨, 스킵")
+        context["ti"].xcom_push(key="daily_files", value={})
+        return "daily 다운로드: 전체 이미 수집됨 (스킵)"
+
+    logger.info(f"daily 누락 {len(pending_keys)}건 다운로드 시작")
+    results = _download_with_retry("daily", pending_keys, download_dir, _session, current_key=_current_key)
+
+    success = sum(1 for v in results.values() if v and v != "__NO_DATA__")
+    no_data = sum(1 for v in results.values() if v == "__NO_DATA__")
+    context["ti"].xcom_push(key="daily_files", value=results)
+    logger.info(f"daily 다운로드 완료: {success}/{len(results)}건 (데이터없음: {no_data}건)")
+    missing = [k for k, v in results.items() if not v]
+    if missing:
+        preview = ", ".join(missing[:10])
+        raise RuntimeError(
+            f"daily 다운로드 미수집 {len(missing)}/{len(results)}건 (예: {preview}). Airflow task retry로 재시도합니다."
+        )
+    return f"daily 다운로드: {success}/{len(results)}건 성공"
+
+
+def report_missing_daily(**context) -> str:
+    """기간 내 okpos_daily.csv 누락 (date, store) 조합을 점검용으로 로그로 출력한다."""
+    sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates")
+    if not sale_dates:
+        raise ValueError("sale_dates XCom 값이 없습니다.")
+
+    missing = _filter_missing_keys(sale_dates, "okpos_daily")
+    missing_pairs = [(sd, st["name"]) for sd, st in missing]
+    context["ti"].xcom_push(key="missing_daily", value=missing_pairs)
+
+    if not missing_pairs:
+        logger.info(f"daily 누락 없음: {sale_dates[0]} ~ {sale_dates[-1]}")
+        return f"daily 누락 없음 ({sale_dates[0]} ~ {sale_dates[-1]})"
+
+    preview_n = int(os.getenv("OKPOS_MISSING_REPORT_PREVIEW", "50"))
+    preview = ", ".join([f"{sd}:{name}" for sd, name in missing_pairs[:preview_n]])
+    logger.warning(f"daily 누락 {len(missing_pairs)}건 ({sale_dates[0]} ~ {sale_dates[-1]}). 예: {preview}")
+    return f"daily 누락 {len(missing_pairs)}건 ({sale_dates[0]} ~ {sale_dates[-1]})"
 
 
 def _read_okpos_excel(path: str) -> pd.DataFrame:
@@ -1002,20 +1671,107 @@ def _read_okpos_excel(path: str) -> pd.DataFrame:
     p = Path(path)
     suffix = p.suffix.lower()
 
+    def _read_tsv_file(file_path: str) -> pd.DataFrame:
+        try:
+            parsed_df = pd.read_csv(file_path, sep="\t", dtype=str, encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            parsed_df = pd.read_csv(file_path, sep="\t", dtype=str, encoding="cp949")
+        parsed_df.columns = [str(c).strip() for c in parsed_df.columns]
+        parsed_df = parsed_df.replace("#NAME?", "", regex=False)
+        parsed_df = parsed_df.replace(r"^\s*$", pd.NA, regex=True)
+        logger.info(f"txt 읽기(TSV): {file_path} | shape={parsed_df.shape} | columns={list(parsed_df.columns[:6])}")
+        return parsed_df
+
+    def _read_html_file(file_path: str) -> pd.DataFrame:
+        try:
+            tables = pd.read_html(file_path)
+        except UnicodeDecodeError:
+            tables = pd.read_html(file_path, encoding="cp949")
+        except ImportError as e:
+            raise ImportError(
+                "HTML receipt 파싱을 위해 pandas read_html 의존성(lxml/bs4 등)이 필요합니다."
+            ) from e
+        except ValueError:
+            raise ValueError(f"HTML에 테이블이 없습니다 (다운로드 오류/로그인 페이지 가능): {file_path}")
+
+        header_candidates = {
+            "NO", "포스번호", "영수증번호", "구분", "테이블명", "최초주문", "결제시간", "결제시각",
+            "상품코드", "바코드", "상품명", "수량", "총매출액", "할인액", "할인구분",
+            "실매출액", "매출액", "가액", "부가세",
+        }
+
+        best_df: pd.DataFrame | None = None
+        best_score = -1
+        for table in tables:
+            if table is None or table.empty:
+                continue
+            df_try = table.copy()
+            if isinstance(df_try.columns, pd.MultiIndex):
+                df_try.columns = [
+                    " ".join([str(x) for x in col if pd.notna(x)]).strip()
+                    for col in df_try.columns
+                ]
+            df_try.columns = [str(c).strip() for c in df_try.columns]
+            score = sum(1 for c in df_try.columns if c in header_candidates)
+            if score > best_score:
+                best_score = score
+                best_df = df_try
+
+        if best_df is None or best_df.empty or best_score < 2:
+            raise ValueError(
+                f"HTML 테이블을 찾았지만 OKPOS 매출 컬럼을 감지하지 못했습니다 "
+                f"(다운로드 오류 가능): {file_path}"
+            )
+
+        best_df = best_df.astype(str)
+        best_df.columns = [str(c).strip() for c in best_df.columns]
+        best_df = best_df.replace("#NAME?", "", regex=False)
+        best_df = best_df.replace(r"^\s*$", pd.NA, regex=True)
+        logger.info(f"html 읽기: {file_path} | shape={best_df.shape} | columns={list(best_df.columns[:6])}")
+        return best_df
+
+    def _sniff_text_prefix(raw_bytes: bytes) -> str:
+        for encoding in ("utf-8-sig", "cp949", "utf-8"):
+            try:
+                return raw_bytes.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return raw_bytes.decode("latin1", errors="ignore")
+
     # ── txt/tsv 파일: OKPOS receipt가 txt로 다운되는 경우 ──────────────────
     if suffix in {".txt", ".tsv", ".csv"}:
-        try:
-            df = pd.read_csv(path, sep="\t", dtype=str, encoding="utf-8-sig")
-        except UnicodeDecodeError:
-            df = pd.read_csv(path, sep="\t", dtype=str, encoding="cp949")
-        df.columns = [str(c).strip() for c in df.columns]
-        df = df.replace("#NAME?", "", regex=False)
-        df = df.replace(r"^\s*$", pd.NA, regex=True)
-        logger.info(f"txt 읽기(TSV): {path} | shape={df.shape} | columns={list(df.columns[:6])}")
-        return df
+        return _read_tsv_file(path)
+
+    # ── html 파일: OKPOS receipt/details가 HTML 테이블로 내려오는 경우 ──────
+    if suffix in {".html", ".htm"}:
+        return _read_html_file(path)
 
     # ── xlsx/xls: 헤더 행 자동 감지 ─────────────────────────────────────────
-    preview = pd.read_excel(path, header=None, nrows=12, dtype=str, engine="openpyxl")
+    # 확장자가 xlsx여도 실제 다운로드는 HTML/TSV인 경우가 있어 바이트 시그니처로 판별한다.
+    with open(path, "rb") as _f:
+        sniff_bytes = _f.read(4096)
+
+    _IMAGE_MAGIC = (b'\x89PNG', b'\xff\xd8\xff', b'GIF8')
+    if any(sniff_bytes.startswith(sig) for sig in _IMAGE_MAGIC):
+        raise ValueError(f"이미지 파일입니다 - 데이터 아님 (다운로드 오류): {path}")
+
+    stripped = sniff_bytes.lstrip()
+    sniff_text = _sniff_text_prefix(stripped[:1024]).strip().lower()
+    if stripped.startswith((b"<", b"<!DO", b"<htm", b"<HTM")) or "<html" in sniff_text or "<!doctype" in sniff_text:
+        logger.warning(f"xlsx 확장자지만 HTML 내용 감지 → HTML 파서로 폴백: {path}")
+        return _read_html_file(path)
+
+    is_zip_container = sniff_bytes.startswith(b"PK\x03\x04") or sniff_bytes.startswith(b"PK\x05\x06") or sniff_bytes.startswith(b"PK\x07\x08")
+    if not is_zip_container:
+        if "\t" in sniff_text or any(token in sniff_text for token in ("no\t", "상품명", "총매출액", "영수증번호", "포스번호")):
+            logger.warning(f"xlsx 확장자지만 TSV 내용 감지 → TSV 파서로 폴백: {path}")
+            return _read_tsv_file(path)
+        raise ValueError(f"xlsx 파일이 zip 포맷이 아닙니다 (다운로드 오류): {path}")
+
+    try:
+        preview = pd.read_excel(path, header=None, nrows=12, dtype=str, engine="openpyxl")
+    except BadZipFile as e:
+        raise ValueError(f"xlsx 파일이 zip 포맷이 아닙니다 (다운로드 오류): {path}") from e
 
     header_candidates = {
         "NO", "포스번호", "영수증번호", "구분", "테이블명", "최초주문", "결제시간",
@@ -1041,7 +1797,10 @@ def _read_okpos_excel(path: str) -> pd.DataFrame:
             if val == "NO":
                 header_row = i
 
-    df = pd.read_excel(path, header=header_row, dtype=str, engine="openpyxl")
+    try:
+        df = pd.read_excel(path, header=header_row, dtype=str, engine="openpyxl")
+    except BadZipFile as e:
+        raise ValueError(f"xlsx 파일이 zip 포맷이 아닙니다 (다운로드 오류): {path}") from e
     df.columns = [str(c).strip() for c in df.columns]
     df = df.replace("#NAME?", "", regex=False)
     df = df.replace(r"^\s*$", pd.NA, regex=True)
@@ -1081,7 +1840,21 @@ def _transform_okpos_df(df: pd.DataFrame, store_name: str, sale_date: str):
             df = df[~df["영수증번호"].isin(cancelled)].copy()
             logger.info(f"반품 포함 영수증 제거: {before - len(df)}행 ({len(cancelled)}건 영수증)")
 
-    df.reset_index(drop=True, inplace=True)
+    # 포스번호·영수증번호 선행 0 정규화: OKPOS가 다운로드마다 '1' vs '01' vs '0001'로 달리
+    # 반환해 _pk가 달라지는 것을 방지한다.
+    for _norm_col in ("포스번호", "영수증번호"):
+        if _norm_col in df.columns:
+            _normed = df[_norm_col].astype(str).str.lstrip("0")
+            df[_norm_col] = _normed.where(_normed != "", "0")
+
+    # 안정적 정렬: 다운로드마다 행 순서가 달라도 row_idx가 동일하게 부여되도록 한다.
+    # (영수증번호, 상품코드, 총매출액) 기준 정렬 → 같은 영수증 내 동일 상품이 여러 개여도
+    # 정렬 순서가 결정론적이므로 _pk 충돌 없이 tie-breaker 역할 유지.
+    _sort_cols = [c for c in ("영수증번호", "상품코드", "총매출액") if c in df.columns]
+    if _sort_cols:
+        df = df.sort_values(_sort_cols, kind="stable").reset_index(drop=True)
+    else:
+        df.reset_index(drop=True, inplace=True)
 
     ym = sale_date[:7]  # YYYY-MM
     n_orig = len(df.columns)
@@ -1092,11 +1865,356 @@ def _transform_okpos_df(df: pd.DataFrame, store_name: str, sale_date: str):
     df["collected_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     # PK: 원본 컬럼 값 결정론적 hash (파생 컬럼 제외) — hashlib.md5 사용
     # Python 내장 hash()는 PYTHONHASHSEED 랜덤화로 프로세스마다 값이 달라져 dedup 불가
+    #
+    # IMPORTANT:
+    # 영수증별매출(okpos_order_item) 리포트는 "동일 상품/수량/금액" 행이 여러 번 존재할 수 있다.
+    # 원본 컬럼만으로 PK를 만들면(전 컬럼 동일) 정상 행이 충돌해 누락될 수 있으므로,
+    # 정제 후 행 위치(row index)를 tie-breaker로 포함한다.
+    # 단, 위에서 선행 0 정규화 + 안정 정렬을 수행했으므로 row_idx가 다운로드 간 일관됨.
+    row_idx = df.index.astype(str)
     df["_pk"] = df.iloc[:, :n_orig].apply(
         lambda r: hashlib.md5("|".join(r.astype(str).tolist()).encode()).hexdigest(),
         axis=1,
     )
+    df["_pk"] = df["_pk"].astype(str) + "|" + row_idx
+    df["_pk"] = df["_pk"].map(lambda s: hashlib.md5(s.encode()).hexdigest())
     return df, ym
+
+
+def _transform_okpos_daily_df(df: pd.DataFrame, store_name: str, sale_date: str) -> tuple[pd.DataFrame, str]:
+    """일자별 종합매출(daily) 엑셀 → (sale_date 단일 행) DataFrame 변환.
+
+    출력 컬럼(최소):
+    - sale_date, ym, 매장명, 총매출액, 총할인액, 실매출액, 영수건수, collected_at, _pk
+    """
+    # _read_okpos_excel()이 이미 header_row를 추정해 컬럼을 세팅해준다.
+    # 따라서 컬럼에 '일자'/'실매출'이 이미 있으면 재헤더링하지 않는다.
+    raw = df.copy()
+    raw = raw.replace(r"^\s*$", pd.NA, regex=True)
+
+    # 1) 정상 케이스: 컬럼이 이미 존재
+    if "일자" in raw.columns and "실매출" in raw.columns:
+        data = raw.copy()
+    else:
+        # 2) 비정상/구버전 케이스: 헤더 행을 다시 찾는다.
+        header_row = None
+        for i in range(min(8, len(raw))):
+            row = raw.iloc[i].astype(str).map(lambda s: (s or "").strip()).tolist()
+            if ("일자" in row) and ("실매출" in row):
+                header_row = i
+                break
+        if header_row is None:
+            header_row = 0
+
+        cols = raw.iloc[header_row].astype(str).map(lambda s: (s or "").strip()).tolist()
+        data = raw.iloc[header_row + 1 :].copy()
+        data.columns = cols
+
+        for c in list(data.columns):
+            if str(c).startswith("Unnamed"):
+                data = data.drop(columns=[c])
+
+    if "일자" not in data.columns:
+        raise ValueError("daily 엑셀 파싱 실패: '일자' 컬럼 없음")
+
+    data["일자"] = data["일자"].astype(str).str.strip()
+
+    # 케이스 A) (구 포맷) 기간 리포트: '소계:' 행에 날짜별 합계가 있다.
+    sub = data[data["일자"].str.startswith("소계:")].copy()
+    if not sub.empty:
+        sub["sale_date"] = sub["일자"].str.extract(r"(\d{4}-\d{2}-\d{2})")[0]
+        row = sub[sub["sale_date"] == sale_date].copy()
+        if row.empty:
+            raise ValueError(f"daily 엑셀에 해당 날짜 소계 없음: {sale_date}")
+        row = row.iloc[:1].copy()
+
+    # 케이스 B) (신 포맷) 단일 일자 리포트: '영업일수합:' 행 1개만 존재 (Airflow 로그 케이스)
+    else:
+        row = data[data["일자"].str.startswith("영업일수합:")].copy()
+        if row.empty and ("영업매장" in data.columns):
+            # 일부 포맷에서 '영업일수합:' 문자열이 누락될 수 있어, '합계' 행으로도 시도한다.
+            store_col = data["영업매장"].astype(str).str.strip()
+            row = data[store_col.isin(["합계", "총계", "전체"])].copy()
+        if row.empty and len(data) == 1:
+            row = data.copy()
+        if row.empty:
+            raise ValueError("daily 엑셀 파싱 실패: '소계:'/'영업일수합:'/합계 행 모두 없음")
+        row = row.iloc[:1].copy()
+
+    def _num(col: str) -> int:
+        if col not in row.columns:
+            return 0
+        return int(pd.to_numeric(str(row.iloc[0][col]).replace(",", "").strip(), errors="coerce") or 0)
+
+    out = pd.DataFrame([{
+        "sale_date": sale_date,
+        "ym": sale_date[:7],
+        "매장명": store_name,
+        "총매출액": _num("총매출"),
+        "총할인액": _num("총할인"),
+        "실매출액": _num("실매출"),
+        "영수건수": _num("영수건수"),
+        "collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }])
+    out["_pk"] = out.apply(
+        lambda r: hashlib.md5(f"{r['sale_date']}|{r['매장명']}|daily".encode()).hexdigest(),
+        axis=1,
+    )
+    return out, sale_date[:7]
+
+
+def ingest_manual_daily_xlsx(
+    manual_xlsx_path: str | None = None,
+    store_name: str = "",
+    **context,
+) -> str:
+    """수동 다운로드된 '일자별 종합매출' 엑셀을 okpos_daily.csv로 적재한다.
+
+    목적:
+    - 자동 수집(daily 페이지)이 누락/오작동한 날짜를 수동 엑셀로 보완
+    - 이후 reconcile_against_daily_summary에서 이 값을 기준으로 today/receipt 재수집 수행
+
+    사용:
+    - DAG에서 op_kwargs로 manual_xlsx_path 전달 또는 dag_run.conf로 manual_xlsx_path 전달
+    - Windows 경로를 그대로 넘길 경우 컨테이너에서 접근 불가할 수 있으니,
+      가능하면 `/opt/airflow/...` 경로로 마운트된 위치에 파일을 두는 것을 권장
+    """
+    from modules.load.load_onedrive import onedrive_csv_save
+
+    conf = (context.get("dag_run").conf or {}) if context else {}
+
+    # 우선순위:
+    # 1) op_kwargs manual_xlsx_path
+    # 2) dag_run.conf manual_xlsx_path
+    # 3) env OKPOS_DAILY_MANUAL_XLSX
+    # 4) (자동탐지) watch dir에서 '일자별 종합매출*.xlsx' 최신 파일
+    path = manual_xlsx_path or conf.get("manual_xlsx_path") or os.getenv("OKPOS_DAILY_MANUAL_XLSX", "")
+    path = str(path or "").strip()
+
+    # store_name도 dag_run.conf/env로 덮어쓸 수 있게 한다(수동다운은 파일명에 매장명이 없을 수 있음).
+    store_name = str(conf.get("store_name") or os.getenv("OKPOS_DAILY_MANUAL_STORE", "") or store_name).strip()
+
+    def _auto_pick_from_watch_dir() -> str:
+        watch_dir = str(conf.get("manual_watch_dir") or os.getenv("OKPOS_DAILY_MANUAL_WATCH_DIR", "")).strip()
+        if not watch_dir:
+            # 기본값: 컨테이너 내에서 접근 가능한 위치(호스트에서는 C:\airflow\download 권장)
+            watch_dir = "/opt/airflow/download"
+        d = Path(watch_dir)
+        if not d.exists() or not d.is_dir():
+            return ""
+        # Windows에서 수동 다운로드가 '일자별 종합매출.xlsx'처럼 고정 파일명으로 저장되는 케이스 대응
+        candidates = list(d.glob("일자별 종합매출*.xlsx")) + list(d.glob("*일자별 종합매출*.xlsx"))
+        if not candidates:
+            return ""
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return str(candidates[0])
+
+    if not path:
+        path = _auto_pick_from_watch_dir()
+        path = str(path or "").strip()
+    if not path:
+        return "manual daily xlsx 없음(지정/자동탐지 모두 실패), 스킵"
+
+    p = Path(path)
+    if not p.exists():
+        return f"manual daily xlsx 경로 없음, 스킵: {path}"
+
+    raw = _read_okpos_excel(str(p))
+
+    # 통합 일자별 종합매출 포맷 처리:
+    # _read_okpos_excel이 서브헤더 행(합매출, 할인액, 실매출...)을 header로 감지해
+    # '일자', '영업매장'이 Unnamed:0, Unnamed:2로 반환되는 경우 올바른 이름으로 복원한다.
+    if "합매출" in raw.columns and "일자" not in raw.columns:
+        unnamed_cols = [c for c in raw.columns if str(c).startswith("Unnamed:")]
+        rename_map: dict[str, str] = {}
+        if len(unnamed_cols) >= 1:
+            rename_map[unnamed_cols[0]] = "일자"
+        if len(unnamed_cols) >= 2:
+            rename_map[unnamed_cols[1]] = "영업일"
+        if len(unnamed_cols) >= 3:
+            rename_map[unnamed_cols[2]] = "영업매장"
+        if rename_map:
+            raw = raw.rename(columns=rename_map)
+            logger.info("통합 daily xlsx 포맷 감지: 컬럼 리네임 %s", list(rename_map.values()))
+
+    def _infer_sale_date_from_xlsx(xlsx_path: str) -> str | None:
+        """단일일자 daily 리포트에서 조회일자를 추론한다.
+
+        - 상단에 '조회일자 : 2026/05/03' 같은 문자열이 들어오는 케이스 지원
+        - 파일명이 항상 날짜를 포함하지 않는(예: '일자별 종합매출.xlsx') Windows 다운로드 케이스 대응
+        """
+        try:
+            sniff = pd.read_excel(xlsx_path, header=None)
+        except Exception:
+            return None
+        for v in sniff.iloc[:10, :5].astype(str).values.ravel().tolist():
+            s = (v or "").strip()
+            if not s or s.lower() == "nan":
+                continue
+            m = re.search(r"(\d{4})[./-](\d{2})[./-](\d{2})", s)
+            if m:
+                return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        return None
+
+    # 수동 엑셀은 (1) 기간 리포트(소계:) 또는 (2) 단일일자 합계(영업일수합:),
+    # 또는 (3) 날짜×매장별 행(스크린샷 형태: '일자','영업매장','총매출','총할인','실매출' 등)을 포함할 수 있다.
+    # 목적은 okpos_daily.csv(일자×매장 1행) 재적재이므로 최소 컬럼만 사용한다.
+
+    # 헤더 파싱
+    # _read_okpos_excel()이 이미 header_row를 추정해 컬럼을 세팅해준다.
+    # 따라서 컬럼에 '일자'/'실매출'이 이미 있으면 재헤더링하지 않는다.
+    tmp = raw.copy()
+    tmp = tmp.replace(r"^\s*$", pd.NA, regex=True)
+    if "일자" in tmp.columns and "실매출" in tmp.columns:
+        data = tmp.copy()
+    else:
+        header_row = None
+        for i in range(min(8, len(tmp))):
+            row = tmp.iloc[i].astype(str).map(lambda s: (s or "").strip()).tolist()
+            if ("일자" in row) and ("실매출" in row):
+                header_row = i
+                break
+        if header_row is None:
+            header_row = 0
+
+        cols = tmp.iloc[header_row].astype(str).map(lambda s: (s or "").strip()).tolist()
+        data = tmp.iloc[header_row + 1 :].copy()
+        data.columns = cols
+        for c in list(data.columns):
+            if str(c).startswith("Unnamed"):
+                data = data.drop(columns=[c])
+
+    if "일자" not in data.columns:
+        raise ValueError("manual daily xlsx 파싱 실패: '일자' 컬럼 없음")
+
+    data["일자"] = data["일자"].astype(str).str.strip()
+
+    # (3) 날짜×매장별 행 포맷: '일자'가 YYYY-MM-DD 형태로 들어있고, '영업매장'에 매장명이 들어있다.
+    if "영업매장" in data.columns:
+        dt = pd.to_datetime(data["일자"].astype(str).str.strip(), errors="coerce")
+        rows = data[dt.notna()].copy()
+        if not rows.empty:
+            rows["sale_date"] = dt.dt.strftime("%Y-%m-%d")
+            rows["영업매장"] = rows["영업매장"].astype(str).str.strip()
+
+            # 소계 행 제거: 영업매장이 'N 개' 패턴인 행 (예: '3 개', '5 개 ')
+            mask_subtotal = rows["영업매장"].str.match(r"^\d+\s*개\s*$", na=False)
+            if mask_subtotal.any():
+                logger.info("소계 행 제거: %d건 ('N 개' 패턴)", mask_subtotal.sum())
+                rows = rows[~mask_subtotal].copy()
+
+            # 미등록 매장 제거: STORES에 없는 매장명 (테스트 매장 등)
+            known_store_names = {s["name"] for s in STORES}
+            mask_unknown = ~rows["영업매장"].isin(known_store_names)
+            if mask_unknown.any():
+                unknown = rows.loc[mask_unknown, "영업매장"].unique().tolist()
+                logger.warning("미등록 매장 제거: %s", unknown)
+                rows = rows[~mask_unknown].copy()
+
+            # 수동파일이 여러 매장을 담을 수 있으므로 store_name이 지정되지 않았으면 전부 적재한다.
+            # 지정된 경우에는 해당 매장만 필터.
+            if store_name:
+                rows = rows[rows["영업매장"].str.replace(" ", "", regex=False) == store_name.replace(" ", "")].copy() if store_name else rows
+            if not rows.empty:
+                sub = rows.copy()
+            else:
+                sub = pd.DataFrame()
+        else:
+            sub = pd.DataFrame()
+    else:
+        sub = pd.DataFrame()
+
+    # (1) 기간 리포트: '소계:' 행 추출
+    if sub.empty:
+        sub = data[data["일자"].str.startswith("소계:")].copy()
+        sub["sale_date"] = sub["일자"].str.extract(r"(\d{4}-\d{2}-\d{2})")[0]
+        sub = sub[sub["sale_date"].notna()].copy()
+
+    # (2) 단일일자 합계 리포트: '영업일수합:' 또는 합계행 1개
+    if sub.empty:
+        # 신 포맷(단일 일자 리포트)은 '소계:'가 없고 '영업일수합:'(또는 합계 행) 1줄만 존재할 수 있다.
+        one = data[data["일자"].str.startswith("영업일수합:")].copy()
+        if one.empty and ("영업매장" in data.columns):
+            store_col = data["영업매장"].astype(str).str.strip()
+            one = data[store_col.isin(["합계", "총계", "전체"])].copy()
+        if one.empty and len(data) == 1:
+            one = data.copy()
+        if one.empty:
+            raise ValueError("manual daily xlsx 파싱 실패: 소계/영업일수합/합계 행 없음")
+
+        # 수동 적재는 날짜 범위가 아닐 수 있으므로, 환경변수/인자 기반으로 날짜를 받아 처리한다.
+        # 우선: dag_run.conf/manual_xlsx_path로 호출되는 케이스에서 파일명이 YYYY-MM-DD로 시작하는 경우가 많다.
+        inferred = None
+        try:
+            inferred = re.search(r"(\d{4}-\d{2}-\d{2})", str(path)).group(1)
+        except Exception:
+            inferred = None
+        if not inferred:
+            inferred = _infer_sale_date_from_xlsx(str(p))
+        if not inferred:
+            raise ValueError("manual daily xlsx 파싱 실패: 단일일자 포맷인데 날짜를 파일명/엑셀내용에서 추론 실패")
+        one = one.iloc[:1].copy()
+        one["sale_date"] = inferred
+        sub = one[["sale_date"] + [c for c in one.columns if c != "sale_date"]].copy()
+
+    def _num(v) -> int: 
+        return int(pd.to_numeric(str(v).replace(",", "").strip(), errors="coerce") or 0) 
+
+    inserted = 0
+    for _, r in sub.iterrows():
+        sale_date = str(r["sale_date"]).strip()
+        ym = sale_date[:7]
+        # 날짜×매장별 포맷이면 해당 행의 매장명을 우선 사용
+        row_store = str(r.get("영업매장") or r.get("매장명") or store_name).strip()
+        store_short = row_store.replace("도리당 ", "", 1)
+        out = pd.DataFrame([{
+            "sale_date": sale_date,
+            "ym": ym,
+            "매장명": row_store,
+            # 통합 포맷 컬럼명 fallback: 총매출→합매출, 총할인→할인액, 실매출→실매출(동일), 영수건수→객수(수)
+            "총매출액": _num(r.get("총매출", r.get("합매출", 0))),
+            "총할인액": _num(r.get("총할인", r.get("할인액", 0))),
+            "실매출액": _num(r.get("실매출", r.get("실매출액", 0))),
+            "영수건수": _num(r.get("영수건수", r.get("객수(수)", 0))),
+            "collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }])
+        out["_pk"] = out.apply(
+            lambda rr: hashlib.md5(f"{rr['sale_date']}|{rr['매장명']}|daily".encode()).hexdigest(),
+            axis=1,
+        )
+
+        dest = RAW_OKPOS_SALES / "brand=도리당" / f"store={store_short}" / f"ym={ym}" / "okpos_daily.csv"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        # 해당 날짜는 replace-by-date로 교체
+        if dest.exists() and dest.stat().st_size > 0:
+            try:
+                existing = pd.read_csv(dest, dtype=str, encoding="utf-8-sig")
+            except Exception:
+                existing = pd.read_csv(dest, dtype=str)
+            existing = existing[existing["sale_date"].astype(str).str.strip() != sale_date].copy() if "sale_date" in existing.columns else existing
+            merged = pd.concat([existing, out], ignore_index=True)
+        else:
+            merged = out
+
+        onedrive_csv_save(df=merged, file_path=str(dest), pk_col="_pk", timestamp_col="collected_at", if_exists="replace") 
+        inserted += 1 
+
+    # watch dir에서 자동탐지한 파일은 재처리를 방지하기 위해 processed/로 이동
+    try:
+        watch_dir = str(conf.get("manual_watch_dir") or os.getenv("OKPOS_DAILY_MANUAL_WATCH_DIR", "")).strip() or "/opt/airflow/download"
+        watch_dir = str(Path(watch_dir))
+        if str(p).startswith(watch_dir) and p.exists():
+            processed = Path(watch_dir) / "processed"
+            processed.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            new_name = f"{p.stem}__ingested__{ts}{p.suffix}"
+            p.rename(processed / new_name)
+    except Exception:
+        # 이동 실패는 적재 성공을 막지 않는다.
+        pass
+
+    return f"manual daily xlsx 적재 완료: {inserted}일 | path={path} | store={store_name}"
 
 
 def save_to_raw(**context) -> str:
@@ -1105,35 +2223,65 @@ def save_to_raw(**context) -> str:
 
     today_files   = context["ti"].xcom_pull(task_ids="download_today",   key="today_files")   or {}
     receipt_files = context["ti"].xcom_pull(task_ids="download_receipt", key="receipt_files") or {}
+    daily_files   = context["ti"].xcom_pull(task_ids="download_daily",   key="daily_files")   or {}
 
     saved: list = []
+    save_errors: list[str] = []
     # page_type → (xcom_files, csv_filename)
     page_map = {
         "today":   (today_files,   "okpos_order"),        # 당일매출 → okpos_order.csv
         "receipt": (receipt_files, "okpos_order_item"),   # 영수증별매출 → okpos_order_item.csv
+        "daily":   (daily_files,   "okpos_daily"),        # 일자별 종합매출 → okpos_daily.csv
     }
+
+    conf = context.get("dag_run").conf or {}
+    replace_by_date = bool(conf.get("replace_by_date") or conf.get("force_redownload") or os.getenv("OKPOS_REPLACE_BY_DATE", ""))
 
     for page_type, (files, csv_name) in page_map.items():
         for key, src_str in files.items():
+            # key format: {sale_date}__{store_name}
+            try:
+                sale_date, store_name = key.split("__", 1)
+            except Exception:
+                sale_date, store_name = "unknown", key
+            store_short = store_name.replace("도리당 ", "", 1)
+            ym_guess = sale_date[:7] if sale_date and sale_date != "unknown" else None
+
             if not src_str:
                 logger.warning(f"파일 없음 (다운로드 실패): {page_type} | {key}")
+                save_errors.append(f"{page_type}:{key}:download_missing_path")
+                continue
+            if src_str == "__NO_DATA__":
+                logger.info(f"데이터 없음(휴무/미영업) → skip: {page_type} | {key}")
+                if ym_guess:
+                    _mark_no_data(store_short, ym_guess, csv_name, sale_date, reason=f"{page_type}:download_no_data")
                 continue
             src = Path(src_str)
             if not src.exists():
                 logger.warning(f"파일 경로 없음: {src}")
+                save_errors.append(f"{page_type}:{key}:path_not_exists")
                 continue
 
-            sale_date, store_name = key.split("__", 1)
-            # "도리당 동두천지행점" → "동두천지행점"
-            store_short = store_name.replace("도리당 ", "", 1)
-
             try:
-                df = _read_okpos_excel(str(src))
+                raw_df = _read_okpos_excel(str(src))
+                likely_okpos = _is_likely_okpos_report(raw_df)
 
-                df, ym = _transform_okpos_df(df, store_name, sale_date)
+                if page_type == "daily":
+                    df, ym = _transform_okpos_daily_df(raw_df, store_name, sale_date)
+                else:
+                    df, ym = _transform_okpos_df(raw_df, store_name, sale_date)
                 if df.empty:
-                    logger.warning(f"변환 후 빈 DataFrame: {page_type} | {key}")
-                    src.unlink(missing_ok=True)
+                    # 매출 없음(휴무/미영업)이어도 엑셀은 내려올 수 있다.
+                    # 헤더가 정상으로 보이면 NO_DATA로 마킹하여 이후 누락 체크/재시도에서 제외한다.
+                    if likely_okpos:
+                        logger.info(f"매출 없음 → NO_DATA 마킹: {page_type} | {key}")
+                        _mark_no_data(store_short, ym, csv_name, sale_date, reason=f"{page_type}:empty_after_transform")
+                        src.unlink(missing_ok=True)
+                        continue
+
+                    logger.warning(f"변환 후 빈 DataFrame(헤더 의심) → 스킵(누락으로 남김): {page_type} | {key}")
+                    save_errors.append(f"{page_type}:{key}:empty_df_suspect_header")
+                    # 디버깅 위해 원본 파일은 남긴다.
                     continue
 
                 # 파티션 경로: brand=도리당/store=동두천지행점/ym=2026-04/{okpos_order|okpos_order_item}.csv
@@ -1167,24 +2315,69 @@ def save_to_raw(**context) -> str:
                     except Exception:
                         logger.warning(f"기존 CSV _pk 재계산 실패 (무시): {dest}")
 
-                result = onedrive_csv_save(
-                    df=df,
-                    file_path=str(dest),
-                    pk_col="_pk",
-                    timestamp_col="collected_at",
-                    if_exists="append",
-                )
+                if replace_by_date and ("sale_date" in df.columns):
+                    # 강제 재다운로드/보정 목적: 같은 날짜 데이터는 교체(덮어쓰기)한다.
+                    if dest.exists() and dest.stat().st_size > 0:
+                        try:
+                            existing = pd.read_csv(dest, dtype=str, encoding="utf-8-sig")
+                        except Exception:
+                            existing = pd.read_csv(dest, dtype=str)
+                        if "sale_date" in existing.columns:
+                            existing = existing[existing["sale_date"].astype(str).str.strip() != str(sale_date).strip()].copy()
+                        merged = pd.concat([existing, df], ignore_index=True)
+                    else:
+                        merged = df
+                    result = onedrive_csv_save(
+                        df=merged,
+                        file_path=str(dest),
+                        pk_col="_pk",
+                        timestamp_col="collected_at",
+                        if_exists="replace",
+                    )
+                else:
+                    result = onedrive_csv_save(
+                        df=df,
+                        file_path=str(dest),
+                        pk_col="_pk",
+                        timestamp_col="collected_at",
+                        if_exists="append",
+                    )
                 src.unlink(missing_ok=True)
                 saved.append(str(dest))
                 logger.info(
                     f"저장 완료: {dest.relative_to(RAW_OKPOS_SALES)} | "
                     f"신규={result.get('inserted',0)} 중복={result.get('duplicated',0)}"
                 )
+            except ValueError as e:
+                msg = str(e)
+                # 다운로드 실패/로그인 페이지/빈 HTML 등은 운영상 흔한 케이스라 경고 후 스킵
+                if (
+                    "xlsx 파일이 HTML입니다" in msg
+                    or "xlsx 파일이 zip 포맷이 아닙니다" in msg
+                    or "HTML에 테이블이 없습니다" in msg
+                    or "OKPOS 매출 컬럼을 감지하지 못했습니다" in msg
+                    or "이미지 파일입니다" in msg
+                ):
+                    logger.warning(f"변환 스킵(다운로드 오류 추정): {page_type} | {key} | {msg}")
+                    src.unlink(missing_ok=True)
+                    save_errors.append(f"{page_type}:{key}:download_parse_error")
+                    continue
+                logger.exception(f"변환/저장 실패: {page_type} | {key}")
+                save_errors.append(f"{page_type}:{key}:{type(e).__name__}")
+            except ImportError as e:
+                logger.warning(f"변환 스킵(HTML 파서 의존성 없음): {page_type} | {key} | {e}")
+                src.unlink(missing_ok=True)
+                save_errors.append(f"{page_type}:{key}:missing_html_deps")
+                continue
             except Exception:
                 logger.exception(f"변환/저장 실패: {page_type} | {key}")
+                save_errors.append(f"{page_type}:{key}:unknown_error")
 
     context["ti"].xcom_push(key="saved_files", value=saved)
     logger.info(f"save_to_raw 완료: {len(saved)}개 저장")
+    if save_errors:
+        preview = ", ".join(save_errors[:10])
+        raise RuntimeError(f"save_to_raw 실패 {len(save_errors)}건 (예: {preview})")
     return f"변환 저장 완료: {len(saved)}개"
 
 
@@ -1201,21 +2394,115 @@ def check_and_fill_missing_today(**context) -> str:
     if not sale_dates:
         return "sale_dates 없음, 스킵"
 
-    def _has_sale_date(csv_path: Path, sale_date: str) -> bool:
+    # NOTE: 기존 구현은 (sale_date, store) 조합마다 CSV를 매번 읽어서,
+    # 날짜 범위가 길면 I/O 과다로 느려지거나 시간초과가 날 수 있다.
+    # CSV별로 한 번만 읽어서 sale_date set을 캐시한다.
+    sale_date_cache: dict[Path, tuple[set[str] | None, bool]] = {}
+    no_data_cache: dict[Path, set[str]] = {}
+
+    def _is_marked_no_data(csv_path: Path, sale_date: str) -> bool:
+        marker_path = csv_path.parent / f".no_data__{csv_path.stem}.txt"
+        cached = no_data_cache.get(marker_path)
+        if cached is None:
+            cached = _read_no_data_dates(marker_path)
+            no_data_cache[marker_path] = cached
+        return sale_date in cached
+
+    def _load_sale_date_set(csv_path: Path) -> tuple[set[str] | None, bool]:
+        """(sale_date_set | None, exists) 반환.
+
+        - 정상: sale_date_set={...}, exists=True
+        - 파일 없음: sale_date_set=set(), exists=False
+        - 컬럼/포맷 문제 등으로 정확한 추출 불가: sale_date_set=None, exists=True
+          (이 경우, 해당 파일이 '어떤 날짜든' 데이터가 있다고 보고 보수적으로 True 처리)
+        """
+        cached = sale_date_cache.get(csv_path)
+        if cached is not None:
+            return cached
+
         if not csv_path.exists():
-            return False
+            sale_date_cache[csv_path] = (set(), False)
+            return sale_date_cache[csv_path]
+
+        # 1) 표준: sale_date 컬럼을 chunk로 읽어 set 구성
         try:
-            df_check = pd.read_csv(csv_path, dtype=str, usecols=["sale_date"])
-            return not df_check[df_check["sale_date"].astype(str).str.strip() == sale_date].empty
-        except Exception:
+            import re as _re
+
+            pat = _re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+            dates: set[str] = set()
+            for chunk in pd.read_csv(
+                csv_path,
+                dtype=str,
+                usecols=["sale_date"],
+                encoding="utf-8-sig",
+                chunksize=200_000,
+            ):
+                ser = chunk["sale_date"].astype(str).str.strip()
+                # "nan"/빈 값 제거
+                for d in ser.unique().tolist():
+                    if not d or d == "nan":
+                        continue
+                    m = pat.search(d)
+                    dates.add(m.group(0) if m else d)
+            sale_date_cache[csv_path] = (dates, True)
+            return sale_date_cache[csv_path]
+        except Exception as e:
+            logger.warning(f"sale_date 컬럼 읽기 실패 (fallback 시도): {csv_path} | {e}")
+
+        # 2) Fallback: 파일 내에서 YYYY-MM-DD 패턴을 제한적으로 스캔
+        try:
+            import re as _re
+
+            pat = _re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+            found: set[str] = set()
+            read_chars = 0
+            max_chars = 2_000_000  # 너무 큰 파일 전체 스캔 방지 (대략 2MB)
+
+            with csv_path.open("r", encoding="utf-8-sig", errors="ignore") as f:
+                for line in f:
+                    read_chars += len(line)
+                    for m in pat.findall(line):
+                        found.add(m)
+                    if read_chars >= max_chars:
+                        break
+
+            if found:
+                sale_date_cache[csv_path] = (found, True)
+            else:
+                # 날짜를 못 찾았더라도 파일이 존재/비어있지 않으면 "있다고 가정"할 수밖에 없음
+                # (구버전 CSV 등으로 sale_date 컬럼이 없을 때, 누락 채우기를 막지 않기 위함)
+                if csv_path.stat().st_size > 0:
+                    sale_date_cache[csv_path] = (None, True)
+                else:
+                    sale_date_cache[csv_path] = (set(), False)
+            return sale_date_cache[csv_path]
+        except Exception as e:
+            logger.warning(f"fallback 스캔 실패 (있다고 가정): {csv_path} | {e}")
+            sale_date_cache[csv_path] = (None, True)
+            return sale_date_cache[csv_path]
+
+    def _has_sale_date(csv_path: Path, sale_date: str) -> bool:
+        # NOTE:
+        # `.no_data__*.txt`는 "해당 날짜는 데이터가 없음"을 의미한다.
+        # 대조/누락 채우기 단계에서는 이를 '존재'로 취급하면
+        # (오늘(today)은 있는데 receipt만 NO_DATA로 잘못 마킹된 케이스 등)
+        # 누락 채우기가 영원히 막히므로, '없음'으로 취급한다.
+        if _is_marked_no_data(csv_path, sale_date):
             return False
+        dates, exists = _load_sale_date_set(csv_path)
+        if not exists:
+            return False
+        if dates is None:
+            return True
+        return sale_date in dates
 
     missing_today_keys: list[tuple[str, dict]] = []
     missing_receipt_keys: list[tuple[str, dict]] = []
-    manual_check_keys: list[tuple[str, str]] = []
     for sale_date in sale_dates:
         ym = sale_date[:7]
         for store in STORES:
+            if not _should_collect(store["name"], sale_date):
+                continue
             store_short = store["name"].replace("도리당 ", "", 1)
 
             today_csv = (
@@ -1242,14 +2529,19 @@ def check_and_fill_missing_today(**context) -> str:
             # receipt는 있는데 today가 없는 경우 → today만 재다운로드
             elif has_receipt and not has_today:
                 missing_today_keys.append((sale_date, store))
-            # 둘 다 없으면 자동 다운로드하지 않고, 수동 확인 리스트에만 남긴다.
+            # 둘 다 없으면 today+receipt 모두 재다운로드
             elif (not has_today) and (not has_receipt):
-                manual_check_keys.append((sale_date, store["name"]))
+                missing_today_keys.append((sale_date, store))
+                missing_receipt_keys.append((sale_date, store))
+
+    logger.info(
+        "today/receipt 대조 완료: sale_dates=%d, stores=%d, csv_cache=%d",
+        len(sale_dates),
+        len(STORES),
+        len(sale_date_cache),
+    )
 
     if not missing_today_keys and not missing_receipt_keys:
-        if manual_check_keys:
-            logger.warning("today/receipt 둘 다 없는 항목(수동 확인 필요): %s", manual_check_keys)
-            return f"수동 확인 필요(둘 다 없음): {len(manual_check_keys)}건 | {manual_check_keys}"
         logger.info("today/receipt 누락 항목 없음")
         return "누락 항목 없음"
 
@@ -1265,9 +2557,6 @@ def check_and_fill_missing_today(**context) -> str:
             len(missing_receipt_keys),
             [(d, s["name"]) for d, s in missing_receipt_keys],
         )
-    if manual_check_keys:
-        logger.warning("today/receipt 둘 다 없는 항목(수동 확인 필요): %s", manual_check_keys)
-
     def _fill_page(page_type: str, pending_keys: list[tuple[str, dict]]) -> tuple[int, list[str]]:
         if not pending_keys:
             return 0, []
@@ -1288,7 +2577,9 @@ def check_and_fill_missing_today(**context) -> str:
                 downloaded = _download_excel_for_store(
                     driver, wait, page_type, page_cfg, sale_date, store, download_dir
                 )
-                if downloaded:
+                if downloaded == "__NO_DATA__":
+                    results[key] = "__NO_DATA__"
+                elif downloaded:
                     results[key] = str(downloaded)
 
         results = _download_with_retry(page_type, pending_keys, download_dir, _session)
@@ -1299,6 +2590,12 @@ def check_and_fill_missing_today(**context) -> str:
             if not src_str:
                 failed.append(key)
                 continue
+            if src_str == "__NO_DATA__":
+                sale_date, store_name = key.split("__", 1)
+                store_short = store_name.replace("도리당 ", "", 1)
+                ym = sale_date[:7]
+                _mark_no_data(store_short, ym, csv_name, sale_date, reason=f"{page_type}:download_no_data_fill")
+                continue
             src = Path(src_str)
             if not src.exists():
                 failed.append(key)
@@ -1306,11 +2603,17 @@ def check_and_fill_missing_today(**context) -> str:
             sale_date, store_name = key.split("__", 1)
             store_short = store_name.replace("도리당 ", "", 1)
             try:
-                df = _read_okpos_excel(str(src))
-                df, ym = _transform_okpos_df(df, store_name, sale_date)
+                raw_df = _read_okpos_excel(str(src))
+                likely_okpos = _is_likely_okpos_report(raw_df)
+                df, ym = _transform_okpos_df(raw_df, store_name, sale_date)
                 if df.empty:
-                    logger.warning(f"재다운로드 후 빈 데이터 (매출 없음): {page_type} | {key}")
-                    src.unlink(missing_ok=True)
+                    if likely_okpos:
+                        logger.info(f"재다운로드 결과 매출 없음 → NO_DATA 마킹: {page_type} | {key}")
+                        _mark_no_data(store_short, ym, csv_name, sale_date, reason=f"{page_type}:empty_after_transform_fill")
+                        src.unlink(missing_ok=True)
+                        continue
+                    logger.warning(f"재다운로드 후 빈 데이터(헤더 의심) → 실패로 남김: {page_type} | {key}")
+                    failed.append(key)
                     continue
                 dest = (
                     RAW_OKPOS_SALES
@@ -1344,16 +2647,559 @@ def check_and_fill_missing_today(**context) -> str:
         f" | today 성공={filled_today}, 실패={len(failed_today)}"
         f" | receipt 성공={filled_receipt}, 실패={len(failed_receipt)}"
     )
-    if manual_check_keys:
-        msg += f" | 수동 확인(둘 다 없음)={len(manual_check_keys)}"
     if failed_today:
         msg += f" | today 실패 목록: {failed_today}"
     if failed_receipt:
         msg += f" | receipt 실패 목록: {failed_receipt}"
-    if manual_check_keys:
-        msg += f" | 수동 확인 목록: {manual_check_keys}"
     logger.info(msg)
     return msg
+
+
+def reconcile_against_daily_summary(**context) -> str:
+    """daily(일자별 종합매출) '실매출액'을 기준으로 today/receipt를 재수집·덮어쓰기하여 정합성을 맞춘다.
+
+    - 기준: okpos_daily.csv의 '실매출액'
+    - okpos_order.csv(실매출액 합), okpos_order_item.csv(실매출액 합) 각각 daily와 비교
+    - mismatch 건은 해당 페이지만 재다운로드 후 '해당 날짜 행만' 덮어쓰기
+    """
+    sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates") or []
+    if not sale_dates:
+        return "sale_dates 없음, 스킵"
+
+    tol = int(os.getenv("OKPOS_DAILY_VALIDATE_TOLERANCE", "0"))
+    max_attempts = int(os.getenv("OKPOS_DAILY_RECONCILE_MAX_ATTEMPTS", "2"))
+
+    def _signed_amount(df: pd.DataFrame, amount: pd.Series) -> pd.Series:
+        if "구분" not in df.columns:
+            return amount
+        gbn = df["구분"].fillna("").astype(str).str.strip()
+        sign = gbn.map(lambda v: -1 if v == "반품" else 1).fillna(1).astype(int)
+        return amount * sign
+
+    def _load_daily_expected(sale_date: str, store: dict) -> tuple[int | None, str | None]:
+        ym = sale_date[:7]
+        store_short = store["name"].replace("도리당 ", "", 1)
+        daily_csv = RAW_OKPOS_SALES / "brand=도리당" / f"store={store_short}" / f"ym={ym}" / "okpos_daily.csv"
+        if not daily_csv.exists():
+            return None, "daily_missing"
+        if sale_date in _read_no_data_dates(daily_csv.parent / ".no_data__okpos_daily.txt"):
+            return None, "daily_no_data"
+        try:
+            ddf = pd.read_csv(daily_csv, dtype=str)
+        except Exception as e:
+            return None, f"daily_read_error({type(e).__name__})"
+        ddf = ddf[ddf["sale_date"].astype(str).str.strip() == sale_date].copy()
+        if ddf.empty:
+            return None, "daily_empty_date"
+        if "실매출액" not in ddf.columns:
+            return None, "daily_no_net_col"
+        expected = int(pd.to_numeric(ddf["실매출액"].astype(str).str.replace(",", "", regex=False), errors="coerce").fillna(0).astype(int).sum())
+        return expected, None
+
+    def _sum_csv(csv_path: Path, sale_date: str, col: str) -> tuple[int | None, str | None]:
+        if not csv_path.exists():
+            return None, "missing"
+        if sale_date in _read_no_data_dates(csv_path.parent / f".no_data__{csv_path.stem}.txt"):
+            return None, "no_data"
+        try:
+            df = pd.read_csv(csv_path, dtype=str)
+        except Exception as e:
+            return None, f"read_error({type(e).__name__})"
+        if "sale_date" not in df.columns:
+            return None, "no_sale_date"
+        df = df[df["sale_date"].astype(str).str.strip() == sale_date].copy()
+        if df.empty:
+            return None, "empty_date"
+        # CSV에 저장된 실매출액은 반품 행이 이미 음수로 저장되어 있으므로 직접 합산
+        amt = _to_int_series(df[col]) if col in df.columns else pd.Series(0, index=df.index)
+        return int(amt.sum()), None
+
+    def _upsert_by_date(dest: Path, df_new: pd.DataFrame, sale_date: str) -> None:
+        from modules.load.load_onedrive import onedrive_csv_save
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists() and dest.stat().st_size > 0:
+            try:
+                existing = pd.read_csv(dest, dtype=str, encoding="utf-8-sig")
+            except Exception:
+                existing = pd.read_csv(dest, dtype=str)
+            if "sale_date" in existing.columns:
+                existing = existing[existing["sale_date"].astype(str).str.strip() != sale_date].copy()
+            merged = pd.concat([existing, df_new], ignore_index=True)
+        else:
+            merged = df_new.copy()
+        onedrive_csv_save(df=merged, file_path=str(dest), pk_col="_pk", timestamp_col="collected_at", if_exists="replace")
+
+    def _redownload_page(page_type: str, pending_keys: list[tuple[str, dict]], attempt_tag: str) -> int:
+        if not pending_keys:
+            return 0
+        download_dir = TEMP_DIR / f"okpos_download_daily_reconcile_{page_type}_{attempt_tag}"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        page_cfg = PAGE_TYPES[page_type]
+        csv_stem = "okpos_order" if page_type == "today" else "okpos_order_item" if page_type == "receipt" else "okpos_daily"
+
+        _current_key: list[str | None] = [None]
+
+        def _session(driver, wait, pending, results):
+            _login(driver, wait)
+            _setup_download_dir(driver, download_dir)
+            driver.get(page_cfg["url"])
+            time.sleep(2)
+            for sale_date, store in pending:
+                key = f"{sale_date}__{store['name']}"
+                _current_key[0] = key
+                downloaded = _download_excel_for_store(driver, wait, page_type, page_cfg, sale_date, store, download_dir)
+                _current_key[0] = None
+                if downloaded == "__NO_DATA__":
+                    results[key] = "__NO_DATA__"
+                elif downloaded:
+                    results[key] = str(downloaded)
+
+        results = _download_with_retry(page_type, pending_keys, download_dir, _session, current_key=_current_key)
+        saved = 0
+        for key, src_str in results.items():
+            sale_date, store_name = key.split("__", 1)
+            store_short = store_name.replace("도리당 ", "", 1)
+            ym = sale_date[:7]
+            dest = RAW_OKPOS_SALES / "brand=도리당" / f"store={store_short}" / f"ym={ym}" / f"{csv_stem}.csv"
+
+            if src_str == "__NO_DATA__":
+                _mark_no_data(store_short, ym, csv_stem, sale_date, reason=f"daily_reconcile:{page_type}:no_data({attempt_tag})")
+                continue
+            if not src_str:
+                continue
+            src = Path(src_str)
+            if not src.exists():
+                continue
+
+            try:
+                raw_df = _read_okpos_excel(str(src))
+                likely_okpos = _is_likely_okpos_report(raw_df)
+                if page_type == "daily":
+                    df_new, ym_new = _transform_okpos_daily_df(raw_df, store_name, sale_date)
+                else:
+                    df_new, ym_new = _transform_okpos_df(raw_df, store_name, sale_date)
+                if df_new.empty:
+                    if likely_okpos:
+                        _mark_no_data(store_short, ym, csv_stem, sale_date, reason=f"daily_reconcile:{page_type}:empty({attempt_tag})")
+                    continue
+                dest = RAW_OKPOS_SALES / "brand=도리당" / f"store={store_short}" / f"ym={ym_new}" / f"{csv_stem}.csv"
+                _upsert_by_date(dest, df_new, sale_date)
+                saved += 1
+            except Exception:
+                logger.exception("daily reconcile 저장 실패: %s | %s", attempt_tag, key)
+            finally:
+                src.unlink(missing_ok=True)
+        return saved
+
+    remaining: list[tuple[str, dict]] = [(d, s) for d in sale_dates for s in STORES if _should_collect(s["name"], d)]
+    for attempt in range(1, max_attempts + 1):
+        mism_today: list[tuple[str, dict]] = []
+        mism_receipt: list[tuple[str, dict]] = []
+        details: list[str] = []
+
+        for sale_date, store in remaining:
+            expected, reason = _load_daily_expected(sale_date, store)
+            if reason or expected is None:
+                continue
+            ym = sale_date[:7]
+            store_short = store["name"].replace("도리당 ", "", 1)
+            order_csv = RAW_OKPOS_SALES / "brand=도리당" / f"store={store_short}" / f"ym={ym}" / "okpos_order.csv"
+            item_csv = RAW_OKPOS_SALES / "brand=도리당" / f"store={store_short}" / f"ym={ym}" / "okpos_order_item.csv"
+
+            order_sum, oreason = _sum_csv(order_csv, sale_date, "실매출액")
+
+            # order vs daily 비교 (order CSV는 반품 행이 음수로 저장되어 직접 합산 = 순매출)
+            if order_sum is not None and abs(expected - order_sum) > tol:
+                mism_today.append((sale_date, store))
+                details.append(f"{sale_date}__{store['name']}:daily={expected}, order={order_sum}, diff={expected-order_sum}")
+            # NOTE: order_item(receipt) vs daily 비교는 제외 — receipt 페이지가 반품 영수증을
+            # 미포함하므로 반품 있는 날은 구조적으로 daily와 불일치하며, 재다운로드로 해결 불가
+
+        if not mism_today and not mism_receipt:
+            msg = f"daily 기준 reconcile 완료: mismatch 없음 (tol={tol}) | attempts={attempt}"
+            logger.info(msg)
+            return msg
+
+        logger.warning("daily 기준 mismatch 발견(attempt=%d): today=%d, receipt=%d | 예: %s", attempt, len(mism_today), len(mism_receipt), details[:10])
+
+        saved_t = _redownload_page("today", mism_today, attempt_tag=str(attempt))
+        saved_r = _redownload_page("receipt", mism_receipt, attempt_tag=str(attempt))
+        logger.info("daily 기준 reconcile attempt %d: today 재저장=%d, receipt 재저장=%d", attempt, saved_t, saved_r)
+
+    # 최대 재시도 후에도 mismatch 남으면 로그/XCom로 남김(실패시키지 않음)
+    try:
+        context["ti"].xcom_push(key="okpos_daily_reconcile_details", value=details)
+    except Exception:
+        pass
+    return f"daily 기준 reconcile 종료: mismatch 남음 (tol={tol}) | 예: {details[:20]}"
+
+
+def validate_today_vs_receipt(**context) -> str:
+    """today(okpos_order) vs receipt(okpos_order_item) 합계 정합성 검증.
+
+    - (sale_date, store) 기준으로 okpos_order 합계와 okpos_order_item 합계가 일치하는지 확인
+    - 불일치 시 수집 누락/중복/PK 충돌 가능성이 높으므로 실패 처리(알림/수동 조치 유도)
+
+    비교 기준:
+    - okpos_order: '실매출액' 합(할인 반영 후 금액) + 반품은 음수 차감
+    - okpos_order_item: '실매출액' 합 + 반품은 음수 차감
+
+    허용 오차:
+    - OKPOS_VALIDATE_TOLERANCE 환경변수(기본 0원)
+
+    NOTE:
+    - `.no_data__*.txt`로 마킹된 날짜는 검증에서 제외한다.
+    """
+    sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates") or []
+    if not sale_dates:
+        return "sale_dates 없음, 스킵"
+
+    tol = int(os.getenv("OKPOS_VALIDATE_TOLERANCE", "0"))
+    failures: list[str] = []
+    checked = 0
+
+    def _signed_amount(df: pd.DataFrame, amount: pd.Series) -> pd.Series:
+        if "구분" not in df.columns:
+            return amount
+        gbn = df["구분"].fillna("").astype(str).str.strip()
+        sign = gbn.map(lambda v: -1 if v == "반품" else 1).fillna(1).astype(int)
+        return amount * sign
+
+    for sale_date in sale_dates:
+        ym = sale_date[:7]
+        for store in STORES:
+            if not _should_collect(store["name"], sale_date):
+                continue
+            store_short = store["name"].replace("도리당 ", "", 1)
+
+            order_csv = (
+                RAW_OKPOS_SALES
+                / "brand=도리당"
+                / f"store={store_short}"
+                / f"ym={ym}"
+                / "okpos_order.csv"
+            )
+            item_csv = (
+                RAW_OKPOS_SALES
+                / "brand=도리당"
+                / f"store={store_short}"
+                / f"ym={ym}"
+                / "okpos_order_item.csv"
+            )
+
+            # NO_DATA 마커가 있으면 검증 제외
+            if sale_date in _read_no_data_dates(order_csv.parent / ".no_data__okpos_order.txt"):
+                continue
+            if sale_date in _read_no_data_dates(item_csv.parent / ".no_data__okpos_order_item.txt"):
+                continue
+
+            if not order_csv.exists() or not item_csv.exists():
+                failures.append(
+                    f"{sale_date}__{store['name']}:missing_csv(order={order_csv.exists()}, item={item_csv.exists()})"
+                )
+                continue
+
+            try:
+                order_df = pd.read_csv(order_csv, dtype=str)
+                item_df = pd.read_csv(item_csv, dtype=str)
+            except Exception as e:
+                failures.append(f"{sale_date}__{store['name']}:read_error({type(e).__name__})")
+                continue
+
+            order_df = order_df[order_df["sale_date"].astype(str).str.strip() == sale_date].copy()
+            item_df = item_df[item_df["sale_date"].astype(str).str.strip() == sale_date].copy()
+
+            if order_df.empty or item_df.empty:
+                failures.append(
+                    f"{sale_date}__{store['name']}:empty_date_rows(order={len(order_df)}, item={len(item_df)})"
+                )
+                continue
+
+            # order: 매출 행만 합산 (반품 행은 receipt 페이지에 미포함이므로 매출분만 비교)
+            if "구분" in order_df.columns:
+                order_sales_df = order_df[order_df["구분"].fillna("").astype(str).str.strip() != "반품"]
+            else:
+                order_sales_df = order_df
+            order_sum = int(
+                (_to_int_series(order_sales_df["실매출액"]) if "실매출액" in order_sales_df.columns else pd.Series(0, index=order_sales_df.index)).sum()
+            )
+
+            # item sum: receipt 페이지는 매출 행만 존재 → 직접 합산
+            item_sum = int(
+                (_to_int_series(item_df["실매출액"]) if "실매출액" in item_df.columns else pd.Series(0, index=item_df.index)).sum()
+            )
+
+            checked += 1
+            diff = abs(order_sum - item_sum)
+            if diff > tol:
+                failures.append(
+                    f"{sale_date}__{store['name']}:mismatch(order={order_sum}, item={item_sum}, diff={diff}, tol={tol})"
+                )
+
+    msg = f"today vs receipt 검증 완료: checked={checked}, failures={len(failures)}, tol={tol}"
+    if failures:
+        preview = ", ".join(failures[:50])
+        logger.error("%s | 예: %s", msg, preview)
+        try:
+            context["ti"].xcom_push(key="okpos_validate_failures", value=failures)
+        except Exception:
+            pass
+        # 운영 안정성: mismatch가 있어도 task는 실패시키지 않는다.
+        return f"{msg} | WARN 예: {preview}"
+    logger.info(msg)
+    return msg
+
+
+def reconcile_today_vs_receipt(**context) -> str:
+    """okpos_order 합계 기준으로 today/receipt를 재수집/재저장하여 정합성을 최대한 맞춘다.
+
+    - mismatch 탐지 → receipt 재수집/덮어쓰기
+    - 그래도 mismatch 남으면 today+receipt 모두 재수집/덮어쓰기
+
+    IMPORTANT:
+    - OKPOS 리포트 정의 차이로 원천 자체가 불일치하는 케이스가 존재할 수 있어,
+      이 task는 기본적으로 실패시키지 않고 mismatch 상세를 XCom/로그로 남긴다.
+    """
+    from modules.load.load_onedrive import onedrive_csv_save
+
+    sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates") or []
+    if not sale_dates:
+        return "sale_dates 없음, 스킵"
+
+    tol = int(os.getenv("OKPOS_VALIDATE_TOLERANCE", "0"))
+    max_attempts = int(os.getenv("OKPOS_RECONCILE_MAX_ATTEMPTS", "2"))
+
+    def _signed_amount(df: pd.DataFrame, amount: pd.Series) -> pd.Series:
+        if "구분" not in df.columns:
+            return amount
+        gbn = df["구분"].fillna("").astype(str).str.strip()
+        sign = gbn.map(lambda v: -1 if v == "반품" else 1).fillna(1).astype(int)
+        return amount * sign
+
+    def _sums_for_one(sale_date: str, store: dict) -> tuple[int | None, int | None, int | None, str | None]:
+        """(order_sum, item_sum_actual, item_sum_total, reason_if_skipped)"""
+        ym = sale_date[:7]
+        store_short = store["name"].replace("도리당 ", "", 1)
+        order_csv = (
+            RAW_OKPOS_SALES / "brand=도리당" / f"store={store_short}" / f"ym={ym}" / "okpos_order.csv"
+        )
+        item_csv = (
+            RAW_OKPOS_SALES / "brand=도리당" / f"store={store_short}" / f"ym={ym}" / "okpos_order_item.csv"
+        )
+
+        # NO_DATA는 비교 제외(휴무 등)
+        if sale_date in _read_no_data_dates(order_csv.parent / ".no_data__okpos_order.txt"):
+            return None, None, None, "order_no_data"
+        if sale_date in _read_no_data_dates(item_csv.parent / ".no_data__okpos_order_item.txt"):
+            return None, None, None, "item_no_data"
+
+        if not order_csv.exists() or not item_csv.exists():
+            return None, None, None, f"missing_csv(order={order_csv.exists()}, item={item_csv.exists()})"
+
+        try:
+            order_df = pd.read_csv(order_csv, dtype=str)
+            item_df = pd.read_csv(item_csv, dtype=str)
+        except Exception as e:
+            return None, None, None, f"read_error({type(e).__name__})"
+
+        order_df = order_df[order_df["sale_date"].astype(str).str.strip() == sale_date].copy()
+        item_df = item_df[item_df["sale_date"].astype(str).str.strip() == sale_date].copy()
+        if order_df.empty or item_df.empty:
+            return None, None, None, f"empty_date_rows(order={len(order_df)}, item={len(item_df)})"
+
+        # CSV 저장 시 반품 행이 이미 음수로 저장 → 직접 합산 (sign flip 금지)
+        # order: 매출 행만 합산 (반품 행은 receipt 페이지에 미포함이므로 매출분만 비교)
+        if "구분" in order_df.columns:
+            order_sales_df = order_df[order_df["구분"].fillna("").astype(str).str.strip() != "반품"]
+        else:
+            order_sales_df = order_df
+        order_sum = int(
+            (_to_int_series(order_sales_df["실매출액"]) if "실매출액" in order_sales_df.columns else pd.Series(0, index=order_sales_df.index)).sum()
+        )
+        item_sum_actual = int(
+            (_to_int_series(item_df["실매출액"]) if "실매출액" in item_df.columns else pd.Series(0, index=item_df.index)).sum()
+        )
+        item_sum_total = int(
+            (_to_int_series(item_df["총매출액"]) if "총매출액" in item_df.columns else pd.Series(0, index=item_df.index)).sum()
+        )
+        return order_sum, item_sum_actual, item_sum_total, None
+
+    def _find_mismatches() -> tuple[list[tuple[str, dict]], list[str], list[str]]:
+        mismatches: list[tuple[str, dict]] = []
+        skipped: list[str] = []
+        details: list[str] = []
+        for sale_date in sale_dates:
+            for store in STORES:
+                if not _should_collect(store["name"], sale_date):
+                    continue
+                o_sum, i_sum_a, i_sum_t, reason = _sums_for_one(sale_date, store)
+                if reason:
+                    skipped.append(f"{sale_date}__{store['name']}:{reason}")
+                    continue
+                if o_sum is None or i_sum_a is None or i_sum_t is None:
+                    continue
+                if abs(o_sum - i_sum_a) > tol:
+                    mismatches.append((sale_date, store))
+                    details.append(
+                        f"{sale_date}__{store['name']}:order={o_sum}, item_actual={i_sum_a}, item_total={i_sum_t}, diff_actual={o_sum-i_sum_a}, diff_total={o_sum-i_sum_t}"
+                    )
+        return mismatches, skipped, details
+
+    def _upsert_csv_by_date(dest: Path, df_new: pd.DataFrame, sale_date: str) -> None:
+        """dest CSV에서 sale_date 행을 교체하고 저장 (월 파일 단위)."""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists() and dest.stat().st_size > 0:
+            try:
+                existing = pd.read_csv(dest, dtype=str, encoding="utf-8-sig")
+            except Exception:
+                existing = pd.read_csv(dest, dtype=str)
+            if "sale_date" in existing.columns:
+                existing = existing[existing["sale_date"].astype(str).str.strip() != sale_date].copy()
+            merged = pd.concat([existing, df_new], ignore_index=True)
+        else:
+            merged = df_new.copy()
+
+        # onedrive_csv_save는 전체 replace만 지원하므로 여기서는 직접 replace 저장
+        onedrive_csv_save(df=merged, file_path=str(dest), pk_col="_pk", timestamp_col="collected_at", if_exists="replace")
+
+    def _redownload_and_upsert(page_type: str, pending_keys: list[tuple[str, dict]], attempt_tag: str) -> int:
+        if not pending_keys:
+            return 0
+
+        download_dir = TEMP_DIR / f"okpos_download_reconcile_{page_type}_{attempt_tag}"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        page_cfg = PAGE_TYPES[page_type]
+        csv_stem = "okpos_order" if page_type == "today" else "okpos_order_item"
+
+        _current_key: list[str | None] = [None]
+
+        def _session(driver, wait, pending, results):
+            _login(driver, wait)
+            _setup_download_dir(driver, download_dir)
+            driver.get(page_cfg["url"])
+            time.sleep(2)
+            for sale_date, store in pending:
+                key = f"{sale_date}__{store['name']}"
+                _current_key[0] = key
+                downloaded = _download_excel_for_store(driver, wait, page_type, page_cfg, sale_date, store, download_dir)
+                _current_key[0] = None
+                if downloaded == "__NO_DATA__":
+                    results[key] = "__NO_DATA__"
+                elif downloaded:
+                    results[key] = str(downloaded)
+
+        # 마커 제거(이전 오판/실패로 인해 영구 차단된 케이스 해제)
+        for sale_date, store in pending_keys:
+            ym = sale_date[:7]
+            store_short = store["name"].replace("도리당 ", "", 1)
+            _unmark_no_data(store_short, ym, csv_stem, sale_date)
+
+        results = _download_with_retry(page_type, pending_keys, download_dir, _session, current_key=_current_key)
+
+        saved = 0
+        for key, src_str in results.items():
+            sale_date, store_name = key.split("__", 1)
+            store_short = store_name.replace("도리당 ", "", 1)
+            ym = sale_date[:7]
+            dest = (
+                RAW_OKPOS_SALES / "brand=도리당" / f"store={store_short}" / f"ym={ym}" / f"{csv_stem}.csv"
+            )
+
+            if src_str == "__NO_DATA__":
+                _mark_no_data(store_short, ym, csv_stem, sale_date, reason=f"reconcile:{page_type}:download_no_data({attempt_tag})")
+                continue
+            if not src_str:
+                continue
+            src = Path(src_str)
+            if not src.exists():
+                continue
+
+            try:
+                raw_df = _read_okpos_excel(str(src))
+                likely_okpos = _is_likely_okpos_report(raw_df)
+                df_new, ym_new = _transform_okpos_df(raw_df, store_name, sale_date)
+                if df_new.empty:
+                    if likely_okpos:
+                        _mark_no_data(store_short, ym, csv_stem, sale_date, reason=f"reconcile:{page_type}:empty_after_transform({attempt_tag})")
+                    continue
+                dest = (
+                    RAW_OKPOS_SALES / "brand=도리당" / f"store={store_short}" / f"ym={ym_new}" / f"{csv_stem}.csv"
+                )
+                _upsert_csv_by_date(dest, df_new, sale_date)
+                saved += 1
+            except Exception:
+                logger.exception("reconcile 저장 실패: %s | %s", attempt_tag, key)
+            finally:
+                src.unlink(missing_ok=True)
+        return saved
+
+    # mismatch 탐지 및 재수집 loop
+    def _run_reconcile() -> str:
+        mismatches, skipped, details = _find_mismatches()
+        if not mismatches:
+            msg = f"reconcile 스킵: mismatch 없음 | skipped={len(skipped)}"
+            logger.info(msg)
+            return msg
+
+        logger.warning("reconcile 시작: mismatch %d건 | 예: %s", len(mismatches), details[:10])
+
+        remaining = mismatches
+        for attempt in range(1, max_attempts + 1):
+            # 1차: receipt만 재수집/덮어쓰기
+            saved_receipt = _redownload_and_upsert("receipt", remaining, attempt_tag=f"{attempt}")
+            logger.info("reconcile attempt %d/%d: receipt 재저장 %d건", attempt, max_attempts, saved_receipt)
+
+            next_remaining: list[tuple[str, dict]] = []
+            next_details: list[str] = []
+            for sale_date, store in remaining:
+                o_sum, i_sum_a, i_sum_t, reason = _sums_for_one(sale_date, store)
+                if reason:
+                    next_remaining.append((sale_date, store))
+                    continue
+                if o_sum is None or i_sum_a is None or i_sum_t is None:
+                    continue
+                if abs(o_sum - i_sum_a) > tol:
+                    next_remaining.append((sale_date, store))
+                    next_details.append(
+                        f"{sale_date}__{store['name']}:order={o_sum}, item_actual={i_sum_a}, item_total={i_sum_t}, diff_actual={o_sum-i_sum_a}, diff_total={o_sum-i_sum_t}"
+                    )
+
+            remaining = next_remaining
+            if not remaining:
+                msg = f"reconcile 완료: mismatch 0건 (tol={tol}) | attempts={attempt}"
+                logger.info(msg)
+                return msg
+
+            # 2차: receipt만으로 해결 안 되면 today+receipt 모두 재수집/덮어쓰기
+            logger.warning("receipt 재수집 후 mismatch %d건 남음 → today+receipt 동시 재수집 시도 | 예: %s", len(remaining), next_details[:10])
+            saved_today = _redownload_and_upsert("today", remaining, attempt_tag=f"{attempt}_full")
+            saved_receipt2 = _redownload_and_upsert("receipt", remaining, attempt_tag=f"{attempt}_full")
+            logger.info("reconcile attempt %d/%d(full): today %d건, receipt %d건 재저장", attempt, max_attempts, saved_today, saved_receipt2)
+            logger.info("reconcile attempt %d/%d(full) 완료 후 재검사 진행", attempt, max_attempts)
+
+        # 재다운로드로도 해결되지 않는 케이스는 상세를 남기고 성공 처리
+        _, _, details2 = _find_mismatches()
+        try:
+            context["ti"].xcom_push(key="okpos_reconcile_remaining", value=[(d, s["name"]) for d, s in remaining])
+            context["ti"].xcom_push(key="okpos_reconcile_details", value=details2)
+        except Exception:
+            pass
+        detail_preview = " | ".join(details2[:50])
+        msg = f"reconcile 완료(부분): mismatch {len(remaining)}건 남음 (tol={tol}) | 예: {detail_preview}"
+        logger.error(msg)
+        return msg
+
+    try:
+        return _run_reconcile()
+    except Exception as e:
+        # 어떤 예외가 떠도 DAG를 실패시키지 않음(운영 안정성)
+        logger.exception("reconcile 예외(무시하고 진행): %s", e)
+        try:
+            context["ti"].xcom_push(key="okpos_reconcile_exception", value=str(e))
+        except Exception:
+            pass
+        return f"reconcile 예외(무시): {type(e).__name__}: {e}"
 
 
 def write_log(**context) -> str:

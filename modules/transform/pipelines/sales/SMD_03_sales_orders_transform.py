@@ -11,6 +11,10 @@ from modules.transform.utility.io import load_data, send_email, text_to_html, cr
 from modules.load.load_local_db import local_db_save
 from modules.load.backup_to_onedrive import backup_to_onedrive
 from modules.transform.utility.store_name_mapping import normalize_store_names
+from modules.transform.pipelines.sales.SMD_07_store_ordesr_alert import (
+    LLM_COLS,
+    add_llm_columns_latest_per_store,
+)
 
 
 # ============================================================
@@ -89,6 +93,24 @@ def parse_mixed_date(date_series, dayfirst=False):
         result.loc[invalid_mask] = pd.NaT
     
     return result
+
+
+def _append_llm_columns_for_csv(df: pd.DataFrame) -> pd.DataFrame:
+    print(f"\n[LLM] CSV 저장 전 llm_* 컬럼 생성 시작...")
+    try:
+        df = add_llm_columns_latest_per_store(df)
+    except Exception as e:
+        print(f"[경고] LLM 컬럼 생성 실패: {e}")
+
+    for col in LLM_COLS:
+        if col not in df.columns:
+            df[col] = ''
+
+    base_cols = [c for c in df.columns if c not in LLM_COLS]
+    llm_cols = [c for c in LLM_COLS if c in df.columns]
+    df = df[base_cols + llm_cols]
+    print(f"[LLM] llm_* {len(llm_cols)}개 컬럼 준비 완료")
+    return df
 
 
 # ============================================================
@@ -3298,6 +3320,7 @@ def filter_alerts(
                 combined_df_save['order_daily'] = combined_df_save['order_daily'].astype(str)
         
         # 안전한 CSV 저장 (헬퍼 함수 사용)
+        combined_df_save = _append_llm_columns_for_csv(combined_df_save)
         safe_csv_save(combined_df_save, csv_path, "전체 집계 CSV")
         
         print(f"[✅ CSV] 전체 집계 저장: {len(combined_df_save):,}건 → {csv_path.name}")

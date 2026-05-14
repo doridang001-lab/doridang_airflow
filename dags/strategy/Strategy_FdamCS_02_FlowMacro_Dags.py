@@ -53,6 +53,13 @@ FALLBACK_CREDENTIALS_PATH = "/opt/airflow/config/glowing-palace-465904-h6-7f82df
 CS_GSHEET_URL             = "https://docs.google.com/spreadsheets/d/1DHbZX5jDkiZfe0SPr3eRinPXuSFomYm2AN-gMADoBkI/edit?gid=1488056813#gid=1488056813"
 CS_SHEET_NAME             = "시트1"
 
+# 진행상황(완료) 표기용 컨트롤 시트 (Flow 업로드 중단 조건)
+STATUS_GSHEET_URL   = "https://docs.google.com/spreadsheets/d/1Ijbf7xTnp4A_VFuonfjCnIiAUN22mVidx0FS_cjfL9I/edit?usp=sharing"
+STATUS_GSHEET_DISPLAY_URL = "https://docs.google.com/spreadsheets/d/1Ijbf7xTnp4A_VFuonfjCnIiAUN22mVidx0FS_cjfL9I/edit?pli=1&gid=0#gid=0"
+STATUS_SHEET_NAME   = None  # None이면 첫 번째 시트 사용
+STATUS_TABLE_RANGE  = "A5:N"  # A5~N5가 DF 헤더 시작점
+STATUS_DONE_VALUE   = "완료"
+
 
 # ============================================================
 # 유틸리티
@@ -69,6 +76,119 @@ def _credential_candidates() -> list:
         if path and path not in deduped and os.path.exists(path):
             deduped.append(path)
     return deduped
+
+
+def _pick_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    if df is None or df.empty:
+        return None
+    cols = list(df.columns)
+    for c in candidates:
+        if c in cols:
+            return c
+    compact_map = {re.sub(r"\s+", "", str(col)): col for col in cols}
+    for c in candidates:
+        key = re.sub(r"\s+", "", c)
+        if key in compact_map:
+            return compact_map[key]
+    return None
+
+
+def _read_gsheet_table(gc, url: str, sheet_name: str | None, a1_range: str) -> pd.DataFrame:
+    sh = gc.open_by_url(url)
+    ws = sh.worksheet(sheet_name) if sheet_name else sh.sheet1
+    values = ws.get(a1_range)
+    if not values or len(values) < 2:
+        return pd.DataFrame()
+
+    header = [str(h).strip() for h in values[0]]
+    rows = values[1:]
+    cleaned_rows = []
+    for r in rows:
+        row = list(r) + [''] * max(0, len(header) - len(r))
+        row = row[:len(header)]
+        if all(str(v).strip() == '' for v in row):
+            continue
+        cleaned_rows.append([str(v).strip() if v is not None else '' for v in row])
+    if not cleaned_rows:
+        return pd.DataFrame(columns=header)
+    return pd.DataFrame(cleaned_rows, columns=header)
+
+
+def _load_status_done_table_df() -> pd.DataFrame:
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    try:
+        scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        candidates = _credential_candidates()
+        if not candidates:
+            return pd.DataFrame()
+        creds = Credentials.from_service_account_file(candidates[0], scopes=scopes)
+        gc = gspread.authorize(creds)
+        df_raw = _read_gsheet_table(gc, STATUS_GSHEET_URL, STATUS_SHEET_NAME, STATUS_TABLE_RANGE)
+        if df_raw.empty:
+            return pd.DataFrame()
+
+        # 컨트롤 시트에서 CS 시트의 '접수번호'와 매칭될 키 컬럼 탐색.
+        # - 과거: '접수번호' 또는 '번호'가 실제 접수번호 역할
+        # - 현재(2026-04): '번호'는 단순 시퀀스이고 '경로번호'가 접수번호 역할
+        receipt_col = _pick_column(df_raw, ['접수번호', '경로번호', '경로 번호', '경로No', '경로 NO', '번호'])
+        route_col = _pick_column(df_raw, ['경로번호', '경로 번호', '경로No', '경로 NO'])
+        if route_col and receipt_col and route_col == receipt_col:
+            route_col = None
+        status_col = _pick_column(df_raw, ['진행상황알림', '진행상황 알림', '진행상태알림', '진행상태 알림'])
+
+        if not receipt_col or not status_col:
+            return pd.DataFrame()
+
+        keep_cols = [receipt_col, status_col] + ([route_col] if route_col else [])
+        df = df_raw[keep_cols].copy()
+        rename = {receipt_col: '접수번호', status_col: '진행상황알림'}
+        if route_col:
+            rename[route_col] = '경로번호'
+        df = df.rename(columns=rename)
+
+        for c in ['접수번호', '경로번호', '진행상황알림']:
+            if c in df.columns:
+                df[c] = df[c].astype(str).str.strip()
+
+        join_cols = ['접수번호'] + (['경로번호'] if '경로번호' in df.columns else [])
+        df = df.dropna(subset=['접수번호']).drop_duplicates(subset=join_cols, keep='last')
+        return df
+    except Exception as e:
+        print(f"[컨트롤시트] 진행상황알림 로드 실패(무시하고 진행): {e}")
+        return pd.DataFrame()
+
+
+def _exclude_done_rows(df_cs: pd.DataFrame, df_done: pd.DataFrame, label: str) -> pd.DataFrame:
+    if df_cs is None or df_cs.empty or df_done is None or df_done.empty:
+        return df_cs
+
+    receipt_col = _pick_column(df_cs, ['접수번호'])
+    if not receipt_col:
+        return df_cs
+
+    df_work = df_cs.copy()
+    if receipt_col != '접수번호':
+        df_work = df_work.rename(columns={receipt_col: '접수번호'})
+    df_work['접수번호'] = df_work['접수번호'].astype(str).str.strip()
+
+    join_cols = ['접수번호']
+    if '경로번호' in df_done.columns:
+        route_col = _pick_column(df_work, ['경로번호'])
+        if route_col:
+            if route_col != '경로번호':
+                df_work = df_work.rename(columns={route_col: '경로번호'})
+            df_work['경로번호'] = df_work['경로번호'].astype(str).str.strip()
+            join_cols.append('경로번호')
+
+    merged = df_work.merge(df_done[join_cols + ['진행상황알림']], on=join_cols, how='left')
+    done_mask = merged['진행상황알림'].astype(str).str.strip().eq(STATUS_DONE_VALUE)
+    excluded = int(done_mask.sum())
+    if excluded:
+        print(f"[{label}] 진행상황알림='{STATUS_DONE_VALUE}' 제외: {excluded}건")
+    merged = merged[~done_mask].copy()
+    return merged.drop(columns=['진행상황알림'], errors='ignore')
 
 
 def _latest_successful_execution_date(dt, **context):
@@ -160,6 +280,9 @@ def _build_flow_post_content(df_alert: pd.DataFrame, today_str: str):
     body_html = f"""<p style="margin:0 0 12px;font-size:13px;color:#c0392b;">
     📋 기준일: <strong>{today_str}</strong> &nbsp;|&nbsp; 총 <strong>{n}건</strong> ({FLOW_ALERT_DAYS}일 이상 미처리)
 </p>
+<p style="margin:0 0 12px;font-size:13px;">
+    <a href="{STATUS_GSHEET_DISPLAY_URL}" target="_blank" rel="noopener noreferrer">[진행상황상세(Gsheet)]</a>
+</p>
 <table style="border-collapse:collapse;font-size:12px;width:100%;border:1px solid #dee2e6;">
     <thead>
         <tr>
@@ -177,7 +300,8 @@ def _build_flow_post_content(df_alert: pd.DataFrame, today_str: str):
     <tbody>
         {row_html}
     </tbody>
-</table>"""
+</table>
+<p style="margin:12px 0 0;font-size:12px;color:#6c757d;">{STATUS_GSHEET_DISPLAY_URL}</p>"""
 
     return title, body_html
 
@@ -205,6 +329,13 @@ def post_overdue_cs_to_flow(**context):
     today_str = now_kst.to_date_string()
     print(f"\n{'='*60}")
     print(f"[Flow게시] 시작 | 기준일: {today_str}")
+
+    dag_run = context.get('dag_run')
+    run_id = getattr(dag_run, 'run_id', '') if dag_run else ''
+    is_task_test = 'temporary_run' in str(run_id)
+    dry_run = bool(is_task_test)
+    if dry_run:
+        print(f"[Flow게시] DRY RUN (airflow tasks test) → 실제 Flow 게시를 스킵합니다. run_id={run_id}")
 
     # ── 1. 구글시트 로드 ───────────────────────────────────────
     print("[Flow게시] 구글시트 데이터 로드 중...")
@@ -267,6 +398,10 @@ def post_overdue_cs_to_flow(**context):
     cond_not_done = df_work['진행상태'].astype(str).str.strip() != '완료'
     df_open       = df_work[cond_not_done].copy()
 
+    # 진행상황알림="완료" (컨트롤 시트)인 건은 처리완료로 간주 → Flow 게시 대상 제외
+    df_done = _load_status_done_table_df()
+    df_open = _exclude_done_rows(df_open, df_done, label="Flow게시")
+
     # 경과일 = 오늘(실행일) - 등록일 (스칼라 직접 사용, 임시 컬럼 불필요)
     df_open['처리소요기간'] = (
         pd.Timestamp(today_str) - pd.to_datetime(df_open['등록일'], errors='coerce')
@@ -288,6 +423,10 @@ def post_overdue_cs_to_flow(**context):
     print(body_html[:600])
 
     # ── 5. Selenium Flow 게시 ────────────────────────────────
+    if dry_run:
+        print(f"[Flow게시] DRY RUN → Flow 게시 스킵 ({len(df_alert)}건)")
+        return f"DRY RUN (미게시) {len(df_alert)}건"
+
     driver = None
     try:
         driver = launch_browser()

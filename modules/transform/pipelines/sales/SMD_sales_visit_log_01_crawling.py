@@ -26,6 +26,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from bs4 import BeautifulSoup
 
+from modules.transform.utility.selenium_uc import configure_uc_data_path
+
 
 # ============================================================================
 # 상수 - DAG 설정
@@ -260,6 +262,7 @@ def launch_browser():
         return options
     
     try:
+        configure_uc_data_path()
         chrome_version = get_chrome_version()
         
         if chrome_version:
@@ -286,6 +289,7 @@ def launch_browser():
             log(f"재시도: version_main={detected_version} 사용")
             
             try:
+                configure_uc_data_path()
                 driver = uc.Chrome(
                     options=create_chrome_options(),
                     version_main=detected_version

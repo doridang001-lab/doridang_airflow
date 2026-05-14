@@ -7,14 +7,14 @@ account_df = pd.DataFrame({
               "doridangofficial@naver.com",
               "doridangofficial@naver.com",
               "doridang001@gmail.com",
-              "doridang1",
+              "doridang15",
               "siw2222@naver.com",
        ],
        "pw": [
               "Ehfl0613!!",
               "Ehfl0613!!",
               "ehfl0907!!",
-              "ehfl0109!!",
+              "ehfl5233!",
               "ehfl8877!!",
        ],
 })

@@ -10,6 +10,10 @@ import datetime as dt
 from modules.load.load_df_glob import load_data
 from modules.transform.utility.paths import TEMP_DIR, LOCAL_DB, COLLECT_DB
 from modules.transform.utility.store_name_mapping import normalize_store_names
+from modules.transform.pipelines.sales.SMD_07_store_ordesr_alert import (
+    LLM_COLS,
+    add_llm_columns_latest_per_store,
+)
 
 PATH_NOW = COLLECT_DB / "영업관리부_수집" / "baemin_metrics_*.csv"
 PATH_HISTORY = COLLECT_DB / "영업관리부_수집" / "baemin_change_history_*.csv"
@@ -24,7 +28,7 @@ BAEMIN_HISTORY_PATTERNS = [
     COLLECT_DB / "baemin_change_history_*.csv",
 ]
 
-PATH_TOORDER = "/opt/airflow/download/toorder_review_doridang1_*.xlsx"
+PATH_TOORDER = "/opt/airflow/download/toorder_review_*.xlsx"
 PATH_ORDERS_ALERTS = LOCAL_DB / "영업관리부_DB" / "sales_daily_orders_alerts.csv"
 
 
@@ -119,6 +123,24 @@ def parse_mixed_date(date_series, dayfirst=False):
         result.loc[invalid_mask] = pd.NaT
     
     return result
+
+
+def _append_llm_columns_for_csv(df: pd.DataFrame) -> pd.DataFrame:
+    print(f"\n[LLM] CSV 저장 전 llm_* 컬럼 생성 시작...")
+    try:
+        df = add_llm_columns_latest_per_store(df)
+    except Exception as e:
+        print(f"[경고] LLM 컬럼 생성 실패: {e}")
+
+    for col in LLM_COLS:
+        if col not in df.columns:
+            df[col] = ''
+
+    base_cols = [c for c in df.columns if c not in LLM_COLS]
+    llm_cols = [c for c in LLM_COLS if c in df.columns]
+    df = df[base_cols + llm_cols]
+    print(f"[LLM] llm_* {len(llm_cols)}개 컬럼을 맨 오른쪽 끝으로 정렬 완료")
+    return df
 
 
 # ============================================================
@@ -308,13 +330,13 @@ def load_reupload_toorder_review(**context):
 
     for upload_temp_path in upload_temp_paths:
         if upload_temp_path.exists():
-            temp_excels = list(upload_temp_path.glob('toorder_review_doridang1_*.xlsx'))
+            temp_excels = list(upload_temp_path.glob('toorder_review_*.xlsx'))
             if temp_excels:
                 print(f"[업로드_temp] {upload_temp_path}에서 {len(temp_excels)}개 엑셀 발견")
                 excel_files.extend(temp_excels)
 
     if download_path.exists():
-        download_excels = list(download_path.glob('toorder_review_doridang1_*.xlsx'))
+        download_excels = list(download_path.glob('toorder_review_*.xlsx'))
         if download_excels:
             print(f"[download] {len(download_excels)}개 엑셀 발견")
             excel_files.extend(download_excels)
@@ -1957,6 +1979,13 @@ def fin_save_to_csv(
     if datetime_cols:
         for col in datetime_cols:
             df[col] = df[col].dt.strftime('%Y-%m-%d %H:%M:%S').fillna('')
+
+    manager_cols = [c for c in df.columns if str(c).startswith('담당자_')]
+    if manager_cols:
+        df = df.drop(columns=manager_cols)
+        print(f"[컬럼] 담당자_ 접두사 컬럼 {len(manager_cols)}개 제거")
+
+    df = _append_llm_columns_for_csv(df)
     
     tmp_path = None
     try:
