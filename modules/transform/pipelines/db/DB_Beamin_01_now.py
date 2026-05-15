@@ -196,48 +196,50 @@ def collect_now_for_driver(driver, account_id: str, store_list: list[dict]) -> N
     combined 파이프라인에서 우가클 수집과 같은 브라우저 세션을 공유할 때 사용.
     """
     for store_info in store_list:
-        logger.info("\uB9E4\uC7A5 \uC120\uD0DD \uC2DC\uB3C4: %s", store_info)
-        if not select_store_by_id(driver, store_info["store_id"]):
-            logger.warning("\uB9E4\uC7A5 \uC120\uD0DD \uC2E4\uD328: %s", store_info)
-            continue
-
-        logger.info(
-            "\uB9E4\uC7A5 \uB370\uC774\uD130 \uB85C\uB4DC \uB300\uAE30: %s",
-            store_info["store"],
-        )
-        if not wait_for_metrics_data(driver, timeout=45):
-            logger.warning(
-                "\uB9E4\uC7A5 \uB370\uC774\uD130 \uB85C\uB4DC \uD0C0\uC784\uC544\uC6C3: %s",
-                store_info["store"],
-            )
-            continue
-
         try:
-            dom_info = driver.execute_script(r"""
-                return {
-                    url: location.href,
-                    itemCount: document.querySelectorAll(
-                        '.WooriShopNowItem-module__TKcC'
-                    ).length,
-                    cardCount: document.querySelectorAll(
-                        '.WooriShopNowCard-module__rcFf'
-                    ).length
-                };
-            """)
-            logger.info("\uC218\uC9D1 \uC2DC\uC810 DOM: %s", dom_info)
-        except Exception:
-            pass
+            logger.info("매장 선택 시도: %s", store_info)
+            if not select_store_by_id(driver, store_info["store_id"]):
+                logger.warning("매장 선택 실패: %s", store_info)
+                continue
 
-        stats = collect_single_store_stats(
-            driver, store_info["store_id"], account_id
-        )
-        stats["brand"] = store_info["brand"]
-        stats["store"] = store_info["store"]
+            logger.info("매장 데이터 로드 대기: %s", store_info["store"])
+            if not wait_for_metrics_data(driver, timeout=45):
+                logger.warning("매장 데이터 로드 타임아웃: %s", store_info["store"])
+                continue
 
-        saved = _save_metrics_csv(stats, store_info["brand"], store_info["store"])
-        logger.info(
-            "\uC218\uC9D1 \uC644\uB8CC: brand=%s store=%s -> %s",
-            store_info["brand"],
-            store_info["store"],
-            saved,
-        )
+            try:
+                dom_info = driver.execute_script(r"""
+                    return {
+                        url: location.href,
+                        itemCount: document.querySelectorAll(
+                            '.WooriShopNowItem-module__TKcC'
+                        ).length,
+                        cardCount: document.querySelectorAll(
+                            '.WooriShopNowCard-module__rcFf'
+                        ).length
+                    };
+                """)
+                logger.info("수집 시점 DOM: %s", dom_info)
+            except Exception:
+                pass
+
+            stats = collect_single_store_stats(
+                driver, store_info["store_id"], account_id
+            )
+            stats["brand"] = store_info["brand"]
+            stats["store"] = store_info["store"]
+
+            saved = _save_metrics_csv(stats, store_info["brand"], store_info["store"])
+            logger.info(
+                "수집 완료: brand=%s store=%s -> %s",
+                store_info["brand"],
+                store_info["store"],
+                saved,
+            )
+
+        except Exception as e:
+            # Connection refused / Max retries = Chrome OOM 크래시 → 상위로 전파
+            if "Connection refused" in str(e) or "Max retries" in str(e):
+                logger.warning("Chrome 세션 종료, now 수집 중단: %s", e)
+                raise
+            logger.warning("매장 now 수집 실패 (건너뜀): %s / %s", store_info["store"], e)

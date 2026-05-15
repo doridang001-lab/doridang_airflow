@@ -105,6 +105,7 @@ def normalize_csv_date_column(**context) -> str:
         raise ValueError(f"'store' 컬럼이 없습니다: {CSV_PATH}")
 
     changed_date_rows = 0
+    changed_platform_rows = 0
 
     def _normalize_date(value: object) -> str:
         nonlocal changed_date_rows
@@ -118,11 +119,19 @@ def normalize_csv_date_column(**context) -> str:
         return text
 
     df["date"] = df["date"].apply(_normalize_date)
+
+    _PLATFORM_CORRECTIONS = {"쿠팽이츠": "쿠팡이츠"}
+    for wrong, correct in _PLATFORM_CORRECTIONS.items():
+        mask = df["platform"].astype(str).str.strip() == wrong
+        changed_platform_rows += int(mask.sum())
+        df.loc[mask, "platform"] = correct
+
     changed_store_rows = int(df["store"].astype(str).str.strip().eq(STORE_NAME).sum())
     df.loc[df["store"].astype(str).str.strip().eq(STORE_NAME), "store"] = STORE_SAVE_NAME
     df.to_csv(CSV_PATH, index=False, encoding="utf-8-sig")
     return (
         f"normalized_date_rows={changed_date_rows}, "
+        f"renamed_platform_rows={changed_platform_rows}, "
         f"renamed_store_rows={changed_store_rows}, csv={CSV_PATH}"
     )
 

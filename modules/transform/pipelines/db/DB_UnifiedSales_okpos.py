@@ -591,15 +591,30 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
     merged["ym"] = merged["sale_date"].str[:7]
     merged["platform"] = (merged[channel_col].fillna("").astype(str).str.strip() if channel_col else "")
 
-    # order_id: 영수증 기준으로 사람이 읽기 쉬운 값(포스번호-영수번호) 우선.
+    # order_time: OKPOS는 "최초주문"이 결제시각보다 더 자연스러운 주문시각인 경우가 많아 우선 사용.
+    # (없으면 결제시각으로 fallback) — order_id 접미사에 사용하므로 order_id 앞에서 계산한다.
+    time_col = next(
+        (c for c in ("최초주문", "최초주문시각", "결제시각_y", "결제시각_x", "결제시각") if c in merged.columns),
+        None,
+    )
+    merged["order_time"] = merged[time_col].apply(_normalize_time) if time_col else ""
+    # item-level 시각(결제시각_y 등) 사용 시 → 반품 등 미매칭 행의 빈값을 결제시각_x(order-level)로 보정
+    if time_col and "_y" in time_col and "결제시각_x" in merged.columns:
+        empty_mask = merged["order_time"] == ""
+        merged.loc[empty_mask, "order_time"] = merged.loc[empty_mask, "결제시각_x"].apply(_normalize_time)
+
+    # order_id: {포스번호-영수번호}_{order_time} 형식 (예: 1-14_11:00:10).
+    # order_time 이 비어있으면 구분자를 '_'로 바꾸고 00:00:00 으로 대체한다 (예: 1_14_00:00:00).
     # (unified PK에는 sale_date/store가 포함되므로 order_id 자체는 매장 간 유일성까지 요구하지 않음)
+    has_time = merged["order_time"] != ""
+    time_suffix = merged["order_time"].where(has_time, "00:00:00")
     if pos_col and rcpt_col:
-        merged["order_id"] = (
-            merged[pos_col].fillna("").astype(str).str.strip()
-            + "-" + merged[rcpt_col].fillna("").astype(str).str.strip()
-        )
+        pos_s = merged[pos_col].fillna("").astype(str).str.strip()
+        rcpt_s = merged[rcpt_col].fillna("").astype(str).str.strip()
+        sep = has_time.map({True: "-", False: "_"})
+        merged["order_id"] = pos_s + sep + rcpt_s + "_" + time_suffix
     else:
-        merged["order_id"] = merged["_order_key"].fillna("").astype(str)
+        merged["order_id"] = merged["_order_key"].fillna("").astype(str) + "_" + time_suffix
 
     # 테이블명 기반 보정: OKPOS의 주문유형이 "홀(매장)"으로 고정되는 경우가 있어 포장 여부를 추가 반영
     table_col = "테이블명_x" if "테이블명_x" in merged.columns else "테이블명" if "테이블명" in merged.columns else None
@@ -645,17 +660,6 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
     ot_v2 = merged["order_type"].fillna("").astype(str).str.strip()
     merged.loc[~ot_v2.isin(_VALID_OT), "order_type"] = "홀_테이블"
 
-    # order_time: OKPOS는 "최초주문"이 결제시각보다 더 자연스러운 주문시각인 경우가 많아 우선 사용.
-    # (없으면 결제시각으로 fallback)
-    time_col = next(
-        (c for c in ("최초주문", "최초주문시각", "결제시각_y", "결제시각_x", "결제시각") if c in merged.columns),
-        None,
-    )
-    merged["order_time"] = merged[time_col].apply(_normalize_time) if time_col else ""
-    # item-level 시각(결제시각_y 등) 사용 시 → 반품 등 미매칭 행의 빈값을 결제시각_x(order-level)로 보정
-    if time_col and "_y" in time_col and "결제시각_x" in merged.columns:
-        empty_mask = merged["order_time"] == ""
-        merged.loc[empty_mask, "order_time"] = merged.loc[empty_mask, "결제시각_x"].apply(_normalize_time)
     merged["item_id"] = merged["상품코드"].fillna("").astype(str)
     merged["item_name"] = merged["상품명"].fillna("").astype(str)
 

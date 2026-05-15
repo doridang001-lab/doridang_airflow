@@ -30,6 +30,10 @@ from modules.transform.pipelines.db.DB_EasyPOS_Sales import (
     save_to_raw,
     verify_missing,
 )
+from modules.transform.pipelines.db.DB_EasyPOS_Product import (
+    download_easypos_product,
+    save_easypos_product,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,4 +135,14 @@ with DAG(
         python_callable=verify_missing,
     )
 
-    t1 >> t2 >> t3 >> t4
+    t5 = PythonOperator(
+        task_id="download_easypos_product",
+        python_callable=download_easypos_product,
+    )
+
+    t6 = PythonOperator(
+        task_id="save_easypos_product",
+        python_callable=save_easypos_product,
+    )
+
+    t1 >> t2 >> t3 >> t4 >> t5 >> t6

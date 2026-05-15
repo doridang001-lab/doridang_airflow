@@ -41,7 +41,7 @@ _TOORDER_ID_DEFAULT = "doridang15"
 _TARGET_STORES_RAW = (
     os.getenv("TOORDER_TARGET_STORES")
     or os.getenv("TOORDER_TARGET_STORE")
-    or "송파삼전점"
+    or ""
 )
 LOGIN_URL = "https://ceo.toorder.co.kr/auth/login?returnTo=%2Fdashboard"
 DELIVERY_URL = (
@@ -50,7 +50,7 @@ DELIVERY_URL = (
 )
 HEADLESS_MODE = os.getenv("AIRFLOW_HOME") is not None
 
-ALERT_CON = ["등록 실패", "연결 오류", "가게없음", "매장연결 필요"]
+ALERT_CON = ["등록 실패", "연결 오류", "가게없음", "매장연결 필요", "매장 연결 필요"]
 ADMIN_EMAIL = ["a17019@kakao.com", "sanbogaja81@kakao.com","bulu1017@kakao.com", "siw22222@kakao.com"]
 # bulu1017@kakao.com 오나영 차장
 # siw22222@kakao.com 대표님

@@ -738,6 +738,45 @@ def extract_order_codes(collect_mode: str = "yesterday", force_rescrape: bool = 
                 len(codes),
             )
 
+    # ── integrity_failed_yms XCom 처리 (check_monthly에서 무결성 실패 ym 전달) ──
+    ti = context.get("ti")
+    if ti:
+        failed_yms = ti.xcom_pull(task_ids="check_monthly_collection", key="integrity_failed_yms") or []
+        if failed_yms:
+            logger.info("[무결성 재수집] 대상 ym=%s | 전체 스캔으로 누락 코드 추출", failed_yms)
+            full_integrity_collected = set() if force_rescrape else _load_collected_set(None)
+            sales_root = ANALYTICS_DB / "posfeed_sales"
+            for ym in failed_yms:
+                for csv_path in sales_root.glob(f"brand=*/store=*/ym={ym}/posfeed_orders.csv"):
+                    parts_map = {p.split("=")[0]: p.split("=")[1] for p in csv_path.parts if "=" in p}
+                    brand_val = parts_map.get("brand", "")
+                    store_val = parts_map.get("store", "")
+                    try:
+                        df_ym = pd.read_csv(csv_path, dtype=str)
+                        if "주문 코드" not in df_ym.columns:
+                            continue
+                        if "등록날짜" not in df_ym.columns:
+                            df_ym["등록날짜"] = ""
+                        df_ym["등록날짜"] = df_ym["등록날짜"].fillna("").astype(str)
+                        for date_key, grp in df_ym.groupby("등록날짜"):
+                            new_codes = [
+                                c for c in grp["주문 코드"].dropna().astype(str).unique().tolist()
+                                if c not in full_integrity_collected
+                            ]
+                            if not new_codes:
+                                continue
+                            existing = next(
+                                (s for s in stores if s["date"] == date_key and s["brand"] == brand_val and s["store"] == store_val),
+                                None,
+                            )
+                            if existing:
+                                existing["codes"] = list(set(existing["codes"]) | set(new_codes))
+                            else:
+                                stores.append({"date": date_key, "brand": brand_val, "store": store_val, "codes": new_codes})
+                            logger.info("[무결성 재수집] ym=%s %s/%s %s | 신규 코드 %d건", ym, brand_val, store_val, date_key, len(new_codes))
+                    except Exception as exc:
+                        logger.warning("[무결성 재수집] 파일 읽기 실패: %s | %s", csv_path, exc)
+
     # ── manual_backfill XCom 처리 (ingest_manual_files가 등록한 신규 매장 전체 기간 수집) ──
     ti = context.get("ti")
     if ti:

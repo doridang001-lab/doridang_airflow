@@ -20,8 +20,10 @@ graph LR
 소스별 파일로 분리, `common.py`가 스키마·저장 공유:
 - `DB_UnifiedSales_common.py` — UNIFIED_COLUMNS, _save_unified_daily, _normalize_item_key
 - `DB_UnifiedSales_{source}.py` — 소스별 변환 (okpos/unionpos/easypos/posfeed/toorder)
-- posfeed whitelist: `fin_product_posfeed_whitelist.csv` (item_name 정규화 키로 저장)
-  - is_valid=N → normalize(parquet.item_name) 기준 차단
+- posfeed whitelist: `fin_product_posfeed_whitelist.csv`
+  - 컬럼: `item_name, is_valid, store, review_needed, classified_by`
+  - 신규 item → `_classify_item_with_llm()` (qwen_client) 자동 분류 → `review_needed=Y`
+  - `is_valid=N` → `sync_posfeed_blacklist()`로 기존 parquet 소급 삭제
 
 ## 참조
 - `docs/architecture.md` - utility 선택 기준표

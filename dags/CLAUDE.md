@@ -22,8 +22,13 @@ graph LR
 - `{"backfill": true}` → 전체 백필 모드
 - conf 없음 → Lookback N일 누락 append 모드
 
+## 폴더
+- `sales/`, `strategy/`, `db/` — 도메인별 일반 DAG
+- `etl/` — 마이그레이션/ETL 유틸 | `private/` — 내부 전용
+
 ## 크롤링 DAG (DB_*) 패턴
-- `combined.py`로 단일 브라우저 세션 유지 (login/logout 1회)
+- `combined.py` 패턴: 매장별 독립 Chrome (OOM 방지), 4단계 구조
+  - 1단계: 매장목록 조회 → 2단계: now+우가클+변경이력(per-store) → 3단계: orders
 - 크롤링 DAG 신규 작성 전 `/crawl` skill로 대상 URL 사전 조사 필수
 
 ## 참조

@@ -9,6 +9,7 @@ Baemin macro DAG — 배달의민족 계정별 자동 수집
     ├─ now 수집        (우리가게NOW 현황 지표)
     ├─ 우가클 수집     (우리가게 클릭 현황 - 이번달 + 저번달)
     ├─ 변경이력 수집   (매장 변경이력 - history/change/shop)
+    ├─ 주문내역 수집   (orders/history - 어제)
     └─ 로그아웃
 
 === 저장 경로 ===
@@ -18,9 +19,12 @@ Baemin macro DAG — 배달의민족 계정별 자동 수집
                brand={brand}/store={store}/ym={YYYY-MM}/woori_shop_click.csv
   변경이력  : analytics/baemin_macro/shop_change/
                brand={brand}/store={store}/ym={YYYY-MM}/shop_change.csv
+  주문내역  : analytics/baemin_macro/orders/
+               brand={brand}/store={store}/ym={YYYY-MM}/orders_{YYYY-MM-DD}.csv
 
 === 수집 월 ===
   우가클: 이번달 + 저번달 (덮어쓰기)
+  주문내역: 어제 (upsert by 주문번호)
 '''
 
 import logging
@@ -113,7 +117,7 @@ def collect_all(**context) -> str:
 with DAG(
     dag_id=dag_id,
     schedule=SMD_BAEMIN_COLLECT_TIME,
-    start_date=pendulum.datetime(2026, 5, 1, tz=KST),
+    start_date=pendulum.datetime(2024, 1, 1, tz="Asia/Seoul"),
     catchup=False,
     max_active_runs=1,
     default_args=default_args,
@@ -128,7 +132,7 @@ with DAG(
     t2 = PythonOperator(
         task_id="collect_all",
         python_callable=collect_all,
-        execution_timeout=timedelta(minutes=150),
+        execution_timeout=timedelta(minutes=200),
     )
 
     t1 >> t2

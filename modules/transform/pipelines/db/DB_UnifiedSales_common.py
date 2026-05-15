@@ -55,7 +55,7 @@ _STORE_MAP_CACHE_MTIME: float | None = None
 _FIN_PRODUCT_CACHE: pd.DataFrame | None = None
 _FIN_PRODUCT_CACHE_MTIME: float | None = None
 
-_POSFEED_WHITELIST_CACHE: set[str] | None = None
+_POSFEED_WHITELIST_CACHE: dict[str, set[str] | None] | None = None
 _POSFEED_WHITELIST_CACHE_MTIME: float | None = None
 
 
@@ -148,27 +148,32 @@ def _apply_fin_item_name(df: pd.DataFrame) -> pd.DataFrame:
 def _normalize_item_key(name: str) -> str:
     """item_name 비교용 정규화 키 생성 (저장값이 아닌 비교 전용).
 
-    1. [...] 전체(괄호+내용) 제거
-    2. (...) 전체(괄호+내용) 제거
+    1. [...] 기호만 제거 (내용 보존)
+    2. (...) 기호만 제거 (내용 보존)
     3. 한글·영문·숫자 이외 문자(공백 포함) 제거
     """
-    s = re.sub(r'\[.*?\]', '', name)
-    s = re.sub(r'\(.*?\)', '', s)
-    s = re.sub(r'[^가-힣a-zA-Z0-9]', '', s)
+    s = re.sub(r'[\[\]]', '', name)
+    s = re.sub(r'[()]', '', s)
+    s = re.sub(r'[^가-힣a-zA-Z0-9一-鿿]', '', s)
     return s
 
 
-def _load_posfeed_blacklist() -> set[str]:
-    """fin_product_posfeed_whitelist.csv에서 is_valid=N 항목을 정규화 키 set으로 반환.
+def _load_posfeed_blacklist() -> dict[str, set[str] | None]:
+    """fin_product_posfeed_whitelist.csv에서 is_valid=N 항목을 store-aware dict로 반환.
 
-    - 필수 컬럼: item_name, is_valid (brand/store_name 불필요, 있어도 무시)
-    - 파일 없거나 N 항목 없으면 빈 set 반환 → 필터링 비활성.
+    반환값: {normalize(item_name): None | set[str]}
+    - None → 전체 매장에서 제외
+    - set[str] → 해당 매장에서만 제외 (store 컬럼의 쉼표 구분 값)
+
+    - 필수 컬럼: item_name, is_valid
+    - store 컬럼 없거나 값이 비면 전체 매장 제외
+    - 파일 없거나 N 항목 없으면 빈 dict 반환 → 필터링 비활성.
     """
     global _POSFEED_WHITELIST_CACHE, _POSFEED_WHITELIST_CACHE_MTIME
     try:
         mtime = POSFEED_WHITELIST_CSV_PATH.stat().st_mtime
     except FileNotFoundError:
-        _POSFEED_WHITELIST_CACHE = set()
+        _POSFEED_WHITELIST_CACHE = {}
         _POSFEED_WHITELIST_CACHE_MTIME = None
         return _POSFEED_WHITELIST_CACHE
 
@@ -179,21 +184,33 @@ def _load_posfeed_blacklist() -> set[str]:
         df = pd.read_csv(POSFEED_WHITELIST_CSV_PATH, dtype=str).fillna("")
     except Exception as e:
         logger.warning("posfeed whitelist 로드 실패: %s", e)
-        _POSFEED_WHITELIST_CACHE = set()
+        _POSFEED_WHITELIST_CACHE = {}
         _POSFEED_WHITELIST_CACHE_MTIME = mtime
         return _POSFEED_WHITELIST_CACHE
 
     if not {"item_name", "is_valid"}.issubset(df.columns):
         logger.warning("posfeed whitelist 컬럼 오류 (필요: item_name, is_valid)")
-        _POSFEED_WHITELIST_CACHE = set()
+        _POSFEED_WHITELIST_CACHE = {}
         _POSFEED_WHITELIST_CACHE_MTIME = mtime
         return _POSFEED_WHITELIST_CACHE
 
-    result = {
-        _normalize_item_key(str(row["item_name"]).strip())
-        for _, row in df[df["is_valid"].str.strip().str.upper() == "N"].iterrows()
-        if str(row["item_name"]).strip()
-    }
+    result: dict[str, set[str] | None] = {}
+    for _, row in df[df["is_valid"].str.strip().str.upper() == "N"].iterrows():
+        key = _normalize_item_key(str(row["item_name"]).strip())
+        if not key:
+            continue
+        store_val = str(row["store"]).strip() if "store" in df.columns else ""
+        if not store_val or store_val == "nan":
+            result[key] = None  # 전체 매장
+        else:
+            stores = {s.strip() for s in store_val.split(",") if s.strip()}
+            if key in result:
+                if result[key] is not None:
+                    result[key].update(stores)
+                # already None (global) → stays global
+            else:
+                result[key] = stores
+
     logger.info("posfeed 블랙리스트 로드: %d 항목 (정규화 키)", len(result))
     _POSFEED_WHITELIST_CACHE = result
     _POSFEED_WHITELIST_CACHE_MTIME = mtime
@@ -203,7 +220,7 @@ def _load_posfeed_blacklist() -> set[str]:
 def _apply_posfeed_blacklist(df: pd.DataFrame) -> pd.DataFrame:
     """posfeed df에서 블랙리스트(is_valid=N) item_name 행 제거.
 
-    - 비교 기준: _normalize_item_key(item_name) ∈ blacklist set
+    - store 컬럼 비어있으면 전체 매장, 값 있으면 해당 매장에서만 제거
     - CSV에 없는 item_name은 자동 통과
     """
     blacklist = _load_posfeed_blacklist()
@@ -211,7 +228,20 @@ def _apply_posfeed_blacklist(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     items = df["item_name"].fillna("").astype(str).str.strip()
-    remove_mask = items.map(_normalize_item_key).isin(blacklist)
+    stores_col = df["store"].fillna("").astype(str).str.strip() if "store" in df.columns else pd.Series("", index=df.index)
+    item_keys = items.map(_normalize_item_key)
+
+    def _is_bl(key: str, store: str) -> bool:
+        if key not in blacklist:
+            return False
+        r = blacklist[key]
+        return r is None or store in r
+
+    remove_mask = pd.Series(
+        [_is_bl(k, s) for k, s in zip(item_keys, stores_col)],
+        index=df.index,
+        dtype=bool,
+    )
 
     if not remove_mask.any():
         return df

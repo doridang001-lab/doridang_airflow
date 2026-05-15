@@ -27,6 +27,7 @@ import pandas as pd
 import pendulum
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import TimeoutException
 
 from modules.extract.croling_beamin import (
     TIMING,
@@ -41,10 +42,10 @@ from modules.transform.utility.paths import BAEMIN_OUR_STORE_CLICKS_DB
 logger = logging.getLogger(__name__)
 
 KST = pendulum.timezone("Asia/Seoul")
-KNOWN_BRANDS = ["나홀로", "도리당"]
+KNOWN_BRANDS = ["도리당", "나홀로"]
 
 _TABLE_CSS = "table[data-atelier-component='Table']"
-_TABLE_TIMEOUT = 20  # seconds (데이터 있는 경우 실측 8초면 로드됨)
+_TABLE_TIMEOUT = 20  # seconds
 _PAGE_SETTLE = 4.0   # URL 이동 후 React 렌더링 안정화 대기(초)
 
 
@@ -114,6 +115,13 @@ def collect_woori_shop_click(account_list: list[dict]) -> str:
                         logger.warning(
                             "페이지 로드 타임아웃 (%s %s): %s", store_id, ym, e
                         )
+
+                    # 배민 SPA: 직접 URL 접근 시 빈 상태 → 새로고침(F5)으로 데이터 로드
+                    time.sleep(random.uniform(1.5, 2.5))
+                    try:
+                        driver.refresh()
+                    except Exception:
+                        pass
 
                     rows = _extract_table_rows(driver, store_id, store_info["store"], ym)
 
@@ -188,28 +196,74 @@ def _extract_table_rows(driver, store_id: str, store_name: str, ym: str) -> list
     - tbody 행 파싱
     """
     def _has_rows(d) -> bool:
-        # WebDriverException 등 Chrome 내부 오류가 lambda 밖으로
-        # propagate되지 않도록 모든 예외를 잡아 False 반환
+        # 첫 행 날짜 셀에 M.DD 패턴이 있을 때만 True
+        # 배민 테이블: CSS 구조상 Selenium .text는 빈값 → innerText로만 읽을 수 있음
+        # M.DD 패턴 체크로 스켈레톤 DOM 오판 방지
         try:
-            return len(d.find_elements(
-                By.CSS_SELECTOR, f"{_TABLE_CSS} tbody tr"
-            )) > 0
-        except Exception:
+            rows = d.find_elements(By.CSS_SELECTOR, f"{_TABLE_CSS} tbody tr")
+            if not rows:
+                return False
+            cells = rows[0].find_elements(By.TAG_NAME, "td")
+            if len(cells) < 7:
+                return False
+            try:
+                val = (cells[0].find_element(
+                    By.CSS_SELECTOR, ".styles-module__x4Tk"
+                ).get_attribute("innerText") or "").strip()
+            except Exception:
+                val = (cells[0].get_attribute("innerText") or cells[0].text or "").strip()
+            return bool(re.search(r"\d+\.\d+", val))
+        except Exception as e:
+            # Chrome 세션 종료 신호 → WebDriverWait를 즉시 중단시키기 위해 재발생
+            err_str = str(e)
+            if "Connection refused" in err_str or "Max retries" in err_str:
+                raise
             return False
 
     try:
-        # tbody tr 데이터 행이 실제로 채워질 때까지 대기
         WebDriverWait(driver, _TABLE_TIMEOUT).until(_has_rows)
+    except TimeoutException:
+        try:
+            cur_url = driver.current_url
+            debug_info = driver.execute_script("""
+                var trs = document.querySelectorAll("table[data-atelier-component='Table'] tbody tr");
+                if (!trs.length) return JSON.stringify({tr:0});
+                var cells = trs[0].querySelectorAll('td');
+                var val = cells.length > 0 ? cells[0].innerText.slice(0, 30) : '';
+                var hasClass = !!(cells.length > 0 && cells[0].querySelector('.styles-module__x4Tk'));
+                return JSON.stringify({tr: trs.length, cells: cells.length, val: val, hasClass: hasClass});
+            """)
+            logger.warning("타임아웃 디버그 URL=%s DOM=%s", cur_url, debug_info)
+        except Exception as _de:
+            logger.warning("타임아웃 디버그 실패: %s", _de)
+        logger.warning("테이블 로드 타임아웃 (store=%s ym=%s): 데이터 없음", store_name, ym)
+        return []
+    except Exception as e:
+        logger.warning("테이블 대기 중 Chrome 오류 (store=%s ym=%s): %s", store_name, ym, e)
+        raise
 
+    try:
         # 전체보기 버튼 클릭
         try:
             btns = driver.find_elements(
                 By.CSS_SELECTOR, "button[data-atelier-component='Button']"
             )
-            expand_btn = next((b for b in btns if "전체보기" in b.text), None)
+            expand_btn = next(
+                (b for b in btns if "전체보기" in (b.get_attribute("innerText") or "")),
+                None,
+            )
             if expand_btn:
-                expand_btn.click()
-                time.sleep(random.uniform(0.5, 1.0))
+                driver.execute_script("arguments[0].scrollIntoView(true);", expand_btn)
+                time.sleep(0.3)
+                driver.execute_script("arguments[0].click();", expand_btn)
+                try:
+                    WebDriverWait(driver, 10).until(
+                        lambda d: len(d.find_elements(
+                            By.CSS_SELECTOR, f"{_TABLE_CSS} tbody tr"
+                        )) > 10
+                    )
+                except TimeoutException:
+                    time.sleep(1.0)
         except Exception:
             pass  # 전체보기 없으면 그냥 진행
 
@@ -226,13 +280,13 @@ def _extract_table_rows(driver, store_id: str, store_name: str, ym: str) -> list
                 continue
 
             def get_val(cell) -> str:
-                # 확인된 클래스명으로 먼저 시도, 없으면 cell 전체 텍스트
+                # 배민 테이블: CSS 구조상 .text가 빈값 → innerText로 읽어야 함
                 try:
-                    return cell.find_element(
+                    return (cell.find_element(
                         By.CSS_SELECTOR, ".styles-module__x4Tk"
-                    ).text.strip()
+                    ).get_attribute("innerText") or "").strip()
                 except Exception:
-                    return cell.text.strip()
+                    return (cell.get_attribute("innerText") or cell.text or "").strip()
 
             raw_date = get_val(cells[0])
             day_match = re.search(r"(\d+)\.(\d+)", raw_date)
@@ -266,7 +320,7 @@ def _extract_table_rows(driver, store_id: str, store_name: str, ym: str) -> list
         return result
 
     except Exception as e:
-        logger.warning("테이블 추출 실패 (store=%s ym=%s): %s", store_name, ym, e)
+        logger.warning("테이블 파싱 실패 (store=%s ym=%s): %s", store_name, ym, e)
         return []
 
 
@@ -287,14 +341,34 @@ def _save_csv(rows: list[dict], brand: str, store: str, ym: str) -> Path:
     return out_path
 
 
+def _navigate_to_woori_url(driver, store_id: str, ym: str, url: str) -> None:
+    """우가클 URL로 이동. 페이지 로드 타임아웃은 무시하고 계속 진행."""
+    try:
+        driver.set_page_load_timeout(45)
+        driver.get(url)
+    except Exception as e:
+        err_str = str(e)
+        if "Connection refused" in err_str or "Max retries" in err_str:
+            raise
+        logger.warning("페이지 이동 타임아웃 (%s %s): %s", store_id, ym, e)
+
+
 def collect_woori_for_driver(driver, store_list: list[dict]) -> None:
     """이미 로그인된 driver로 우리가게 클릭 현황을 수집한다 (login/logout 없음).
 
     combined 파이프라인에서 now 수집과 같은 브라우저 세션을 공유할 때 사용.
+    실패 시 대시보드 경유 후 1회 재시도한다.
     """
     target_months = _get_target_months()
 
     for store_info in store_list:
+        if store_info.get("brand") not in KNOWN_BRANDS:
+            logger.info(
+                "우가클 광고 없는 브랜드 스킵: %s (%s)",
+                store_info["store"], store_info.get("brand"),
+            )
+            continue
+
         store_id = store_info["store_id"]
 
         for ym in target_months:
@@ -303,30 +377,34 @@ def collect_woori_for_driver(driver, store_list: list[dict]) -> None:
                 f"/stat/marketing/woori-shop-click"
                 f"?initialDateOption=MONTHLY&initialMonth={ym}"
             )
-            logger.info("\uC218\uC9D1 \uC774\uB3D9: %s %s", store_info["store"], ym)
+            logger.info("수집 이동: %s %s", store_info["store"], ym)
 
-            try:
-                driver.set_page_load_timeout(45)
-                driver.get(url)
-            except Exception as e:
-                logger.warning(
-                    "\uD398\uC774\uC9C0 \uB85C\uB4DC \uD0C0\uC784\uC544\uC6C3 (%s %s): %s",
-                    store_id, ym, e,
-                )
-
-            time.sleep(_PAGE_SETTLE)  # React 초기 렌더링 대기
-
+            _navigate_to_woori_url(driver, store_id, ym, url)
+            time.sleep(_PAGE_SETTLE)
             rows = _extract_table_rows(driver, store_id, store_info["store"], ym)
+
+            if not rows:
+                # SPA 상태 리셋: 대시보드 경유 후 재시도
+                logger.info("재시도: 대시보드 경유 후 %s %s", store_info["store"], ym)
+                try:
+                    driver.set_page_load_timeout(45)
+                    driver.get("https://self.baemin.com/")
+                except Exception:
+                    pass
+                time.sleep(3.0)
+                _navigate_to_woori_url(driver, store_id, ym, url)
+                time.sleep(_PAGE_SETTLE)
+                rows = _extract_table_rows(driver, store_id, store_info["store"], ym)
 
             if rows:
                 saved = _save_csv(rows, store_info["brand"], store_info["store"], ym)
                 logger.info(
-                    "\uC800\uC7A5 \uC644\uB8CC: brand=%s store=%s ym=%s -> %s",
+                    "저장 완료: brand=%s store=%s ym=%s -> %s",
                     store_info["brand"], store_info["store"], ym, saved,
                 )
             else:
                 logger.warning(
-                    "\uB370\uC774\uD130 \uC5C6\uC74C: store=%s ym=%s",
+                    "데이터 없음: store=%s ym=%s",
                     store_info["store"], ym,
                 )
 

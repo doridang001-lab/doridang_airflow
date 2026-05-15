@@ -38,6 +38,7 @@ from modules.transform.pipelines.db.DB_UnifiedSales_easypos import (
 from modules.transform.pipelines.db.DB_UnifiedSales_posfeed import (
     backfill_posfeed as pipeline_backfill_posfeed,
     generate_posfeed_whitelist_draft as pipeline_generate_whitelist_draft,
+    report_posfeed_exclusions as pipeline_report_posfeed_exclusions,
     run_posfeed as pipeline_run_posfeed,
     run_lookback_posfeed as pipeline_lookback_posfeed,
     sync_posfeed_blacklist as pipeline_sync_posfeed_blacklist,
@@ -202,6 +203,11 @@ def build_toorder(**context) -> str:
     return pipeline_lookback_toorder(days=LOOKBACK_DAYS)
 
 
+def report_posfeed_exclusions(**context) -> str:
+    """posfeed 블랙리스트 제외 내역을 ym별 상세·집계 CSV로 저장."""
+    return pipeline_report_posfeed_exclusions(**context)
+
+
 def sync_posfeed_blacklist(**context) -> str:
     """fin_product_posfeed_whitelist.csv의 N 항목을 기존 parquet에 소급 적용 (매 실행마다)."""
     return pipeline_sync_posfeed_blacklist()
@@ -265,6 +271,11 @@ with DAG(
         python_callable=build_toorder,
     )
 
+    t5a3 = PythonOperator(
+        task_id="report_posfeed_exclusions",
+        python_callable=report_posfeed_exclusions,
+    )
+
     t5b = PythonOperator(
         task_id="sync_posfeed_blacklist",
         python_callable=sync_posfeed_blacklist,
@@ -291,4 +302,4 @@ with DAG(
     )
 
     # 순차 실행: 같은 날짜 parquet에 동시 write 방지
-    t1 >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a2 >> t5b >> t5c >> t6 >> t7 >> t8
+    t1 >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5a2 >> t5b >> t5c >> t6 >> t7 >> t8

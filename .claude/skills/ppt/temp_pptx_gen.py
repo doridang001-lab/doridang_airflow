@@ -1,291 +1,377 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 다크 테마 + 실제 스크린샷 이미지 포함
-
 from pptx import Presentation
-from pptx.util import Cm, Pt
+from pptx.util import Inches, Pt
 from pptx.enum.text import PP_ALIGN
 from pptx.dml.color import RGBColor
-from pathlib import Path
+import os
+from datetime import datetime
 
-output_path = r"C:\Users\민준\OneDrive - 주식회사 도리당\data\report\PowerPoint\프담_CS_DX전환_2_애니메이션없는_ppt.pptx"
+ONEDRIVE_PATH = r"C:\Users\민준\OneDrive - 주식회사 도리당\data\report\PowerPoint"
+os.makedirs(ONEDRIVE_PATH, exist_ok=True)
+FILE_NAME = "AI_데이터기반_의사결정_2_애니메이션없는_ppt.pptx"
+OUTPUT_PATH = os.path.join(ONEDRIVE_PATH, FILE_NAME)
 
-IMG_DASH   = Path(r"C:\Users\민준\AppData\Local\Temp\wmux\screenshot-1778720674583.png")  # 대시보드
-IMG_ALERTS = Path(r"C:\Users\민준\AppData\Local\Temp\wmux\screenshot-1778720681969.png")  # 알림 3개
-
-BG     = RGBColor(0x0d, 0x0d, 0x0d)
-DARK2  = RGBColor(0x11, 0x11, 0x11)
-MINT   = RGBColor(0x00, 0xe5, 0xa0)
-WHITE  = RGBColor(0xff, 0xff, 0xff)
-GRAY   = RGBColor(0x99, 0x99, 0x99)
-GRAY2  = RGBColor(0x55, 0x55, 0x55)
-RED    = RGBColor(0xe0, 0x55, 0x55)
-AMBER  = RGBColor(0xf0, 0xa5, 0x00)
-PURPLE = RGBColor(0x8b, 0x5c, 0xf6)
-MINT_BG   = RGBColor(0x0a, 0x18, 0x0e)
-RED_BG    = RGBColor(0x18, 0x0a, 0x0a)
-AMBER_BG  = RGBColor(0x16, 0x0e, 0x00)
+DARK_BG   = RGBColor(13, 13, 13)
+MINT      = RGBColor(0, 229, 160)
+DARK_MINT = RGBColor(0, 160, 110)
+WHITE     = RGBColor(255, 255, 255)
+LGRAY     = RGBColor(180, 180, 180)
+CARD_BG   = RGBColor(30, 30, 30)
+CARD_BG2  = RGBColor(20, 45, 35)
+RED       = RGBColor(220, 80, 80)
+RED_DARK  = RGBColor(180, 50, 50)
 
 prs = Presentation()
-prs.slide_width  = Cm(33.87)
-prs.slide_height = Cm(19.05)
+prs.slide_width  = Inches(13.333)
+prs.slide_height = Inches(7.5)
+BLANK = prs.slide_layouts[6]
 
-def blank(bg=BG):
-    s = prs.slides.add_slide(prs.slide_layouts[6])
-    s.background.fill.solid()
-    s.background.fill.fore_color.rgb = bg
-    return s
 
-def tb(s, text, l, t, w, h, size, bold=False, color=WHITE, align=PP_ALIGN.LEFT):
-    box = s.shapes.add_textbox(l, t, w, h)
-    tf = box.text_frame
-    tf.word_wrap = True
+# ── 공통 유틸 ──────────────────────────────────────────
+def bg(slide):
+    fill = slide.background.fill
+    fill.solid()
+    fill.fore_color.rgb = DARK_BG
+
+def txbox(slide, l, t, w, h, text, size,
+          bold=False, color=None, align=PP_ALIGN.LEFT, wrap=True):
+    tb = slide.shapes.add_textbox(Inches(l), Inches(t), Inches(w), Inches(h))
+    tf = tb.text_frame
+    tf.word_wrap = wrap
     p = tf.paragraphs[0]
+    p.text = text
     p.alignment = align
-    r = p.add_run()
-    r.text = text
-    r.font.size = Pt(size)
-    r.font.bold = bold
-    r.font.color.rgb = color
-    r.font.name = '맑은 고딕'
-    return box
+    p.font.size = Pt(size)
+    p.font.bold = bold
+    p.font.color.rgb = color if color else WHITE
+    return tb
 
-def rect(s, l, t, w, h, fill, line=None, lw=1.5):
-    shp = s.shapes.add_shape(1, l, t, w, h)
-    shp.fill.solid()
-    shp.fill.fore_color.rgb = fill
-    if line:
-        shp.line.color.rgb = line
-        shp.line.width = Pt(lw)
+def rect(slide, l, t, w, h, fill_rgb, line_rgb=None, line_width_pt=1):
+    sh = slide.shapes.add_shape(1,
+        Inches(l), Inches(t), Inches(w), Inches(h))
+    sh.fill.solid()
+    sh.fill.fore_color.rgb = fill_rgb
+    if line_rgb:
+        sh.line.color.rgb = line_rgb
+        sh.line.width = Pt(line_width_pt)
     else:
-        shp.line.fill.background()
-    return shp
+        sh.line.fill.background()
+    return sh
 
-def img(s, path, l, t, w, h):
-    if Path(path).exists():
-        s.shapes.add_picture(str(path), l, t, w, h)
+def title_bar(slide, title_text, font_size=34):
+    rect(slide, 0, 0, 13.333, 0.85, MINT)
+    txbox(slide, 0.4, 0.09, 12.5, 0.66, title_text, font_size,
+          bold=True, color=DARK_BG)
 
-def note(s, text):
-    s.notes_slide.notes_text_frame.text = text
+def set_notes(slide, script):
+    slide.notes_slide.notes_text_frame.text = script
 
-def tag_title(s, tag, title):
-    tb(s, tag, Cm(0), Cm(1.5), Cm(33.87), Cm(1), 11, color=MINT, align=PP_ALIGN.CENTER)
-    tb(s, title, Cm(0), Cm(2.5), Cm(33.87), Cm(2), 28, bold=True, align=PP_ALIGN.CENTER)
 
-# ── S1: 표지 ──────────────────────────────────────────────
-s = blank()
-rect(s, Cm(0), Cm(0), Cm(0.5), Cm(19.05), MINT)
-tb(s, '전략기획부  ·  2026.05', Cm(1.5), Cm(4.5), Cm(20), Cm(1), 11, color=MINT)
-tb(s, '프담 CS DX전환', Cm(1.5), Cm(5.8), Cm(28), Cm(4.5), 44, bold=True)
-rect(s, Cm(1.5), Cm(10.5), Cm(6), Cm(0.25), MINT)
-tb(s, '기억 기반  →  시스템 기반 관리 전환', Cm(1.5), Cm(11), Cm(28), Cm(1.5), 18, color=GRAY)
-tb(s, '미처리 감지  ·  자동 알림  ·  비공개 메모  ·  Dashboard', Cm(1.5), Cm(12.8), Cm(28), Cm(1.2), 12, color=GRAY2)
-note(s, "안녕하세요, 전략기획부 조민준 PM입니다.\n\n이번 프로젝트의 핵심은\n기억에 의존하던 CS 운영을\n시스템이 먼저 감지하고 관리하는 구조로 전환한 것입니다.\n\n단순히 대시보드나 알림 기능을 만든 것이 아니라,\n업무 흐름 자체를 다시 설계한 사례라고 보시면 됩니다.")
+# ── 슬라이드 함수들 ─────────────────────────────────────
 
-# ── S2: 기존 CS 운영 구조 ──────────────────────────────────
-s = blank()
-tag_title(s, '기존 상황', '기존 CS 운영 구조')
+def slide_cover(title, subtitle, date_str):
+    s = prs.slides.add_slide(BLANK)
+    bg(s)
+    rect(s, 0, 0, 13.333, 1.8, MINT)
+    rect(s, 12.5, 0, 0.833, 1.8, DARK_MINT)
+    rect(s, 0, 7.2, 13.333, 0.12, MINT)
+    txbox(s, 0.5, 2.1, 12, 1.6, title, 52,
+          bold=True, align=PP_ALIGN.CENTER)
+    txbox(s, 0.5, 3.9, 12, 0.8, subtitle, 22,
+          color=LGRAY, align=PP_ALIGN.CENTER)
+    txbox(s, 0.5, 6.5, 12, 0.6, date_str, 15,
+          color=LGRAY, align=PP_ALIGN.CENTER)
 
-flow_labels = ['접수', '카톡 공유', '이사님 판단', '영업관리부\n소통', '모니터링']
-bw, bh = Cm(5.2), Cm(2.8)
-gap = Cm(0.9)
-total_w = len(flow_labels) * bw + (len(flow_labels)-1) * gap
-sx = (Cm(33.87) - total_w) / 2
-by = Cm(5.2)
-for i, label in enumerate(flow_labels):
-    x = sx + i * (bw + gap)
-    rect(s, x, by, bw, bh, DARK2, GRAY2, 1)
-    tb(s, label, x, by+Cm(0.5), bw, Cm(1.8), 12, bold=True, align=PP_ALIGN.CENTER)
-    if i < len(flow_labels)-1:
-        tb(s, '→', x+bw, by+Cm(0.6), gap, Cm(1.5), 16, color=GRAY2, align=PP_ALIGN.CENTER)
 
-ty = Cm(9)
-rect(s, Cm(2.5), ty, Cm(29), Cm(0.8), MINT)
-tb(s, '단계', Cm(3), ty+Cm(0.1), Cm(9), Cm(0.7), 11, bold=True, color=BG, align=PP_ALIGN.CENTER)
-tb(s, '문제점', Cm(12), ty+Cm(0.1), Cm(19), Cm(0.7), 11, bold=True, color=BG, align=PP_ALIGN.CENTER)
-rows = [
-    ('카톡 공유', '사람이 직접 전달해야 인지 가능 — 담당자가 전달하지 않으면 아무도 모름'),
-    ('이사님↔담당자 소통', '둘만 상황 인지, 기록 부재 — 제3자가 현황 파악 불가'),
-    ('모니터링', '개별 건을 직접 찾아서 재정리해야 함 — 장기 지연 감지 어려움'),
-]
-for i, (stage, prob) in enumerate(rows):
-    ry = ty + Cm(0.8 + i * 2.8)
-    rc = DARK2 if i % 2 == 0 else RGBColor(0x14, 0x14, 0x14)
-    rect(s, Cm(2.5), ry, Cm(29), Cm(2.8), rc, GRAY2, 0.5)
-    tb(s, stage, Cm(3), ry+Cm(0.6), Cm(9), Cm(1.5), 11, bold=True, align=PP_ALIGN.CENTER)
-    tb(s, prob,  Cm(12), ry+Cm(0.6), Cm(19), Cm(1.5), 11, color=GRAY)
+def slide_content(title, content_text, script):
+    s = prs.slides.add_slide(BLANK)
+    bg(s)
+    title_bar(s, title)
+    txbox(s, 0.8, 1.1, 11.7, 5.9, content_text, 19, wrap=True)
+    set_notes(s, script)
 
-note(s, "기존에는 접수 이후 영업이 직접 카카오톡으로 공유해야\n이사님이 상황을 인지할 수 있는 구조였습니다.\n\n즉, 사람이 직접 전달해야 다음 단계가 진행되는 방식이었습니다.\n\n이사님과 담당자가 소통은 하고 있었지만,\n그 내용이 별도로 기록되지 않아\n담당자 외에는 현재 상황 파악이 어려웠습니다.\n\n모니터링도 개별 건을 직접 확인해야 해서\n장기 지연이나 반복 이슈를 빠르게 판단하기 어려웠습니다.")
 
-# ── S3: 핵심 문제 ──────────────────────────────────────────
-s = blank()
-tag_title(s, '근본 원인', '기존 운영의 핵심 문제')
+def slide_two_col(title, l_title, l_items, r_title, r_items, script):
+    s = prs.slides.add_slide(BLANK)
+    bg(s)
+    title_bar(s, title)
+    rect(s, 0.4, 1.05, 5.9, 5.9, CARD_BG)
+    txbox(s, 0.7, 1.2, 5.3, 0.55, l_title, 19, bold=True, color=LGRAY)
+    txbox(s, 0.7, 1.85, 5.3, 4.8, l_items, 17, wrap=True)
+    rect(s, 7.0, 1.05, 5.9, 5.9, CARD_BG2, line_rgb=MINT, line_width_pt=2)
+    txbox(s, 7.3, 1.2, 5.3, 0.55, r_title, 19, bold=True, color=MINT)
+    txbox(s, 7.3, 1.85, 5.3, 4.8, r_items, 17, wrap=True)
+    set_notes(s, script)
 
-problems = [
-    ('①', '사람 전달 기반', '누락 가능\n특정 담당자 의존'),
-    ('②', '기록 부재', '진행 상황 비가시화\n담당자 외 판단 어려움'),
-    ('③', '실시간 모니터링\n어려움', '장기 지연 추적 어려움\n재정리 필요'),
-]
-bw2, bh2 = Cm(9), Cm(9.5)
-gap2 = Cm(2.0)
-total2 = len(problems) * bw2 + (len(problems)-1) * gap2
-sx2 = (Cm(33.87) - total2) / 2
-by2 = Cm(5.5)
-for idx, (num, title, desc) in enumerate(problems):
-    x = sx2 + idx * (bw2 + gap2)
-    rect(s, x, by2, bw2, bh2, DARK2, RED, 2)
-    tb(s, num,   x, by2+Cm(0.8), bw2, Cm(1.8), 30, bold=True, color=RED, align=PP_ALIGN.CENTER)
-    tb(s, title, x+Cm(0.3), by2+Cm(2.6), bw2-Cm(0.6), Cm(1.8), 13, bold=True, align=PP_ALIGN.CENTER)
-    tb(s, desc,  x+Cm(0.3), by2+Cm(4.5), bw2-Cm(0.6), Cm(4),   12, color=GRAY, align=PP_ALIGN.CENTER)
 
-rect(s, Cm(4), Cm(16.2), Cm(26), Cm(2), MINT_BG, MINT, 1.5)
-tb(s, '업무가 시스템이 아니라 사람 기억 중심으로 운영되고 있었습니다.', Cm(4), Cm(16.6), Cm(26), Cm(1.3), 13, bold=True, color=MINT, align=PP_ALIGN.CENTER)
+def slide_flow(title, steps, script):
+    s = prs.slides.add_slide(BLANK)
+    bg(s)
+    title_bar(s, title)
+    n = len(steps)
+    box_w  = 1.6
+    gap    = 0.22
+    arr_w  = 0.28
+    total  = n * box_w + (n - 1) * (gap + arr_w)
+    sx     = (13.333 - total) / 2
+    top    = 2.1
+    bh     = 3.8
 
-note(s, "결국 가장 큰 문제는\n업무가 시스템이 아니라 사람 기억 중심으로 운영되고 있었다는 점입니다.\n\n누가 전달했는지, 누가 기억하고 있는지에 따라\n업무 추적 가능 여부가 달라지는 구조였습니다.")
+    for i, (num, label, sub) in enumerate(steps):
+        x = sx + i * (box_w + gap + arr_w)
+        rect(s, x, top, box_w, bh, CARD_BG, line_rgb=MINT, line_width_pt=1.5)
+        txbox(s, x + 0.05, top + 0.15, box_w - 0.1, 0.55,
+              num, 24, bold=True, color=MINT, align=PP_ALIGN.CENTER)
+        txbox(s, x + 0.05, top + 0.82, box_w - 0.1, 1.2,
+              label, 14, bold=True, align=PP_ALIGN.CENTER)
+        if sub:
+            txbox(s, x + 0.05, top + 2.1, box_w - 0.1, 1.5,
+                  sub, 11, color=LGRAY, align=PP_ALIGN.CENTER)
+        if i < n - 1:
+            ax = x + box_w + gap / 2
+            txbox(s, ax, top + 1.6, arr_w + 0.1, 0.55,
+                  "→", 22, color=MINT, align=PP_ALIGN.CENTER)
+    set_notes(s, script)
 
-# ── S4: 현재 운영 구조 ──────────────────────────────────────
-s = blank()
-tag_title(s, '개선 방향', '현재 운영 구조')
 
-flow_after = ['접수', '자동 알림', '비공개\n메모 기록', '지연 자동\n감지', 'Dashboard\n실시간 모니터링']
-bw3, bh3 = Cm(5.0), Cm(2.8)
-gap3 = Cm(1.0)
-total3 = len(flow_after) * bw3 + (len(flow_after)-1) * gap3
-sx3 = (Cm(33.87) - total3) / 2
-by3 = Cm(5.2)
-for i, label in enumerate(flow_after):
-    x = sx3 + i * (bw3 + gap3)
-    rect(s, x, by3, bw3, bh3, MINT_BG, MINT, 1.5)
-    tb(s, label, x, by3+Cm(0.4), bw3, Cm(2), 11, bold=True, color=MINT, align=PP_ALIGN.CENTER)
-    if i < len(flow_after)-1:
-        tb(s, '→', x+bw3, by3+Cm(0.5), gap3, Cm(1.5), 16, color=MINT, align=PP_ALIGN.CENTER)
+def slide_case(title, problem, goal, solution, script):
+    s = prs.slides.add_slide(BLANK)
+    bg(s)
+    title_bar(s, title)
+    rect(s, 0.35, 1.05, 5.9, 2.85, CARD_BG)
+    txbox(s, 0.55, 1.12, 0.9, 0.55, "①", 22, bold=True, color=MINT)
+    txbox(s, 1.3,  1.12, 4.7, 0.55, "문제 정의", 17, bold=True, color=LGRAY)
+    txbox(s, 0.55, 1.72, 5.5, 2.0, problem, 15, wrap=True)
 
-ty2 = Cm(9)
-rect(s, Cm(2.5), ty2, Cm(14), Cm(0.8), RED_BG, RED, 1)
-rect(s, Cm(16.5), ty2, Cm(15), Cm(0.8), MINT_BG, MINT, 1)
-tb(s, '기존', Cm(2.5), ty2+Cm(0.1), Cm(14), Cm(0.7), 11, bold=True, color=RED, align=PP_ALIGN.CENTER)
-tb(s, '현재', Cm(16.5), ty2+Cm(0.1), Cm(15), Cm(0.7), 11, bold=True, color=MINT, align=PP_ALIGN.CENTER)
-compare = [
-    ('카톡 전달 필요', '자동 알림'),
-    ('담당자만 상황 인지', '비공개 메모 기록'),
-    ('기록 시점 불명확', '즉시 기록'),
-    ('개별 확인 필요', 'Dashboard 실시간 확인'),
-    ('사람이 찾아야 함', '시스템이 먼저 감지'),
-]
-for i, (bf, af) in enumerate(compare):
-    ry2 = ty2 + Cm(0.8 + i * 1.7)
-    rc = DARK2 if i % 2 == 0 else RGBColor(0x14, 0x14, 0x14)
-    rect(s, Cm(2.5), ry2, Cm(14), Cm(1.7), rc, RED, 0.5)
-    rect(s, Cm(16.5), ry2, Cm(15), Cm(1.7), rc, MINT, 0.5)
-    tb(s, bf, Cm(2.5),  ry2+Cm(0.3), Cm(14), Cm(1.1), 11, color=RED, align=PP_ALIGN.CENTER)
-    tb(s, af, Cm(16.5), ry2+Cm(0.3), Cm(15), Cm(1.1), 11, bold=True, color=MINT, align=PP_ALIGN.CENTER)
+    rect(s, 6.95, 1.05, 5.9, 2.85, CARD_BG)
+    txbox(s, 7.15, 1.12, 0.9, 0.55, "②", 22, bold=True, color=MINT)
+    txbox(s, 7.9,  1.12, 4.7, 0.55, "목표 설정", 17, bold=True, color=LGRAY)
+    txbox(s, 7.15, 1.72, 5.5, 2.0, goal, 15, wrap=True)
 
-note(s, "이번에는 업무 흐름 자체를 다시 설계했습니다.\n\n자동 알림 구조를 추가하여\n사람이 직접 전달하지 않아도 시스템이 먼저 인지할 수 있도록 변경했습니다.\n\n비공개 메모를 통해 진행 상황과 이슈 내용을 기록하도록 구조를 변경했습니다.\n\n이를 통해 특정 담당자만 알고 있던 업무를\n조직 전체가 함께 추적 가능한 구조로 전환했습니다.")
+    rect(s, 0.35, 4.1, 12.5, 2.9, CARD_BG2, line_rgb=MINT, line_width_pt=1.5)
+    txbox(s, 0.55, 4.17, 0.9, 0.55, "③", 22, bold=True, color=MINT)
+    txbox(s, 1.3,  4.17, 11.0, 0.55, "해결 방법", 17, bold=True, color=MINT)
+    txbox(s, 0.55, 4.77, 12.0, 2.1, solution, 15, wrap=True)
+    set_notes(s, script)
 
-# ── S5: KPI 재정의 ──────────────────────────────────────────
-s = blank()
-tag_title(s, '성과 지표', 'KPI 재정의')
 
-rect(s, Cm(3), Cm(5), Cm(28), Cm(4), RED_BG, RED, 1.5)
-tb(s, '"얼마나 처리했는가"', Cm(3), Cm(5.8), Cm(28), Cm(2.2), 22, color=RED, align=PP_ALIGN.CENTER)
-tb(s, '↓', Cm(0), Cm(9.5), Cm(33.87), Cm(1.5), 32, bold=True, color=MINT, align=PP_ALIGN.CENTER)
-rect(s, Cm(3), Cm(11), Cm(28), Cm(4), MINT_BG, MINT, 1.5)
-tb(s, '"얼마나 빠르게 대응했는가"', Cm(3), Cm(11.8), Cm(28), Cm(2.2), 22, bold=True, color=MINT, align=PP_ALIGN.CENTER)
-rect(s, Cm(5), Cm(15.8), Cm(24), Cm(2.3), DARK2, GRAY2, 1)
-for i, item in enumerate(['비공개 메모 최초 입력일까지 측정', '응답 속도 중심 관리', '지연 원인 데이터화 가능']):
-    tb(s, f'· {item}', Cm(7), Cm(16.0 + i * 0.65), Cm(20), Cm(0.7), 11, color=GRAY)
+def slide_kpi(title, cards, script):
+    s = prs.slides.add_slide(BLANK)
+    bg(s)
+    title_bar(s, title)
+    cw = 3.8
+    ch = 5.3
+    xs = [0.35, 4.73, 9.12]
+    for (icon, heading, body), x in zip(cards, xs):
+        rect(s, x, 1.1, cw, ch, CARD_BG, line_rgb=MINT, line_width_pt=1.5)
+        txbox(s, x + 0.1, 1.22, cw - 0.2, 0.9,
+              icon, 34, align=PP_ALIGN.CENTER)
+        txbox(s, x + 0.1, 2.18, cw - 0.2, 0.72,
+              heading, 16, bold=True, color=MINT, align=PP_ALIGN.CENTER)
+        txbox(s, x + 0.15, 2.96, cw - 0.3, 3.3,
+              body, 14, color=LGRAY, wrap=True, align=PP_ALIGN.CENTER)
+    set_notes(s, script)
 
-note(s, "KPI도 함께 재정의했습니다.\n\n기존에는 처리 건수가 기준이었다면,\n이번에는 얼마나 빠르게 대응했는가를 측정합니다.\n\n비공개 메모 최초 입력일까지의 시간을 응답 속도로 측정하고,\n이를 통해 지연 원인을 데이터로 남길 수 있게 됐습니다.")
 
-# ── S6: 지연 CS 자동 감지 + 알림 스크린샷 ──────────────────
-s = blank()
-tag_title(s, '자동화', '지연 CS가 숨겨질 수 없는 구조')
+def slide_quote(title, quote, points, script):
+    s = prs.slides.add_slide(BLANK)
+    bg(s)
+    title_bar(s, title)
+    rect(s, 0.5, 1.05, 12.3, 1.55, CARD_BG2, line_rgb=MINT, line_width_pt=2)
+    txbox(s, 0.8, 1.12, 11.8, 1.38,
+          f'"{quote}"', 22, bold=True, color=MINT, align=PP_ALIGN.CENTER)
+    cw = 3.7
+    xs = [0.5, 4.77, 9.05]
+    for (heading, body), x in zip(points, xs):
+        rect(s, x, 2.8, cw, 4.25, CARD_BG)
+        txbox(s, x + 0.15, 2.9, cw - 0.3, 0.62, heading, 15, bold=True, color=MINT)
+        txbox(s, x + 0.15, 3.57, cw - 0.3, 3.3, body, 13, color=LGRAY, wrap=True)
+    set_notes(s, script)
 
-# 타임라인 뱃지 + 레이블
-timeline = [
-    ('4',  '4일 후',    '기록 요청',  AMBER,  AMBER_BG),
-    ('7',  '7일 후',    '지연 알림',  RED,    RED_BG),
-    ('14', '14일 이상', 'Flow 자동 보고', PURPLE, RGBColor(0x10, 0x0a, 0x1e)),
-]
-bwt, bht = Cm(7.5), Cm(3.2)
-gapt = Cm(2.3)
-totalt = len(timeline) * bwt + (len(timeline)-1) * gapt
-sxt = (Cm(33.87) - totalt) / 2
-byt = Cm(4.5)
 
-for idx, (num, label, action, color, bg) in enumerate(timeline):
-    x = sxt + idx * (bwt + gapt)
-    rect(s, x, byt, bwt, bht, bg, color, 2)
-    tb(s, num,    x, byt+Cm(0.3), bwt, Cm(1.4), 22, bold=True, color=color, align=PP_ALIGN.CENTER)
-    tb(s, label,  x, byt+Cm(1.6), bwt, Cm(0.8), 12, bold=True, align=PP_ALIGN.CENTER)
-    tb(s, action, x, byt+Cm(2.4), bwt, Cm(0.7), 11, color=GRAY, align=PP_ALIGN.CENTER)
-    if idx < len(timeline)-1:
-        tb(s, '→', x+bwt, byt+Cm(0.8), gapt, Cm(1.5), 20, color=GRAY2, align=PP_ALIGN.CENTER)
+def slide_conclusion(title, main_msg, bad_text, good_text, script):
+    s = prs.slides.add_slide(BLANK)
+    bg(s)
+    title_bar(s, title)
+    rect(s, 0.5, 1.05, 12.3, 1.85, CARD_BG2, line_rgb=MINT, line_width_pt=2)
+    txbox(s, 0.65, 1.15, 12.1, 1.65,
+          main_msg, 26, bold=True, color=MINT, align=PP_ALIGN.CENTER)
+    rect(s, 0.5, 3.15, 5.9, 3.75, CARD_BG, line_rgb=RED_DARK, line_width_pt=1.5)
+    txbox(s, 0.7, 3.25, 5.5, 0.58, "✕  많이 사용하는 것", 17, bold=True, color=RED)
+    txbox(s, 0.7, 3.88, 5.5, 2.9, bad_text, 14, color=LGRAY, wrap=True)
+    rect(s, 7.0, 3.15, 5.9, 3.75, CARD_BG2, line_rgb=MINT, line_width_pt=2)
+    txbox(s, 7.2, 3.25, 5.5, 0.58, "✓  실행까지 연결하는 것", 17, bold=True, color=MINT)
+    txbox(s, 7.2, 3.88, 5.5, 2.9, good_text, 14, wrap=True)
+    set_notes(s, script)
 
-# 알림 스크린샷 이미지
-img(s, IMG_ALERTS, Cm(1.5), Cm(8.2), Cm(31), Cm(9.5))
 
-rect(s, Cm(4), Cm(17.9), Cm(26), Cm(1), MINT_BG, MINT, 1)
-tb(s, '사람이 직접 찾지 않아도  시스템이 먼저 감지하도록 설계', Cm(4), Cm(18.1), Cm(26), Cm(0.8), 11, bold=True, color=MINT, align=PP_ALIGN.CENTER)
+# ═══════════════════════════════════════════════════════
+# 슬라이드 생성
+# ═══════════════════════════════════════════════════════
+today = datetime.now().strftime("%Y년 %m월 %d일")
 
-note(s, "핵심은 사람이 직접 찾지 않아도\n시스템이 먼저 감지하도록 만든 점입니다.\n\n4일 이후에는 기록 요청,\n7일 이후에는 지연 알림,\n14일 이상 건은 자동 보고되도록 구성했습니다.")
+# 1. 표지
+slide_cover("AI 데이터 기반 의사결정",
+            "반복 업무를 빠르게 처리하는 방법  |  직원 교육", today)
 
-# ── S7: Dashboard + 대시보드 스크린샷 ──────────────────────
-s = blank()
-tag_title(s, '가시화', '보이지 않던 업무를 보이는 구조로')
+# 2. 교육 목적
+slide_content("교육 목적",
+    "이번 교육은 AI 자체를 배우는 교육이 아닙니다.\n\n"
+    "• 보고서 정리 시간 단축\n"
+    "• 데이터 분석 속도 향상\n"
+    "• 인수인계 시간 감소\n\n"
+    "처럼 내 업무를 더 빠르고 쉽게 처리하는 방법을\n"
+    "실제 사례 중심으로 경험하는 교육입니다.",
+    "이번 교육은 AI 자체를 배우는 교육이 아닙니다.\n"
+    "보고서 정리, 데이터 분석, 인수인계 같은 반복 업무를\n"
+    "조금 더 빠르고 쉽게 처리하는 방법을\n"
+    "실제 사례 중심으로 같이 보는 시간입니다.")
 
-# 왼쪽: 대시보드 이미지
-img(s, IMG_DASH, Cm(0.8), Cm(4.5), Cm(19.5), Cm(12.5))
+# 3. DX vs AX
+slide_two_col(
+    "DX vs AX — 무엇이 다른가?",
+    "DX (Digital Transformation)",
+    "데이터를 빠르게 보고 공유하는 구조\n\n"
+    "• 데이터 수집\n"
+    "• 대시보드\n"
+    "• 알림 시스템\n\n"
+    "\"데이터를 보는 속도\"를 높이는 것",
+    "AX (AI Transformation)",
+    "AI를 활용해 의사결정과 실행까지 연결\n\n"
+    "• AI가 데이터 분석\n"
+    "• AI가 문제 원인 해석\n"
+    "• AI가 액션 제안\n\n"
+    "\"의사결정 속도\"를 높이는 것",
+    "DX는 데이터를 빠르게 보고 공유하는 구조입니다.\n"
+    "예를 들면 데이터 수집, 대시보드, 알림 시스템 같은 것들입니다.\n"
+    "AX는 여기서 한 단계 더 나아가\n"
+    "AI가 데이터를 분석하고, 문제 원인을 해석하고,\n"
+    "액션까지 제안하는 구조입니다.\n"
+    "결국 핵심은 AI를 활용해서 실행까지 연결하는 것입니다.")
 
-# 오른쪽: 설명 박스들
-rect(s, Cm(21.5), Cm(4.5), Cm(11.5), Cm(5.8), DARK2, GRAY2, 1)
-tb(s, '기존', Cm(22), Cm(4.8), Cm(5), Cm(0.8), 11, color=GRAY2)
-tb(s, '개별 건 직접 확인\n필요할 때 찾아보는 방식', Cm(22), Cm(5.7), Cm(11), Cm(3.5), 13, color=GRAY)
+# 4. 활용 방법 (프레임워크)
+slide_flow(
+    "AI 활용 기본 프레임워크",
+    [
+        ("①", "문제 정의", "해결해야 할\n핵심 문제"),
+        ("②", "목표 설정", "원하는\n결과 명확화"),
+        ("③", "데이터 첨부", "프로젝트 연결\n+ 데이터"),
+        ("④", "AI 질문", "명확하게\n요청"),
+        ("⑤", "의사결정", "AI 결과를\n판단"),
+        ("⑥", "실행", "바로\n적용"),
+    ],
+    "오늘은 복잡하게 하지 않고 이 흐름 하나만 기억하시면 됩니다.\n"
+    "문제 정의 → 목표 설정 → 프로젝트 연결 + 데이터 첨부\n"
+    "→ AI 질문 → 의사결정 → 실행\n"
+    "중요한 건 AI에게 그냥 질문하는 게 아니라\n"
+    "업무 흐름 안에서 활용하는 것입니다.")
 
-tb(s, '↓', Cm(21.5), Cm(10.7), Cm(11.5), Cm(1.2), 20, bold=True, color=MINT, align=PP_ALIGN.CENTER)
+# 5. 사례1: 마케팅팀
+slide_case(
+    "사례1: 마케팅팀 — 담당자 변경 시 공백 최소화",
+    "담당자가 변경되면 이전 광고 운영 내용과\n"
+    "매장 이슈 파악이 어려움\n\n→ 정보 공백 발생",
+    "담당자 변경 시에도\n"
+    "광고 운영 흐름과 핵심 이슈를\n빠르게 파악",
+    "[마케팅 요청사항] 프로젝트 연결\n"
+    "+ 최근 광고 운영 내역 & 매장별 특이사항 첨부\n\n"
+    "→ \"광고 운영 내역과 매장별 이슈를 정리해줘\"\n"
+    "→ 인수인계 시간을 크게 줄일 수 있습니다",
+    "예를 들면 마케팅팀은 담당자가 바뀌면\n"
+    "이전 광고 운영 내용이나 매장 이슈 파악이 어려운 경우가 많습니다.\n"
+    "이럴 때 프로젝트와 데이터를 연결한 뒤\n"
+    "AI에게 광고 운영 내역이나 특이사항을 정리하게 하면\n"
+    "인수인계 시간을 크게 줄일 수 있습니다.")
 
-rect(s, Cm(21.5), Cm(12), Cm(11.5), Cm(5), MINT_BG, MINT, 2)
-tb(s, '현재', Cm(22), Cm(12.3), Cm(5), Cm(0.8), 11, color=MINT)
-tb(s, 'KPI + 처리 현황\n실시간 확인 가능\n즉시 판단 가능한 구조', Cm(22), Cm(13.2), Cm(11), Cm(3.5), 13, bold=True, color=MINT)
+# 6. 사례2: 영업관리부
+slide_case(
+    "사례2: 영업관리부 — 점주 대응 전략 수립",
+    "송파점 점주가 매출 관련\n"
+    "부정적인 의견을 반복적으로 제기\n\n→ 대응 전략 필요",
+    "점주 설득 및\n"
+    "실행 가능한 개선 방향 도출",
+    "[서울_송파점] 프로젝트 연결 + 최근 매출 데이터 첨부\n\n"
+    "→ \"최근 방문일지 기준 이슈 정리, 점주 성향/반복 불만 분석,\n"
+    "   매출 대응 방향 제안해줘\"\n"
+    "→ 단순 요약이 아닌 실제 대응 방향까지 정리",
+    "영업관리부는 방문일지 활용 사례입니다.\n"
+    "예를 들어 송파점 점주가 매출 관련 부정적인 의견을 반복적으로 이야기하고 있다고 하면\n"
+    "최근 매출 데이터와 방문일지를 같이 넣고\n"
+    "'점주의 성향과 반복 불만을 분석해서 대응 방향을 제안해줘'\n"
+    "라고 질문할 수 있습니다.\n"
+    "그러면 단순 요약이 아니라 실제 대응 방향까지 같이 정리할 수 있습니다.")
 
-note(s, "기존에는 개별 건을 직접 확인해야 했다면,\n현재는 KPI와 처리 현황을 실시간으로 확인할 수 있는 구조로 변경했습니다.\n\n즉, 필요할 때 찾아보는 방식이 아니라\n즉시 판단 가능한 구조로 바뀌었습니다.")
+# 7. 프레임워크 재강조
+slide_flow(
+    "핵심 프레임워크 — 모든 업무에 동일하게 적용",
+    [
+        ("①", "문제 정의", ""),
+        ("②", "목표 설정", ""),
+        ("③", "데이터 첨부", ""),
+        ("④", "AI 질문", ""),
+        ("⑤", "의사결정", ""),
+        ("⑥", "실행", ""),
+    ],
+    "결국 핵심 구조는 동일합니다.\n"
+    "문제 정의 → 목표 설정 → 프로젝트 연결 + 데이터 첨부\n"
+    "→ AI 질문 → 의사결정 → 실행\n"
+    "이 흐름 안에서 AI를 활용하는 게 중요합니다.")
 
-# ── S8: 결과 ────────────────────────────────────────────────
-s = blank()
-tag_title(s, '성과', '운영 구조 전환 완료')
+# 8. 실전팁
+slide_quote(
+    "실전팁",
+    "일단 업무에 붙여서 자주 써보세요",
+    [
+        ("어떤 방식으로 질문?",
+         "어떤 방식으로 질문해야\n"
+         "원하는 답이 나오는지\n"
+         "반복하면서 감각이 생깁니다"),
+        ("어떤 정보를 넣어야?",
+         "어떤 데이터를 함께\n"
+         "제공해야 좋은 결과가\n"
+         "나오는지 알게 됩니다"),
+        ("어떤 형태로 요청?",
+         "어떤 형태로 요청해야\n"
+         "바로 쓸 수 있는 결과가\n"
+         "나오는지 체감합니다"),
+    ],
+    "좋은 프롬프트를 외우는 것보다\n"
+    "일단 업무에 많이 붙여서 써보는 걸 추천드립니다.\n"
+    "계속 사용하다 보면\n"
+    "어떤 정보를 넣어야 하는지,\n"
+    "어떻게 질문해야 원하는 결과가 나오는지\n"
+    "자연스럽게 감각이 생기기 시작합니다.")
 
-rect(s, Cm(3), Cm(5), Cm(28), Cm(4), DARK2, GRAY2, 1)
-tb(s, '기존  기억 기반', Cm(3.5), Cm(5.4), Cm(27), Cm(0.8), 13, bold=True)
-tb(s, '사람에 따라 인지 가능 여부가 달라짐  —  담당자가 기억하지 않으면 진행 불가', Cm(3.5), Cm(6.3), Cm(27), Cm(1.5), 12, color=GRAY)
+# 9. 기대효과
+slide_kpi(
+    "기대효과",
+    [
+        ("⏱", "반복 업무 시간 단축",
+         "보고서 정리, 데이터 분석,\n인수인계 등 반복 업무를\nAI로 빠르게 처리"),
+        ("📊", "의사결정 속도 향상",
+         "데이터 기반으로\n더 빠르고 정확한\n의사결정 가능"),
+        ("🚀", "실행 문화 강화",
+         "부서별 활용 사례 확산\n및 AI 활용\n실행 문화 정착"),
+    ],
+    "반복 업무 정리 시간은 줄이고\n"
+    "데이터 기반 의사결정 속도는 높이고\n"
+    "부서별 활용 사례도 점점 확산될 수 있을 것으로 기대하고 있습니다.")
 
-tb(s, '↓', Cm(0), Cm(9.7), Cm(33.87), Cm(1.5), 28, bold=True, color=MINT, align=PP_ALIGN.CENTER)
+# 10. 결론
+slide_conclusion(
+    "결론",
+    "AI는 의사결정을 빠르게 만드는 도구입니다",
+    "사용 횟수만 늘리는 것은\n진정한 활용이 아닙니다.\n\n"
+    "단순히 AI를 켜두는 것으로는\n업무가 개선되지 않습니다.",
+    "문제 정의 → 데이터 첨부\n→ AI 질문 → 의사결정 → 실행\n\n"
+    "이 흐름을 실제 업무에 연결할 때\n진정한 효과가 생깁니다.",
+    "AI는 단순히 데이터를 정리하는 도구가 아니라\n"
+    "의사결정을 빠르게 만드는 도구라고 생각합니다.\n"
+    "중요한 건 많이 사용하는 것보다\n"
+    "실제 업무에 활용해서 실행까지 연결하는 것입니다.")
 
-rect(s, Cm(3), Cm(11.5), Cm(28), Cm(4), MINT_BG, MINT, 2)
-tb(s, '현재  조직 추적 가능', Cm(3.5), Cm(11.9), Cm(27), Cm(0.8), 13, bold=True, color=MINT)
-tb(s, '누구든 상황을 파악하고 의사결정 가능  —  기억 기반 운영에서 탈피', Cm(3.5), Cm(12.8), Cm(27), Cm(1.5), 12, color=WHITE)
-
-note(s, "기억 기반 운영에서 조직 추적 가능 구조로 전환했습니다.\n\n담당자가 기억하지 않아도,\n시스템이 현황을 추적하고 알려주는 구조입니다.\n\n누구든 상황을 파악하고 의사결정할 수 있게 됐습니다.")
-
-# ── S9: 확장 방향 ────────────────────────────────────────────
-s = blank()
-tag_title(s, '의미', '이번 사례의 핵심 의미')
-
-rect(s, Cm(3), Cm(5), Cm(28), Cm(4.5), MINT_BG, MINT, 2)
-tb(s, '사람이 기억해야 운영되는 구조', Cm(3), Cm(5.6), Cm(28), Cm(1.2), 18, color=GRAY, align=PP_ALIGN.CENTER)
-tb(s, '↓', Cm(0), Cm(6.9), Cm(33.87), Cm(1.2), 22, bold=True, color=MINT, align=PP_ALIGN.CENTER)
-tb(s, '시스템이 먼저 감지하는 구조로 전환', Cm(3), Cm(7.8), Cm(28), Cm(1.2), 18, bold=True, color=MINT, align=PP_ALIGN.CENTER)
-
-rect(s, Cm(3), Cm(10.3), Cm(28), Cm(3), DARK2, GRAY2, 1)
-tb(s, '단순히 CS 업무를 개선한 것이 아니라,', Cm(3.5), Cm(10.7), Cm(27), Cm(0.8), 12, color=GRAY)
-tb(s, '반복되고 누락될 수 있는 업무를 데이터 기반 구조로 전환한 사례', Cm(3.5), Cm(11.5), Cm(27), Cm(0.8), 12, bold=True)
-
-rect(s, Cm(3), Cm(14.1), Cm(28), Cm(3.5), DARK2, MINT, 1.5)
-tb(s, '다른 부서의 반복 업무와 지연 업무도', Cm(3.5), Cm(14.5), Cm(27), Cm(0.8), 12, color=GRAY)
-tb(s, '동일한 방식으로 충분히 개선 가능합니다', Cm(3.5), Cm(15.4), Cm(27), Cm(1), 14, bold=True, color=MINT)
-
-note(s, "이번 사례는 단순히 CS 업무를 개선한 것이 아니라,\n반복되고 누락될 수 있는 업무를\n데이터 기반 구조로 전환한 사례라고 생각합니다.\n\n동일한 방식으로\n다른 부서의 반복 업무나 지연 업무도\n충분히 개선 가능하다고 보고 있습니다.")
-
-# ── 저장 ────────────────────────────────────────────────────
-prs.save(output_path)
-print("saved:", output_path)
-print("slides: 9")
+# 저장
+prs.save(OUTPUT_PATH)
+print(f"OK | {OUTPUT_PATH}")
+print(f"Slides: {len(prs.slides)}")

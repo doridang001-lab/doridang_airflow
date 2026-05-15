@@ -35,7 +35,7 @@ _PLATFORMS = [
     "\ubc30\ub2ec\uc758\ubbfc\uc871",
     "\ubc30\ubbfc \uc0ac\uc7a5",
     "\ubc30\ubbfc1",
-    "\ucfe0\ud33d\uc774\uce20",
+    "\ucfe0\ud321\uc774\uce20",
     "\uc694\uae30\uc694",
 ]
 _PRICE_COLS = list(range(5, 12))

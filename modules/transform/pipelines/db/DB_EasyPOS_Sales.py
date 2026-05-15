@@ -24,7 +24,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -439,6 +439,30 @@ def _set_sale_date_inputs(mf: Frame, sale_date: str) -> bool:
     return filled > 0
 
 
+def _click_popup_day(mf: Frame, page: "Page", day: int) -> bool:
+    """팝업 달력에서 날짜(day) 셀 클릭. 성공 시 True 반환."""
+    day_str = str(day)
+    # NexacroN 팝업 달력 셀: id 패턴 "...cal...day..."
+    for sel in ["[id*='cal'][id*='day']", "[id*='Cal'][id*='Day']", "[id*='calendar']"]:
+        try:
+            cells = mf.query_selector_all(sel)
+            for cell in cells:
+                try:
+                    text = (cell.inner_text() or "").strip()
+                    if text == day_str:
+                        cell.scroll_into_view_if_needed()
+                        cell.click()
+                        time.sleep(0.3)
+                        logger.info("팝업 날짜 클릭 성공: day=%d", day)
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    logger.warning("팝업 날짜 셀을 찾지 못함: day=%d", day)
+    return False
+
+
 def _set_sale_date_inputs_v2(mf: Frame, sale_date: str, page: "Page | None" = None) -> bool:
     """날짜 입력 v2 — mskSales 마스크 입력 우선, YYYYMMDD 형식으로 keyboard.type() 사용.
     NexacroN mskSales는 fill()/el.type() 으로 내부 상태가 갱신되지 않아
@@ -453,24 +477,52 @@ def _set_sale_date_inputs_v2(mf: Frame, sale_date: str, page: "Page | None" = No
         except Exception:
             return ""
 
-    def _matches(el) -> bool:
-        return _digits(_read_value(el)) == _digits(sale_date)
+    def _matches_for_id(el, eid: str) -> bool:
+        """스피너 여부에 따라 비교 범위 조정 (NexacroN은 el.value가 부분값일 수 있음)"""
+        val = _digits(_read_value(el))
+        if "yearspin" in eid.lower():
+            return val == date_no_dash[:4]
+        if "monthspin" in eid.lower():
+            return val == date_no_dash[4:6]
+        return val == date_no_dash
 
     date_no_dash = _digits(sale_date)
     filled = 0
     seen_ids: set[str] = set()
+    has_spinner = False
+
+    # 팝업 달력이 필요할 수 있으므로 선제적으로 열기 시도
+    for cal_sel in [
+        "[id*='divSalesDate'][id$='btnDropCalendar']",
+        "[id*='SalesDate'][id$='btnDropCalendar']",
+        "[id*='btnDropCalendar']",
+    ]:
+        try:
+            btn = mf.query_selector(cal_sel)
+            if btn:
+                btn.click()
+                time.sleep(0.5)
+                logger.info("팝업 달력 열기: %s", cal_sel)
+                break
+        except Exception:
+            continue
 
     for sel in _DATE_INPUT_SELECTORS:
         try:
             els = mf.query_selector_all(sel)
         except Exception:
             continue
+        if els:
+            logger.info("날짜 입력 탐색: sel=%r found=%d ids=%s",
+                        sel[:60], len(els),
+                        [e.get_attribute("id") for e in els[:4]])
         for el in els:
             el_id = el.get_attribute("id") or ""
             if el_id and el_id in seen_ids:
                 continue
             if el_id:
                 seen_ids.add(el_id)
+            is_spinner_el = "yearspin" in el_id.lower() or "monthspin" in el_id.lower()
             try:
                 try:
                     el.scroll_into_view_if_needed()
@@ -479,43 +531,276 @@ def _set_sale_date_inputs_v2(mf: Frame, sale_date: str, page: "Page | None" = No
                 el.click()
                 time.sleep(0.2)
 
-                if _matches(el):
-                    logger.info("날짜 이미 일치: id=%s sel=%s value=%r", el_id, sel, _read_value(el))
+                if _matches_for_id(el, el_id):
+                    logger.info("날짜 이미 일치: id=%s value=%r", el_id, _read_value(el))
                     filled += 1
+                    if is_spinner_el:
+                        has_spinner = True
                     continue
 
                 if page:
                     page.keyboard.press("Control+a")
                     time.sleep(0.1)
-                    page.keyboard.type(date_no_dash)
+                    if "yearspin" in el_id.lower():
+                        typed_val = date_no_dash[:4]
+                    elif "monthspin" in el_id.lower():
+                        typed_val = date_no_dash[4:6]
+                    else:
+                        typed_val = date_no_dash
+                    page.keyboard.type(typed_val)
                     time.sleep(0.2)
                     page.keyboard.press("Tab")
                 else:
                     el.press("Control+a")
                     time.sleep(0.1)
-                    el.type(date_no_dash)
+                    if "yearspin" in el_id.lower():
+                        typed_val = date_no_dash[:4]
+                    elif "monthspin" in el_id.lower():
+                        typed_val = date_no_dash[4:6]
+                    else:
+                        typed_val = date_no_dash
+                    el.type(typed_val)
                     time.sleep(0.2)
                     el.press("Tab")
                 time.sleep(0.3)
 
-                if _matches(el):
-                    logger.info("날짜 입력 성공: id=%s sel=%s value=%r", el_id, sel, _read_value(el))
+                if is_spinner_el:
+                    # NexacroN 스피너는 el.value에 반영 안 됨 → 타이핑 성공 자체를 filled로 처리
+                    logger.info("스피너 입력 완료: id=%s typed=%r", el_id, typed_val)
+                    filled += 1
+                    has_spinner = True
+                    if filled >= 2:
+                        day = int(date_no_dash[6:8])
+                        _click_popup_day(mf, page, day)
+                        return True
+                    continue
+
+                if _matches_for_id(el, el_id):
+                    logger.info("날짜 입력 성공: id=%s value=%r", el_id, _read_value(el))
                     filled += 1
                     continue
 
-                # fallback: fill + enter
+                # fallback: poll 2초
                 for _ in range(10):
-                    if _matches(el):
+                    if _matches_for_id(el, el_id):
                         logger.info("날짜 입력 성공(폴백): id=%s", el_id)
                         filled += 1
                         break
                     time.sleep(0.2)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("날짜 입력 요소 예외: id=%s err=%s", el_id, _exc)
                 continue
             if filled >= 2:
+                if page and has_spinner:
+                    day = int(date_no_dash[6:8])
+                    _click_popup_day(mf, page, day)
                 return True
 
+    if filled > 0:
+        logger.info("날짜 입력 부분 성공: filled=%d/%d", filled, 2)
+    else:
+        logger.warning("날짜 입력 실패: sale_date=%s seen_ids=%s", sale_date, list(seen_ids)[:6])
     return filled > 0
+
+
+def _type_date_direct(page: "Page", mf: Frame, sale_date: str) -> bool:
+    """NexacroN mskSales 날짜 입력.
+
+    순서: inner input 클릭(browser focus) → Ctrl+A → Delete → 한 자리씩 입력
+    NexacroN 마스크는 기존 값을 Delete로 지운 뒤 입력해야 슬롯이 초기화됨.
+
+    1차: inner input 클릭 + page.keyboard (browser focus 방식)
+    2차: outer 클릭 + frame document.dispatchEvent (frame 내부 dispatch)
+    3차: NexacroN JS set_value()
+    """
+    date_no_dash = re.sub(r"\D", "", sale_date)
+    if len(date_no_dash) != 8:
+        logger.warning("날짜 형식 오류: %s", sale_date)
+        return False
+
+    _INNER_SEL = "[id*='divSalesDate'][id*='mskSales'][id$='_input']"
+
+    def _read_inner_digits() -> str:
+        try:
+            el = mf.query_selector(_INNER_SEL)
+            if el is None:
+                return ""
+            raw = (el.evaluate("el => el.value") or "").strip()
+            return re.sub(r"\D", "", raw)
+        except Exception:
+            return ""
+
+    # ── 1차: inner input 더블클릭 → NexacroN 편집 모드 진입 → Ctrl+A → Delete → 입력 ─
+    # mskSales_input은 더블클릭해야 편집 가능 상태로 진입함
+    try:
+        inner = mf.query_selector(_INNER_SEL)
+        if inner:
+            inner.scroll_into_view_if_needed()
+            inner.dblclick()      # 더블클릭으로 NexacroN 편집 모드 진입
+            time.sleep(0.3)
+            page.keyboard.press("Control+a")
+            time.sleep(0.1)
+            page.keyboard.press("Delete")
+            time.sleep(0.15)
+            for ch in date_no_dash:
+                page.keyboard.press(ch)
+                time.sleep(0.07)
+            page.keyboard.press("Tab")
+            time.sleep(0.4)
+
+            got = _read_inner_digits()
+            if got == date_no_dash:
+                logger.info("날짜 더블클릭 입력 성공: %s", sale_date)
+                return True
+            logger.info("날짜 더블클릭 불일치: expected=%s got=%r → 2차 시도", date_no_dash, got)
+    except Exception as e:
+        logger.info("날짜 더블클릭 예외: %s | %s", sale_date, e)
+
+    # ── 2차: outer 클릭 + frame document.dispatchEvent ───────────────
+    outer = None
+    for sel in [
+        "[id*='divSalesDate'][id*='mskSales']:not([id$='_input']):not([id$='InputElement'])",
+        "[id*='mskSales']:not([id$='_input']):not([id$='InputElement'])",
+        *_DATE_INPUT_SELECTORS,
+    ]:
+        try:
+            outer = mf.query_selector(sel)
+            if outer is not None:
+                break
+        except Exception:
+            continue
+
+    if outer:
+        try:
+            outer.scroll_into_view_if_needed()
+            outer.dblclick()   # 더블클릭으로 NexacroN 편집 모드 진입
+            time.sleep(0.3)
+
+            def _dispatch(key, code, kc, char_code=None):
+                cc = char_code if char_code is not None else kc
+                mf.evaluate(f"""
+                    () => {{
+                        var o = {{key:'{key}',code:'{code}',keyCode:{kc},which:{kc},
+                                   charCode:{cc},bubbles:true,cancelable:true}};
+                        document.dispatchEvent(new KeyboardEvent('keydown', o));
+                        document.dispatchEvent(new KeyboardEvent('keypress', o));
+                        document.dispatchEvent(new KeyboardEvent('keyup', o));
+                    }}
+                """)
+
+            _dispatch("a", "KeyA", 65)      # Ctrl+A 대체: 전체선택
+            time.sleep(0.1)
+            _dispatch("Delete", "Delete", 46)
+            time.sleep(0.1)
+            for ch in date_no_dash:
+                _dispatch(ch, f"Digit{ch}", ord(ch))
+                time.sleep(0.07)
+            _dispatch("Tab", "Tab", 9)
+            time.sleep(0.4)
+
+            got = _read_inner_digits()
+            if got == date_no_dash:
+                logger.info("날짜 frame-dispatch 입력 성공: %s", sale_date)
+                return True
+            logger.info("날짜 frame-dispatch 불일치: expected=%s got=%r → 3차 시도", date_no_dash, got)
+        except Exception as e:
+            logger.info("날짜 frame-dispatch 예외: %s | %s", sale_date, e)
+
+    # ── 3차: 부모 페이지에서 iframe contentWindow.nexacro 접근 ─────────
+    # nexacro 전역 객체는 main iframe 내부가 아닌 부모 window에 있음
+    _NEXACRO_JS_PATH = (
+        "mainframe.childframe.form"
+        ".divMain.divWork.divSalesDate.mskSales"
+    )
+    try:
+        result = page.evaluate(f"""
+            () => {{
+                try {{
+                    // 방법 A: iframe contentWindow를 통해 nexacro 접근
+                    var iframe = document.querySelector('iframe[name="main"]');
+                    if (!iframe) return "no_iframe";
+                    var w = iframe.contentWindow;
+                    if (!w || !w.nexacro) return "no_nexacro_in_iframe";
+                    var app = w.nexacro.getApplication();
+                    var msk = app.{_NEXACRO_JS_PATH};
+                    if (!msk || typeof msk.set_value !== 'function') return "not_found";
+                    msk.set_value("{date_no_dash}");
+                    return "ok:" + String(msk.value !== undefined ? msk.value : "?");
+                }} catch(e1) {{
+                    try {{
+                        // 방법 B: 부모 window.nexacro 직접 접근
+                        var app2 = window.nexacro.getApplication();
+                        var msk2 = app2.{_NEXACRO_JS_PATH};
+                        if (!msk2 || typeof msk2.set_value !== 'function') return "not_found_b";
+                        msk2.set_value("{date_no_dash}");
+                        return "ok_b:" + String(msk2.value !== undefined ? msk2.value : "?");
+                    }} catch(e2) {{
+                        return "err:" + e1.message + " | " + e2.message;
+                    }}
+                }}
+            }}
+        """)
+        logger.info("NexacroN set_value(%s) from page: %s", date_no_dash, result)
+        if isinstance(result, str) and result.startswith("ok"):
+            time.sleep(0.3)
+            got = _read_inner_digits()
+            if got == date_no_dash:
+                logger.info("날짜 JS set_value 성공: %s", sale_date)
+                return True
+            logger.info("날짜 JS set_value 후 el.value=%r — 진행 속행", got)
+            return True
+    except Exception as e:
+        logger.warning("NexacroN set_value 예외: %s", e)
+
+    logger.warning("날짜 입력 3차 모두 실패: %s (inner=%r)", sale_date, _read_inner_digits())
+    return False
+
+
+def _navigate_by_direct_input(page: "Page", sale_date: str) -> Frame:
+    """mskSales에 날짜 직접 타이핑 → 조회 버튼 클릭 → 갱신된 Frame 반환."""
+    mf = _get_main_frame(page)
+    try:
+        _wait_for_any_selector(mf, _DAILY_VIEW_READY_SELECTORS, timeout_ms=WAIT_TIMEOUT)
+    except Exception as e:
+        logger.info("화면 준비 대기 실패(계속 진행): %s", e)
+
+    mf = _get_main_frame(page)
+    ok = _type_date_direct(page, mf, sale_date)
+    if not ok:
+        logger.warning("날짜 직접 입력 실패 — 전일 버튼 1회 fallback 시도: %s", sale_date)
+
+    mf = _get_main_frame(page)
+    for attempt in range(1, 10):
+        s_btn, s_sel = _find_first_selector(mf, _BTN_SEARCH_SELECTORS)
+        if s_btn is not None:
+            clicked = _click_handle(page, s_btn, f"조회({sale_date})", prefer_mouse=True)
+            if clicked:
+                time.sleep(2.5)
+                logger.info("직접입력/조회 완료: %s", sale_date)
+                return _get_main_frame(page)
+        time.sleep(0.8)
+        mf = _get_main_frame(page)
+
+    _debug_dump(page, "direct_input_search_failed")
+    raise RuntimeError(f"조회 버튼 클릭 실패 (sale_date={sale_date})")
+
+
+def _read_displayed_date(mf: Frame) -> str | None:
+    """mskSales 입력 필드에서 현재 표시 날짜를 YYYY-MM-DD로 읽기."""
+    for sel in _DATE_INPUT_SELECTORS:
+        try:
+            el = mf.query_selector(sel)
+            if el is None:
+                continue
+            raw = (el.evaluate("el => el.value") or "").strip()
+            if not raw:
+                raw = (el.inner_text() or "").strip()
+            digits = re.sub(r"\D", "", raw)
+            if len(digits) == 8:
+                return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+        except Exception:
+            continue
+    return None
 
 
 def _pw_text(mf: Frame, element_id: str) -> str:
@@ -821,9 +1106,28 @@ def _login(page: Page) -> Frame:
     """EasyPOS 로그인 → 팝업 닫기 → main 프레임 반환"""
     page.goto(LOGIN_URL, wait_until="networkidle", timeout=60_000)
     logger.info("EasyPOS 접속 완료, NexacroN 렌더링 대기...")
-    time.sleep(5)
 
-    mf = _get_main_frame(page)
+    # 고정 sleep 대신 적극 폴링: main 프레임이 나타날 때까지 최대 30초 대기
+    _fr_deadline = time.time() + 30
+    while time.time() < _fr_deadline:
+        if any(f.name == "main" for f in page.frames):
+            break
+        time.sleep(1)
+    time.sleep(3)  # 프레임 안정화 버퍼
+
+    # NexacroN이 내부 JS 리다이렉트로 프레임을 교체할 수 있음 → 유효성 재검증
+    mf = None
+    for _fr_attempt in range(5):
+        try:
+            mf = _get_main_frame(page)
+            time.sleep(1)  # detach 직후 evaluate 실패 방지
+            mf.evaluate("1")  # 프레임 살아있는지 확인
+            break
+        except Exception:
+            if _fr_attempt == 4:
+                raise RuntimeError("NexacroN main 프레임 획득 5회 실패")
+            logger.warning("NexacroN 프레임 재획득 시도 %d/5", _fr_attempt + 1)
+            time.sleep(5)
 
     # ID 입력 — 외부 컴포넌트 클릭 후 fill()로 NexacroN 내부 상태 갱신
     id_outer = mf.query_selector(f"#{_ID_OUTER}")
@@ -1054,45 +1358,54 @@ def _navigate_to_daily_sales(page: Page, mf: Frame) -> Frame:
 
     menu_snapshot: list[str] = []
 
-    for attempt in range(1, 4):
+    _MAX_ATTEMPT = 5
+    for attempt in range(1, _MAX_ATTEMPT + 1):
         mf = _get_main_frame(page)
 
         # Step 1: '영업속보' 단일 클릭 → 서브메뉴(당일매출내역) 확장
         ybs_el = _find_grd_row_by_text(["영업속보"])
-        if ybs_el is not None:
-            ybs_box = ybs_el.bounding_box()
-            if ybs_box:
-                cx = ybs_box["x"] + ybs_box["width"] / 2
-                cy = ybs_box["y"] + ybs_box["height"] / 2
-                page.mouse.click(cx, cy)
-                logger.info("영업속보 단일클릭 @ (%.0f, %.0f)", cx, cy)
-                time.sleep(1.5)
+        ybs_box = ybs_el.bounding_box() if ybs_el else None
+        if ybs_box:
+            cx = ybs_box["x"] + ybs_box["width"] / 2
+            cy = ybs_box["y"] + ybs_box["height"] / 2
+            page.mouse.click(cx, cy)
+            logger.info("영업속보 단일클릭 @ (%.0f, %.0f)", cx, cy)
+            time.sleep(2.0)  # NexacroN 트리 확장 대기 (재시작 후 렌더링 지연 고려)
 
-        # Step 2: '당일매출내역' 더블클릭
-        daily_el = _find_grd_row_by_text(["당일매출내역", "당일 매출 내역"])
-        if daily_el is not None:
-            daily_box = daily_el.bounding_box()
-            if daily_box:
-                cx = daily_box["x"] + daily_box["width"] / 2
-                cy = daily_box["y"] + daily_box["height"] / 2
-                page.mouse.click(cx, cy)
-                time.sleep(0.3)
-                page.mouse.click(cx, cy, click_count=2)
-                logger.info(
-                    "당일매출내역 더블클릭 @ (%.0f, %.0f) (attempt=%d/3)",
-                    cx, cy, attempt,
-                )
+        # Step 2: '당일매출내역' 더블클릭 (텍스트 검색 + 좌표 fallback)
+        daily_el = _find_grd_row_by_text(["당일매출내역", "당일 매출 내역", "당일매출"])
+        daily_box = daily_el.bounding_box() if daily_el else None
 
-                # 화면 로드 대기
-                try:
-                    mf = _get_main_frame(page)
-                    _wait_for_any_selector(mf, _DAILY_VIEW_READY_SELECTORS, timeout_ms=WAIT_TIMEOUT)
-                    logger.info("당일매출내역 화면 로드 성공 (attempt=%d/3)", attempt)
-                    return _get_main_frame(page)
-                except Exception as e:
-                    logger.info("화면 로드 대기 실패 (attempt=%d/3): %s", attempt, e)
-                    time.sleep(2.0)
-                    continue
+        # 좌표 fallback: 영업속보 바로 아래 항목 (26px 아래 = 다음 메뉴 항목)
+        if daily_box is None and ybs_box is not None:
+            logger.info("당일매출내역 텍스트 미발견 → 좌표 fallback (영업속보 y+26)")
+            daily_cx = ybs_box["x"] + ybs_box["width"] / 2
+            daily_cy = ybs_box["y"] + ybs_box["height"] / 2 + 26
+        elif daily_box:
+            daily_cx = daily_box["x"] + daily_box["width"] / 2
+            daily_cy = daily_box["y"] + daily_box["height"] / 2
+        else:
+            daily_cx = daily_cy = None
+
+        if daily_cx is not None:
+            page.mouse.click(daily_cx, daily_cy)
+            time.sleep(0.3)
+            page.mouse.click(daily_cx, daily_cy, click_count=2)
+            logger.info(
+                "당일매출내역 더블클릭 @ (%.0f, %.0f) (attempt=%d/%d, text=%s)",
+                daily_cx, daily_cy, attempt, _MAX_ATTEMPT, daily_el is not None,
+            )
+
+            # 화면 로드 대기
+            try:
+                mf = _get_main_frame(page)
+                _wait_for_any_selector(mf, _DAILY_VIEW_READY_SELECTORS, timeout_ms=WAIT_TIMEOUT)
+                logger.info("당일매출내역 화면 로드 성공 (attempt=%d/%d)", attempt, _MAX_ATTEMPT)
+                return _get_main_frame(page)
+            except Exception as e:
+                logger.info("화면 로드 대기 실패 (attempt=%d/%d): %s", attempt, _MAX_ATTEMPT, e)
+                time.sleep(2.0)
+                continue
 
         # 메뉴를 찾지 못한 경우 — 스냅샷 수집 후 재시도
         menu_snapshot = []
@@ -1103,10 +1416,10 @@ def _navigate_to_daily_sales(page: Page, mf: Frame) -> Frame:
                 menu_snapshot.append(txt)
         menu_snapshot = menu_snapshot[:10]
         logger.warning(
-            "당일매출내역 메뉴 탐색 실패 (attempt=%d/3) | 현재 메뉴=%s",
-            attempt, menu_snapshot,
+            "당일매출내역 메뉴 탐색 실패 (attempt=%d/%d) | 현재 메뉴=%s",
+            attempt, _MAX_ATTEMPT, menu_snapshot,
         )
-        if attempt < 3:
+        if attempt < _MAX_ATTEMPT:
             # 영업속보 탭 재클릭해서 좌측 메뉴 리셋
             tab_el2 = mf.query_selector(f"#{_MENU_SALES_BRIEF}")
             if tab_el2:
@@ -1122,76 +1435,65 @@ def _navigate_to_daily_sales(page: Page, mf: Frame) -> Frame:
         return mf
 
     raise RuntimeError(
-        "당일매출내역 메뉴를 찾을 수 없음. "
+        f"당일매출내역 메뉴를 찾을 수 없음 ({_MAX_ATTEMPT}회 시도). "
         f"현재 메뉴 샘플: {menu_snapshot}"
     )
 
 
-def _select_yesterday_and_search(page: Page, mf: Frame, sale_date: str) -> Frame:
-    """전일 버튼 또는 날짜 입력 → 조회 버튼 클릭"""
-    date_selected = False
-    s_clicked = False
-    last_diag = ""
-
-    # NexacroN 렌더링이 느린 경우가 있어, 조회영역(버튼/컨테이너) 먼저 대기
+def _select_yesterday_and_search(
+    page: Page, mf: Frame, sale_date: str, current_displayed: str | None = None
+) -> Frame:
+    """전일 버튼을 필요한 횟수만큼 클릭해서 sale_date로 이동 후 조회."""
     try:
         mf = _get_main_frame(page)
         _wait_for_any_selector(mf, _DAILY_VIEW_READY_SELECTORS, timeout_ms=WAIT_TIMEOUT)
     except Exception as e:
         logger.info("당일매출내역 뷰 준비 대기 실패(계속 시도): %s", e)
 
-    for attempt in range(1, 16):
-        mf = _get_main_frame(page)
-        y_btn, y_sel = _find_first_selector(mf, _BTN_YESTERDAY_SELECTORS)
-        s_btn, s_sel = _find_first_selector(mf, _BTN_SEARCH_SELECTORS)
-        view_ready = _has_any_selector(mf, _DAILY_VIEW_READY_SELECTORS)
+    mf = _get_main_frame(page)
+    if current_displayed is None:
+        current_displayed = _read_displayed_date(mf)
+    if current_displayed is None:
+        current_displayed = date.today().isoformat()
+        logger.warning("현재 날짜 읽기 실패 → 오늘(%s)로 가정", current_displayed)
 
-        if not date_selected and y_btn is not None:
-            date_selected = _click_handle(page, y_btn, f"전일 버튼({y_sel})", prefer_mouse=True)
-            if date_selected:
-                time.sleep(0.8)
+    target_dt = date.fromisoformat(sale_date)
+    current_dt = date.fromisoformat(current_displayed)
+    days_back = (current_dt - target_dt).days
 
-        # 전일 버튼이 없거나 동작하지 않는 화면(일부 UI 변경)에서는 날짜 입력으로 대체
-        if not date_selected and attempt in {3, 6, 10}:
-            try:
-                mf = _get_main_frame(page)
-                if _set_sale_date_inputs(mf, sale_date):
-                    logger.info("날짜 입력으로 조회일 설정 성공: %s", sale_date)
-                    date_selected = True
-                    time.sleep(0.8)
-            except Exception:
-                pass
-
-        # 조회 버튼은 전일 클릭 이후에 다시 탐색하는 편이 안정적임
-        if date_selected and not s_clicked:
-            mf = _get_main_frame(page)
-            s_btn, s_sel = _find_first_selector(mf, _BTN_SEARCH_SELECTORS)
-            if s_btn is not None:
-                s_clicked = _click_handle(page, s_btn, f"조회 버튼({s_sel})", prefer_mouse=True)
-                if s_clicked:
-                    time.sleep(2.5)
-
-        if date_selected and s_clicked:
-            logger.info("전일/조회 클릭 완료 (attempt=%s/15)", attempt)
-            break
-
-        last_diag = (
-            f"attempt={attempt}, y={bool(y_btn)}, s={bool(s_btn)}, view_ready={view_ready}, "
-            f"date_selected={date_selected}"
-        )
-        logger.info("전일/조회 버튼 탐색 재시도 중 | %s", last_diag)
-        if DEBUG_MODE and attempt in {3, 6, 10, 15}:
-            _debug_dump(page, f"daily_retry_{attempt}")
-        time.sleep(1.2)
-
-    if not date_selected or not s_clicked:
-        _debug_dump(page, "daily_click_failed")
+    if days_back < 0:
         raise RuntimeError(
-            "전일/조회 클릭 실패 "
-            f"(date_selected={date_selected}, s_clicked={s_clicked}, last_diag={last_diag})"
+            f"목표 날짜가 현재 표시 날짜보다 미래: {sale_date} > {current_displayed}"
         )
 
-    return _get_main_frame(page)
+    logger.info("전일 클릭 %d회: %s → %s", days_back, current_displayed, sale_date)
+    for i in range(days_back):
+        for attempt in range(1, 8):
+            mf = _get_main_frame(page)
+            y_btn, y_sel = _find_first_selector(mf, _BTN_YESTERDAY_SELECTORS)
+            if y_btn is not None:
+                clicked = _click_handle(page, y_btn, f"전일({i + 1}/{days_back})", prefer_mouse=True)
+                if clicked:
+                    time.sleep(0.4)
+                    break
+            time.sleep(0.5)
+        else:
+            _debug_dump(page, "daily_click_failed")
+            raise RuntimeError(f"전일 버튼 클릭 실패 ({i + 1}/{days_back})")
+
+    for attempt in range(1, 10):
+        mf = _get_main_frame(page)
+        s_btn, s_sel = _find_first_selector(mf, _BTN_SEARCH_SELECTORS)
+        if s_btn is not None:
+            clicked = _click_handle(page, s_btn, f"조회({sale_date})", prefer_mouse=True)
+            if clicked:
+                time.sleep(2.5)
+                logger.info("전일/조회 클릭 완료 (days_back=%d, sale_date=%s)", days_back, sale_date)
+                return _get_main_frame(page)
+        time.sleep(0.8)
+
+    _debug_dump(page, "daily_click_failed")
+    raise RuntimeError(f"조회 버튼 클릭 실패 (sale_date={sale_date})")
 
 
 def _collect_all_receipts(page: Page, mf: Frame, sale_date: str) -> list:
@@ -1411,7 +1713,7 @@ def collect_receipts(**context) -> str:
             page2 = bctx2.new_page()
             _mf = _login(page2)
             _mf = _navigate_to_daily_sales(page2, _mf)
-            _select_yesterday_and_search(page2, _mf, target_date)
+            _navigate_by_direct_input(page2, target_date)
             logger.info("EasyPOS 세션 재오픈 완료: %s", target_date)
             return browser2, bctx2, page2
 
@@ -1430,9 +1732,12 @@ def collect_receipts(**context) -> str:
                     _debug_dump(page, "daily_inquiry_failed")
 
             # ── STEP 2: 당일매출내역 → 영수증 수집
+            # 내림차순 정렬: 최근 날짜부터 수집 → 전일 버튼 순차 클릭으로 정확한 날짜 이동
+            sale_dates = sorted(sale_dates, reverse=True)
+
             try:
                 mf = _navigate_to_daily_sales(page, mf)
-                mf = _select_yesterday_and_search(page, mf, sale_dates[0])
+                mf = _navigate_by_direct_input(page, sale_dates[0])
             except Exception as e:
                 _debug_dump(page, "navigation_failed")
                 logger.exception("당일매출내역 화면 진입 실패: %s", e)
@@ -1449,20 +1754,13 @@ def collect_receipts(**context) -> str:
                         browser, bctx, page = _reopen_session(sale_date)
                         mf = _get_main_frame(page)
                     else:
-                        mf = _get_main_frame(page)
-                        if not _set_sale_date_inputs_v2(mf, sale_date, page=page):
-                            if not _is_page_closed(page):
-                                _debug_dump(page, f"date_set_failed_{sale_date}")
-                            logger.warning("sale_date 변경 실패, 재세션: %s", sale_date)
+                        prev_date = sale_dates[idx - 1]
+                        try:
+                            mf = _navigate_by_direct_input(page, sale_date)
+                        except Exception as e:
+                            logger.warning("전일 이동 실패 (%s) → 재세션: %s", e, sale_date)
                             browser, bctx, page = _reopen_session(sale_date)
                             mf = _get_main_frame(page)
-                        time.sleep(0.5)
-                        mf = _get_main_frame(page)
-                        s_btn, s_sel = _find_first_selector(mf, _BTN_SEARCH_SELECTORS)
-                        if s_btn is not None:
-                            _click_handle(page, s_btn, f"조회({s_sel}, {sale_date})", prefer_mouse=True)
-                            time.sleep(2.5)
-                        mf = _get_main_frame(page)
 
                 logger.info("수집 시작: %s (%d/%d)", sale_date, idx + 1, len(sale_dates))
 
@@ -1583,38 +1881,82 @@ def _recollect_dates(missing_dates: list[str]) -> int:
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
     )
+    # 내림차순 정렬: 최근 날짜부터 수집 → 전일 버튼 누적 클릭 최소화
+    missing_dates = sorted(missing_dates, reverse=True)
+
     total_inserted = 0
     all_rows: list[dict] = []
+    today_str = date.today().isoformat()
+
+    def _navigate_and_set_date(pg, sale_dt: str, cur_disp: str) -> tuple[Frame, str]:
+        """날짜 직접 입력 후 조회. (mf, new_current_displayed) 반환."""
+        mf2 = _navigate_by_direct_input(pg, sale_dt)
+        return mf2, sale_dt
 
     with sync_playwright() as p:
         browser = launch_chromium(p, headless=launch_kwargs["headless"], args=launch_kwargs["args"])
         bctx = browser.new_context(**context_opts)
         bctx.add_init_script(_NEXACRO_INIT_SCRIPT)
         page = bctx.new_page()
+        current_displayed = today_str
         try:
-            mf = _login(page)
-            mf = _navigate_to_daily_sales(page, mf)
-            mf = _select_yesterday_and_search(page, mf, missing_dates[0])
+            for _init_attempt in range(2):
+                try:
+                    mf = _login(page)
+                    mf = _navigate_to_daily_sales(page, mf)
+                    mf, current_displayed = _navigate_and_set_date(page, missing_dates[0], current_displayed)
+                    break
+                except (TargetClosedError, RuntimeError) as e:
+                    if _init_attempt == 1:
+                        raise
+                    logger.warning("초기 로그인 실패 (%s) → 브라우저 재시작", e)
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    browser = launch_chromium(p, headless=launch_kwargs["headless"], args=launch_kwargs["args"])
+                    bctx = browser.new_context(**context_opts)
+                    bctx.add_init_script(_NEXACRO_INIT_SCRIPT)
+                    page = bctx.new_page()
+                    current_displayed = today_str
+
+            BROWSER_RESTART_EVERY = 20  # 메모리 누수 방지: N개마다 브라우저 재시작
 
             for idx, sale_date in enumerate(missing_dates):
-                try:
-                    if idx > 0:
-                        mf = _get_main_frame(page)
-                        if not _set_sale_date_inputs_v2(mf, sale_date, page=page):
-                            logger.warning("재수집 날짜 입력 실패: %s", sale_date)
-                        time.sleep(0.5)
-                        mf = _get_main_frame(page)
-                        s_btn, s_sel = _find_first_selector(mf, _BTN_SEARCH_SELECTORS)
-                        if s_btn:
-                            _click_handle(page, s_btn, f"재수집 조회({sale_date})", prefer_mouse=True)
-                            time.sleep(2.5)
-                        mf = _get_main_frame(page)
+                if idx > 0 and idx % BROWSER_RESTART_EVERY == 0:
+                    logger.info("주기적 브라우저 재시작 (idx=%d, 메모리 해제)", idx)
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    browser = launch_chromium(p, headless=launch_kwargs["headless"], args=launch_kwargs["args"])
+                    bctx = browser.new_context(**context_opts)
+                    bctx.add_init_script(_NEXACRO_INIT_SCRIPT)
+                    page = bctx.new_page()
+                    try:
+                        mf = _login(page)
+                        mf = _navigate_to_daily_sales(page, mf)
+                    except (TargetClosedError, RuntimeError) as e:
+                        logger.warning("주기적 재시작 후 로그인 실패 (%s) → 재시도", e)
+                        try:
+                            browser.close()
+                        except Exception:
+                            pass
+                        browser = launch_chromium(p, headless=launch_kwargs["headless"], args=launch_kwargs["args"])
+                        bctx = browser.new_context(**context_opts)
+                        bctx.add_init_script(_NEXACRO_INIT_SCRIPT)
+                        page = bctx.new_page()
+                        mf = _login(page)
+                        mf = _navigate_to_daily_sales(page, mf)
+                    current_displayed = today_str
 
+                try:
+                    mf, current_displayed = _navigate_and_set_date(page, sale_date, current_displayed)
                     logger.info("누락 재수집: %s (%d/%d)", sale_date, idx + 1, len(missing_dates))
                     rows = _collect_all_receipts(page, mf, sale_date)
                     logger.info("재수집 완료: %s → %d건", sale_date, len(rows))
                     all_rows.extend(rows)
-                except TargetClosedError:
+                except (TargetClosedError, RuntimeError):
                     logger.warning("브라우저 컨텍스트 종료 감지 (%s) → 재시작 후 재시도", sale_date)
                     try:
                         browser.close()
@@ -1626,7 +1968,8 @@ def _recollect_dates(missing_dates: list[str]) -> int:
                     page = bctx.new_page()
                     mf = _login(page)
                     mf = _navigate_to_daily_sales(page, mf)
-                    mf = _select_yesterday_and_search(page, mf, sale_date)
+                    current_displayed = today_str
+                    mf, current_displayed = _navigate_and_set_date(page, sale_date, current_displayed)
                     logger.info("누락 재수집(재시작 후 재시도): %s (%d/%d)", sale_date, idx + 1, len(missing_dates))
                     rows = _collect_all_receipts(page, mf, sale_date)
                     logger.info("재수집 완료: %s → %d건", sale_date, len(rows))
@@ -1650,10 +1993,24 @@ def _recollect_dates(missing_dates: list[str]) -> int:
     )
     for ym, ym_df in df.groupby(df["sale_date"].str[:7]):
         out_path = ANALYTICS_DB / "easypos_sales_raw" / f"ym={ym}" / "receipts.csv"
-        result = onedrive_csv_save(df=ym_df, file_path=str(out_path), pk_col="_pk")
-        inserted = result.get("inserted", 0)
+        recollect_dates_in_ym = set(ym_df["sale_date"].unique())
+        # 기존 CSV에서 재수집 날짜 행 제거 후 신규 데이터로 교체 (line_amount 오류 덮어쓰기)
+        if out_path.exists():
+            try:
+                existing = pd.read_csv(out_path, dtype=str)
+                if "sale_date" in existing.columns:
+                    existing = existing[~existing["sale_date"].isin(recollect_dates_in_ym)]
+            except Exception as e:
+                logger.warning("기존 CSV 읽기 실패, 신규 데이터만 저장: %s", e)
+                existing = pd.DataFrame()
+        else:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            existing = pd.DataFrame()
+        combined = pd.concat([existing, ym_df], ignore_index=True)
+        combined.to_csv(out_path, index=False, encoding="utf-8-sig")
+        inserted = len(ym_df)
         total_inserted += inserted
-        logger.info("재수집 저장: %s | 신규=%d", out_path, inserted)
+        logger.info("재수집 저장(교체): %s | 날짜=%s 신규=%d", out_path, sorted(recollect_dates_in_ym), inserted)
     return total_inserted
 
 
@@ -1714,23 +2071,28 @@ def verify_missing(**context) -> str:
             {d: ref_map[d] for d in remaining}
         )
 
-        if not last_still_missing:
-            msg = f"재수집 완료: {len(to_recollect)}일 → 신규={total_inserted}건"
-            if last_still_mismatched:
-                logger.warning("재수집 후에도 합계 불일치(경고): %s", last_still_mismatched)
-                msg += f" | 불일치 경고 {len(last_still_mismatched)}건: {last_still_mismatched}"
-            return msg
+        if not last_still_missing and not last_still_mismatched:
+            return f"재수집 완료: {len(to_recollect)}일 → 신규={total_inserted}건"
 
         if attempt < MAX_RECOLLECT:
-            logger.warning("재수집 %d/%d 후에도 누락 %d건: %s — 재시도",
-                           attempt, MAX_RECOLLECT, len(last_still_missing), last_still_missing)
-            remaining = last_still_missing
+            remaining = sorted(set(last_still_missing + last_still_mismatched))
+            logger.warning(
+                "재수집 %d/%d 후에도 미해결 %d건 (빈=%d, 불일치=%d): %s — 재시도",
+                attempt, MAX_RECOLLECT,
+                len(remaining), len(last_still_missing), len(last_still_mismatched), remaining,
+            )
 
-    # 2회 재수집 후에도 데이터 없음 → 휴일로 간주, 알람 없이 정상 종료
-    logger.warning(
-        "EasyPOS 재수집 %d회 후에도 데이터 없음 %d건: %s — 휴일로 간주, 알람 없이 종료",
-        MAX_RECOLLECT, len(last_still_missing), last_still_missing,
-    )
+    # 2회 재수집 후에도 미해결 → 빈 날짜는 휴일 추정, 불일치는 RuntimeError
+    if last_still_missing:
+        logger.warning(
+            "EasyPOS 재수집 %d회 후에도 데이터 없음 %d건: %s — 휴일로 간주",
+            MAX_RECOLLECT, len(last_still_missing), last_still_missing,
+        )
+    if last_still_mismatched:
+        raise RuntimeError(
+            f"EasyPOS 재수집 {MAX_RECOLLECT}회 후에도 합계 불일치 {len(last_still_mismatched)}건: "
+            f"{last_still_mismatched}"
+        )
     return (
         f"휴일 추정 (재수집 {MAX_RECOLLECT}회 후 데이터 없음 {len(last_still_missing)}건): "
         f"{last_still_missing}"

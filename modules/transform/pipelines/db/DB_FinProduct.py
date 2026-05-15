@@ -801,6 +801,16 @@ def send_alert_email(**context) -> str:
     html = html.replace(f" (현재 pending {exported}행)", "")
     html = html.replace(f" (í˜„ìž¬ pending {exported}í–‰)", "")
 
+    file_link = (
+        f'<p style="margin-top:16px;">'
+        f'<a href="{FIN_PRODUCT_CSV_PATH.as_uri()}"'
+        f' style="display:inline-block;padding:8px 16px;background:#1565C0;color:#fff;border-radius:4px;text-decoration:none;font-size:13px;">'
+        f'📂 CSV 파일 열기</a>'
+        f'<span style="color:#999;font-size:11px;margin-left:10px;">{FIN_PRODUCT_CSV_PATH}</span>'
+        f'</p>'
+    )
+    html = html.replace("</body></html>", f"{file_link}</body></html>")
+
     send_email(subject=subject, html_content=html, to_emails=ALERT_EMAIL)
     logger.info("이메일 발송 완료: %s (%d건)", ALERT_EMAIL, len(classified))
     return f"이메일 발송 완료 ({len(classified)}건)"

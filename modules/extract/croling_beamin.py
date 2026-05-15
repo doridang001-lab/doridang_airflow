@@ -308,8 +308,7 @@ def launch_browser(account_id: str):
     options.add_argument('--disable-background-networking')
     options.add_argument('--disable-sync')
     options.add_argument('--mute-audio')
-    options.add_argument('--renderer-process-limit=1')    # 렌더러 프로세스 1개 제한 (메모리)
-    options.add_argument('--js-flags=--max-old-space-size=256')  # JS 힙 256MB 제한
+    options.add_argument('--js-flags=--max-old-space-size=512')  # JS 힙 512MB (256 → 512: 크래시 방지)
     w, h = random.choice(WINDOW_SIZES)
     options.add_argument(f'--window-size={w},{h}')
     options.add_argument('--lang=ko-KR')
@@ -400,20 +399,28 @@ def login_baemin(driver, account_id: str, password: str) -> bool:
         log(f"  [실패] 로그인 버튼 클릭 오류: {e}", account_id)
         return False
     
-    random_delay("login_wait")
-    current_url = driver.current_url
-    
+    try:
+        random_delay("login_wait")
+        current_url = driver.current_url
+    except WebDriverException as e:
+        log(f"  [실패] WebDriver 세션 끊김 (Chrome 크래시 추정): {e}", account_id)
+        return False
+
     if is_on_success_page(current_url):
         log(f"  로그인 성공 (URL 매칭)", account_id)
         return True
-    
+
     if not is_on_login_page(current_url):
         log(f"  로그인 성공 (URL 변경 확인)", account_id)
         return True
-    
-    random_delay("page_load")
-    current_url = driver.current_url
-    page_title = driver.title
+
+    try:
+        random_delay("page_load")
+        current_url = driver.current_url
+        page_title = driver.title
+    except WebDriverException as e:
+        log(f"  [실패] WebDriver 세션 끊김 (재확인 중): {e}", account_id)
+        return False
     log(f"  로그인 재확인 URL={current_url}, title={page_title}", account_id)
     
     if is_on_login_page(current_url):
@@ -936,6 +943,10 @@ def wait_for_page(driver, css_selector: str, timeout: int = 60) -> bool:
                     log(f"새로고침 중 브라우저 크래시: {e}")
                     return False
         except WebDriverException as e:
+            log(f"브라우저 연결 끊김 (attempt={attempt}): {e}")
+            return False
+        except Exception as e:
+            # urllib3.exceptions.MaxRetryError 등 Chrome OOM 크래시
             log(f"브라우저 연결 끊김 (attempt={attempt}): {e}")
             return False
     return False

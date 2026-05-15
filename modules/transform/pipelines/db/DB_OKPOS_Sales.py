@@ -1777,6 +1777,8 @@ def _read_okpos_excel(path: str) -> pd.DataFrame:
         "NO", "포스번호", "영수증번호", "구분", "테이블명", "최초주문", "결제시간",
         "상품코드", "바코드", "상품명", "수량", "총매출액", "할인액", "할인구분",
         "실매출액", "가액", "부가세",
+        # daily(일자별 종합매출) 전용 컬럼명
+        "일자", "영업매장", "합매출", "총매출", "실매출", "영수건수",
     }
 
     header_row = 0
@@ -1893,14 +1895,16 @@ def _transform_okpos_daily_df(df: pd.DataFrame, store_name: str, sale_date: str)
     raw = raw.replace(r"^\s*$", pd.NA, regex=True)
 
     # 1) 정상 케이스: 컬럼이 이미 존재
-    if "일자" in raw.columns and "실매출" in raw.columns:
+    _DAILY_AMT_COLS = {"실매출", "실매출액", "합매출", "총매출"}
+    if "일자" in raw.columns and bool(_DAILY_AMT_COLS & set(raw.columns)):
         data = raw.copy()
     else:
         # 2) 비정상/구버전 케이스: 헤더 행을 다시 찾는다.
         header_row = None
         for i in range(min(8, len(raw))):
             row = raw.iloc[i].astype(str).map(lambda s: (s or "").strip()).tolist()
-            if ("일자" in row) and ("실매출" in row):
+            row_set = set(row)
+            if "일자" in row_set and bool(_DAILY_AMT_COLS & row_set):
                 header_row = i
                 break
         if header_row is None:
@@ -1941,19 +1945,23 @@ def _transform_okpos_daily_df(df: pd.DataFrame, store_name: str, sale_date: str)
             raise ValueError("daily 엑셀 파싱 실패: '소계:'/'영업일수합:'/합계 행 모두 없음")
         row = row.iloc[:1].copy()
 
-    def _num(col: str) -> int:
-        if col not in row.columns:
-            return 0
-        return int(pd.to_numeric(str(row.iloc[0][col]).replace(",", "").strip(), errors="coerce") or 0)
+    def _num(*cols: str) -> int:
+        for col in cols:
+            if col in row.columns:
+                v = str(row.iloc[0][col]).replace(",", "").strip()
+                result = pd.to_numeric(v, errors="coerce")
+                if pd.notna(result):
+                    return int(result)
+        return 0
 
     out = pd.DataFrame([{
         "sale_date": sale_date,
         "ym": sale_date[:7],
         "매장명": store_name,
-        "총매출액": _num("총매출"),
-        "총할인액": _num("총할인"),
-        "실매출액": _num("실매출"),
-        "영수건수": _num("영수건수"),
+        "총매출액": _num("총매출", "합매출"),
+        "총할인액": _num("총할인", "할인액"),
+        "실매출액": _num("실매출", "실매출액"),
+        "영수건수": _num("영수건수", "객수(수)"),
         "collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }])
     out["_pk"] = out.apply(

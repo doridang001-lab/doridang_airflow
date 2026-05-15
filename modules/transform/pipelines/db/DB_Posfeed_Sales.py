@@ -44,6 +44,7 @@ ORDER_URL   = "https://admin.posfeed.co.kr/#/order/list"
 # 상수 - 브라우저 설정
 # ============================================================
 HEADLESS_MODE = os.getenv("AIRFLOW_HOME") is not None
+INTEGRITY_WARN_THRESHOLD = 10_000  # 이 금액 미만 차이는 float 오차로 무시
 
 
 # ============================================================
@@ -591,23 +592,34 @@ def download_posfeed_excel(collect_mode: str = None, **context) -> str:
     download_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"다운로드 경로: {download_dir}")
 
-    driver, wait = _restart_driver_with_download(download_dir)
-    logger.info("CDP 다운로드 경로 설정: %s", download_dir)
+    MAX_ATTEMPTS = 5
+    last_exc: Exception = RuntimeError("download_excel 시도 0회")
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        driver, wait = _restart_driver_with_download(download_dir)
+        logger.info("CDP 다운로드 경로 설정: %s (시도 %d/%d)", download_dir, attempt, MAX_ATTEMPTS)
+        try:
+            _login(driver, wait)
+            download_start = time.time()
+            _click_download(driver, wait)
+            downloaded_file = _wait_for_downloaded_file(download_dir, min_mtime=download_start)
+            file_path = str(downloaded_file)
+            from datetime import timedelta
+            data_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            logger.info("✅ 다운로드 완료 | 파일: %s | 데이터 날짜: %s", downloaded_file.name, data_date)
+            context['ti'].xcom_push(key='downloaded_file_path', value=file_path)
+            return file_path
+        except (TimeoutException, WebDriverException, Exception) as e:
+            last_exc = e
+            logger.warning("다운로드 시도 %d/%d 실패: %s — Chrome 재시작", attempt, MAX_ATTEMPTS, e)
+        finally:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            _kill_chrome_processes()
+            logger.info("WebDriver 종료 (시도 %d)", attempt)
 
-    try:
-        _login(driver, wait)
-        download_start = time.time()
-        _click_download(driver, wait)
-        downloaded_file = _wait_for_downloaded_file(download_dir, min_mtime=download_start)
-        file_path = str(downloaded_file)
-        from datetime import timedelta
-        data_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        logger.info("✅ 다운로드 완료 | 파일: %s | 데이터 날짜: %s", downloaded_file.name, data_date)
-        context['ti'].xcom_push(key='downloaded_file_path', value=file_path)
-        return file_path
-    finally:
-        driver.quit()
-        logger.info("WebDriver 종료")
+    raise last_exc
 
 
 def move_to_storage(**context) -> str:
@@ -1185,6 +1197,7 @@ def check_monthly_collection(**context) -> str:
         logger.info("[무결성] 검사 대상 완성 ym 없음")
 
     integrity_warnings = 0
+    integrity_failed_yms: list[str] = []
     for ym in completed_yms:
         try:
             orders_total = 0.0
@@ -1208,17 +1221,23 @@ def check_monthly_collection(**context) -> str:
                     logger.warning("[무결성] 아이템 파티션 읽기 실패: %s | %s", csv_path, exc)
 
             diff = abs(orders_total - items_total)
-            if diff > 0:
+            if diff > INTEGRITY_WARN_THRESHOLD:
                 logger.warning(
-                    "[무결성] ym=%s | 주문금액=%s ≠ 아이템합계=%s | 차이=%s → detail 재수집 필요",
+                    "[무결성] ym=%s | 주문금액=%s ≠ 아이템합계=%s | 차이=%s → extract_order_codes 재수집 예약",
                     ym, f"{orders_total:,.0f}", f"{items_total:,.0f}", f"{diff:,.0f}",
                 )
+                integrity_failed_yms.append(ym)
                 integrity_warnings += 1
             else:
                 logger.info("[무결성] ym=%s OK | 주문금액=%s / 아이템합계=%s", ym, f"{orders_total:,.0f}", f"{items_total:,.0f}")
 
         except Exception as exc:
             logger.warning("[무결성] ym=%s 검사 오류: %s", ym, exc)
+
+    ti = context.get("ti")
+    if ti and integrity_failed_yms:
+        ti.xcom_push(key="integrity_failed_yms", value=integrity_failed_yms)
+        logger.info("[무결성] XCom push integrity_failed_yms=%s", integrity_failed_yms)
 
     result = (
         f"[check_monthly] 파티션={len(summary_rows)}개 | "
