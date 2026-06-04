@@ -26,6 +26,7 @@ from modules.transform.pipelines.db.DB_ItemMaster import (
     update_item_master_labels,
 )
 from modules.transform.utility.mailer import send_email
+from modules.transform.utility.notifier import send_telegram
 from modules.transform.utility.paths import ITEM_MASTER_CHECKPOINT_DIR
 from modules.transform.utility.schedule import DB_ITEM_MASTER_TIME
 
@@ -43,14 +44,17 @@ default_args = {
 
 
 def on_failure_callback(context):
+    ti = context.get("task_instance")
+    body = f"DAG: {dag_id}\nTask: {ti.task_id}\n에러: {context.get('exception', '')}\n로그: {ti.log_url}"
     try:
         send_email(
             subject=f"[Airflow 실패] {dag_id}",
-            html_content=f"Task: {context['task_instance'].task_id}<br>오류: {context.get('exception', '')}",
+            html_content=f"Task: {ti.task_id}<br>오류: {context.get('exception', '')}",
             to_emails="tjrrjwu92@gmail.com",
         )
     except Exception as exc:
         logger.warning("실패 알림 발송 실패: %s", exc)
+    send_telegram(body + "\n해결해라")
 
 
 def task_extract_and_classify(**context):

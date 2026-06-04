@@ -1,0 +1,357 @@
+"""
+홀 매장 주간보고 Excel 생성 파이프라인
+
+입력:
+  - MART_DB/hall_sales_target/hall_sale_target.csv      (매출 실적)
+  - MART_DB/hall_sales_target/hall_marketing_target.csv (마케팅 실적)
+출력:
+  - MART_DB/hall_sales_target/hall_weekly_report_{YYMMDD}.xlsx  (날짜별 누적)
+
+레이아웃 (1시트 "주간보고"):
+  [표1] 매출 현황 — 월목표 / 월누계 / 월달성률 / 주목표 / 이번주 / 주달성률
+  [표2] 마케팅 현황 — 동일 구조
+  [표3] AI 진단 요약 (Ollama gpt-oss)
+"""
+
+import calendar
+import logging
+from datetime import date, timedelta
+
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+from modules.transform.utility.paths import MART_DB
+
+logger = logging.getLogger(__name__)
+
+SALE_CSV  = MART_DB / "hall_sales_target" / "hall_sale_target.csv"
+MKT_CSV   = MART_DB / "hall_sales_target" / "hall_marketing_target.csv"
+XLSX_DIR  = MART_DB / "hall_sales_target"
+
+# Windows 경로 (로그 안내용)
+_WIN_BASE = r"C:\Users\민준\OneDrive - 주식회사 도리당\data\mart\hall_sales_target"
+
+# ── 스타일 상수 ────────────────────────────────────────────────
+_DARK_FILL  = PatternFill("solid", fgColor="1F3864")  # 제목: 진남색
+_HEAD_FILL  = PatternFill("solid", fgColor="2F5597")  # 컬럼 헤더: 진청
+_SEC_FILL   = PatternFill("solid", fgColor="17375E")  # 섹션 소제목: 중청
+_AI_FILL    = PatternFill("solid", fgColor="EBF3FB")  # AI 진단 배경: 연청
+
+_GREEN  = PatternFill("solid", fgColor="C6EFCE")
+_YELLOW = PatternFill("solid", fgColor="FFEB9C")
+_RED    = PatternFill("solid", fgColor="FFC7CE")
+
+_WHITE_BOLD  = Font(color="FFFFFF", bold=True, size=11)
+_TITLE_FONT  = Font(color="FFFFFF", bold=True, size=13)
+_BOLD        = Font(bold=True, size=10)
+_NORMAL      = Font(size=10)
+_AI_LABEL    = Font(bold=True, size=10, color="1F3864")
+
+_CENTER = Alignment(horizontal="center", vertical="center")
+_LEFT   = Alignment(horizontal="left",   vertical="center")
+_WRAP   = Alignment(horizontal="left",   vertical="top", wrap_text=True)
+
+_THIN   = Side(style="thin")
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+
+_FMT_NUM = "#,##0"
+_FMT_KRW = '#,##0"원"'
+_FMT_PCT = "0.0%"
+
+
+# ── 헬퍼 ───────────────────────────────────────────────────────
+
+def _rate(actual, target):
+    return actual / target if target else None
+
+
+def _fill_for(rate):
+    if rate is None:
+        return None
+    return _GREEN if rate >= 1.0 else (_YELLOW if rate >= 0.8 else _RED)
+
+
+def _cell(ws, row, col, value, font=None, fill=None, align=None,
+          fmt=None, border=True):
+    c = ws.cell(row=row, column=col, value=value)
+    c.font      = font  or _NORMAL
+    c.alignment = align or _CENTER
+    if fill:   c.fill = fill
+    if fmt:    c.number_format = fmt
+    if border: c.border = _BORDER
+    return c
+
+
+def _header_row(ws, row, labels, col_start=1):
+    for i, lbl in enumerate(labels):
+        _cell(ws, row, col_start + i, lbl, font=_WHITE_BOLD,
+              fill=_HEAD_FILL, align=_CENTER)
+
+
+def _data_row(ws, row, label,
+              m_tgt, m_act, w_tgt, w_act,
+              num_fmt=_FMT_NUM, show_m=True, show_w=True):
+    m_rate = _rate(m_act, m_tgt) if show_m else None
+    w_rate = _rate(w_act, w_tgt) if show_w else None
+
+    _cell(ws, row, 1, label,  font=_BOLD, align=_LEFT)
+    _cell(ws, row, 2, m_tgt,  fmt=num_fmt)
+    _cell(ws, row, 3, m_act,  fmt=num_fmt)
+    if m_rate is None:
+        _cell(ws, row, 4, "—", align=_CENTER)
+    else:
+        _cell(ws, row, 4, m_rate, fmt=_FMT_PCT, fill=_fill_for(m_rate))
+    _cell(ws, row, 5, w_tgt, fmt=num_fmt)
+    _cell(ws, row, 6, w_act, fmt=num_fmt)
+    if w_rate is None:
+        _cell(ws, row, 7, "—", align=_CENTER)
+    else:
+        _cell(ws, row, 7, w_rate, fmt=_FMT_PCT, fill=_fill_for(w_rate))
+
+
+def _section(ws, row, title):
+    ws.merge_cells(f"A{row}:G{row}")
+    c = ws.cell(row=row, column=1, value=f"▶ {title}")
+    c.font = Font(bold=True, size=11, color="FFFFFF")
+    c.fill = _SEC_FILL
+    c.alignment = _LEFT
+
+
+# ── 데이터 로드 ────────────────────────────────────────────────
+
+def _load_sale():
+    df = pd.read_csv(SALE_CSV, dtype=str)
+    df["입력날짜"] = pd.to_datetime(df["입력날짜"], errors="coerce")
+    for c in df.columns:
+        if c not in ("입력날짜", "기준주", "기준월"):
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    return df
+
+
+def _load_mkt():
+    df = pd.read_csv(MKT_CSV, dtype=str)
+    df = df.rename(columns={"인스타_노출_traget": "인스타_노출_target"})
+    df["입력날짜"] = pd.to_datetime(df["입력날짜"], errors="coerce")
+    df["기준일자"] = pd.to_datetime(df["기준일자"], errors="coerce")
+    for c in df.columns:
+        if c not in ("입력날짜", "기준일자"):
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    df["_month"] = df["기준일자"].dt.month
+    df["_year"]  = df["기준일자"].dt.year
+    return df
+
+
+def _mkt_weekly_targets(ym, week_start, mkt_monthly):
+    cnt = sum(
+        1 for i in range(7)
+        if (week_start + timedelta(days=i)).strftime("%Y-%m") == ym
+    )
+    t   = mkt_monthly.get(ym, {})
+    dim = calendar.monthrange(int(ym[:4]), int(ym[5:]))[1]
+    return {k: round(v / dim * cnt) for k, v in t.items()}
+
+
+# ── Ollama 진단 ────────────────────────────────────────────────
+
+def _ai_diagnose(sale_ctx: str, mkt_ctx: str):
+    try:
+        from modules.transform.utility.qwen_client import query_qwen
+
+        sys_prompt = (
+            "F&B 매장 분석가. 2문장 이내, 숫자 포함, 개선점 1가지만. 번호/기호 없이 자연스럽게."
+        )
+        sale_diag = query_qwen(
+            f"아래 매출 데이터를 2문장으로 요약하세요. 달성률과 가장 취약한 지표, 개선점 1가지.\n\n{sale_ctx}",
+            system_prompt=sys_prompt,
+        )
+        mkt_diag = query_qwen(
+            f"아래 마케팅 데이터를 2문장으로 요약하세요. 가장 낮은 채널과 가장 높은 채널, 개선점 1가지.\n\n{mkt_ctx}",
+            system_prompt=sys_prompt,
+        )
+    except Exception as e:
+        logger.warning("Ollama 진단 실패 (fallback 사용): %s", e)
+        sale_diag = "⚠ AI 진단 불가 — Ollama 서비스 연결 실패. 수동 분석이 필요합니다."
+        mkt_diag  = "⚠ AI 진단 불가 — Ollama 서비스 연결 실패. 수동 분석이 필요합니다."
+    return sale_diag, mkt_diag
+
+
+# ── 메인 함수 ──────────────────────────────────────────────────
+
+def build_weekly_report_excel(monthly_targets: dict,
+                               marketing_monthly_targets: dict) -> str:
+    if not SALE_CSV.exists():
+        raise FileNotFoundError(f"hall_sale_target.csv 없음: {SALE_CSV}")
+    if not MKT_CSV.exists():
+        raise FileNotFoundError(f"hall_marketing_target.csv 없음: {MKT_CSV}")
+
+    sale_df = _load_sale()
+    mkt_df  = _load_mkt()
+
+    # ── 최신 주 결정 ──────────────────────────────────────────
+    latest    = sale_df.sort_values("입력날짜").iloc[-1]
+    ym        = latest["기준월"]          # "2026-05"
+    wk_label  = latest["기준주"]          # "5월5주차"
+    entry_dt  = latest["입력날짜"]        # 입력날짜(Timestamp)
+    week_start = (entry_dt - timedelta(days=7)).date()
+    week_end   = (entry_dt - timedelta(days=1)).date()
+
+    yr, mon = int(ym[:4]), int(ym[5:])
+
+    # ── 월 누계 (매출) ────────────────────────────────────────
+    mrows = sale_df[sale_df["기준월"] == ym]
+    ms = lambda c: int(mrows[c].sum())
+    ws = lambda c: int(latest[c])
+
+    mt = monthly_targets.get(ym, {})
+
+    # ── 이번주 targets (매출) — CSV에서 직접 읽음 ─────────────
+    wt_sale   = ws("매출_target")
+    wt_cnt    = ws("영수건수_target")
+    wt_lunch  = ws("점심_매출_target")
+    wt_l_cnt  = ws("점심_영수건수_target")
+    wt_dinner = ws("저녁_매출_target")
+    wt_d_cnt  = ws("저녁_영수건수_target")
+
+    # ── 마케팅 ────────────────────────────────────────────────
+    mkt_month  = mkt_df[(mkt_df["_year"] == yr) & (mkt_df["_month"] == mon)]
+    mkt_latest = mkt_df.sort_values("입력날짜").iloc[-1]
+    mm  = lambda c: int(mkt_month[c].sum()) if c in mkt_month else 0
+    mw  = lambda c: int(mkt_latest[c])      if c in mkt_latest.index else 0
+    mmt = marketing_monthly_targets.get(ym, {})
+    mwt = _mkt_weekly_targets(ym, week_start, marketing_monthly_targets)
+
+    # ── AI 진단 ───────────────────────────────────────────────
+    def pct(a, t): return f"{a/t*100:.1f}%" if t else "N/A"
+    sale_ctx = (
+        f"[{wk_label} | {week_start} ~ {week_end}]\n"
+        f"- 전체 매출: 이번주 {ws('매출'):,}원 / 목표 {wt_sale:,}원 (달성률 {pct(ws('매출'), wt_sale)})\n"
+        f"- 월 누계:   {ms('매출'):,}원 / 월 목표 {mt.get('sale',0):,}원 (달성률 {pct(ms('매출'), mt.get('sale',1))})\n"
+        f"- 점심 매출: 이번주 {ws('점심_매출'):,}원 / 목표 {wt_lunch:,}원 (달성률 {pct(ws('점심_매출'), wt_lunch)})\n"
+        f"- 저녁 매출: 이번주 {ws('저녁_매출'):,}원 / 목표 {wt_dinner:,}원 (달성률 {pct(ws('저녁_매출'), wt_dinner)})\n"
+        f"- 영수건수:  이번주 {ws('영수건수')}건 / 목표 {wt_cnt}건"
+    )
+    mkt_ctx = (
+        f"[{wk_label}]\n"
+        f"- 플레이스 유입: {mw('플레이스_유입')}명 / 목표 {mwt.get('플레이스_유입',0)}명\n"
+        f"- 홍보물 배포:  {mw('홍보물_배포')}건 / 목표 {mwt.get('홍보물_배포',0)}건\n"
+        f"- 쿠폰 회수:   {mw('쿠폰_회수율')}건 / 목표 {mwt.get('쿠폰_회수',0)}건\n"
+        f"- 인스타 노출:  {mw('인스타_노출')}회 / 목표 {mwt.get('인스타_노출',0)}회\n"
+        f"- 당근 노출:   {mw('당근_노출')}회 / 목표 {mwt.get('당근_노출',0)}회\n"
+        f"- 네이버 오더: {mw('네이버_오더')}건 / 목표 {mwt.get('네이버_오더',0)}건"
+    )
+    sale_diag, mkt_diag = _ai_diagnose(sale_ctx, mkt_ctx)
+
+    # ── Excel 생성 ────────────────────────────────────────────
+    wb = Workbook()
+    ws_ = wb.active
+    ws_.title = "주간보고"
+
+    col_widths = [18, 15, 15, 11, 15, 15, 11]
+    for i, w in enumerate(col_widths, 1):
+        ws_.column_dimensions[get_column_letter(i)].width = w
+
+    # 제목
+    ws_.merge_cells("A1:G1")
+    c = ws_["A1"]
+    c.value = f"◆ 홀 주간보고  {wk_label}"
+    c.font  = _TITLE_FONT
+    c.fill  = _DARK_FILL
+    c.alignment = _CENTER
+    ws_.row_dimensions[1].height = 30
+
+    ws_.merge_cells("A2:G2")
+    c2 = ws_["A2"]
+    c2.value = f"기준:  {week_start.strftime('%Y-%m-%d')} ~ {week_end.strftime('%Y-%m-%d')}"
+    c2.font  = Font(size=10, italic=True)
+    c2.alignment = _CENTER
+    ws_.row_dimensions[2].height = 16
+
+    HEADERS = ["구분", "월목표", "월누계", "월달성률", "주목표", "이번주", "주달성률"]
+
+    # ── 표1: 매출 현황 ─────────────────────────────────────────
+    _section(ws_, 4, "매출 현황")
+    _header_row(ws_, 5, HEADERS)
+    ws_.row_dimensions[5].height = 18
+
+    def _ms_aov(prefix_매출, prefix_cnt):
+        """월 누계 테이블단가 = 누계매출/누계영수건수"""
+        total = ms(prefix_매출)
+        cnt   = ms(prefix_cnt)
+        return int(total / cnt) if cnt else 0
+
+    sale_rows = [
+        # (label, m_tgt, m_act, w_tgt, w_act, num_fmt, show_m, show_w)
+        ("전체 매출",    mt.get("sale",0),          ms("매출"),          wt_sale,   ws("매출"),         _FMT_KRW, True,  True),
+        ("영수건수",     mt.get("orders",0),          ms("영수건수"),     wt_cnt,    ws("영수건수"),     _FMT_NUM, True,  True),
+        ("테이블단가",   mt.get("aov",0),             _ms_aov("매출","영수건수"), mt.get("aov",0), ws("테이블_객단가"), _FMT_KRW, True,  True),
+        ("점심 매출",    mt.get("lunch_sale",0),      ms("점심_매출"),     wt_lunch,  ws("점심_매출"),    _FMT_KRW, True,  True),
+        ("점심 영수건수",mt.get("lunch_orders",0),    ms("점심_영수건수"), wt_l_cnt,  ws("점심_영수건수"),_FMT_NUM, True,  True),
+        ("점심 테이블단가",mt.get("lunch_aov",0),     _ms_aov("점심_매출","점심_영수건수"), mt.get("lunch_aov",0), ws("점심_테이블_객단가"), _FMT_KRW, True,  True),
+        ("저녁 매출",    mt.get("dinner_sale",0),     ms("저녁_매출"),     wt_dinner, ws("저녁_매출"),    _FMT_KRW, True,  True),
+        ("저녁 영수건수",mt.get("dinner_orders",0),   ms("저녁_영수건수"), wt_d_cnt,  ws("저녁_영수건수"),_FMT_NUM, True,  True),
+        ("저녁 테이블단가",mt.get("dinner_aov",0),    _ms_aov("저녁_매출","저녁_영수건수"), mt.get("dinner_aov",0), ws("저녁_테이블_객단가"), _FMT_KRW, True,  True),
+    ]
+    r = 6
+    for lbl, m_t, m_a, w_t, w_a, fmt, sm, sw in sale_rows:
+        _data_row(ws_, r, lbl, m_t, m_a, w_t, w_a, num_fmt=fmt, show_m=sm, show_w=sw)
+        ws_.row_dimensions[r].height = 17
+        r += 1
+
+    r += 1  # 빈 행
+
+    # ── 표2: 마케팅 현황 ───────────────────────────────────────
+    _section(ws_, r, "마케팅 현황")
+    r += 1
+    _header_row(ws_, r, HEADERS)
+    ws_.row_dimensions[r].height = 18
+    r += 1
+
+    # (표시명, 월누계_csv컬럼, 이번주_csv컬럼, target_key)
+    mkt_metrics = [
+        ("플레이스 유입", "플레이스_유입", "플레이스_유입", "플레이스_유입"),
+        ("홍보물 배포",   "홍보물_배포",   "홍보물_배포",   "홍보물_배포"),
+        ("쿠폰 회수",     "쿠폰_회수율",   "쿠폰_회수율",   "쿠폰_회수"),
+        ("인스타 노출",   "인스타_노출",   "인스타_노출",   "인스타_노출"),
+        ("당근 노출",     "당근_노출",     "당근_노출",     "당근_노출"),
+        ("네이버 오더",   "네이버_오더",   "네이버_오더",   "네이버_오더"),
+    ]
+    for lbl, csv_m, csv_w, tkey in mkt_metrics:
+        _data_row(ws_, r, lbl,
+                  mmt.get(tkey, 0), mm(csv_m),
+                  mwt.get(tkey, 0), mw(csv_w),
+                  num_fmt=_FMT_NUM)
+        ws_.row_dimensions[r].height = 17
+        r += 1
+
+    r += 1  # 빈 행
+
+    # ── 표3: AI 진단 요약 ─────────────────────────────────────
+    _section(ws_, r, "AI 진단 요약  (챗Gpt)")
+    ws_.row_dimensions[r].height = 18
+    r += 1
+
+    for lbl, diag in [("매출 진단", sale_diag), ("마케팅 진단", mkt_diag)]:
+        ws_.merge_cells(f"B{r}:G{r}")
+        lbl_c = _cell(ws_, r, 1, lbl, font=_AI_LABEL,
+                      fill=_AI_FILL, align=_LEFT)
+        diag_c = ws_.cell(row=r, column=2, value=diag)
+        diag_c.font      = _NORMAL
+        diag_c.alignment = _WRAP
+        diag_c.fill      = _AI_FILL
+        diag_c.border    = _BORDER
+        ws_.row_dimensions[r].height = 72
+        r += 1
+
+    # ── 저장 ─────────────────────────────────────────────────
+    today_str = date.today().strftime("%y%m%d")
+    output_path = XLSX_DIR / f"hall_weekly_report_{today_str}.xlsx"
+    latest_path = XLSX_DIR / "hall_weekly_report.xlsx"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(output_path)
+    wb.save(latest_path)   # 고정 파일명 — Excel/PowerBI 참조용
+
+    win_path = rf"{_WIN_BASE}\hall_weekly_report_{today_str}.xlsx"
+    logger.info("주간보고 저장 완료 (%s)\nWindows: %s", wk_label, win_path)
+    return f"완료: {wk_label} → {win_path}"

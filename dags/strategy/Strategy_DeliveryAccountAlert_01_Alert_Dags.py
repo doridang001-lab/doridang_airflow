@@ -23,6 +23,7 @@ from airflow.operators.python import PythonOperator
 
 from modules.common.config import ADMIN_EMAIL
 from modules.transform.utility.mailer import send_email, text_to_html
+from modules.transform.utility.notifier import send_telegram
 from modules.transform.utility.schedule import SMP_DELIVERY_ALERT_TIME
 
 # ============================================================
@@ -88,6 +89,18 @@ def _on_task_failure(context):
         )
     except Exception:
         logger.exception("Failure alert callback failed")
+    try:
+        _ti2 = context.get("task_instance") or context.get("ti")
+        _exc2 = context.get("exception", "알 수 없음")
+        _rd2 = getattr(_ti2, "execution_date", None)
+        _ed2 = _rd2.strftime("%Y-%m-%d %H:%M") if _rd2 else ""
+        _retry2 = getattr(_ti2, "try_number", 1) - 1
+        send_telegram(
+            f"DAG: {_ti2.dag_id}\nTask: {_ti2.task_id}\n재시도: {_retry2}회차\n"
+            f"실행일시: {_ed2}\n에러: {_exc2}\n로그: {_ti2.log_url}\n해결해라"
+        )
+    except Exception:
+        pass
 
 # ============================================================
 # 파이프라인 모듈 동적 임포트

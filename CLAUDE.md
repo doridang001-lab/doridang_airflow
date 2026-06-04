@@ -51,14 +51,19 @@ docker exec airflow-airflow-worker-1 bash -c "cat '/opt/airflow/logs/dag_id={DAG
 - 새 크롤링 DAG 작성 시 `/crawl` skill 필수 사용
 
 ## 배민 수집 파이프라인 (DB_Beamin_Macro_Dags)
-- 매장별 독립 Chrome 세션 (OOM 방지): 1단계(매장목록) → 2단계(now+우가클+변경이력, per-store) → 3단계(orders)
-- 저장: `analytics/baemin_macro/{metrics_now,metrics_our_store_clicks,shop_change,orders}/`
+- 매장별 독립 Chrome 세션 (OOM 방지): 1단계(매장목록) → 2단계(now+우가클+변경이력) → 3단계(orders 정상+취소) → 4단계(ad_funnel)
+- 저장: `analytics/baemin_macro/{metrics_now,metrics_our_store_clicks,shop_change,orders,ad_funnel}/`
+- ad_funnel: `stat/advertisement` 페이지, 노출수·클릭수·주문수·주문금액, 월별 CSV upsert by target_date
 - 우가클 KNOWN_BRANDS: `["도리당", "나홀로"]` (광고 미집행 매장은 `DOM={"tr":0}` 정상)
 
 ## 배민 크롤링 Gotcha
 - 배민 우가클 테이블: Selenium `.text` 빈값 → `.get_attribute("innerText")` 필수
 - `전체보기` 버튼도 `.text` 빈값 → `b.get_attribute("innerText")`로 찾아야 함
 - SPA 상태 꼬임 시: 대시보드 경유 후 재시도 (`driver.get("https://self.baemin.com/")`)
+- orders 가게+상태 필터: `FilterContainer-module__ccrG` 하나의 통합 팝업 — 가게·주문취소 상태 함께 처리
+- orders 주문취소: `input[name="status"][value="CANCELLED"]` readonly → `label[for=id].click()` 필수
+- ad_funnel `Filter-module__lRdH` 버튼 **2개 독립**: [0]=노출수·클릭수, [1]=주문수·주문금액 각각 설정
+- ad_funnel DAILY 라디오(readonly) 클릭 후 **0.5s sleep 필수** — React 배치 업데이트 완료 대기
 
 ## DAG 수동 트리거 conf 패턴
 - `{"sale_date": "YYYY-MM-DD"}` → 정정 모드 (overwrite=True)
@@ -75,6 +80,15 @@ docker exec airflow-airflow-worker-1 bash -c "cat '/opt/airflow/logs/dag_id={DAG
 - CSV 컬럼: `item_name, is_valid, store, review_needed, classified_by`
 - `review_needed=Y` → 이메일 알림 → 검토 후 N으로 변경 (`is_valid` 틀렸으면 같이 수정)
 - DAG 재실행 시 `sync_posfeed_blacklist`가 `is_valid=N` 항목 parquet 소급 삭제
+
+## daily_summary.parquet (PowerBI 핵심 파일)
+- 경로: `MART_DB/unified_sales_grp/daily_summary.parquet`
+- 생성: `build_daily_summary()` → DAG `DB_UnifiedSales` t9
+- 컬럼 분류:
+  - **Additive (SUM 가능)**: `total_price`, `order_cnt`, `expected_month_sales`, `expected_week_sales`
+  - **Non-additive (MAX 사용)**: `store_expected_month_sales`, `store_expected_week_sales`
+- PowerBI 예상누적매출: `MAX(store_expected_month_sales)` groupby `store×brand×ym`
+- `store_expected_month_sales` = `bdf["es"]` (store 전체 tp / store max_day × 말일) — 채널별 SUM 아님
 
 ## 읽기 제외
 - `.claudeignore`

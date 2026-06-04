@@ -286,6 +286,16 @@ def _transform_df(orders: pd.DataFrame, items: pd.DataFrame, date_str: str) -> p
     dfs = dfs.drop(columns=["_skey"])
 
     dfs["order_id"] = dfs["외부 주문 번호"].fillna("").astype(str).str.strip()
+    # 외부 주문번호 없는 행: store+시각 조합으로 surrogate order_id 부여
+    # (같은 매장·같은 시각 항목은 동일 주문으로 유지, 다른 그룹과 홀 오염 방지)
+    _no_id = dfs["order_id"] == ""
+    if _no_id.any():
+        dfs.loc[_no_id, "order_id"] = (
+            "tmp_"
+            + dfs.loc[_no_id, "store"].astype(str).str.strip()
+            + "_"
+            + dfs.loc[_no_id, "주문등록 시각"].fillna("").astype(str).str.strip()
+        )
     dfs["order_time"] = dfs["주문등록 시각"].apply(_normalize_time)
     dfs["item_name"] = (
         dfs["상품명"].fillna("").astype(str)
@@ -407,7 +417,8 @@ def report_posfeed_exclusions(**context) -> str:
         if not doridori_df.empty:
             from modules.transform.utility.mailer import send_email
             rows_html = "".join(
-                f"<tr><td>{r.get('store','')}</td><td>{r.get('item_name','')}</td>"
+                f"<tr><td>{r.get('store','')}</td><td>{r.get('menu_name','')}</td>"
+                f"<td>{r.get('item_name','')}</td>"
                 f"<td>{r.get('sale_date','')}</td><td>{r.get('total_price','')}</td></tr>"
                 for _, r in doridori_df.iterrows()
             )
@@ -417,7 +428,7 @@ def report_posfeed_exclusions(**context) -> str:
 <p>블랙리스트로 제외된 항목 중 <b>"도리"</b>가 포함된 상품명이 발견됐습니다. 검토가 필요합니다.</p>
 <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;width:100%;">
   <thead style="background:#f2f2f2;">
-    <tr><th>매장</th><th>상품명</th><th>날짜</th><th>금액</th></tr>
+    <tr><th>매장</th><th>제외 메뉴명</th><th>상품명(블랙리스트)</th><th>날짜</th><th>금액</th></tr>
   </thead>
   <tbody>{rows_html}</tbody>
 </table>
@@ -629,15 +640,29 @@ _BRAND_DESC = {
 _WHITELIST_COLUMNS = ["item_name", "is_valid", "store", "review_needed", "classified_by"]
 
 
-def _classify_item_with_llm(item_name: str, brands: set[str]) -> str:
+def _classify_item_with_llm(
+    item_name: str,
+    brands: set[str],
+    examples: list[dict] | None = None,
+) -> str:
     """Ollama로 item_name이 브랜드에 적절한지 Y/N 판정. 실패 시 N 반환."""
     brand_context = "\n".join(
         f"- {b}: {_BRAND_DESC.get(b, '외식 브랜드')}"
         for b in sorted(brands)
     ) if brands else "- 알 수 없음: 외식 브랜드"
+
+    example_block = ""
+    if examples:
+        y_ex = [e["item_name"] for e in examples if str(e.get("is_valid", "")).upper() == "Y"][:10]
+        n_ex = [e["item_name"] for e in examples if str(e.get("is_valid", "")).upper() == "N"][:10]
+        ex_lines = [f"- {n} → Y" for n in y_ex] + [f"- {n} → N" for n in n_ex]
+        if ex_lines:
+            example_block = "기존 분류 예시:\n" + "\n".join(ex_lines) + "\n\n"
+
     prompt = (
         f"다음 상품이 해당 외식 브랜드의 정상 메뉴인지 판단하세요.\n\n"
         f"브랜드:\n{brand_context}\n\n"
+        f"{example_block}"
         f"상품명: {item_name}\n\n"
         "정상 메뉴이면 Y, 브랜드와 전혀 맞지 않는 잘못된 주문이면 N.\n"
         "Y 또는 N 한 글자만 답하세요."
@@ -740,7 +765,8 @@ def generate_posfeed_whitelist_draft() -> str:
         if norm in existing_items:
             continue
         brands = item_brands.get(norm, set())
-        is_valid = _classify_item_with_llm(norm, brands)
+        ex = existing_df.to_dict("records") if existing_df is not None else None
+        is_valid = _classify_item_with_llm(norm, brands, examples=ex)
         classified_by = "auto_llm"
         new_rows.append({
             "item_name": norm,

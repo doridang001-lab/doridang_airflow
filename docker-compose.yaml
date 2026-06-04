@@ -76,6 +76,9 @@ x-airflow-common:
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
     LOCAL_GPT_OSS_20B_ENDPOINT: 'http://host.docker.internal:11434/v1/chat/completions'
     LOCAL_GPT_OSS_20B_MODEL: 'gpt-oss:20b'
+    # Coupang collection attaches to the minimized real Chrome launched on the Windows host.
+    # Chrome DevTools rejects host.docker.internal as a Host header; use Docker Desktop's host IP.
+    COUPANG_CHROME_DEBUGGER: '192.168.65.254:9222'
     # yamllint disable rule:line-length
     # Use simple http server on scheduler for health checks
     # See https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/check-health.html#scheduler-health-check-server
@@ -103,6 +106,7 @@ x-airflow-common:
     - "c:/Local_DB:/opt/airflow/Local_DB"
     - "c:/Doridang:/opt/airflow/Doridang"
     - e:/down:/opt/airflow/download
+    - e:/d_down:/opt/airflow/manual_download
     - ./logs:/opt/airflow/logs
   user: "0:0"
   depends_on:
@@ -163,7 +167,7 @@ services:
 
   airflow-webserver:
     <<: *airflow-common
-    command: webserver
+    command: bash -c "rm -f /opt/airflow/airflow-webserver.pid && airflow webserver"
     ports:
       - "8080:8080"
     healthcheck:

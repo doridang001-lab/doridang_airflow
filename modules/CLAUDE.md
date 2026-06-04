@@ -28,7 +28,9 @@ graph TD
 ## 크롤링 모듈 규칙
 - 새 크롤링 파이프라인 작성 전 `/crawl` skill 필수 (URL 구조·API 사전 검증)
 - `croling_beamin.py` - launch_browser / login / logout / get_store_options 공통 함수
-- DB 크롤링은 `combined.py` 패턴: 단일 세션에서 여러 수집 함수 순차 호출
+- DB 크롤링은 `combined.py` 패턴: **매장별 독립 Chrome** (OOM 방지), 4단계 순차 수집
+  - 1단계 매장목록 → 2단계 now+우가클+변경이력 → 3단계 orders(정상+취소) → 4단계 ad_funnel
+- `DB_Beamin_05_ad_funnel.py` — stat/advertisement 광고 funnel 수집 (노출수·클릭수·주문수·주문금액)
 
 ## 참조
 - `docs/architecture.md` - utility 선택 기준표

@@ -47,11 +47,15 @@ SMD_TOORDER_SALES_REPORT_TIME = "0 9 * * *"  # 매일 09:00 실행
 
 DB_TOORDER_STORE_PLATFORM_TIME = "10 9 * * *"  # 매일 09:10 실행 (SMD_TOORDER_SALES_REPORT 이후)
 
+DB_UNIFIED_REVIEW_TIME         = "33 9 * * *"  # 매일 09:33 실행 (ToOrderVoc Transform 9:30 이후)
+
 SMD_BAEMIN_COLLECT_TIME = "47 8 * * *"  # 매일 KST 08:55 (UTC 23:55 전날)
 
 SMP_MORNING_BRIEFING_TIME = "50 8 * * 1,2,3,4,5"  # 매주 월~금 08:50 실행 (KST)
 
 SMD_STORE_SALES_TIME = "0 11 * * *"  # 매일 11:00 실행 (POS 수집 완료 후)
+
+DB_HALL_SALES_TARGET_TIME = "55 10 * * 1"  # 매주 월요일 10:55 (UnifiedSales 10:30 시작 +25분)
 
 
 # ============================================================

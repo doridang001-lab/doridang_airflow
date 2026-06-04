@@ -29,6 +29,14 @@ from modules.transform.utility.mailer import send_email
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_replace(src: Path, dst: Path) -> None:
+    """os.replace with fallback for FUSE/OneDrive mounts where rename may fail."""
+    try:
+        os.replace(src, dst)
+    except (PermissionError, OSError):
+        dst.write_bytes(src.read_bytes())
+
 OKPOS_PRODUCT_XLSX = ANALYTICS_DB / "okpos_product" / "상품조회.xlsx"
 EASYPOS_PRODUCT_XLSX = ANALYTICS_DB / "easypos_product" / "상품조회.xlsx"
 SOURCE_CODE = "okpos"
@@ -239,7 +247,7 @@ def _write_review_file(pending_latest: pd.DataFrame) -> int:
     tmp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
     try:
         out.to_csv(tmp, index=False, encoding="utf-8-sig")
-        os.replace(tmp, FIN_PRODUCT_CSV_PATH)
+        _safe_replace(tmp, FIN_PRODUCT_CSV_PATH)
     finally:
         try:
             tmp.unlink(missing_ok=True)
@@ -289,7 +297,7 @@ def _write_review_file(pending_latest: pd.DataFrame) -> int:
     tmp = FIN_PRODUCT_REVIEW_CSV_PATH.with_suffix(".tmp")
     try:
         out.to_csv(tmp, index=False, encoding="utf-8-sig")
-        os.replace(tmp, FIN_PRODUCT_REVIEW_CSV_PATH)
+        _safe_replace(tmp, FIN_PRODUCT_REVIEW_CSV_PATH)
     finally:
         try:
             tmp.unlink(missing_ok=True)
@@ -392,11 +400,25 @@ def _read_easypos_xlsx() -> pd.DataFrame:
     return result.reset_index(drop=True)
 
 
+def _mark_is_latest(df: pd.DataFrame) -> pd.DataFrame:
+    """상품코드별 마지막 행에 is_latest=Y, 나머지 N 마킹 (저장 직전 호출)."""
+    if df.empty or "상품코드" not in df.columns:
+        return df
+    df = df.copy()
+    if "updated_at" in df.columns:
+        _ts = pd.to_datetime(df["updated_at"], errors="coerce").fillna(pd.Timestamp.min)
+        df = df.iloc[_ts.argsort().values].reset_index(drop=True)
+    df["is_latest"] = "N"
+    df.loc[df.groupby("상품코드").tail(1).index, "is_latest"] = "Y"
+    return df
+
+
 def _read_master() -> pd.DataFrame:
     """fin_product_grp.csv 로드. 없으면 빈 DataFrame."""
     if not FIN_PRODUCT_CSV_PATH.exists():
         return pd.DataFrame(columns=["source", "구분", "대메뉴", "중메뉴", "상품코드", "상품명",
-                                     "판매단가", "수동분류", "is_main_candidate", "llm_check", "exclude_check", "updated_at"])
+                                     "판매단가", "수동분류", "is_main_candidate", "llm_check",
+                                     "exclude_check", "updated_at", "is_latest"])
     df = pd.read_csv(FIN_PRODUCT_CSV_PATH, dtype=str).fillna("")
 
     # Backward compatibility: 신규 컬럼이 뒤늦게 추가될 수 있음
@@ -406,6 +428,8 @@ def _read_master() -> pd.DataFrame:
         df["updated_at"] = ""
     if "구분" not in df.columns:
         df["구분"] = ""
+    if "is_latest" not in df.columns:
+        df["is_latest"] = "N"
     # 표준_메뉴명 컬럼은 더 이상 사용하지 않음(과거 파일 호환을 위해 존재할 수는 있으나 파이프라인에서는 제거)
     if "표준_메뉴명" in df.columns:
         df = df.drop(columns=["표준_메뉴명"], errors="ignore")
@@ -699,12 +723,13 @@ def update_product_master(**context) -> str:
 
     df_append = pd.DataFrame(new_rows)
     df_out = pd.concat([df_master, df_append], ignore_index=True)
+    df_out = _mark_is_latest(df_out)
 
     FIN_PRODUCT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
     try:
         df_out.to_csv(tmp, index=False, encoding="utf-8-sig")
-        os.replace(tmp, FIN_PRODUCT_CSV_PATH)
+        _safe_replace(tmp, FIN_PRODUCT_CSV_PATH)
     finally:
         try:
             tmp.unlink(missing_ok=True)
@@ -874,12 +899,13 @@ def apply_review_approvals(**context) -> str:
 
     df_append = pd.DataFrame(rows)
     out = pd.concat([master, df_append], ignore_index=True)
+    out = _mark_is_latest(out)
 
     FIN_PRODUCT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
     try:
         out.to_csv(tmp, index=False, encoding="utf-8-sig")
-        os.replace(tmp, FIN_PRODUCT_CSV_PATH)
+        _safe_replace(tmp, FIN_PRODUCT_CSV_PATH)
     finally:
         try:
             tmp.unlink(missing_ok=True)
@@ -898,7 +924,7 @@ def apply_review_approvals(**context) -> str:
     tmp2 = FIN_PRODUCT_REVIEW_CSV_PATH.with_suffix(".tmp")
     try:
         review.to_csv(tmp2, index=False, encoding="utf-8-sig")
-        os.replace(tmp2, FIN_PRODUCT_REVIEW_CSV_PATH)
+        _safe_replace(tmp2, FIN_PRODUCT_REVIEW_CSV_PATH)
     finally:
         try:
             tmp2.unlink(missing_ok=True)
@@ -955,12 +981,13 @@ def finalize_unionpos_pending(enable_llm: bool = True, **context) -> str:
 
     df_append = pd.DataFrame(rows)
     df_out = pd.concat([df_master, df_append], ignore_index=True)
+    df_out = _mark_is_latest(df_out)
 
     FIN_PRODUCT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
     try:
         df_out.to_csv(tmp, index=False, encoding="utf-8-sig")
-        os.replace(tmp, FIN_PRODUCT_CSV_PATH)
+        _safe_replace(tmp, FIN_PRODUCT_CSV_PATH)
     finally:
         try:
             tmp.unlink(missing_ok=True)

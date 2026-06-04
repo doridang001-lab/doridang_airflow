@@ -1051,11 +1051,22 @@ def _collect_flow_ai(driver, query: str, label: str = "", max_wait: int = 90) ->
         _wait_for_iframe_ai_response(driver, max_wait=max_wait)
 
         # Prefer the iframe's actual location (often includes a result context/id).
+        # URL이 /ai/chat/... 형태로 이동 완료될 때까지 최대 10초 대기
         result_url = ""
-        try:
-            result_url = (driver.execute_script("return window.location.href;") or "").strip()
-        except Exception:
-            result_url = ""
+        for _ in range(20):
+            try:
+                url_try = (driver.execute_script("return window.location.href;") or "").strip()
+            except Exception:
+                url_try = ""
+            if url_try and url_try.rstrip("/") != "https://flow.team/ai" and "/chat/" in url_try:
+                result_url = url_try
+                break
+            time.sleep(0.5)
+        else:
+            try:
+                result_url = (driver.execute_script("return window.location.href;") or "").strip()
+            except Exception:
+                result_url = ""
         if not result_url:
             result_url = (ai_frame.get_attribute("src") or "").strip()
             if result_url.startswith("/"):

@@ -1,11 +1,68 @@
 import logging
 import os
+import re
+import shutil
+import subprocess
 import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Callable
 
 import undetected_chromedriver as uc
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _uc_launch_lock(timeout_sec: int = 180):
+    """Serialize UC driver patch/launch across Airflow task processes."""
+    lock_dir = Path(tempfile.gettempdir()) / "undetected_chromedriver.launch.lock"
+    deadline = time.time() + timeout_sec
+    acquired = False
+    while time.time() < deadline:
+        try:
+            lock_dir.mkdir()
+            acquired = True
+            break
+        except FileExistsError:
+            time.sleep(1.0)
+
+    if not acquired:
+        logger.warning("UC launch lock timeout; continuing without lock: %s", lock_dir)
+
+    try:
+        yield
+    finally:
+        if acquired:
+            try:
+                lock_dir.rmdir()
+            except Exception:
+                pass
+
+
+def _invalidate_driver_cache_if_chrome_updated(data_dir: str, current_version: int | None) -> None:
+    """Chrome 버전이 변경됐을 때 UC 캐시 바이너리를 삭제해 재다운로드를 강제한다.
+
+    data_dir/chrome_version.txt에 마지막으로 사용한 버전을 기록하고,
+    다음 호출 시 현재 버전과 비교 — 달라졌으면 chromedriver 바이너리를 삭제한다.
+    """
+    if current_version is None:
+        return
+    version_file = Path(data_dir) / "chrome_version.txt"
+    try:
+        if version_file.exists():
+            cached = version_file.read_text().strip()
+            if cached != str(current_version):
+                driver_bin = Path(data_dir) / "undetected_chromedriver"
+                if driver_bin.exists():
+                    driver_bin.unlink()
+                    logger.info(
+                        "Chrome %s→%s: UC driver binary 삭제 (재다운로드 유도)", cached, current_version
+                    )
+        version_file.write_text(str(current_version))
+    except Exception as err:
+        logger.warning("UC driver cache 버전 체크 실패(무시): %s", err)
 
 
 def configure_uc_data_path(data_path: str | None = None) -> str | None:
@@ -42,3 +99,166 @@ def configure_uc_data_path(data_path: str | None = None) -> str | None:
 
     return abs_path
 
+
+def _emit_uc_log(log_fn: Callable[[str], None] | None, message: str) -> None:
+    if log_fn is not None:
+        log_fn(message)
+    else:
+        logger.info(message)
+
+
+def _resolve_chrome_binary(chrome_bin: str | None = None) -> str | None:
+    candidates: list[str] = []
+    if chrome_bin:
+        candidates.append(chrome_bin)
+
+    env_chrome_bin = os.getenv("CHROME_BIN")
+    if env_chrome_bin and env_chrome_bin not in candidates:
+        candidates.append(env_chrome_bin)
+
+    for candidate in (
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium-browser",
+        "chromium",
+    ):
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        expanded = os.path.abspath(os.path.expanduser(candidate))
+        if os.path.exists(expanded):
+            return expanded
+
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+
+    return None
+
+
+def _detect_chrome_major_version(chrome_binary: str | None) -> int | None:
+    if not chrome_binary:
+        return None
+
+    try:
+        result = subprocess.run(
+            [chrome_binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return None
+
+    version_text = (result.stdout or result.stderr or "").strip()
+    match = re.search(r"(\d+)\.", version_text)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _apply_failfast_client(driver, timeout_sec: int = 30, log_fn: Callable[[str], None] | None = None) -> None:
+    """죽은 chromedriver에 대한 urllib3 재시도 폭주를 차단한다.
+
+    세션이 끊기면(localhost 포트 Connection refused) selenium이 명령마다
+    urllib3로 수 회씩 재시도하며 수백 줄의 로그와 수 분의 지연을 만든다.
+    명령 timeout을 짧게(기본 무한 대기 → timeout_sec) 잡고 urllib3 Retry를
+    0회로 낮춰, 죽은 세션에서 즉시 예외가 나도록 한다 → 상위 복구 로직이 바로 작동.
+    """
+    try:
+        import urllib3
+
+        executor = getattr(driver, "command_executor", None)
+        cfg = getattr(executor, "_client_config", None)
+        if executor is None or cfg is None:
+            return
+
+        cfg.timeout = timeout_sec
+        pool_args = cfg.init_args_for_pool_manager
+        inner = pool_args.setdefault("init_args_for_pool_manager", {})
+        inner["retries"] = urllib3.Retry(total=0, connect=0, read=0, redirect=0)
+        # keep_alive 풀이 이미 생성돼 있으므로 새 설정으로 재생성
+        executor._conn = executor._get_connection_manager()
+        _emit_uc_log(log_fn, f"failfast client 적용: timeout={timeout_sec}s, urllib3 retries=0")
+    except Exception as err:
+        _emit_uc_log(log_fn, f"failfast client config 적용 실패(무시): {err}")
+
+
+def launch_uc_chrome(
+    options: uc.ChromeOptions,
+    account_id: str | None = None,
+    chrome_bin: str | None = None,
+    log_fn: Callable[[str], None] | None = None,
+):
+    chrome_binary = _resolve_chrome_binary(chrome_bin)
+    detected_version = _detect_chrome_major_version(chrome_binary)
+
+    if chrome_binary and not getattr(options, "binary_location", None):
+        options.binary_location = chrome_binary
+
+    _emit_uc_log(log_fn, f"resolved chrome binary={chrome_binary or 'auto'}")
+    _emit_uc_log(log_fn, f"detected chrome major version={detected_version or 'auto'}")
+
+    data_dir = configure_uc_data_path()
+    if data_dir:
+        _invalidate_driver_cache_if_chrome_updated(data_dir, detected_version)
+
+    kwargs: dict = {"options": options}
+    if detected_version is not None:
+        kwargs["version_main"] = detected_version
+    _emit_uc_log(log_fn, f"launch uc chrome with version_main={detected_version or 'auto'}")
+
+    try:
+        with _uc_launch_lock():
+            driver = uc.Chrome(**kwargs)
+        _apply_failfast_client(driver, log_fn=log_fn)
+        return driver
+    except Exception as exc:
+        err_str = str(exc)
+
+        # version mismatch: 에러 메시지에서 올바른 버전 추출 후 재시도
+        match = re.search(r"Current browser version is (\d+)", err_str)
+        if match:
+            retry_version = int(match.group(1))
+            _emit_uc_log(
+                log_fn,
+                f"chromedriver/browser version mismatch detected; retry with version_main={retry_version}",
+            )
+            configure_uc_data_path()
+            try:
+                with _uc_launch_lock():
+                    driver = uc.Chrome(options=options, version_main=retry_version)
+                _apply_failfast_client(driver, log_fn=log_fn)
+                return driver
+            except Exception:
+                pass
+
+        # RemoteDisconnected / ProtocolError: 바이너리 오염 → 삭제 후 재시도
+        if "RemoteDisconnected" in err_str or "Connection aborted" in err_str:
+            _emit_uc_log(log_fn, "RemoteDisconnected: UC driver binary 강제 삭제 후 재시도")
+            if data_dir:
+                driver_bin = Path(data_dir) / "undetected_chromedriver"
+                if driver_bin.exists():
+                    try:
+                        driver_bin.unlink()
+                    except Exception:
+                        pass
+            configure_uc_data_path()
+            try:
+                with _uc_launch_lock():
+                    driver = uc.Chrome(**kwargs)
+                _apply_failfast_client(driver, log_fn=log_fn)
+                return driver
+            except Exception:
+                pass
+
+        _emit_uc_log(
+            log_fn,
+            "browser launch failed "
+            f"binary path={chrome_binary or 'auto'} "
+            f"detected version={detected_version or 'auto'} "
+            f"original exception={exc}",
+        )
+        raise

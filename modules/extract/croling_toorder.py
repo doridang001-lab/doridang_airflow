@@ -31,6 +31,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
+from modules.transform.utility.selenium_uc import launch_uc_chrome
 
 
 # ============================================================================
@@ -219,8 +220,12 @@ def launch_browser(account_id: str):
     try:
         log(f"🔍 [DEBUG] ========== uc.Chrome 호출 시작 ==========", account_id)
         
-        # version_main=None 제거 (자동 감지 사용)
-        driver = uc.Chrome(options=options)
+        driver = launch_uc_chrome(
+            options,
+            account_id=account_id,
+            chrome_bin=chrome_bin,
+            log_fn=lambda message: log(message, account_id),
+        )
         
         log(f"✅ ========== 브라우저 실행 성공! ==========", account_id)
         return driver

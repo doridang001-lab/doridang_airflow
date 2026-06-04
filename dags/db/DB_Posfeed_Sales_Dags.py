@@ -23,6 +23,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.utils.trigger_rule import TriggerRule
 
+from modules.transform.utility.notifier import send_telegram
 from modules.transform.utility.schedule import DB_POSFEED_SALES_TIME
 from modules.transform.pipelines.db.DB_Posfeed_Sales import (
     reset_posfeed_partitions,
@@ -104,6 +105,7 @@ def _on_failure_callback(context):
         logger.info("실패 알림 발송 완료: %s", _ALERT_EMAILS)
     except Exception as e:
         logger.error("실패 알림 발송 실패: %s", e)
+    send_telegram(body + "\n해결해라")
 
 
 default_args = {

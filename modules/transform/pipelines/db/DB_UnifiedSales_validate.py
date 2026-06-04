@@ -14,6 +14,7 @@ unified_sales 일별/월별 검증 파이프라인.
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -25,6 +26,28 @@ from modules.transform.utility.paths import ANALYTICS_DB, MART_DB
 logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
+
+_DOCKER_TO_WIN = [
+    ("/opt/airflow/onedrive_mart",  r"C:\Users\민준\OneDrive - 주식회사 도리당\data\mart"),
+    ("/opt/airflow/analytics",      r"C:\Users\민준\OneDrive - 주식회사 도리당\data\analytics"),
+    ("/opt/airflow/Repository",     r"C:\Users\민준\OneDrive - 주식회사 도리당\Repository"),
+    ("/opt/airflow/Collect_Data",   r"C:\Users\민준\OneDrive - 주식회사 도리당\Collect_Data"),
+    ("/opt/airflow/Local_DB",       r"C:\Local_DB"),
+    ("/opt/airflow/onedrive_llm",   r"C:\Users\민준\OneDrive - 주식회사 도리당\data\llm"),
+]
+
+
+def _to_win_file_uri(path: Path) -> tuple[str, str]:
+    """Docker 경로를 Windows 경로 문자열과 file:/// URI로 변환한다."""
+    posix = path.as_posix()
+    for docker_prefix, win_prefix in _DOCKER_TO_WIN:
+        if posix.startswith(docker_prefix):
+            rel = posix[len(docker_prefix):]
+            win_str = win_prefix + rel.replace("/", "\\")
+            uri_path = win_prefix.replace("\\", "/") + rel
+            href = "file:///" + quote(uri_path, safe="/:@!$&'()*+,;=")
+            return win_str, href
+    return str(path), path.as_uri()
 UNIFIED_ROOT = MART_DB / "unified_sales_grp"
 VALIDATION_DIR = MART_DB / "unified_sales_grp_error_list"
 VALIDATION_FILE_PREFIX = "unified_sales_error_"
@@ -57,7 +80,7 @@ def _resolve_target_date(**context) -> str:
         if sale_date:
             return str(sale_date)
 
-    for key in ("logical_date", "data_interval_end", "execution_date"):
+    for key in ("data_interval_end", "logical_date", "execution_date"):
         dt = context.get(key)
         if dt is None:
             continue
@@ -129,6 +152,7 @@ def _build_html_table(df: pd.DataFrame) -> str:
 
 
 def _build_email_html(title: str, subtitle: str, table_html: str, csv_path: Path) -> str:
+    win_path, file_uri = _to_win_file_uri(csv_path)
     return f"""<html>
 <head><meta charset="UTF-8"></head>
 <body style="font-family:'Malgun Gothic',Arial,sans-serif;margin:24px;line-height:1.6;background:#f4f6f8;">
@@ -137,7 +161,7 @@ def _build_email_html(title: str, subtitle: str, table_html: str, csv_path: Path
   <h2 style="margin-top:0;color:#2c3e50;border-bottom:2px solid #2c3e50;padding-bottom:8px;">{title}</h2>
   <p style="color:#555;">{subtitle}</p>
   {table_html}
-  <p style="color:#999;font-size:12px;margin-top:16px;">결과 파일: {csv_path}</p>
+  <p style="color:#999;font-size:12px;margin-top:16px;">결과 파일: <a href="{file_uri}" style="color:#2980b9;">{win_path}</a></p>
   <p style="color:#bbb;font-size:11px;">이 메일은 자동으로 발송되었습니다.</p>
 </div>
 </body>
@@ -443,3 +467,281 @@ def validate_monthly_sales(**context) -> str:
     if alert_sent:
         summary += f" | {current_ym} 오차 알림 발송"
     return summary
+
+
+# ---------------------------------------------------------------------------
+# 일별 요약 Parquet (단일 출력)
+# ---------------------------------------------------------------------------
+
+DAILY_SUMMARY_PATH = MART_DB / "unified_sales_grp" / "daily_summary.parquet"
+
+
+def _status(v: int) -> str:
+    if v <= 10_000_000:  return "1천 이하"
+    if v <= 20_000_000:  return "1천 초과 ~ 2천 이하"
+    if v <= 30_000_000:  return "2천 초과 ~ 3천 이하"
+    if v <= 50_000_000:  return "3천초과 ~ 5천 이하"
+    return "5천 초과"
+
+
+def build_daily_summary() -> str:
+    """unified_sales parquet → 일별×store×brand×order_type×platform 집계 parquet.
+
+    월별 집계(expected, lag/rolling, LLM)는 내부 계산 후 일별 행에 broadcast.
+    출력: daily_summary.parquet 단일 파일.
+    """
+    import calendar
+
+    files = sorted(UNIFIED_ROOT.glob("unified_sales*.parquet"))
+    if not files:
+        logger.warning("unified_sales parquet 없음: %s", UNIFIED_ROOT)
+        return "parquet 없음"
+
+    df = pd.concat(
+        [pd.read_parquet(f, columns=[
+            "sale_date", "ym", "store", "brand", "region", "담당자", "실오픈일",
+            "order_type", "platform", "total_price", "order_cnt",
+        ]) for f in files],
+        ignore_index=True,
+    )
+    df["sale_date"] = pd.to_datetime(df["sale_date"], errors="coerce")
+    df["total_price"] = pd.to_numeric(df["total_price"], errors="coerce").fillna(0)
+    df["order_cnt"] = pd.to_numeric(df["order_cnt"], errors="coerce").fillna(0)
+    df["day"] = df["sale_date"].dt.day
+    df["ym"] = df["sale_date"].dt.strftime("%Y-%m")
+
+    today_ym = datetime.now(KST).strftime("%Y-%m")
+
+    # ── 1. 일별 집계 ─────────────────────────────────────────────────────────
+    daily = (
+        df.groupby(["sale_date", "ym", "store", "brand", "order_type", "platform"], sort=False)
+        .agg(
+            region=("region", "first"),
+            담당자=("담당자", "first"),
+            실오픈일=("실오픈일", "first"),
+            total_price=("total_price", "sum"),
+            order_cnt=("order_cnt", "sum"),
+        )
+        .reset_index()
+    )
+    daily["total_price"] = daily["total_price"].round(0).astype(int)
+    daily["order_cnt"] = daily["order_cnt"].round(0).astype(int)
+
+    # ── 2. 월별 집계 (store×brand×order_type×platform×ym) ────────────────────
+    monthly = (
+        df.groupby(["ym", "store", "brand", "order_type", "platform"], sort=False)
+        .agg(
+            month_sales=("total_price", "sum"),
+            month_order_cnt=("order_cnt", "sum"),
+            actual_days=("sale_date", "nunique"),
+            max_sale_date=("sale_date", "max"),
+        )
+        .reset_index()
+    )
+    monthly["avg_daily_sales"] = (monthly["month_sales"] / monthly["actual_days"]).round(2)
+    monthly["avg_daily_order_cnt"] = (monthly["month_order_cnt"] / monthly["actual_days"]).round(2)
+
+    past_mask = monthly["ym"] < today_ym
+    curr_mask = monthly["ym"] == today_ym
+    monthly.loc[past_mask, "expected_month_sales"] = monthly.loc[past_mask, "month_sales"]
+    monthly.loc[past_mask, "expected_month_order_cnt"] = monthly.loc[past_mask, "month_order_cnt"]
+    if curr_mask.any():
+        curr_idx = monthly[curr_mask].index
+        last_days = monthly.loc[curr_idx, "max_sale_date"].apply(
+            lambda d: calendar.monthrange(d.year, d.month)[1]
+        )
+        monthly.loc[curr_idx, "expected_month_sales"] = (
+            monthly.loc[curr_idx, "avg_daily_sales"] * last_days
+        ).round(0)
+        monthly.loc[curr_idx, "expected_month_order_cnt"] = (
+            monthly.loc[curr_idx, "avg_daily_order_cnt"] * last_days
+        ).round(0)
+    monthly["expected_month_sales"] = monthly["expected_month_sales"].fillna(0).round(0).astype(int)
+    monthly["expected_month_order_cnt"] = monthly["expected_month_order_cnt"].fillna(0).round(0).astype(int)
+    # status는 store 단위에서 계산 (채널별 expected 기준 아님)
+
+    # ── 3. lag/rolling (store×order_type×platform 기준) ──────────────────────
+    monthly_s = monthly.sort_values(["store", "brand", "order_type", "platform", "ym"]).reset_index(drop=True)
+    grp_key = ["store", "brand", "order_type", "platform"]
+    monthly_s["prev_expected_month_sales"] = (
+        monthly_s.groupby(grp_key)["expected_month_sales"]
+        .shift(1).fillna(0).round(0).astype(int)
+    )
+    monthly_s["prev_month_order_cnt"] = (
+        monthly_s.groupby(grp_key)["month_order_cnt"]
+        .shift(1).fillna(0).round(0).astype(int)
+    )
+    monthly_s["avg_3m_expected_sales"] = (
+        monthly_s.groupby(grp_key)["expected_month_sales"]
+        .transform(lambda s: s.shift(1).rolling(3, min_periods=1).mean())
+        .fillna(0).round(0).astype(int)
+    )
+    monthly_s["avg_3m_order_cnt"] = (
+        monthly_s.groupby(grp_key)["expected_month_order_cnt"]
+        .transform(lambda s: s.shift(1).rolling(3, min_periods=1).mean())
+        .fillna(0).round(0).astype(int)
+    )
+
+    def _agg_expected(grp_df: pd.DataFrame, keys: list) -> pd.DataFrame:
+        """keys 기준 월별 집계 + expected 계산 + lag/rolling 반환."""
+        g = grp_df.groupby(keys + ["ym"], sort=False).agg(
+            tp=("total_price","sum"), oc=("order_cnt","sum"),
+            actual_days=("sale_date","nunique"), ms=("sale_date","max")
+        ).reset_index()
+        g["ad"] = (g["tp"] / g["actual_days"]).round(0).astype(int)
+        g["ado"] = (g["oc"] / g["actual_days"]).round(2)
+        p = g["ym"] < today_ym; c = g["ym"] == today_ym
+        g.loc[p, "es"] = g.loc[p, "tp"]; g.loc[p, "eo"] = g.loc[p, "oc"]
+        if c.any():
+            ci = g[c].index
+            ld = g.loc[ci, "ms"].apply(lambda d: calendar.monthrange(d.year, d.month)[1])
+            g.loc[ci, "es"] = (g.loc[ci, "ad"] * ld).round(0)
+            g.loc[ci, "eo"] = (g.loc[ci, "ado"] * ld).round(0)
+        g["es"] = g["es"].fillna(0).round(0).astype(int)
+        g["eo"] = g["eo"].fillna(0).round(0).astype(int)
+        gs = g.sort_values(keys + ["ym"]).reset_index(drop=True)
+        # prev_es/eo: shift(1) 대신 날짜 기반 join → 월 공백이 있어도 정확한 전달 값 사용
+        _prev = gs[keys + ["ym", "es", "oc"]].copy()
+        _prev["_next_ym"] = _prev["ym"].apply(
+            lambda y: (pd.Period(y, "M") + 1).strftime("%Y-%m")
+        )
+        gs = gs.merge(
+            _prev[keys + ["_next_ym", "es", "oc"]].rename(
+                columns={"_next_ym": "ym", "es": "prev_es", "oc": "prev_eo"}
+            ),
+            on=keys + ["ym"], how="left",
+        )
+        gs["prev_es"] = gs["prev_es"].fillna(0).astype(int)
+        gs["prev_eo"] = gs["prev_eo"].fillna(0).astype(int)
+        gs["avg3_s"]  = gs.groupby(keys)["es"].transform(lambda s: s.shift(1).rolling(3, min_periods=1).mean()).fillna(0).astype(int)
+        gs["avg3_o"]  = gs.groupby(keys)["eo"].transform(lambda s: s.shift(1).rolling(3, min_periods=1).mean()).fillna(0).astype(int)
+        # 일평균 기반 비교 (partial month 보정)
+        gs["prev_ad"]  = gs.groupby(keys)["ad"].shift(1).fillna(0).astype(int)
+        gs["avg3_ad"]  = gs.groupby(keys)["ad"].transform(lambda s: s.shift(1).rolling(3, min_periods=1).mean()).fillna(0).astype(int)
+        gs["prev_ado"] = gs.groupby(keys)["ado"].shift(1).fillna(0).round(2)
+        gs["avg3_ado"] = gs.groupby(keys)["ado"].transform(lambda s: s.shift(1).rolling(3, min_periods=1).mean()).fillna(0).round(2)
+        return gs
+
+    # ── 5. 브랜드별 집계 (store_month_df용) ──────────────────────────────────
+    bdf = _agg_expected(df, ["store", "brand"])
+
+    # ── 6. 주별 집계 (store×brand×order_type×platform×week_start) ────────────
+    from datetime import timedelta
+    df["week_start"] = df["sale_date"] - pd.to_timedelta(df["sale_date"].dt.weekday, unit="D")
+    today_dt = datetime.now(KST)
+    today_ws = (today_dt - timedelta(days=today_dt.weekday())).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    today_ws = pd.Timestamp(today_ws)
+
+    weekly = (
+        df.groupby(["week_start", "store", "brand", "order_type", "platform"], sort=False)
+        .agg(week_sales=("total_price","sum"), week_order_cnt=("order_cnt","sum"),
+             days_cnt=("sale_date","nunique"))
+        .reset_index()
+    )
+    weekly["week_sales"] = weekly["week_sales"].round(0).astype(int)
+    weekly["week_order_cnt"] = weekly["week_order_cnt"].round(0).astype(int)
+    weekly["avg_dw"] = (weekly["week_sales"] / weekly["days_cnt"]).round(2)
+    weekly["avg_dw_o"] = (weekly["week_order_cnt"] / weekly["days_cnt"]).round(2)
+
+    w_past = weekly["week_start"] < today_ws
+    w_curr = weekly["week_start"] == today_ws
+    weekly.loc[w_past, "expected_week_sales"] = weekly.loc[w_past, "week_sales"]
+    weekly.loc[w_past, "expected_week_order_cnt"] = weekly.loc[w_past, "week_order_cnt"]
+    if w_curr.any():
+        weekly.loc[w_curr, "expected_week_sales"] = (weekly.loc[w_curr, "avg_dw"] * 7).round(0)
+        weekly.loc[w_curr, "expected_week_order_cnt"] = (weekly.loc[w_curr, "avg_dw_o"] * 7).round(0)
+    weekly["expected_week_sales"] = weekly["expected_week_sales"].fillna(0).round(0).astype(int)
+    weekly["expected_week_order_cnt"] = weekly["expected_week_order_cnt"].fillna(0).round(0).astype(int)
+
+    wk_grp = ["store", "brand", "order_type", "platform"]
+    weekly_s = weekly.sort_values(wk_grp + ["week_start"]).reset_index(drop=True)
+    weekly_s["prev_expected_week_sales"] = weekly_s.groupby(wk_grp)["expected_week_sales"].shift(1).fillna(0).astype(int)
+    weekly_s["prev_week_order_cnt"] = weekly_s.groupby(wk_grp)["week_order_cnt"].shift(1).fillna(0).astype(int)
+    weekly_s["avg_3w_expected_sales"] = weekly_s.groupby(wk_grp)["expected_week_sales"].transform(lambda s: s.shift(1).rolling(3, min_periods=1).mean()).fillna(0).astype(int)
+    weekly_s["avg_3w_order_cnt"] = weekly_s.groupby(wk_grp)["expected_week_order_cnt"].transform(lambda s: s.shift(1).rolling(3, min_periods=1).mean()).fillna(0).astype(int)
+
+    daily["week_start"] = daily["sale_date"] - pd.to_timedelta(daily["sale_date"].dt.weekday, unit="D")
+
+    # ── 8a. 매장 종합 월별 expected (store 전체 tp / store max_day × 말일) ────
+    # bdf["es"] = store 전체 집계 기준 expected → 채널별 max_day 불일치 오차 없음
+    store_month_df = (
+        bdf[["ym", "store", "brand", "es", "eo", "prev_es", "prev_eo"]]
+        .rename(columns={
+            "es":      "store_expected_month_sales",
+            "eo":      "store_expected_month_order_cnt",
+            "prev_es": "store_prev_expected_month_sales",
+            "prev_eo": "store_prev_expected_month_order_cnt",
+        })
+    )
+    # status = 현재월 store 전체(브랜드 합산) expected 기준 → 전 기간 동일 적용
+    # → PowerBI 슬라이서로 "현재 1천 이하 매장" 필터 시 전체 이력이 정확히 걸림
+    curr_store_es = (
+        bdf[bdf["ym"] == today_ym]
+        .groupby("store", as_index=False)["es"]
+        .sum()
+    )
+    curr_store_es["status"] = curr_store_es["es"].apply(_status)
+    status_map = curr_store_es.set_index("store")["status"].to_dict()
+    store_month_df["status"] = store_month_df["store"].map(status_map).fillna(
+        store_month_df["store_expected_month_sales"].apply(lambda v: _status(int(v)))
+    )
+
+    # ── 8b. 매장 종합 주별 expected (채널별 expected SUM → store×brand×week) ──
+    store_weekly_df = (
+        weekly_s.groupby(["week_start", "store", "brand"])[["expected_week_sales", "expected_week_order_cnt"]]
+        .sum().reset_index()
+        .rename(columns={
+            "expected_week_sales":      "store_expected_week_sales",
+            "expected_week_order_cnt":  "store_expected_week_order_cnt",
+        })
+    )
+
+    # ── 9. 일별에 모든 컬럼 broadcast merge ──────────────────────────────────
+    m_cols = ["ym", "store", "brand", "order_type", "platform",
+              "expected_month_sales", "expected_month_order_cnt",
+              "prev_expected_month_sales", "avg_3m_expected_sales",
+              "prev_month_order_cnt", "avg_3m_order_cnt"]
+    daily = daily.merge(monthly_s[m_cols],    on=["ym","store","brand","order_type","platform"], how="left")
+    daily = daily.merge(store_month_df,        on=["ym","store","brand"],                         how="left")
+
+    # 전월 이전: expected_month_sales = total_price (일별 실매출) → SUM 집계 정합성 보장
+    past_daily_mask = daily["ym"] < today_ym
+    daily.loc[past_daily_mask, "expected_month_sales"] = daily.loc[past_daily_mask, "total_price"]
+
+    w_cols = ["week_start", "store", "brand", "order_type", "platform",
+              "expected_week_sales", "expected_week_order_cnt",
+              "prev_expected_week_sales", "avg_3w_expected_sales",
+              "prev_week_order_cnt", "avg_3w_order_cnt"]
+    daily = daily.merge(weekly_s[w_cols],     on=["week_start","store","brand","order_type","platform"], how="left")
+    daily = daily.merge(store_weekly_df,       on=["week_start","store","brand"],                         how="left")
+
+    for col in ["llm_total_summary","llm_total_reason","llm_total_action",
+                "llm_brand_summary","llm_brand_reason","llm_brand_action"]:
+        daily[col] = ""
+
+    # ── 10. 최종 컬럼 순서 & 저장 ────────────────────────────────────────────
+    daily = daily[[
+        "sale_date", "ym", "week_start", "store", "brand", "region", "담당자", "실오픈일",
+        "order_type", "platform", "total_price", "order_cnt",
+        # 월별 채널 (SUM 가능)
+        "expected_month_sales", "expected_month_order_cnt",
+        "prev_expected_month_sales", "avg_3m_expected_sales",
+        "prev_month_order_cnt", "avg_3m_order_cnt",
+        # 월별 매장 종합 (MAX 사용) + status는 store 기준
+        "store_expected_month_sales", "store_expected_month_order_cnt",
+        "store_prev_expected_month_sales", "store_prev_expected_month_order_cnt",
+        "status",
+        # 월별 LLM
+        "llm_total_summary", "llm_total_reason", "llm_total_action",
+        "llm_brand_summary", "llm_brand_reason", "llm_brand_action",
+        # 주별 채널 (SUM 가능)
+        "expected_week_sales", "expected_week_order_cnt",
+        "prev_expected_week_sales", "avg_3w_expected_sales",
+        "prev_week_order_cnt", "avg_3w_order_cnt",
+        # 주별 매장 종합 (MAX 사용)
+        "store_expected_week_sales", "store_expected_week_order_cnt",
+    ]]
+    DAILY_SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    daily.to_parquet(DAILY_SUMMARY_PATH, index=False, engine="pyarrow")
+    logger.info("일별 요약 저장: %s (%d행)", DAILY_SUMMARY_PATH, len(daily))
+    return f"일별 요약 {len(daily)}행 → {DAILY_SUMMARY_PATH}"

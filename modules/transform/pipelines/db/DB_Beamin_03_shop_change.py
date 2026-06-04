@@ -23,34 +23,63 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.select import Select
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import StaleElementReferenceException
 
+from selenium.common.exceptions import WebDriverException
 from modules.extract.croling_beamin import (
     TIMING,
-    get_store_options,
+    clean_chrome_profile,
     human_click,
+    is_driver_crash_error,
     launch_browser,
     login_baemin,
     logout_baemin,
+    quit_driver_safely,
     wait_for_page,
 )
-from modules.transform.utility.paths import BAEMIN_SHOP_CHANGE_DB
+from modules.transform.utility.paths import BAEMIN_SHOP_CHANGE_DB, BAEMIN_SHOP_OPERATION_DB
+from modules.transform.utility.notifier import send_telegram, _send_email_alert
 
 logger = logging.getLogger(__name__)
 
 KST = pendulum.timezone("Asia/Seoul")
 KNOWN_BRANDS = ["나홀로", "도리당"]
+BRAND_COLLECTION_ORDER = {"나홀로": 0, "도리당": 1}
 
 SHOP_CHANGE_URL = "https://self.baemin.com/history/change/shop"
+SHOP_OPERATION_URL = "https://self.baemin.com/shops/{store_id}/manage/operation"
+OP_HOUR_P_CSS = "p[class*='ShopOperationHourBody-module']"
+
+OP_CSV_COLUMNS = ['수집일시', '매장명', 'store_id', 'brand', '요일', '운영시간']
 SELECT_CSS = "select[class*='Select-module']"
 QUERY_BTN_CSS = "button.button.medium.primary.self-ds"
-ITEM_CSS = "li.ListItem.self-ds"   # 테이블 아닌 리스트 구조
-ITEM_TIMEOUT = 20
+ITEM_CSS = "li.ListItem.self-ds"
 _PAGE_SETTLE = 4.0
-_SCROLL_PX = 400
-_SCROLL_WAIT = 0.4
-_SCROLL_NO_NEW_MAX = 5
-_SCROLL_MAX_ITER = 200
+_MAX_NO_NEW = 6      # 연속 새 항목 없으면 종료
+_MAX_ITER = 300      # 최대 스크롤 반복
+_COLLECT_DAYS = 60   # 60일 이전 항목은 수집 대상 제외
+
+CSV_COLUMNS = [
+    '수집일시', '매장명', 'store_id', '지역명',
+    '대분류', '분류', '변경시간', '작업자',
+    '변경후_정기휴무일', '변경후_임시휴무일',
+    '변경후_사유', '변경후_가게중지', '변경후_배민배달',
+    '변경후_운영시간',
+    '변경전_정기휴무일', '변경전_임시휴무일',
+    '변경전_사유', '변경전_가게중지', '변경전_배민배달',
+    '변경전_운영시간',
+]
+
+
+_MAX_BROWSER_RETRY = 3  # Chrome 크래시 시 재시도 횟수
+
+
+def _store_collection_sort_key(store_info: dict) -> tuple[int, str, str]:
+    return (
+        BRAND_COLLECTION_ORDER.get(store_info.get("brand", ""), 99),
+        store_info.get("store", ""),
+        str(store_info.get("store_id", "")),
+    )
 
 
 def collect_shop_change(account_list: list[dict]) -> str:
@@ -60,65 +89,242 @@ def collect_shop_change(account_list: list[dict]) -> str:
     for account in account_list:
         account_id = account["account_id"]
         driver = None
-        try:
-            driver = launch_browser(account_id)
+        for attempt in range(_MAX_BROWSER_RETRY + 1):
+            try:
+                clean_chrome_profile(account_id)
+                driver = launch_browser(account_id)
 
-            if not login_baemin(driver, account_id, account["password"]):
-                logger.warning("로그인 실패: %s", account_id)
-                fail += 1
-                continue
+                if not login_baemin(driver, account_id, account["password"]):
+                    logger.warning("로그인 실패: %s", account_id)
+                    fail += 1
+                    break  # 로그인 실패는 재시도 의미 없음
 
-            logger.info("로그인 성공: %s", account_id)
+                logger.info("로그인 성공: %s", account_id)
 
-            from urllib.parse import urlparse as _urlparse
-
-            if _urlparse(driver.current_url).hostname != "self.baemin.com":
-                try:
-                    driver.set_page_load_timeout(45)
-                    driver.get("https://self.baemin.com/")
-                except Exception as e:
-                    logger.warning("대시보드 이동 타임아웃 (계속 진행): %s", e)
-            else:
-                time.sleep(2)
-
-            if not wait_for_page(driver, "select[class*='ShopSelect']", timeout=60):
-                logger.warning("메인 대시보드 로드 실패: %s", account_id)
-                fail += 1
-                continue
-
-            raw_options = get_store_options(driver)
-            store_list = [_parse_store_option(o) for o in raw_options]
-            store_list = [s for s in store_list if s]
-
-            if not store_list:
-                logger.warning(
-                    "수집 대상 브랜드 없음: %s (옵션=%s)", account_id, raw_options
+                store_list = _load_shop_change_store_list(
+                    driver,
+                    account_id,
+                    requested_store_names=None,
                 )
-                fail += 1
-                continue
 
-            collect_shop_change_for_driver(driver, store_list)
+                if not store_list:
+                    logger.warning("수집 대상 브랜드 없음: %s", account_id)
+                    fail += 1
+                    break
 
-            logout_baemin(driver, account_id)
-            logger.info("로그아웃 완료: %s", account_id)
+                collect_shop_change_for_driver(driver, store_list)
 
-            wait_sec = random.uniform(*TIMING["logout_wait"])
-            logger.info("다음 계정까지 %.0f초 대기", wait_sec)
-            time.sleep(wait_sec)
+                logout_baemin(driver, account_id)
+                logger.info("로그아웃 완료: %s", account_id)
 
-            success += 1
+                wait_sec = random.uniform(*TIMING["logout_wait"])
+                logger.info("다음 계정까지 %.0f초 대기", wait_sec)
+                time.sleep(wait_sec)
 
-        except Exception as e:
-            logger.error("처리 실패 [%s]: %s", account_id, e, exc_info=True)
-            fail += 1
-        finally:
-            if driver:
+                success += 1
+                break  # 성공
+
+            except Exception as e:
+                # WebDriverException 또는 urllib3 연결 끊김 → Chrome 크래시로 판정
+                is_crash = isinstance(e, WebDriverException) or any(
+                    kw in str(e) for kw in (
+                        "Remote end closed", "Connection aborted", "RemoteDisconnected",
+                        "Connection refused", "Max retries exceeded", "NewConnectionError",
+                    )
+                )
+                if is_crash and attempt < _MAX_BROWSER_RETRY:
+                    logger.warning(
+                        "Chrome 크래시, %d/%d 재시도: %s | %s",
+                        attempt + 1, _MAX_BROWSER_RETRY, account_id, e,
+                    )
+                    time.sleep(5.0)
+                    # 다음 attempt에서 브라우저 새로 실행 (_force_kill_chrome은 finally에서 처리)
+                else:
+                    level = "처리 실패 (재시도 소진)" if is_crash else "처리 실패"
+                    logger.error("%s [%s]: %s", level, account_id, e, exc_info=True)
+                    fail += 1
+                    break
+
+            finally:
+                # 항상 정리 — 재시도 시 다음 iteration 시작에서 새 브라우저 생성
                 try:
-                    driver.quit()
+                    if driver:
+                        driver.quit()
                 except Exception:
                     pass
+                _force_kill_chrome(account_id)  # 크래시 여부 무관하게 항상 정리
+                driver = None
 
     summary = f"성공 {success}/{success + fail} 계정"
+    logger.info(summary)
+    return summary
+
+
+def _is_driver_crash_error(exc: Exception) -> bool:
+    # 공통 키워드 판정 + shop_change는 모든 WebDriverException을 크래시로 간주(보수적).
+    return isinstance(exc, WebDriverException) or is_driver_crash_error(exc)
+_SHOP_CHANGE_ALERT_LIMIT = 20
+_SHOP_CHANGE_ALERT_STATE = {
+    "collection_failures": [],
+    "parse_failures": [],
+}
+
+
+def _reset_shop_change_alerts() -> None:
+    _SHOP_CHANGE_ALERT_STATE["collection_failures"] = []
+    _SHOP_CHANGE_ALERT_STATE["parse_failures"] = []
+
+
+def _push_shop_change_alert(kind: str, target: str, detail: str) -> None:
+    bucket = _SHOP_CHANGE_ALERT_STATE.setdefault(kind, [])
+    bucket.append({"target": str(target), "detail": str(detail)})
+
+
+def _flush_shop_change_alerts() -> None:
+    collection_failures = _SHOP_CHANGE_ALERT_STATE.get("collection_failures", [])
+    parse_failures = _SHOP_CHANGE_ALERT_STATE.get("parse_failures", [])
+    if not collection_failures and not parse_failures:
+        return
+
+    lines = [
+        "DAG: DB_Beamin_Macro_Dags",
+        "Task: collect_shop_change",
+        f"collection_failures={len(collection_failures)}",
+        f"parse_failures={len(parse_failures)}",
+    ]
+    for entry in collection_failures[:_SHOP_CHANGE_ALERT_LIMIT]:
+        lines.append(f"[collect] {entry['target']} | {entry['detail']}")
+    if len(collection_failures) > _SHOP_CHANGE_ALERT_LIMIT:
+        lines.append(f"[collect] ... {len(collection_failures) - _SHOP_CHANGE_ALERT_LIMIT} more")
+    for entry in parse_failures[:_SHOP_CHANGE_ALERT_LIMIT]:
+        lines.append(f"[parse] {entry['target']} | {entry['detail']}")
+    if len(parse_failures) > _SHOP_CHANGE_ALERT_LIMIT:
+        lines.append(f"[parse] ... {len(parse_failures) - _SHOP_CHANGE_ALERT_LIMIT} more")
+
+    body = "\n".join(lines)
+    _send_email_alert("[Airflow partial] DB_Beamin_Macro_Dags / collect_shop_change", body)
+    send_telegram(body)
+
+
+def collect_shop_change(account_list: list[dict]) -> str:
+    """Override earlier implementation to isolate dead Chrome sessions per store."""
+    success, fail = 0, 0
+    store_fail = 0
+    _reset_shop_change_alerts()
+
+    for account in account_list:
+        account_id = account["account_id"]
+        driver = None
+        store_list: list[dict] = []
+        bootstrap_failed = False
+        for attempt in range(_MAX_BROWSER_RETRY + 1):
+            try:
+                clean_chrome_profile(account_id)
+                driver = launch_browser(account_id)
+
+                if not login_baemin(driver, account_id, account["password"]):
+                    logger.warning("로그인 실패: %s", account_id)
+                    _push_shop_change_alert("collection_failures", account_id, "login failed")
+                    fail += 1
+                    bootstrap_failed = True
+                    break
+
+                logger.info("로그인 성공: %s", account_id)
+                store_list = _load_shop_change_store_list(
+                    driver,
+                    account_id,
+                    requested_store_names=None,
+                )
+                break
+            except Exception as e:
+                if _is_driver_crash_error(e) and attempt < _MAX_BROWSER_RETRY:
+                    logger.warning(
+                        "매장 목록 조회 중 Chrome 크래시, 재시도 %d/%d [%s]: %s",
+                        attempt + 1,
+                        _MAX_BROWSER_RETRY,
+                        account_id,
+                        e,
+                    )
+                    time.sleep(5.0)
+                else:
+                    logger.error("매장 목록 조회 실패 [%s]: %s", account_id, e, exc_info=True)
+                    _push_shop_change_alert("collection_failures", account_id, f"load store list failed: {e}")
+                    fail += 1
+                    bootstrap_failed = True
+                    break
+            finally:
+                quit_driver_safely(driver, account_id)
+                _force_kill_chrome(account_id)  # 프로파일 점유 잔여 프로세스 보강 정리
+                driver = None
+
+        if bootstrap_failed:
+            continue
+
+        if not store_list:
+            logger.warning("수집 대상 브랜드 없음: %s", account_id)
+            _push_shop_change_alert("collection_failures", account_id, "no stores to collect")
+            fail += 1
+            continue
+
+        for store_info in store_list:
+            target_label = _format_store_target(store_info)
+            store_done = False
+            for attempt in range(_MAX_BROWSER_RETRY + 1):
+                try:
+                    clean_chrome_profile(account_id)
+                    driver = launch_browser(account_id)
+                    if not login_baemin(driver, account_id, account["password"]):
+                        raise RuntimeError(f"login failed for {target_label}")
+
+                    collect_shop_change_for_driver(driver, [store_info])
+
+                    try:
+                        logout_baemin(driver, account_id)
+                    except Exception:
+                        pass
+                    logger.info("store 변경이력 수집 완료: %s", target_label)
+                    store_done = True
+                    break
+                except Exception as e:
+                    if _is_driver_crash_error(e) and attempt < _MAX_BROWSER_RETRY:
+                        logger.warning(
+                            "Chrome 크래시 store 재시도 %d/%d %s | %s",
+                            attempt + 1,
+                            _MAX_BROWSER_RETRY,
+                            target_label,
+                            e,
+                        )
+                        time.sleep(5.0)
+                        continue
+
+                    logger.error(
+                        "store 변경이력 수집 실패 [%s]: %s",
+                        target_label,
+                        e,
+                        exc_info=True,
+                    )
+                    _push_shop_change_alert("collection_failures", target_label, str(e))
+                    store_fail += 1
+                    break
+                finally:
+                    try:
+                        if driver:
+                            driver.quit()
+                    except Exception:
+                        pass
+                    _force_kill_chrome(account_id)
+                    driver = None
+
+            if not store_done:
+                logger.warning("store 건너뜀: %s", target_label)
+
+        wait_sec = random.uniform(*TIMING["logout_wait"])
+        logger.info("다음 계정까지 %.0f초 대기", wait_sec)
+        time.sleep(wait_sec)
+        success += 1
+
+    summary = f"성공 {success}/{success + fail} 계정 / store_fail={store_fail}"
+    _flush_shop_change_alerts()
     logger.info(summary)
     return summary
 
@@ -131,7 +337,12 @@ def collect_shop_change_for_driver(driver, store_list: list[dict]) -> None:
     """
     # 변경이력 페이지 최초 진입해 select 옵션 교차 검증
     try:
-        driver.set_page_load_timeout(45)
+        driver.set_page_load_timeout(5)
+        driver.get("about:blank")  # 이전 DOM 해제
+    except Exception:
+        pass
+    try:
+        driver.set_page_load_timeout(25)
         driver.get(SHOP_CHANGE_URL)
     except Exception as e:
         logger.warning("변경이력 페이지 첫 진입 타임아웃 (계속): %s", e)
@@ -141,7 +352,10 @@ def collect_shop_change_for_driver(driver, store_list: list[dict]) -> None:
         return
 
     page_options = _get_page_options(driver)  # {store_id: text}
-    matched_stores = [s for s in store_list if s["store_id"] in page_options]
+    matched_stores = sorted(
+        _dedupe_store_targets([s for s in store_list if s["store_id"] in page_options]),
+        key=_store_collection_sort_key,
+    )
 
     if not matched_stores:
         logger.warning(
@@ -149,21 +363,22 @@ def collect_shop_change_for_driver(driver, store_list: list[dict]) -> None:
         )
         return
 
-    logger.info("변경이력 수집 대상 매장: %s", [s["store"] for s in matched_stores])
+    logger.info(
+        "변경이력 수집 대상 매장: %s",
+        [_format_store_target(s) for s in matched_stores],
+    )
+    logger.info(
+        "변경이력 수집 매장 순서: %s",
+        [f"{s['brand']} {s['store']}" for s in matched_stores],
+    )
 
-    for store_info in matched_stores:
+    for index, store_info in enumerate(matched_stores):
         store_id = store_info["store_id"]
-        logger.info("변경이력 수집 시작: %s (%s)", store_info["store"], store_id)
+        target_label = _format_store_target(store_info)
+        logger.info("변경이력 수집 시작: %s", target_label)
 
-        # 매장마다 페이지 재방문 → StaleElementException 방지
-        try:
-            driver.set_page_load_timeout(45)
-            driver.get(SHOP_CHANGE_URL)
-        except Exception as e:
-            logger.warning("페이지 재방문 타임아웃 (%s): %s", store_id, e)
-
-        if not wait_for_page(driver, SELECT_CSS, timeout=30):
-            logger.warning("select 로드 실패, 건너뜀: %s", store_info["store"])
+        if index > 0 and not _ensure_shop_change_page(driver, target_label):
+            logger.warning("select 로드 실패, 건너뜀: %s", target_label)
             continue
 
         try:
@@ -175,28 +390,62 @@ def collect_shop_change_for_driver(driver, store_list: list[dict]) -> None:
                 EC.element_to_be_clickable((By.CSS_SELECTOR, QUERY_BTN_CSS))
             )
             human_click(driver, btn)
-            logger.info("조회 클릭 완료: %s", store_info["store"])
+            logger.info("조회 클릭 완료: %s", target_label)
 
         except Exception as e:
-            logger.warning("매장 선택/조회 실패 (%s): %s", store_info["store"], e)
+            if _is_driver_crash_error(e):
+                raise
+            logger.warning("매장 선택/조회 실패 (%s): %s", target_label, e)
             continue
 
-        time.sleep(_PAGE_SETTLE)  # React 초기 렌더링 안정화 대기
-        rows = _extract_change_rows(driver, store_info)
+        result_state = _wait_for_change_results(driver, target_label)
+        if result_state != "ready":
+            logger.warning("조회 결과 없음 또는 로드 실패: %s (%s)", target_label, result_state)
+            continue
+        time.sleep(0.5)  # React 초기 렌더링 안정화 대기
+        full_name = _get_full_name(page_options.get(store_id, store_info["store"]))
+        rows = _extract_change_rows(driver, store_info, full_name)
 
         if rows:
             saved = _save_csv(rows, store_info["brand"], store_info["store"])
             logger.info(
-                "저장 완료: brand=%s store=%s → %s (%d행)",
-                store_info["brand"],
-                store_info["store"],
+                "저장 완료: %s -> %s (%d건)",
+                target_label,
                 saved,
                 len(rows),
             )
         else:
-            logger.warning("데이터 없음: %s", store_info["store"])
+            logger.warning("데이터 없음: %s", target_label)
 
         time.sleep(random.uniform(1.5, 3.0))
+
+    # 변경이력 수집 완료 후 운영시간 수집
+    logger.info("운영시간 수집 시작: %d개 매장", len(matched_stores))
+    for store_info in matched_stores:
+        full_name = _get_full_name(page_options.get(store_info["store_id"], store_info["store"]))
+        try:
+            op_rows = _collect_one_store_operation(driver, store_info, full_name)
+        except Exception as e:
+            if _is_driver_crash_error(e):
+                raise
+            logger.warning("운영시간 수집 실패: %s | %s", _format_store_target(store_info), e)
+            op_rows = []
+        if op_rows:
+            _save_operation_csv(op_rows, store_info["brand"], store_info["store"])
+        else:
+            logger.warning("운영시간 데이터 없음: %s", _format_store_target(store_info))
+        time.sleep(random.uniform(1.0, 2.0))
+
+    # 월간 영업시간·영업일수 계산
+    from modules.transform.pipelines.db.DB_Beamin_monthly_operation import compute_monthly_operation  # noqa: PLC0415
+    ym = pendulum.now(KST).format("YYYY-MM")
+    for store_info in matched_stores:
+        try:
+            compute_monthly_operation(
+                store_info["brand"], store_info["store"], store_info["store_id"], ym
+            )
+        except Exception as e:
+            logger.warning("월간 운영 요약 실패 (%s): %s", _format_store_target(store_info), e)
 
 
 # ---------------------------------------------------------------------------
@@ -204,9 +453,17 @@ def collect_shop_change_for_driver(driver, store_list: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def _parse_store_option(opt: dict) -> dict | None:
-    """드롭다운 옵션 → 매장 메타데이터. 대상 브랜드 아니면 None."""
+    """드롭다운 옵션 → 매장 메타데이터. 대상 브랜드 아니면 None.
+
+    한글 단어 경계 체크: '곱도리당'이 '도리당'으로 매칭되는 것을 방지.
+    앞뒤에 한글이 없는 경우에만 브랜드로 인정.
+    """
     text = opt.get("text", "")
-    brand = next((b for b in KNOWN_BRANDS if b in text), None)
+    brand = next(
+        (b for b in KNOWN_BRANDS
+         if re.search(rf"(?<![가-힣]){re.escape(b)}(?![가-힣])", text)),
+        None,
+    )
     if not brand:
         return None
 
@@ -214,6 +471,109 @@ def _parse_store_option(opt: dict) -> dict | None:
     store = matches[-1] if matches else text[:20]
 
     return {"store_id": str(opt["store_id"]), "brand": brand, "store": store}
+
+
+def _load_shop_change_store_list(
+    driver,
+    account_id: str,
+    requested_store_names: list[str] | None = None,
+) -> list[dict]:
+    """변경이력 페이지 select 옵션에서 대상 매장 목록 구성."""
+    try:
+        driver.set_page_load_timeout(25)
+        driver.get(SHOP_CHANGE_URL)
+    except Exception as e:
+        logger.warning("변경이력 페이지 진입 타임아웃 (계속 진행): %s", e)
+
+    if not wait_for_page(driver, SELECT_CSS, timeout=30):
+        logger.warning("변경이력 페이지 select 로드 실패: %s", account_id)
+        return []
+
+    raw_options = [
+        {"store_id": store_id, "text": text}
+        for store_id, text in _get_page_options(driver).items()
+        if store_id
+    ]
+    store_list = []
+    for option in raw_options:
+        store_info = _parse_store_option(option)
+        if not store_info:
+            continue
+        if requested_store_names and not _matches_requested_store(
+            store_info, option["text"], requested_store_names
+        ):
+            continue
+        store_list.append(store_info)
+
+    return sorted(
+        _dedupe_store_targets([s for s in store_list if s]),
+        key=_store_collection_sort_key,
+    )
+
+
+def _normalize_store_match_text(value: str) -> str:
+    """매장명 비교용: 공백/구분자/ID 차이를 제거한다."""
+    value = re.sub(r"\d+", "", value or "")
+    return re.sub(r"[^0-9A-Za-z가-힣]+", "", value)
+
+
+def _matches_requested_store(
+    store_info: dict,
+    option_text: str,
+    requested_store_names: list[str],
+) -> bool:
+    option_key = _normalize_store_match_text(
+        f'{option_text} {store_info["brand"]} {store_info["store"]}'
+    )
+    brand = _normalize_store_match_text(store_info["brand"])
+    store = _normalize_store_match_text(store_info["store"])
+
+    for requested in requested_store_names:
+        requested_key = _normalize_store_match_text(requested)
+        if not requested_key:
+            continue
+        if requested_key in option_key or option_key in requested_key:
+            return True
+        requested_has_brand = any(
+            _normalize_store_match_text(known) in requested_key
+            for known in KNOWN_BRANDS
+        )
+        if store and store in requested_key:
+            if not requested_has_brand or brand in requested_key:
+                return True
+    return False
+
+
+def _ensure_shop_change_page(driver, target_label: str) -> bool:
+    """현재 세션에서 변경이력 페이지 select 사용 가능 여부 확인, 필요 시 1회 재진입."""
+    if wait_for_page(driver, SELECT_CSS, timeout=10):
+        return True
+
+    try:
+        driver.set_page_load_timeout(25)
+        driver.get(SHOP_CHANGE_URL)
+    except Exception as e:
+        logger.warning("변경이력 페이지 재진입 타임아웃 (%s): %s", target_label, e)
+
+    return wait_for_page(driver, SELECT_CSS, timeout=30)
+
+
+def _dedupe_store_targets(store_list: list[dict]) -> list[dict]:
+    """같은 (brand, store_id) 중복 옵션만 제거하고 순서는 유지."""
+    deduped: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for store_info in store_list:
+        key = (store_info["brand"], store_info["store_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(store_info)
+    return deduped
+
+
+def _format_store_target(store_info: dict) -> str:
+    """로그용 매장 식별자."""
+    return f'{store_info["brand"]}/{store_info["store"]}/{store_info["store_id"]}'
 
 
 def _get_page_options(driver) -> dict[str, str]:
@@ -227,156 +587,884 @@ def _get_page_options(driver) -> dict[str, str]:
     """) or {}
 
 
-_EXTRACT_JS = r"""
-return (function() {
-    const items = document.querySelectorAll('li.ListItem.self-ds');
-    const rows = [];
-    for (const item of items) {
-        const title = item.querySelector('h5.flex-1')?.textContent.trim() || '';
-        const date  = item.querySelector('time.ListItem-date')?.getAttribute('date') || '';
-
-        let category = '', worker = '';
-        item.querySelectorAll('.HistoryItemContents-module__Zcx3').forEach(row => {
-            const label = row.querySelector('.HistoryItemContents-module__sGh2')?.textContent.trim() || '';
-            const value = row.querySelector('.HistoryItemContents-module__FXZ7')?.textContent.trim() || '';
-            if (label === '분류')   category = value;
-            else if (label === '작업자') worker = value;
-        });
-
-        let after = '', before = '';
-        const zone = item.querySelector('.HistoryItemContents-module__ZwKd');
-        if (zone) {
-            const divs = zone.querySelectorAll(':scope > div');
-            if (divs[0]) after  = divs[0].textContent.replace('[변경 후]', '').trim();
-            const beforeEl = zone.querySelector('.HistoryItemContents-module__fKIx');
-            if (beforeEl) before = beforeEl.textContent.replace('[변경 전]', '').trim();
-        }
-
-        const TARGET = ['영업임시중지', '휴무일', '운영시간'];
-        if ((title || date) && TARGET.some(t => title.includes(t)))
-            rows.push({ title, date, category, worker, after, before });
-    }
-    return rows;
-})();
-"""
-
-
-def _scroll_to_load_all(driver) -> int:
-    """가상 스크롤을 내려 모든 변경이력 항목을 DOM에 로드한다.
-
-    새 항목이 _SCROLL_NO_NEW_MAX 회 연속 없으면 종료.
-    반환: 최종 로드된 항목 수.
+def _get_full_name(option_text: str) -> str:
+    """드롭다운 옵션 텍스트에서 매장 상호명 추출.
+    '[브랜드] 상호명 14364235' → '상호명'
     """
-    prev_count = 0
-    no_new = 0
-    current = 0
-
-    for _ in range(_SCROLL_MAX_ITER):
-        driver.execute_script("window.scrollBy(0, arguments[0]);", _SCROLL_PX)
-        time.sleep(_SCROLL_WAIT)
-
-        current = driver.execute_script(
-            "return document.querySelectorAll('li.ListItem.self-ds').length;"
-        )
-        if current == prev_count:
-            no_new += 1
-            if no_new >= _SCROLL_NO_NEW_MAX:
-                break
-        else:
-            no_new = 0
-            prev_count = current
-
-    logger.info("스크롤 완료: %d항목 로드", current)
-    return current
+    # 끝의 숫자(ID) 제거
+    name = re.sub(r'\s*\d+\s*$', '', option_text).strip()
+    # 앞의 [브랜드] 제거
+    name = re.sub(r'^\[.*?\]\s*', '', name).strip()
+    return name or option_text
 
 
-def _extract_change_rows(driver, store_info: dict) -> list[dict]:
-    """변경이력 리스트 항목 파싱.
+def _wait_for_change_results(driver, target_label: str, timeout: float = 20.0) -> str:
+    """Wait until the first change-history item is actually rendered."""
+    logger.info("조회 결과 대기 시작: %s", target_label)
 
-    DOM 구조: li.ListItem.self-ds (테이블 없음, 익스텐션 동일 로직)
-    조회 클릭 + _PAGE_SETTLE 대기 후 호출된다.
-    항목이 없으면 변경이력 없음 (0행), 새로고침 재시도 1회.
-    """
-    def _has_items(d) -> bool:
+    start = time.monotonic()
+    saw_loading = False
+    logged_virtual = False
+
+    while time.monotonic() - start < timeout:
         try:
-            return len(d.find_elements(By.CSS_SELECTOR, ITEM_CSS)) > 0
+            item_count = len(driver.find_elements(By.CSS_SELECTOR, ITEM_CSS))
+            virtual_count = len(driver.find_elements(By.CSS_SELECTOR, "div[data-index]"))
+            loading = driver.execute_script(
+                """
+                const text = document.body ? document.body.innerText : "";
+                return ['\uB85C\uB529', '\uBD88\uB7EC\uC624\uB294 \uC911', '\uC870\uD68C \uC911'].some((keyword) => text.includes(keyword));
+                """
+            )
+        except StaleElementReferenceException:
+            time.sleep(0.2)
+            continue
         except Exception:
-            return False
+            item_count = 0
+            virtual_count = 0
+            loading = False
 
-    loaded = False
-    for attempt in range(2):
+        if item_count > 0:
+            logger.info("첫 항목 감지: %s", target_label)
+            return "ready"
+
+        if loading and not saw_loading:
+            logger.info("조회 결과 로딩 시작: %s", target_label)
+            saw_loading = True
+
+        if virtual_count > 0 and not logged_virtual:
+            logger.info("가상 리스트 컨테이너 감지: %s (%d개)", target_label, virtual_count)
+            logged_virtual = True
+
+        if not loading and saw_loading and virtual_count == 0:
+            break
+
+        time.sleep(0.5)
+
+    if saw_loading:
+        logger.info("조회 결과 없음: %s", target_label)
+        return "empty"
+
+    logger.warning("조회 결과 대기 시간 초과: %s", target_label)
+    return "timeout"
+
+
+def _get_item_summary(item) -> tuple[str, str, str]:
+    """Extract title, date and item key from a visible list item."""
+    title_els = item.find_elements(By.CSS_SELECTOR, "h5.flex-1")
+    date_els = item.find_elements(By.CSS_SELECTOR, "time.ListItem-date")
+    title = title_els[0].text.strip() if title_els else ""
+    date = date_els[0].get_attribute("date") if date_els else ""
+    return title, date, f"{title}|{date}"
+
+
+def _wait_for_item_expanded(item, attempts: int = 10, delay: float = 0.2) -> bool:
+    """Poll until the expanded detail panel is visible AND has rendered text."""
+    for _ in range(attempts):
         try:
-            WebDriverWait(driver, ITEM_TIMEOUT).until(_has_items)
-            loaded = True
-            break
-        except TimeoutException:
-            if attempt == 0:
-                logger.info(
-                    "리스트 %d초 초과 → 새로고침 재시도 (%s)",
-                    ITEM_TIMEOUT,
-                    store_info["store"],
-                )
-                driver.refresh()
-                time.sleep(random.uniform(3.0, 5.0))
+            contents = item.find_elements(By.CSS_SELECTOR, ".ListItem-content.on")
+            if contents:
+                content = contents[0]
+                if (content.get_attribute("innerText") or "").strip():
+                    return True
+        except StaleElementReferenceException:
+            return False
         except Exception as e:
-            logger.warning("리스트 대기 중 오류 (%s): %s", store_info["store"], e)
-            break
+            if _is_driver_crash_error(e):
+                raise
+            return False
+        time.sleep(delay)
+    return False
 
-    if not loaded:
-        logger.info("변경이력 없음 (리스트 미검출): %s", store_info["store"])
-        return []
 
-    _scroll_to_load_all(driver)
+def _extract_section_texts(content) -> tuple[str, str]:
+    """Read after/before text from ZwKd section.
+
+    DOM structure (2026-05 확인):
+      <div class="ZwKd">
+        <div>
+          <div>[변경 후]</div>   ← sub[0]: label
+          <div>내용...</div>     ← sub[1]: value
+        </div>
+        <div class="fKIx">
+          <div>[변경 전]</div>   ← sub[0]: label
+          <div>내용...</div>     ← sub[1]: value
+        </div>
+      </div>
+    """
+    try:
+        change_contents = content.find_element(
+            By.CSS_SELECTOR, '[class*="HistoryItemContents-module__ZwKd"]'
+        )
+    except Exception:
+        return "", ""
+
+    after_text = ""
+    before_text = ""
+    for section in change_contents.find_elements(By.XPATH, "./*"):
+        sub = section.find_elements(By.XPATH, "./*")
+        if len(sub) < 2:
+            continue
+        lbl = (sub[0].get_attribute("innerText") or "").strip()
+        val = (sub[1].get_attribute("innerText") or "").strip()
+        if "[변경 후]" in lbl:
+            after_text = val
+        elif "[변경 전]" in lbl:
+            before_text = val
+
+    return after_text, before_text
+
+
+def _force_kill_chrome(account_id: str) -> None:
+    """크래시 후 프로파일 디렉토리를 점유한 Chrome 프로세스를 강제 종료한다."""
+    import subprocess
+    try:
+        subprocess.run(
+            ["pkill", "-f", f"chrome_profiles/{account_id}"],
+            capture_output=True, timeout=5,
+        )
+        logger.info("Chrome 프로세스 강제 종료: %s", account_id)
+    except Exception as e:
+        logger.warning("Chrome 강제 종료 실패 (무시): %s | %s", account_id, e)
+
+
+def _scroll_to_top(driver) -> None:
+    """Scroll the virtualized list container to the top."""
+    driver.execute_script(
+        """
+        const container = document.querySelector('div[style*="overflow"]');
+        if (container) {
+            container.scrollTop = 0;
+            return;
+        }
+        window.scrollTo(0, 0);
+        """
+    )
+
+
+def _scroll_by(driver, offset: int) -> None:
+    """Scroll the virtualized list container if present, otherwise the window."""
+    driver.execute_script(
+        """
+        const offset = arguments[0];
+        const container = document.querySelector('div[style*="overflow"]');
+        if (container) {
+            container.scrollTop += offset;
+            return;
+        }
+        window.scrollBy(0, offset);
+        """,
+        offset,
+    )
+
+
+def _extract_change_rows(driver, store_info: dict, full_name: str) -> list[dict]:
+    """Collect virtualized change-history items one by one."""
+    title_pause = "영업임시중지"
+    title_holiday = "휴무일"
+    title_op_time = "운영시간"
+
+    iso = pendulum.now(KST).isoformat()
+    area_name = store_info["store"]
+    target_label = _format_store_target(store_info)
+    processed: set[str] = set()
+    failed: set[str] = set()
+    all_rows: list[dict] = []
+    no_new = 0
+
+    _scroll_to_top(driver)
+    time.sleep(0.3)
+
+    for _ in range(_MAX_ITER):
+        try:
+            items = driver.find_elements(By.CSS_SELECTOR, ITEM_CSS)
+        except Exception:
+            items = []
+
+        target_item = None
+        target_key = ""
+        target_title = ""
+
+        for item in items:
+            try:
+                title, _, item_key = _get_item_summary(item)
+                if item_key in processed or item_key in failed:
+                    continue
+
+                is_pause = title_pause in title
+                is_holiday = title_holiday in title
+                is_op_time = title_op_time in title
+                if not is_pause and not is_holiday and not is_op_time:
+                    processed.add(item_key)
+                    continue
+
+                target_item = item
+                target_key = item_key
+                target_title = title
+                break
+            except StaleElementReferenceException:
+                target_item = None
+                break
+
+        if target_item is None:
+            no_new += 1
+            if no_new >= _MAX_NO_NEW:
+                break
+            logger.info("스크롤 후 다음 항목 대기: %s (%d/%d)", target_label, no_new, _MAX_NO_NEW)
+            _scroll_by(driver, 400)
+            time.sleep(random.uniform(0.3, 0.5))
+            continue
+
+        no_new = 0
+
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({behavior:'instant', block:'center'});",
+                target_item,
+            )
+            time.sleep(random.uniform(0.15, 0.25))
+            logger.info("항목 확장 시도: %s -> %s", target_label, target_title)
+
+            # .ListItem-content.on: 두 클래스 모두 있는 요소만 (CSS 선택자로 정확히 체크)
+            expanded_divs = target_item.find_elements(By.CSS_SELECTOR, ".ListItem-content.on")
+            is_expanded = bool(expanded_divs) and any(
+                (div.get_attribute("innerText") or "").strip() for div in expanded_divs
+            )
+
+            if not is_expanded:
+                # 타이틀 클릭으로 상세 패널 펼치기
+                title_els = target_item.find_elements(By.CSS_SELECTOR, "h5.flex-1")
+                click_target = title_els[0] if title_els else target_item
+                human_click(driver, click_target)
+                time.sleep(0.8)  # React 렌더 시작 대기
+                if not _wait_for_item_expanded(target_item):
+                    # innerText 로드가 느린 경우 — 건너뛰지 않고 파싱 계속 시도
+                    logger.warning("항목 확장 대기 초과, 파싱 시도: %s -> %s", target_label, target_key)
+
+            logger.info("항목 확장 완료: %s -> %s", target_label, target_title)
+            row = _parse_change_history_item(target_item, iso, store_info, full_name, area_name)
+            if row:
+                all_rows.append(row)
+                processed.add(target_key)
+                logger.info("항목 파싱 완료: %s -> %s", target_label, target_title)
+            else:
+                logger.warning("항목 파싱 실패, 계속 진행: %s -> %s", target_label, target_key)
+                failed.add(target_key)
+
+            logger.info("스크롤 후 다음 항목 대기: %s", target_label)
+            _scroll_by(driver, 300)
+            time.sleep(random.uniform(0.2, 0.4))
+        except StaleElementReferenceException:
+            time.sleep(0.2)
+            continue
+
+    logger.info("변경이력 추출 완료: %s -> %d행", target_label, len(all_rows))
+    return all_rows
+
+
+def _parse_change_history_item(
+    item, iso: str, store_info: dict, full_name: str, area_name: str
+) -> dict | None:
+    """Parse one expanded change-history item."""
+    label_category = "분류"
+    label_changed_at = "변경시간"
+    label_worker = "작업자"
+    title_pause = "영업임시중지"
+    title_holiday = "휴무일"
+    title_op_time = "운영시간"
+    title, date_attr, _ = _get_item_summary(item)
+    change_datetime = date_attr
 
     try:
-        raw = driver.execute_script(_EXTRACT_JS) or []
-        iso = pendulum.now(KST).isoformat()
-        rows = [
-            {
-                "title": r.get("title", ""),
-                "date": r.get("date", ""),
-                "category": r.get("category", ""),
-                "worker": r.get("worker", ""),
-                "after": r.get("after", ""),
-                "before": r.get("before", ""),
-                "brand": store_info["brand"],
-                "store_id": store_info["store_id"],
-                "store_name": store_info["store"],
-                "collected_at": iso,
-            }
-            for r in raw
-        ]
-        logger.info("변경이력 추출 완료: store=%s → %d행", store_info["store"], len(rows))
-        return rows
+        content = item.find_element(By.CSS_SELECTOR, ".ListItem-content.on")
+    except Exception:
+        content = None
 
+    category = ""
+    worker = ""
+
+    if content is not None:
+        try:
+            details_div = content.find_element(
+                By.CSS_SELECTOR, '[class*="HistoryItemContents-module__rs7S"]'
+            )
+        except Exception:
+            details_div = None
+
+        if details_div is not None:
+            detail_rows = details_div.find_elements(
+                By.CSS_SELECTOR, '[class*="HistoryItemContents-module__Zcx3"]'
+            ) or details_div.find_elements(By.XPATH, ".//*")
+
+            for row in detail_rows:
+                text = (row.get_attribute("innerText") or "").strip()
+                if not text:
+                    continue
+                label_els = row.find_elements(
+                    By.CSS_SELECTOR, '[class*="HistoryItemContents-module__sGh2"]'
+                )
+                value_els = row.find_elements(
+                    By.CSS_SELECTOR, '[class*="HistoryItemContents-module__FXZ7"]'
+                )
+                if label_els and value_els:
+                    label = (label_els[0].get_attribute("innerText") or "").strip()
+                    value = " ".join(
+                        (v.get_attribute("innerText") or "").strip()
+                        for v in value_els
+                        if (v.get_attribute("innerText") or "").strip()
+                    )
+                else:
+                    parts = [part.strip() for part in text.splitlines() if part.strip()]
+                    if len(parts) < 2:
+                        continue
+                    label = parts[0]
+                    value = " ".join(parts[1:])
+                if label == label_category:
+                    category = value
+                elif label == label_changed_at:
+                    change_datetime = value
+                elif label == label_worker:
+                    worker = value
+        else:
+            logger.warning("상세 메타 영역 없음: %s -> %s", _format_store_target(store_info), title)
+
+    after_text = ""
+    before_text = ""
+    if content is not None:
+        after_text, before_text = _extract_section_texts(content)
+
+    content_text = (content.get_attribute("innerText") or "").strip() if content is not None else ""
+    if (not after_text and not before_text) and content_text:
+        after_text, before_text = _split_after_before_text(content_text)
+
+    if not category and content_text:
+        category = _extract_labeled_value(content_text, label_category)
+    if not worker and content_text:
+        worker = _extract_labeled_value(content_text, label_worker)
+    if not change_datetime and content_text:
+        change_datetime = _extract_labeled_value(content_text, label_changed_at) or date_attr
+
+    base = {column: "" for column in CSV_COLUMNS}
+    base["수집일시"] = iso
+    base["매장명"] = full_name
+    base["store_id"] = store_info["store_id"]
+    base["지역명"] = area_name
+    base["대분류"] = title
+    base["분류"] = category
+    base["변경시간"] = change_datetime
+    base["작업자"] = worker
+
+    if not category and not worker and not after_text and not before_text and not content_text:
+        logger.warning("확장된 상세 텍스트 없음: %s -> %s", _format_store_target(store_info), title)
+        return base
+
+    if not category and not worker and not after_text and not before_text:
+        logger.warning(
+            "상세 파싱 데이터 비어있음: %s -> %s",
+            _format_store_target(store_info),
+            title,
+        )
+
+    if title_pause in title:
+        after_d = _parse_business_pause_data(after_text or content_text)
+        before_d = _parse_business_pause_data(before_text)
+        base["변경후_사유"] = after_d["reason"]
+        base["변경후_가게중지"] = after_d["store_closure"]
+        base["변경후_배민배달"] = after_d["baemin_delivery"]
+        base["변경전_사유"] = before_d["reason"]
+        base["변경전_가게중지"] = before_d["store_closure"]
+        base["변경전_배민배달"] = before_d["baemin_delivery"]
+    elif title_holiday in title:
+        after_h = _parse_holiday_data(after_text or content_text)
+        before_h = _parse_holiday_data(before_text)
+        base["변경후_정기휴무일"] = after_h["regular"]
+        base["변경후_임시휴무일"] = after_h["temp"]
+        base["변경전_정기휴무일"] = before_h["regular"]
+        base["변경전_임시휴무일"] = before_h["temp"]
+    elif title_op_time in title:
+        base["변경후_운영시간"] = after_text or content_text
+        base["변경전_운영시간"] = before_text
+
+    return base
+
+
+def _split_after_before_text(content_text: str) -> tuple[str, str]:
+    """Fallback split for expanded content text."""
+    after_text = ""
+    before_text = ""
+
+    after_match = re.search(r"\[변경 후\]\s*(.*?)(?=\[변경 전\]|\Z)", content_text, re.DOTALL)
+    before_match = re.search(r"\[변경 전\]\s*(.*)\Z", content_text, re.DOTALL)
+
+    if after_match:
+        after_text = after_match.group(1).strip()
+    if before_match:
+        before_text = before_match.group(1).strip()
+
+    return after_text, before_text
+
+
+def _extract_labeled_value(content_text: str, label: str) -> str:
+    """Fallback parse for `분류`, `변경시간`, `작업자` labels from raw text."""
+    lines = [line.strip() for line in content_text.splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        if line == label and index + 1 < len(lines):
+            return lines[index + 1]
+        if line.startswith(f"{label} :"):
+            return line.split(":", 1)[1].strip()
+        if line.startswith(f"{label}:"):
+            return line.split(":", 1)[1].strip()
+        if line.startswith(f"{label} ："):
+            return line.split("：", 1)[1].strip()
+    return ""
+
+
+def _parse_business_pause_data(text: str) -> dict:
+    """영업임시중지 변경 전/후 텍스트에서 사유 + 배민배달 시간 파싱.
+
+    실제 DOM 구조 (2026-05 확인):
+      영업 임시중지 사유 : 가게사정
+      가게 영업 임시중지
+      - 시간 : 26. 5. 27. 11:37 ~ 26. 5. 27. 12:37
+      주문유형 : 배민배달
+      - 시간 : 26. 5. 27. 11:37 ~ 26. 5. 27. 12:37
+      주문유형 : 가게배달  ← 수집 안 함
+      주문유형 : 픽업      ← 수집 안 함
+    """
+    result = {"reason": "없음", "store_closure": "없음", "baemin_delivery": "없음"}
+    if not text:
+        return result
+
+    reason_match = re.search(r"영업 임시중지 사유\s*[:：]\s*(.+)", text)
+    if reason_match:
+        result["reason"] = reason_match.group(1).strip()
+
+    time_pattern = re.compile(
+        r"시간\s*[:：]\s*(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{1,2}):(\d{2})"
+        r"\s*~\s*(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{1,2}):(\d{2})"
+    )
+
+    def _extract_time(section: str) -> str:
+        if "없음" in section:
+            return "없음"
+        m = time_pattern.search(section)
+        if not m:
+            return "없음"
+        y1, mo1, d1, h1, min1, y2, mo2, d2, h2, min2 = m.groups()
+        return (
+            f"{y1.zfill(2)}.{mo1.zfill(2)}.{d1.zfill(2)} {h1.zfill(2)}:{min1}"
+            f" ~ {y2.zfill(2)}.{mo2.zfill(2)}.{d2.zfill(2)} {h2.zfill(2)}:{min2}"
+        )
+
+    # 가게 전체 임시중지 시간
+    store_match = re.search(
+        r"가게 영업 임시중지\s*\n(.*?)(?=\n주문유형|\Z)",
+        text, re.DOTALL
+    )
+    if store_match:
+        result["store_closure"] = _extract_time(store_match.group(1).strip())
+
+    # 배민배달 / 과거 명칭 알뜰·한집배달
+    baemin_match = re.search(
+        r"주문유형\s*:\s*(?:배민배달|알뜰[··]한집배달)\s*\n(.*?)(?=\n주문유형|\Z)",
+        text, re.DOTALL
+    )
+    if baemin_match:
+        result["baemin_delivery"] = _extract_time(baemin_match.group(1).strip())
+
+    return result
+
+
+def _parse_holiday_data(text: str) -> dict:
+    """휴무일 변경 전/후 텍스트에서 정기휴무일 + 임시휴무일 파싱.
+
+    실제 DOM 구조 (2026-05 확인):
+      정기휴무일
+      - 매주 화요일
+      임시휴무일
+      - 2026-05-28 ~ 2026-05-28
+    """
+    result = {"regular": "", "temp": ""}
+    if not text:
+        return result
+
+    regular_match = re.search(r"정기휴무일\s*\n(.*?)(?=\n임시휴무일|\Z)", text, re.DOTALL)
+    if regular_match:
+        lines = [l.strip().lstrip("- ") for l in regular_match.group(1).splitlines() if l.strip()]
+        result["regular"] = ", ".join(lines)
+
+    temp_match = re.search(r"임시휴무일\s*\n(.*?)\Z", text, re.DOTALL)
+    if temp_match:
+        lines = [l.strip().lstrip("- ") for l in temp_match.group(1).splitlines() if l.strip()]
+        result["temp"] = ", ".join(lines)
+
+    return result
+
+
+def _collect_one_store_operation(driver, store_info: dict, full_name: str) -> list[dict]:
+    """매장 운영시간 페이지에서 요일/시간 쌍을 수집한다."""
+    store_id = store_info["store_id"]
+    url = SHOP_OPERATION_URL.format(store_id=store_id)
+    try:
+        driver.set_page_load_timeout(25)
+        driver.get(url)
     except Exception as e:
-        logger.warning("변경이력 추출 실패 (%s): %s", store_info["store"], e)
+        logger.warning("운영시간 페이지 로드 타임아웃 (%s): %s", store_id, e)
+
+    if not wait_for_page(driver, OP_HOUR_P_CSS, timeout=15):
+        logger.warning("운영시간 요소 로드 실패: %s", store_id)
         return []
+
+    iso = pendulum.now(KST).isoformat()
+    rows = []
+    try:
+        p_els = driver.find_elements(By.CSS_SELECTOR, OP_HOUR_P_CSS)
+        for p_el in p_els:
+            day = (p_el.get_attribute("innerText") or "").strip()
+            try:
+                parent = p_el.find_element(By.XPATH, "..")
+                time_els = parent.find_elements(By.CSS_SELECTOR, "time")
+                hours = (time_els[0].get_attribute("innerText") or "").strip() if time_els else ""
+            except Exception:
+                hours = ""
+            if day:
+                rows.append({
+                    "수집일시": iso,
+                    "매장명": full_name,
+                    "store_id": store_id,
+                    "brand": store_info["brand"],
+                    "요일": day,
+                    "운영시간": hours,
+                })
+    except Exception as e:
+        logger.warning("운영시간 파싱 오류 (%s): %s", store_id, e)
+
+    logger.info("운영시간 수집: %s -> %d행", store_id, len(rows))
+    return rows
+
+
+def _save_operation_csv(rows: list[dict], brand: str, store: str) -> Path:
+    """운영시간 CSV에 수집일시 기준 월 파티션으로 누적 저장."""
+    ym = pendulum.now(KST).format("YYYY-MM")
+    out_dir = BAEMIN_SHOP_OPERATION_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "shop_operation.csv"
+
+    new_df = pd.DataFrame(rows, columns=OP_CSV_COLUMNS).astype(str)
+
+    if out_path.exists():
+        existing = pd.read_csv(out_path, dtype=str)
+        for col in OP_CSV_COLUMNS:
+            if col not in existing.columns:
+                existing[col] = ""
+        new_isos = set(new_df["수집일시"])
+        mask = ~existing["수집일시"].isin(new_isos)
+        combined = pd.concat([existing[mask][OP_CSV_COLUMNS], new_df], ignore_index=True)
+    else:
+        combined = new_df
+
+    combined.to_csv(out_path, index=False, encoding="utf-8-sig")
+    logger.info("운영시간 CSV 저장: %s -> %s (%d행)", store, out_path, len(combined))
+    return out_path
 
 
 def _save_csv(rows: list[dict], brand: str, store: str) -> Path:
     """upsert 방식으로 CSV 저장 (ym 파티션).
 
-    같은 date+title 이면 덮어쓰고, 신규 항목은 추가.
+    같은 (변경시간 + 대분류) 조합이면 덮어쓰고, 신규 항목은 추가.
+    컬럼 순서는 CSV_COLUMNS 고정.
     """
     ym = pendulum.now(KST).format("YYYY-MM")
     out_dir = BAEMIN_SHOP_CHANGE_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "shop_change.csv"
 
-    new_df = pd.DataFrame(rows).astype(str)
+    new_df = pd.DataFrame(rows, columns=CSV_COLUMNS).astype(str)
 
     if out_path.exists():
         existing = pd.read_csv(out_path, dtype=str)
-        # 신규 rows의 (date, title) 키와 겹치는 기존 행 제거
-        new_keys = set(zip(new_df.get("date", pd.Series(dtype=str)), new_df.get("title", pd.Series(dtype=str))))
+        # 기존 파일에 없는 컬럼 추가 (스키마 호환)
+        for col in CSV_COLUMNS:
+            if col not in existing.columns:
+                existing[col] = ""
+        new_keys = set(zip(new_df["변경시간"], new_df["대분류"]))
         mask = ~existing.apply(
-            lambda r: (r.get("date", ""), r.get("title", "")) in new_keys, axis=1
+            lambda r: (r.get("변경시간", ""), r.get("대분류", "")) in new_keys, axis=1
         )
-        combined = pd.concat([existing[mask], new_df], ignore_index=True)
+        combined = pd.concat([existing[mask][CSV_COLUMNS], new_df], ignore_index=True)
     else:
         combined = new_df
 
     combined.to_csv(out_path, index=False, encoding="utf-8-sig")
-    logger.info("저장 완료: %s (%d행)", out_path, len(combined))
+    logger.info(
+        "CSV 병합 저장 완료: brand=%s store=%s → %s (%d행)",
+        brand,
+        store,
+        out_path,
+        len(combined),
+    )
+    return out_path
+
+
+def _element_text(el) -> str:
+    if el is None:
+        return ""
+    for attr in ("innerText", "textContent"):
+        try:
+            value = el.get_attribute(attr)
+        except Exception:
+            value = ""
+        if value and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _expanded_content_text(item) -> str:
+    try:
+        content = item.find_element(By.CSS_SELECTOR, ".ListItem-content.on")
+    except Exception:
+        content = None
+
+    text = _element_text(content)
+    if text:
+        return text
+
+    try:
+        text = item.parent.execute_script(
+            """
+            const root = arguments[0];
+            const selectors = [
+              '.ListItem-content.on',
+              '[class*="ListItem-content"][class*="on"]',
+              '[class*="HistoryItemContents"]',
+            ];
+            for (const selector of selectors) {
+              const node = root.querySelector(selector);
+              if (!node) continue;
+              const text = (node.innerText || node.textContent || '').trim();
+              if (text) return text;
+            }
+            return (root.innerText || root.textContent || '').trim();
+            """,
+            item,
+        )
+        return (text or "").strip()
+    except Exception:
+        return ""
+
+
+def _wait_for_item_expanded(item, attempts: int = 10, delay: float = 0.2) -> bool:
+    for _ in range(attempts):
+        try:
+            if _expanded_content_text(item):
+                return True
+        except StaleElementReferenceException:
+            return False
+        time.sleep(delay)
+    return False
+
+
+def _parse_change_history_item(
+    item, iso: str, store_info: dict, full_name: str, area_name: str
+) -> dict | None:
+    title, date_attr, _ = _get_item_summary(item)
+    base = {column: "" for column in CSV_COLUMNS}
+    base["?섏쭛?쇱떆"] = iso
+    base["留ㅼ옣紐?"] = full_name
+    base["store_id"] = store_info["store_id"]
+    base["吏??챸"] = area_name
+    base["?遺꾨쪟"] = title
+    base["蹂寃쎌떆媛?"] = date_attr
+
+    content_text = _expanded_content_text(item)
+    if not content_text:
+        logger.warning("?뺤옣???곸꽭 ?띿뒪???놁쓬: %s -> %s", _format_store_target(store_info), title)
+        _push_shop_change_alert("parse_failures", _format_store_target(store_info), f"missing detail text: {title}")
+        return base
+
+    after_text, before_text = _split_after_before_text(content_text)
+    label_category = "遺꾨쪟"
+    label_changed_at = "蹂寃쎌떆媛?"
+    label_worker = "?묒뾽??"
+    base["遺꾨쪟"] = _extract_labeled_value(content_text, label_category)
+    base["蹂寃쎌떆媛?"] = _extract_labeled_value(content_text, label_changed_at) or date_attr
+    base["?묒뾽??"] = _extract_labeled_value(content_text, label_worker)
+
+    if "?곸뾽?꾩떆以묒?" in title:
+        after_d = _parse_business_pause_data(after_text or content_text)
+        before_d = _parse_business_pause_data(before_text)
+        base["蹂寃쏀썑_?ъ쑀"] = after_d["reason"]
+        base["蹂寃쏀썑_媛寃뚯쨷吏"] = after_d["store_closure"]
+        base["蹂寃쏀썑_諛곕?諛곕떖"] = after_d["baemin_delivery"]
+        base["蹂寃쎌쟾_?ъ쑀"] = before_d["reason"]
+        base["蹂寃쎌쟾_媛寃뚯쨷吏"] = before_d["store_closure"]
+        base["蹂寃쎌쟾_諛곕?諛곕떖"] = before_d["baemin_delivery"]
+    elif "?대Т??" in title:
+        after_h = _parse_holiday_data(after_text or content_text)
+        before_h = _parse_holiday_data(before_text)
+        base["蹂寃쏀썑_?뺢린?대Т??"] = after_h["regular"]
+        base["蹂寃쏀썑_?꾩떆?대Т??"] = after_h["temp"]
+        base["蹂寃쎌쟾_?뺢린?대Т??"] = before_h["regular"]
+        base["蹂寃쎌쟾_?꾩떆?대Т??"] = before_h["temp"]
+    elif "?댁쁺?쒓컙" in title:
+        base["蹂寃쏀썑_?댁쁺?쒓컙"] = after_text or content_text
+        base["蹂寃쎌쟾_?댁쁺?쒓컙"] = before_text
+
+    return base
+
+
+def _row_signature(row: dict) -> tuple[str, ...]:
+    return (
+        str(row.get("?遺꾨쪟", "")),
+        str(row.get("蹂寃쎌떆媛?", "")),
+        str(row.get("?묒뾽??", "")),
+        str(row.get("蹂寃쏀썑_?댁쁺?쒓컙", "")),
+        str(row.get("蹂寃쎌쟾_?댁쁺?쒓컙", "")),
+        str(row.get("蹂寃쏀썑_?ъ쑀", "")),
+        str(row.get("蹂寃쎌쟾_?ъ쑀", "")),
+        str(row.get("蹂寃쏀썑_?뺢린?대Т??", "")),
+        str(row.get("蹂寃쎌쟾_?뺢린?대Т??", "")),
+        str(row.get("蹂寃쏀썑_?꾩떆?대Т??", "")),
+        str(row.get("蹂寃쎌쟾_?꾩떆?대Т??", "")),
+        str(row.get("蹂寃쏀썑_媛寃뚯쨷吏", "")),
+        str(row.get("蹂寃쎌쟾_媛寃뚯쨷吏", "")),
+        str(row.get("蹂寃쏀썑_諛곕?諛곕떖", "")),
+        str(row.get("蹂寃쎌쟾_諛곕?諛곕떖", "")),
+    )
+
+
+def _extract_change_rows(driver, store_info: dict, full_name: str) -> list[dict]:
+    """Override earlier implementation to avoid under-collecting virtualized rows."""
+    iso = pendulum.now(KST).isoformat()
+    area_name = store_info["store"]
+    target_label = _format_store_target(store_info)
+    processed_rows: set[tuple[str, ...]] = set()
+    failed_items: set[str] = set()
+    all_rows: list[dict] = []
+    no_new = 0
+    cutoff_date = pendulum.now(KST).subtract(days=_COLLECT_DAYS).date()
+
+    _scroll_to_top(driver)
+    time.sleep(0.3)
+
+    hit_cutoff = False
+    for _ in range(_MAX_ITER):
+        if hit_cutoff:
+            break
+        try:
+            items = driver.find_elements(By.CSS_SELECTOR, ITEM_CSS)
+        except Exception as e:
+            if _is_driver_crash_error(e):
+                raise
+            items = []
+
+        visible_progress = 0
+        for item in items:
+            item_key = ""
+            try:
+                title, date_attr, item_key = _get_item_summary(item)
+                if item_key in failed_items or not item_key:
+                    continue
+                if not title.strip():
+                    continue
+
+                # 커트오프 이전 항목 → 정렬 내림차순이므로 이후 항목도 모두 오래됨
+                if date_attr:
+                    try:
+                        if pendulum.parse(date_attr[:10]).date() < cutoff_date:
+                            logger.info(
+                                "커트오프(%s) 이전 항목 도달, 수집 종료: %s -> %s",
+                                cutoff_date, target_label, date_attr,
+                            )
+                            hit_cutoff = True
+                            break
+                    except Exception:
+                        pass
+
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({behavior:'instant', block:'center'});",
+                    item,
+                )
+                time.sleep(random.uniform(0.1, 0.2))
+
+                expanded_divs = item.find_elements(By.CSS_SELECTOR, ".ListItem-content.on")
+                is_expanded = bool(expanded_divs) and any(
+                    (div.get_attribute("innerText") or "").strip() for div in expanded_divs
+                )
+                if not is_expanded:
+                    title_els = item.find_elements(By.CSS_SELECTOR, "h5.flex-1")
+                    click_target = title_els[0] if title_els else item
+                    human_click(driver, click_target)
+                    time.sleep(0.8)
+                    if not _wait_for_item_expanded(item):
+                        logger.warning("항목 확장 대기 실패, 파싱 시도: %s -> %s", target_label, item_key)
+
+                row = _parse_change_history_item(item, iso, store_info, full_name, area_name)
+                if row is None:
+                    failed_items.add(item_key)
+                    continue
+
+                signature = _row_signature(row)
+                if signature in processed_rows:
+                    continue
+
+                processed_rows.add(signature)
+                all_rows.append(row)
+                visible_progress += 1
+                logger.info("항목 파싱 완료: %s -> %s", target_label, title)
+            except StaleElementReferenceException:
+                time.sleep(0.2)
+                continue
+            except Exception as e:
+                if _is_driver_crash_error(e):
+                    raise
+                logger.warning("항목 처리 실패, 계속 진행: %s -> %s", target_label, e)
+                if item_key:
+                    failed_items.add(item_key)
+                continue
+
+        if visible_progress == 0:
+            no_new += 1
+            if no_new >= _MAX_NO_NEW:
+                break
+            logger.info("스크롤 후 다음 항목 대기: %s (%d/%d)", target_label, no_new, _MAX_NO_NEW)
+            _scroll_by(driver, 450)
+            time.sleep(random.uniform(0.3, 0.5))
+            continue
+
+        no_new = 0
+        _scroll_by(driver, 500)
+        time.sleep(random.uniform(0.3, 0.5))
+
+    if not all_rows:
+        _push_shop_change_alert("parse_failures", target_label, "zero parsed rows")
+    logger.info("변경이력 추출 완료: %s -> %d건", target_label, len(all_rows))
+    return all_rows
+
+
+def _save_csv(rows: list[dict], brand: str, store: str) -> Path:
+    """Override earlier implementation to preserve same-timestamp multi-row changes."""
+    ym = pendulum.now(KST).format("YYYY-MM")
+    out_dir = BAEMIN_SHOP_CHANGE_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "shop_change.csv"
+
+    new_df = pd.DataFrame(rows, columns=CSV_COLUMNS).astype(str)
+    new_df["_sig"] = new_df.apply(lambda row: str(_row_signature(row)), axis=1)
+
+    if out_path.exists():
+        existing = pd.read_csv(out_path, dtype=str)
+        for col in CSV_COLUMNS:
+            if col not in existing.columns:
+                existing[col] = ""
+        existing = existing[CSV_COLUMNS].astype(str)
+        existing["_sig"] = existing.apply(lambda row: str(_row_signature(row)), axis=1)
+        combined = pd.concat([existing, new_df], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["_sig"], keep="last")
+        combined = combined.drop(columns=["_sig"])
+    else:
+        combined = new_df.drop(columns=["_sig"])
+
+    combined.to_csv(out_path, index=False, encoding="utf-8-sig")
+    logger.info("CSV 蹂묓빀 저장 완료: brand=%s store=%s -> %s (%d건)", brand, store, out_path, len(combined))
     return out_path

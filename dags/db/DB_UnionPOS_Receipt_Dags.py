@@ -22,11 +22,13 @@ import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
+from modules.transform.utility.notifier import send_telegram
 from modules.transform.utility.schedule import DB_UNIONPOS_RECEIPT_TIME
 from modules.transform.pipelines.db.DB_UnionPOS_Receipt import (
     resolve_sale_dates,
     collect_and_save,
     write_log,
+    verify_missing,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,11 @@ dag_id = Path(__file__).stem
 # None    → 어제 1일만 수집 (기본 스케줄 동작)
 # 기간 지정 → ("2026-04-01", "2026-04-19") 형식으로 입력하면 1일씩 순차 수집
 MANUAL_DATE_RANGE: tuple | None = None
+
+# LOOKBACK_DAYS: MANUAL_DATE_RANGE/conf 미지정 시 최근 N일을 수집 (누락 자동 보충)
+# None → 어제 1일만 (기본), int → 최근 N일 전체 (collect_and_save upsert으로 중복 방지)
+# Backfill: conf {"sale_date": "YYYY-MM-DD"} 또는 {"sale_date_from": "...", "sale_date_to": "..."}
+LOOKBACK_DAYS: int | None = 7
 _ALERT_EMAILS = ["a17019@kakao.com"]
 
 
@@ -56,6 +63,7 @@ def _on_failure_callback(context):
         logger.info(f"실패 알림 발송 완료: {_ALERT_EMAILS}")
     except Exception as e:
         logger.error(f"실패 알림 발송 실패: {e}")
+    send_telegram(body + "\n해결해라")
 
 
 default_args = {
@@ -80,7 +88,7 @@ with DAG(
     t1 = PythonOperator(
         task_id="resolve_dates",
         python_callable=resolve_sale_dates,
-        op_kwargs={"manual_date_range": MANUAL_DATE_RANGE},
+        op_kwargs={"manual_date_range": MANUAL_DATE_RANGE, "lookback_days": LOOKBACK_DAYS},
     )
 
     t2 = PythonOperator(
@@ -95,4 +103,10 @@ with DAG(
         python_callable=write_log,
     )
 
-    t1 >> t2 >> t3
+    t4 = PythonOperator(
+        task_id="verify_missing",
+        python_callable=verify_missing,
+        trigger_rule="all_done",
+    )
+
+    t1 >> t2 >> t3 >> t4

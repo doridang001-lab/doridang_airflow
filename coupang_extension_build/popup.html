@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {
+      width: 320px;
+      max-height: 600px;
+      padding: 16px;
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 14px;
+      overflow-y: auto;
+    }
+    h3 {
+      margin: 0 0 12px 0;
+      font-size: 16px;
+      color: #333;
+    }
+    .setting-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    label {
+      color: #555;
+    }
+    #shortcutInput {
+      width: 60px;
+      padding: 8px;
+      border: 2px solid #ddd;
+      border-radius: 6px;
+      text-align: center;
+      font-size: 16px;
+      font-weight: bold;
+    }
+    #shortcutInput:focus {
+      outline: none;
+      border-color: #4a90d9;
+    }
+    .status {
+      font-size: 12px;
+      color: #888;
+      margin-top: 8px;
+    }
+    .status.saved {
+      color: #28a745;
+    }
+    .btn {
+      width: 100%;
+      padding: 10px;
+      margin-top: 12px;
+      background: #4a90d9;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    .btn:hover {
+      background: #357abd;
+    }
+    .btn-batch {
+      background: #34c759;
+    }
+    .btn-batch:hover {
+      background: #28a745;
+    }
+    .info {
+      margin-top: 12px;
+      padding: 10px;
+      background: #f5f5f5;
+      border-radius: 6px;
+      font-size: 12px;
+      color: #666;
+    }
+    .divider {
+      border-top: 1px solid #eee;
+      margin: 14px 0;
+    }
+
+    /* 로그인 페이지 전용 스타일 */
+    #loginView {
+      display: none;
+    }
+    #normalView {
+      display: block;
+    }
+    .platform-title {
+      font-size: 15px;
+      font-weight: bold;
+      color: #4a90d9;
+      margin-bottom: 12px;
+      padding-bottom: 8px;
+      border-bottom: 2px solid #4a90d9;
+    }
+    .manager-section {
+      margin-bottom: 16px;
+    }
+    .manager-name {
+      font-size: 13px;
+      font-weight: 600;
+      color: #555;
+      margin-bottom: 6px;
+      padding: 6px 8px;
+      background: #f8f9fa;
+      border-radius: 4px;
+    }
+    .store-list {
+      margin-left: 12px;
+    }
+    .store-item {
+      padding: 8px 10px;
+      margin: 4px 0;
+      background: white;
+      border: 1px solid #e0e0e0;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all 0.2s;
+      font-size: 13px;
+    }
+    .store-item:hover {
+      background: #e3f2fd;
+      border-color: #4a90d9;
+      transform: translateX(4px);
+    }
+    .store-item:active {
+      background: #bbdefb;
+    }
+    .login-info {
+      font-size: 12px;
+      color: #666;
+      margin-top: 12px;
+      padding: 10px;
+      background: #fff3cd;
+      border-left: 3px solid #ffc107;
+      border-radius: 4px;
+    }
+    .auto-mode-toggle {
+      margin-top: 12px;
+      padding: 10px;
+      background: #e8f5e9;
+      border-radius: 6px;
+      border: 1px solid #4caf50;
+    }
+    .auto-mode-toggle label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      font-size: 13px;
+      color: #2e7d32;
+    }
+    .auto-mode-toggle input[type="checkbox"] {
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <!-- 일반 페이지용 UI -->
+  <div id="normalView">
+    <h3>Doridang Collector 0.1 26-01-05</h3>
+
+    <div class="setting-row">
+      <label>단축키:</label>
+      <input type="text" id="shortcutInput" maxlength="1" placeholder="/">
+    </div>
+
+    <div class="setting-row" style="margin-top: 12px;">
+      <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+        <input type="checkbox" id="showConfirmToggle" style="cursor: pointer;">
+        <span>페이지 이동 시 확인창 표시 (권장: OFF)</span>
+      </label>
+      <div style="font-size: 11px; color: #999; margin-top: 4px; margin-left: 24px;">
+        OFF: 수집 완료 후 자동으로 다음 페이지 이동 (빠름)<br>
+        ON: 이동 전 확인창 표시 (안전함)
+      </div>
+    </div>
+
+    <div id="status" class="status">현재 단축키: /</div>
+
+    <div class="divider"></div>
+
+    <button id="runBtn" class="btn">▶ 지금 수집 실행</button>
+    <button id="batchBtn" class="btn btn-batch">🐔 쿠팡 전체 자동수집 (대시보드 열기)</button>
+
+    <div class="info">
+      <strong>지원 사이트:</strong>
+      <ul>
+        <li>배민셀프서비스</li>
+          <ul>
+            <li>주문내역</li>
+            <li>가계통계</li>
+            <li>변경이력</li>
+          </ul>
+        <li>
+          쿠팡이츠 사장님사이트
+          <ul>
+            <li>매출 관리</li>
+            <li>광고 관리</li>
+          </ul>
+        </li>
+      </ul>
+
+      <strong>오류발생시 :</strong><br>
+      조민준 PM에게 문의바랍니다 :)
+    </div>
+  </div>
+
+  <!-- 로그인 페이지용 UI -->
+  <div id="loginView">
+    <div class="platform-title" id="platformTitle"></div>
+
+    <div class="auto-mode-toggle">
+      <label>
+        <input type="checkbox" id="autoClickBtn" checked>
+        <span>로그인 버튼 자동 클릭 (권장: OFF)</span>
+      </label>
+    </div>
+
+    <div id="managerList"></div>
+
+    <div class="login-info">
+      💡 매장을 클릭하면 ID/PW가 자동 입력됩니다<br>
+      <small style="color: #999;">※ 자동 클릭이 실패하면 체크 해제 후 수동 로그인하세요</small>
+    </div>
+  </div>
+
+  <script src="accounts.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

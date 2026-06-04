@@ -2011,7 +2011,11 @@ def ingest_manual_daily_xlsx(
         if not d.exists() or not d.is_dir():
             return ""
         # Windows에서 수동 다운로드가 '일자별 종합매출.xlsx'처럼 고정 파일명으로 저장되는 케이스 대응
-        candidates = list(d.glob("일자별 종합매출*.xlsx")) + list(d.glob("*일자별 종합매출*.xlsx"))
+        # ~$ 접두사 파일은 Excel 임시 잠금 파일이므로 제외
+        candidates = [
+            p for p in (list(d.glob("일자별 종합매출*.xlsx")) + list(d.glob("*일자별 종합매출*.xlsx")))
+            if not p.name.startswith("~$")
+        ]
         if not candidates:
             return ""
         candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)

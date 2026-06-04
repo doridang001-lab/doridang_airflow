@@ -20,6 +20,7 @@ import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
+from modules.transform.utility.notifier import send_telegram
 from modules.transform.pipelines.db.DB_UnifiedSales import (
     backfill_okpos as pipeline_backfill_okpos,
     backfill_unionpos as pipeline_backfill_unionpos,
@@ -48,11 +49,43 @@ from modules.transform.pipelines.db.DB_UnifiedSales_toorder import (
     run_toorder as pipeline_run_toorder,
     run_lookback_toorder as pipeline_lookback_toorder,
 )
-from modules.transform.pipelines.db.DB_UnifiedSales_validate import validate_sales, validate_monthly_sales
+from modules.transform.pipelines.db.DB_UnifiedSales_validate import (
+    validate_sales,
+    validate_monthly_sales,
+    build_daily_summary as pipeline_build_daily_summary,
+)
 
 logger = logging.getLogger(__name__)
 
 dag_id = Path(__file__).stem
+
+_ALERT_EMAILS = ["a17019@kakao.com"]
+
+
+def _send_alert(subject: str, body: str) -> None:
+    from modules.transform.utility.mailer import send_email, text_to_html
+    try:
+        send_email(subject=subject, html_content=text_to_html(body), to_emails=_ALERT_EMAILS)
+        logger.info("알림 발송 완료: %s", _ALERT_EMAILS)
+    except Exception as e:
+        logger.error("알림 발송 실패: %s", e)
+
+
+def _on_failure_callback(context):
+    """Task 최종 실패 시 이메일 + Telegram 알림"""
+    ti             = context.get("task_instance")
+    execution_date = ti.execution_date.strftime("%Y-%m-%d %H:%M")
+    exception      = context.get("exception", "알 수 없음")
+    body = (
+        f"DAG: {ti.dag_id}\n"
+        f"Task: {ti.task_id}\n"
+        f"실행일시: {execution_date}\n"
+        f"에러: {exception}\n"
+        f"로그: {ti.log_url}"
+    )
+    _send_alert(subject=f"[Airflow 실패] {ti.dag_id} / {ti.task_id}", body=body)
+    send_telegram(body + "\n해결해라")
+
 
 default_args = {
     "retries": 1,
@@ -60,6 +93,7 @@ default_args = {
     "depends_on_past": False,
     "email_on_failure": False,
     "email_on_retry": False,
+    "on_failure_callback": _on_failure_callback,
 }
 
 # LOOKBACK_DAYS:
@@ -218,6 +252,11 @@ def generate_posfeed_whitelist_draft(**context) -> str:
     return pipeline_generate_whitelist_draft()
 
 
+def build_daily_summary(**context) -> str:
+    """unified_sales → 일별×store×brand×order_type×platform 요약 parquet (LLM broadcast)."""
+    return pipeline_build_daily_summary()
+
+
 def reclassify_platform(**context) -> str:
     """unified_sales의 포스/제휴사주문 platform을 테이블명 기반으로 재분류."""
     sale_date = context["ti"].xcom_pull(task_ids="resolve_date", key="sale_date")
@@ -301,5 +340,10 @@ with DAG(
         python_callable=validate_monthly_sales,
     )
 
+    t9 = PythonOperator(
+        task_id="build_daily_summary",
+        python_callable=build_daily_summary,
+    )
+
     # 순차 실행: 같은 날짜 parquet에 동시 write 방지
-    t1 >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5a2 >> t5b >> t5c >> t6 >> t7 >> t8
+    t1 >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5a2 >> t5b >> t5c >> t6 >> t7 >> t8 >> t9

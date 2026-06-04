@@ -35,6 +35,7 @@ from modules.transform.pipelines.db.DB_UnifiedSales_common import (
     _strip_and_coalesce_columns,
     _to_int_series,
 )
+from modules.transform.pipelines.db.DB_FinProduct import _mark_is_latest
 
 logger = logging.getLogger(__name__)
 
@@ -566,12 +567,16 @@ def upsert_fin_product_grp_from_unionpos(
         return f"dry_run: fin_product_grp.csv {' '.join(msg)} 추가 예정"
 
     out = pd.concat([master, to_add, to_change], ignore_index=True)
+    out = _mark_is_latest(out)
 
     FIN_PRODUCT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
     try:
         out.to_csv(tmp, index=False, encoding="utf-8-sig")
-        os.replace(tmp, FIN_PRODUCT_CSV_PATH)
+        try:
+            os.replace(tmp, FIN_PRODUCT_CSV_PATH)
+        except (PermissionError, OSError):
+            FIN_PRODUCT_CSV_PATH.write_bytes(tmp.read_bytes())
     finally:
         try:
             tmp.unlink(missing_ok=True)

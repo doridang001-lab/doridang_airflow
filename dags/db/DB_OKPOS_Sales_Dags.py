@@ -20,6 +20,7 @@ import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
+from modules.transform.utility.notifier import send_telegram
 from modules.transform.utility.schedule import DB_OKPOS_SALES_TIME
 from modules.transform.pipelines.db.DB_OKPOS_Sales import (
     resolve_sale_dates,
@@ -92,6 +93,7 @@ def _on_failure_callback(context):
         logger.info(f"실패 알림 발송 완료: {_ALERT_EMAILS}")
     except Exception as e:
         logger.error(f"실패 알림 발송 실패: {e}")
+    send_telegram(body + "\n해결해라")
 
 
 default_args = {

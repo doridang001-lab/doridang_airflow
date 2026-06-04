@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>쿠팡 전체 자동수집 — 대시보드</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: 'Segoe UI', 'Malgun Gothic', sans-serif;
+      background: #0f1115; color: #e6e6e6; font-size: 14px;
+    }
+    header {
+      padding: 16px 24px; background: #161a22; border-bottom: 1px solid #262b36;
+      display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    }
+    header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+    .controls { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+    button {
+      border: none; border-radius: 6px; padding: 9px 16px; font-size: 13px;
+      cursor: pointer; font-weight: 600;
+    }
+    #startBtn { background: #4a90d9; color: #fff; }
+    #stopBtn { background: #c0392b; color: #fff; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .toggle { font-size: 12px; color: #9aa4b2; display: flex; align-items: center; gap: 6px; }
+
+    .progress-wrap { padding: 14px 24px; background: #12151c; border-bottom: 1px solid #262b36; }
+    .progress-bar { height: 10px; background: #232a36; border-radius: 6px; overflow: hidden; }
+    .progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg,#4a90d9,#34c759); transition: width .4s; }
+    .progress-meta { margin-top: 8px; display: flex; gap: 20px; font-size: 12px; color: #9aa4b2; flex-wrap: wrap; }
+    .progress-meta b { color: #e6e6e6; }
+
+    .layout { display: flex; height: calc(100vh - 170px); }
+    .table-wrap { flex: 2; overflow-y: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid #20242e; font-size: 13px; }
+    th { position: sticky; top: 0; background: #161a22; color: #8a93a2; font-weight: 600; z-index: 1; }
+    tr.current { background: #1b2430; }
+    .badge { padding: 2px 9px; border-radius: 10px; font-size: 11px; font-weight: 700; }
+    .b-wait { background: #2b313c; color: #9aa4b2; }
+    .b-run  { background: #20364d; color: #5ab0ff; }
+    .b-ok   { background: #1e3a2a; color: #46d17f; }
+    .b-empty{ background: #3a341e; color: #d1b246; }
+    .b-fail { background: #3a1e1e; color: #ff6b6b; }
+
+    .log-wrap { flex: 1; border-left: 1px solid #262b36; background: #0b0d11; overflow-y: auto; padding: 10px 14px; }
+    .log-wrap h3 { margin: 0 0 8px; font-size: 12px; color: #8a93a2; text-transform: uppercase; letter-spacing: .5px; }
+    .log-line { font-family: 'Consolas', monospace; font-size: 12px; line-height: 1.6; color: #b8c0cc; white-space: pre-wrap; word-break: break-all; }
+    .log-line .t { color: #5a6373; }
+    .log-line.err { color: #ff7b7b; }
+    .log-line.ok { color: #5fd38a; }
+
+    .summary { padding: 14px 24px; background: #12151c; border-top: 1px solid #262b36; display: none; gap: 24px; }
+    .summary.show { display: flex; }
+    .summary .card { font-size: 13px; }
+    .summary .card b { font-size: 20px; display: block; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🐔 쿠팡 전체 자동수집</h1>
+    <span id="modeLabel" class="toggle"></span>
+    <div class="controls">
+      <label class="toggle"><input type="checkbox" id="clearSessionChk" checked> 매장마다 세션 초기화(로그아웃)</label>
+      <button id="startBtn">▶ 수집 시작</button>
+      <button id="stopBtn" disabled>■ 중단</button>
+    </div>
+  </header>
+
+  <div class="progress-wrap">
+    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+    <div class="progress-meta">
+      <span>진행 <b id="mProgress">0 / 0</b></span>
+      <span>성공 <b id="mOk">0</b></span>
+      <span>빈수집 <b id="mEmpty">0</b></span>
+      <span>실패 <b id="mFail">0</b></span>
+      <span>경과 <b id="mElapsed">00:00</b></span>
+      <span>현재 <b id="mCurrent">-</b></span>
+    </div>
+  </div>
+
+  <div class="layout">
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>#</th><th>매장</th><th>계정ID</th><th>상태</th><th>건수</th><th>소요</th><th>비고</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <div class="log-wrap">
+      <h3>라이브 로그</h3>
+      <div id="log"></div>
+    </div>
+  </div>
+
+  <div class="summary" id="summary">
+    <div class="card">총 매장 <b id="sTotal">0</b></div>
+    <div class="card">성공 <b id="sOk">0</b></div>
+    <div class="card">빈수집 <b id="sEmpty">0</b></div>
+    <div class="card">실패 <b id="sFail">0</b></div>
+    <div class="card">소요시간 <b id="sElapsed">-</b></div>
+  </div>
+
+  <script src="accounts.js"></script>
+  <script src="runner.js"></script>
+</body>
+</html>

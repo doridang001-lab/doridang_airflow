@@ -28,8 +28,14 @@ graph LR
 
 ## 크롤링 DAG (DB_*) 패턴
 - `combined.py` 패턴: 매장별 독립 Chrome (OOM 방지), 4단계 구조
-  - 1단계: 매장목록 조회 → 2단계: now+우가클+변경이력(per-store) → 3단계: orders
+  - 1단계: 매장목록 조회 → 2단계: now+우가클+변경이력(per-store) → 3단계: orders(정상+취소) → 4단계: ad_funnel
 - 크롤링 DAG 신규 작성 전 `/crawl` skill로 대상 URL 사전 조사 필수
+
+## DB_UnifiedSales 현재 task 체인
+```
+t1 >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5a2 >> t5b >> t5c >> t6 >> t7 >> t8 >> t9
+t9 = build_daily_summary (daily_summary.parquet 생성, LLM 포함)
+```
 
 ## 참조
 - `docs/architecture.md` - 아키텍처/모듈 구조도

@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+       xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:cSld><p:spTree>
+    <p:nvGrpSpPr>
+      <p:cNvPr id="1" name="Canvas 1"/>
+      <p:cNvGrpSpPr/>
+      <p:nvPr/>
+    </p:nvGrpSpPr>
+    <p:grpSpPr>
+      <a:xfrm><a:off x="0" y="0"/><a:ext cx="18288000" cy="10287000"/>
+              <a:chOff x="0" y="0"/><a:chExt cx="18288000" cy="10287000"/></a:xfrm>
+    </p:grpSpPr>
+    <p:grpSp>
+  <p:nvGrpSpPr>
+    <p:cNvPr id="10" name="Group 10"/>
+    <p:cNvGrpSpPr/>
+    <p:nvPr/>
+  </p:nvGrpSpPr>
+  <p:grpSpPr>
+    <a:xfrm>
+      <a:off x="275797" y="303268"/>
+      <a:ext cx="17656784" cy="800000"/>
+      <a:chOff x="275797" y="303268"/>
+      <a:chExt cx="17656784" cy="800000"/>
+    </a:xfrm>
+  </p:grpSpPr>
+  <p:sp>
+  <p:nvSpPr>
+    <p:cNvPr id="11" name="Badge11"/>
+    <p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr>
+    <p:nvPr/>
+  </p:nvSpPr>
+  <p:spPr>
+    <a:xfrm><a:off x="275797" y="303268"/><a:ext cx="2200000" cy="680000"/></a:xfrm>
+    <a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val 50000"/></a:avLst></a:prstGeom>
+    <a:solidFill><a:srgbClr val="86B499"/></a:solidFill>
+    <a:ln><a:noFill/></a:ln>
+  </p:spPr>
+  <p:txBody>
+    <a:bodyPr wrap="square" anchor="ctr" lIns="180000" rIns="180000" tIns="180000" bIns="180000"><a:normAutofit/></a:bodyPr>
+    <a:lstStyle/>
+    <a:p><a:pPr algn="ctr"><a:buNone/></a:pPr><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2200" dirty="0" b="1"><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>마무리</a:t></a:r></a:p>
+  </p:txBody>
+</p:sp>
+  <p:sp>
+  <p:nvSpPr>
+    <p:cNvPr id="12" name="Title12"/>
+    <p:cNvSpPr txBox="1"><a:spLocks noGrp="1"/></p:cNvSpPr>
+    <p:nvPr/>
+  </p:nvSpPr>
+  <p:spPr>
+    <a:xfrm><a:off x="624116" y="292485"/><a:ext cx="17308465" cy="900000"/></a:xfrm>
+    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+    <p:noFill/>
+    <a:ln><a:noFill/></a:ln>
+  </p:spPr>
+  <p:txBody>
+    <a:bodyPr wrap="square" anchor="ctr"><a:normAutofit/></a:bodyPr>
+    <a:lstStyle/>
+    <a:p><a:pPr algn="l"><a:buNone/></a:pPr><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="4066" dirty="0" b="1"><a:solidFill><a:srgbClr val="2E7D32"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>마무리</a:t></a:r></a:p>
+  </p:txBody>
+</p:sp>
+</p:grpSp>
+<p:sp>
+  <p:nvSpPr>
+    <p:cNvPr id="20" name="Tagline"/>
+    <p:cNvSpPr txBox="1"><a:spLocks noGrp="1"/></p:cNvSpPr>
+    <p:nvPr/>
+  </p:nvSpPr>
+  <p:spPr>
+    <a:xfrm><a:off x="500000" y="1600000"/><a:ext cx="17288000" cy="900000"/></a:xfrm>
+    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+    <p:noFill/>
+    <a:ln><a:noFill/></a:ln>
+  </p:spPr>
+  <p:txBody>
+    <a:bodyPr wrap="square" anchor="ctr"><a:normAutofit/></a:bodyPr>
+    <a:lstStyle/>
+    <a:p><a:pPr algn="ctr"><a:buNone/></a:pPr><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="5600" dirty="0" b="1"><a:solidFill><a:srgbClr val="004AAD"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>AI는 사람을 대체하지 않습니다</a:t></a:r></a:p>
+  </p:txBody>
+</p:sp>
+<p:sp>
+  <p:nvSpPr>
+    <p:cNvPr id="21" name="Sub"/>
+    <p:cNvSpPr txBox="1"><a:spLocks noGrp="1"/></p:cNvSpPr>
+    <p:nvPr/>
+  </p:nvSpPr>
+  <p:spPr>
+    <a:xfrm><a:off x="500000" y="2620000"/><a:ext cx="17288000" cy="700000"/></a:xfrm>
+    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+    <p:noFill/>
+    <a:ln><a:noFill/></a:ln>
+  </p:spPr>
+  <p:txBody>
+    <a:bodyPr wrap="square" anchor="ctr"><a:normAutofit/></a:bodyPr>
+    <a:lstStyle/>
+    <a:p><a:pPr algn="ctr"><a:buNone/></a:pPr><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2400" dirty="0"><a:solidFill><a:srgbClr val="333333"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>반복 정리·요약·기록은 AI가 보조하고, 현장 판단·소통·의사결정은 사람이 담당합니다.</a:t></a:r></a:p>
+  </p:txBody>
+</p:sp>
+<p:sp>
+  <p:nvSpPr>
+    <p:cNvPr id="30" name="LeftBox"/>
+    <p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr>
+    <p:nvPr/>
+  </p:nvSpPr>
+  <p:spPr>
+    <a:xfrm><a:off x="400000" y="3500000"/><a:ext cx="8100000" cy="5800000"/></a:xfrm>
+    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+    <a:solidFill><a:srgbClr val="1E1E1E"/></a:solidFill>
+    <a:ln><a:noFill/></a:ln>
+  </p:spPr>
+  <p:txBody>
+    <a:bodyPr wrap="square" anchor="t" lIns="220000" rIns="220000" tIns="220000" bIns="220000"><a:normAutofit/></a:bodyPr>
+    <a:lstStyle/>
+    <a:p><a:pPr algn="l"><a:buNone/></a:pPr><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2600" dirty="0" b="1"><a:solidFill><a:srgbClr val="86B499"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>AI가 보조하는 것</a:t></a:r></a:p><a:p><a:endParaRPr lang="ko-KR" altLang="en-US" dirty="0"/></a:p><a:p><a:pPr algn="l"><a:lnSpc><a:spcPts val="3600"/></a:lnSpc><a:spcBef><a:spcPts val="100"/></a:spcBef><a:buNone/></a:pPr><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2200" dirty="0"><a:solidFill><a:srgbClr val="86B499"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>▸  </a:t></a:r><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2200" dirty="0"><a:solidFill><a:srgbClr val="EEEEEE"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>문서 정리 / 회의록 자동 요약</a:t></a:r></a:p><a:p><a:pPr algn="l"><a:lnSpc><a:spcPts val="3600"/></a:lnSpc><a:spcBef><a:spcPts val="100"/></a:spcBef><a:buNone/></a:pPr><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2200" dirty="0"><a:solidFill><a:srgbClr val="86B499"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>▸  </a:t></a:r><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2200" dirty="0"><a:solidFill><a:srgbClr val="EEEEEE"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>데이터 분류 및 반복 집계</a:t></a:r></a:p><a:p><a:pPr algn="l"><a:lnSpc><a:spcPts val="3600"/></a:lnSpc><a:spcBef><a:spcPts val="100"/></a:spcBef><a:buNone/></a:pPr><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2200" dirty="0"><a:solidFill><a:srgbClr val="86B499"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>▸  </a:t></a:r><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2200" dirty="0"><a:solidFill><a:srgbClr val="EEEEEE"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>표준 문구 생성 / 이메일 초안</a:t></a:r></a:p><a:p><a:pPr algn="l"><a:lnSpc><a:spcPts val="3600"/></a:lnSpc><a:spcBef><a:spcPts val="100"/></a:spcBef><a:buNone/></a:pPr><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2200" dirty="0"><a:solidFill><a:srgbClr val="86B499"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>▸  </a:t></a:r><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2200" dirty="0"><a:solidFill><a:srgbClr val="EEEEEE"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>정보 검색 및 빠른 요약</a:t></a:r></a:p>
+  </p:txBody>
+</p:sp>
+<p:sp>
+  <p:nvSpPr><p:cNvPr id="32" name="Divider"/><p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr/></p:nvSpPr>
+  <p:spPr>
+    <a:xfrm><a:off x="9144000" y="3500000"/><a:ext cx="50000" cy="5800000"/></a:xfrm>
+    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+    <a:solidFill><a:srgbClr val="DDDDDD"/></a:solidFill>
+    <a:ln><a:noFill/></a:ln>
+  </p:spPr>
+  <p:txBody><a:bodyPr/><a:lstStyle/></p:txBody>
+</p:sp>
+<p:sp>
+  <p:nvSpPr>
+    <p:cNvPr id="31" name="RightBox"/>
+    <p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr>
+    <p:nvPr/>
+  </p:nvSpPr>
+  <p:spPr>
+    <a:xfrm><a:off x="9788000" y="3500000"/><a:ext cx="8100000" cy="5800000"/></a:xfrm>
+    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+    <a:solidFill><a:srgbClr val="004AAD"/></a:solidFill>
+    <a:ln><a:noFill/></a:ln>
+  </p:spPr>
+  <p:txBody>
+    <a:bodyPr wrap="square" anchor="t" lIns="220000" rIns="220000" tIns="220000" bIns="220000"><a:normAutofit/></a:bodyPr>
+    <a:lstStyle/>
+    <a:p><a:pPr algn="l"><a:buNone/></a:pPr><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2600" dirty="0" b="1"><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>사람이 담당하는 것</a:t></a:r></a:p><a:p><a:endParaRPr lang="ko-KR" altLang="en-US" dirty="0"/></a:p><a:p><a:pPr algn="l"><a:lnSpc><a:spcPts val="3600"/></a:lnSpc><a:spcBef><a:spcPts val="100"/></a:spcBef><a:buNone/></a:pPr><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2200" dirty="0"><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>▸  </a:t></a:r><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2200" dirty="0"><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>현장 상황 판단 및 의사결정</a:t></a:r></a:p><a:p><a:pPr algn="l"><a:lnSpc><a:spcPts val="3600"/></a:lnSpc><a:spcBef><a:spcPts val="100"/></a:spcBef><a:buNone/></a:pPr><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2200" dirty="0"><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>▸  </a:t></a:r><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2200" dirty="0"><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>팀원·고객과의 소통 및 신뢰 형성</a:t></a:r></a:p><a:p><a:pPr algn="l"><a:lnSpc><a:spcPts val="3600"/></a:lnSpc><a:spcBef><a:spcPts val="100"/></a:spcBef><a:buNone/></a:pPr><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2200" dirty="0"><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>▸  </a:t></a:r><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2200" dirty="0"><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>창의적 아이디어 및 문제 해결</a:t></a:r></a:p><a:p><a:pPr algn="l"><a:lnSpc><a:spcPts val="3600"/></a:lnSpc><a:spcBef><a:spcPts val="100"/></a:spcBef><a:buNone/></a:pPr><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2200" dirty="0"><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>▸  </a:t></a:r><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2200" dirty="0"><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>책임 있는 실행과 결과 관리</a:t></a:r></a:p>
+  </p:txBody>
+</p:sp>
+<p:sp>
+  <p:nvSpPr>
+    <p:cNvPr id="33" name="Quote"/>
+    <p:cNvSpPr txBox="1"><a:spLocks noGrp="1"/></p:cNvSpPr>
+    <p:nvPr/>
+  </p:nvSpPr>
+  <p:spPr>
+    <a:xfrm><a:off x="500000" y="9450000"/><a:ext cx="17288000" cy="700000"/></a:xfrm>
+    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+    <p:noFill/>
+    <a:ln><a:noFill/></a:ln>
+  </p:spPr>
+  <p:txBody>
+    <a:bodyPr wrap="square" anchor="ctr"><a:normAutofit/></a:bodyPr>
+    <a:lstStyle/>
+    <a:p><a:pPr algn="ctr"><a:buNone/></a:pPr><a:r><a:rPr lang="ko-KR" altLang="en-US" sz="2000" dirty="0" i="1"><a:solidFill><a:srgbClr val="777777"/></a:solidFill><a:latin typeface="210 네버랜드"/><a:ea typeface="210 네버랜드"/><a:cs typeface="210 네버랜드"/><a:sym typeface="210 네버랜드"/></a:rPr><a:t>"사람은 말과 달리기 시합을 하지 않습니다. 말이 더 빠르기 때문이 아니라, 함께 더 멀리 가기 위해서입니다."</a:t></a:r></a:p>
+  </p:txBody>
+</p:sp>
+  </p:spTree></p:cSld>
+  <p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>
+</p:sld>

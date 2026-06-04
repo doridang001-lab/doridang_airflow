@@ -41,6 +41,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
+from modules.transform.utility.selenium_uc import launch_uc_chrome
 
 
 # ============================================================================
@@ -219,7 +220,12 @@ def launch_browser(account_id: str):
     options.add_experimental_option("prefs", prefs)
     
     try:
-        driver = uc.Chrome(options=options, version_main=None)
+        driver = launch_uc_chrome(
+            options,
+            account_id=account_id,
+            chrome_bin=chrome_bin,
+            log_fn=lambda message: log(message, account_id),
+        )
         log(f"✅ 브라우저 실행 성공", account_id)
         return driver
     except Exception as e:

@@ -551,6 +551,11 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
             + "|" + merged[pos_col].fillna("").astype(str).str.strip()
             + "|" + merged[rcpt_col].fillna("").astype(str).str.strip()
         )
+    else:
+        logger.warning("okpos: pos_col/rcpt_col 미존재 → _order_key fallback to _pk_x (pos=%s, rcpt=%s)", pos_col, rcpt_col)
+    _empty_key = (merged["_order_key"] == "").sum()
+    if _empty_key:
+        logger.warning("okpos: _order_key 빈값 %d행 — order_cnt 오집계 위험", _empty_key)
 
     # 그룹 내 정렬을 고정해 item_seq / 대표메뉴(menu_name) 산정이 재실행에도 동일하도록 보장
     if "_item_row" in merged.columns:
@@ -566,13 +571,8 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
     merged["item_seq"] = (merged.groupby("_order_key").cumcount() + 1).astype(str)
     merged["menu_name"] = _resolve_menu_name(merged).fillna("").astype(str)
     merged.drop(columns=["_is_main", "_unit_price_num", "_item_seq_num"], errors="ignore", inplace=True)
-    # 주문건수 계산용: order_id(=주문) 기준으로 딱 1행만 1로 표기
-    # (item_seq 최댓값 행을 대표 행으로 선택)
+    # sale_type 확정 후 order_cnt 계산하기 위해 _item_seq_int만 미리 계산해 둠
     merged["_item_seq_int"] = pd.to_numeric(merged["item_seq"], errors="coerce").fillna(0).astype(int)
-    merged["order_cnt"] = (
-        merged["_item_seq_int"] == merged.groupby("_order_key")["_item_seq_int"].transform("max")
-    ).astype(int)
-    merged = merged.drop(columns=["_item_seq_int"])
 
     if store_name_col:
         merged["brand"] = merged[store_name_col].str.split(" ").str[0].fillna("")
@@ -598,10 +598,15 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
         None,
     )
     merged["order_time"] = merged[time_col].apply(_normalize_time) if time_col else ""
-    # item-level 시각(결제시각_y 등) 사용 시 → 반품 등 미매칭 행의 빈값을 결제시각_x(order-level)로 보정
-    if time_col and "_y" in time_col and "결제시각_x" in merged.columns:
-        empty_mask = merged["order_time"] == ""
-        merged.loc[empty_mask, "order_time"] = merged.loc[empty_mask, "결제시각_x"].apply(_normalize_time)
+    if time_col and "_y" in time_col:
+        # item-level 시각은 영수증 내 행마다 달라질 수 있어 order_id가 불안정해짐.
+        # _order_key 기준 첫 비어있지 않은 값으로 통일해 order_id를 안정화한다.
+        merged["order_time"] = merged.groupby("_order_key", sort=False)["order_time"].transform(
+            lambda s: next((v for v in s if v), "")
+        )
+        if "결제시각_x" in merged.columns:
+            empty_mask = merged["order_time"] == ""
+            merged.loc[empty_mask, "order_time"] = merged.loc[empty_mask, "결제시각_x"].apply(_normalize_time)
 
     # order_id: {포스번호-영수번호}_{order_time} 형식 (예: 1-14_11:00:10).
     # order_time 이 비어있으면 구분자를 '_'로 바꾸고 00:00:00 으로 대체한다 (예: 1_14_00:00:00).
@@ -612,7 +617,12 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
         pos_s = merged[pos_col].fillna("").astype(str).str.strip()
         rcpt_s = merged[rcpt_col].fillna("").astype(str).str.strip()
         sep = has_time.map({True: "-", False: "_"})
-        merged["order_id"] = pos_s + sep + rcpt_s + "_" + time_suffix
+        store_s = (
+            merged[store_name_col].fillna("").astype(str).str.split(" ").str[-1].str.strip()
+            if store_name_col
+            else pd.Series("", index=merged.index)
+        )
+        merged["order_id"] = store_s + "_" + pos_s + sep + rcpt_s + "_" + time_suffix
     else:
         merged["order_id"] = merged["_order_key"].fillna("").astype(str) + "_" + time_suffix
 
@@ -680,8 +690,14 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
     else:
         merged["sale_type"] = "정상"
 
-    # 취소 주문의 order_cnt는 -1 (집계 시 주문건수 차감)
-    merged.loc[merged["sale_type"] == "취소", "order_cnt"] = -1
+    # order_cnt: 영수증(order_key)당 마지막 item 행에만 1(정상) 또는 -1(취소) 할당.
+    # 취소 주문도 마지막 item 행만 -1로 처리해야 합산 시 1건 차감이 된다.
+    # (모든 취소 item 행에 -1을 쓰면 item 수만큼 중복 차감됨)
+    _is_last = merged["_item_seq_int"] == merged.groupby("_order_key")["_item_seq_int"].transform("max")
+    merged["order_cnt"] = 0
+    merged.loc[_is_last & (merged["sale_type"] != "취소"), "order_cnt"] = 1
+    merged.loc[_is_last & (merged["sale_type"] == "취소"), "order_cnt"] = -1
+    merged = merged.drop(columns=["_item_seq_int"])
     # 취소 라인은 total_price를 음수로 저장(집계 시 CASE 불필요)
     refund_mask = merged["sale_type"] == "취소"
     merged.loc[refund_mask, "total_price"] = -merged.loc[refund_mask, "total_price"].abs()
@@ -767,6 +783,7 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
                     row["total_price"] = int(diff_val)
                     row["discount_amount"] = 0
                     row["sale_type"] = "정상" if diff_val >= 0 else "취소"
+                    row["order_cnt"] = 0
                     row["_pk"] = ""  # 재계산
                     adj_rows.append(row)
 

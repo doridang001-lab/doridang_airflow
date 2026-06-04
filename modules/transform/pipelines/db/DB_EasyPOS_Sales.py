@@ -973,14 +973,16 @@ def _load_manual_daily_totals() -> dict[str, int]:
             logger.warning("EasyPOS 수동다운 로드 실패: %s | %s", path, e)
             continue
 
-        if "매출일자" not in df.columns or "총매출" not in df.columns:
-            logger.warning("EasyPOS 수동다운 형식 불일치(매출일자/총매출 없음): %s", path)
+        if "매출일자" not in df.columns or ("순매출" not in df.columns and "총매출" not in df.columns):
+            logger.warning("EasyPOS 수동다운 형식 불일치(매출일자/순매출|총매출 없음): %s", path)
             continue
 
+        # 팝업 수집금액은 할인 적용 후 순금액이므로 순매출 우선, 없으면 총매출 fallback
+        _net_col = "순매출" if "순매출" in df.columns else "총매출"
         mtime = datetime.fromtimestamp(path.stat().st_mtime).isoformat()
         for _, r in df.iterrows():
             sale_date = _normalize_sale_date(r.get("매출일자"))
-            total_sales = _parse_amount(r.get("총매출"))
+            total_sales = _parse_amount(r.get(_net_col))
             if not sale_date or sale_date.lower() == "nan" or sale_date == "합계":
                 continue
             rows.append({
@@ -1291,17 +1293,23 @@ def _download_and_save_daily_totals(page: Page, download_dir: Path) -> dict[str,
 
     # 컬럼명 매핑 (실제 다운로드 파일에 따라 조정 가능)
     date_col  = next((c for c in df.columns if "일자" in c or "날짜" in c or "date" in c.lower()), None)
-    total_col = next((c for c in df.columns if "매출" in c and ("합계" in c or "총" in c or "금액" in c)), None)
+    # 팝업 수집금액은 할인 적용 후 순금액이므로 순매출 우선, 없으면 총매출 fallback
+    total_col = next((c for c in df.columns if c == "순매출"), None)
+    if total_col is None:
+        total_col = next((c for c in df.columns if "매출" in c and ("합계" in c or "총" in c or "금액" in c)), None)
     if date_col is None or total_col is None:
         logger.warning("일자별매출조회 컬럼 매핑 실패: date_col=%s total_col=%s cols=%s",
                        date_col, total_col, list(df.columns))
         return {}
 
+    today_str = datetime.now().strftime("%Y-%m-%d")
     result: dict[str, int] = {}
     for _, r in df.iterrows():
         sale_date = _normalize_sale_date(r.get(date_col))
         if not sale_date or sale_date in ("합계", "소계", "nan"):
             continue
+        if sale_date >= today_str:
+            continue  # 당일 이후는 매출 진행 중 — 참조값으로 사용 금지
         total = _parse_amount(r.get(total_col))
         result[sale_date] = total
         _upsert_daily_total_csv(sale_date, total, save_path.name)
@@ -1605,12 +1613,33 @@ def _collect_all_receipts(page: Page, mf: Frame, sale_date: str) -> list:
 # Task 함수
 # ============================================================
 
-def resolve_sale_dates(dag_date_from=None, dag_date_to=None, **context) -> str:
+def _get_missing_easypos_dates(lookback_days: int) -> list[str]:
+    """최근 lookback_days일 중 raw CSV에 없는 날짜 반환."""
+    missing = []
+    today = datetime.now()
+    for i in range(1, lookback_days + 1):
+        d = today - timedelta(days=i)
+        date_str = d.strftime("%Y-%m-%d")
+        ym = d.strftime("%Y-%m")
+        csv_path = ANALYTICS_DB / "easypos_sales_raw" / f"ym={ym}" / "receipts.csv"
+        if not csv_path.exists():
+            missing.append(date_str)
+            continue
+        try:
+            df = pd.read_csv(csv_path, dtype=str, usecols=["sale_date"])
+            if date_str not in df["sale_date"].values:
+                missing.append(date_str)
+        except Exception:
+            missing.append(date_str)
+    return missing
+
+
+def resolve_sale_dates(dag_date_from=None, dag_date_to=None, lookback_days=None, **context) -> str:
     """실행 날짜 결정.
-    우선순위: conf(date_from/date_to) > conf(sale_date) > dag 상수 > 어제
+    우선순위: conf(date_from/date_to) > conf(sale_date) > dag 상수 > lookback > 어제
     결과는 XCom key='sale_dates' (list)로 push.
     """
-    conf = context.get("dag_run").conf or {}
+    conf = (getattr(context.get("dag_run"), "conf", None) or {})
     date_from = conf.get("date_from") or dag_date_from
     date_to   = conf.get("date_to")   or dag_date_to
 
@@ -1632,6 +1661,14 @@ def resolve_sale_dates(dag_date_from=None, dag_date_to=None, **context) -> str:
             raise ValueError(f"날짜 형식 오류 (YYYY-MM-DD 필요): {e}")
         sale_dates = [conf["sale_date"]]
         logger.info(f"conf sale_date override → {conf['sale_date']}")
+    elif lookback_days:
+        sale_dates = _get_missing_easypos_dates(lookback_days)
+        if sale_dates:
+            logger.info(f"lookback {lookback_days}일: 누락 {len(sale_dates)}일 → {sale_dates}")
+        else:
+            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            sale_dates = [yesterday]
+            logger.info(f"lookback {lookback_days}일: 누락 없음 → 어제({yesterday}) 수집")
     else:
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
         sale_dates = [yesterday]
@@ -1786,7 +1823,11 @@ def collect_receipts(**context) -> str:
                     if retry < MAX_RETRY:
                         logger.warning("합계 불일치 — 재수집 시도 %d/%d: %s", retry, MAX_RETRY, sale_date)
                         time.sleep(2.0)
-                        mf = _get_main_frame(page)
+                        try:
+                            mf = _navigate_by_direct_input(page, sale_date)
+                        except Exception as _nav_e:
+                            logger.warning("재수집 재내비게이션 실패(계속): %s", _nav_e)
+                            mf = _get_main_frame(page)
                     else:
                         raise RuntimeError(
                             f"EasyPOS 총매출 불일치({ref_source}): {sale_date} "

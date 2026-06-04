@@ -335,17 +335,18 @@ def _click_next_page(page: Page) -> bool:
 
 # ── Task 함수 ─────────────────────────────────────────────────────────────────
 
-def resolve_sale_dates(manual_date_range=None, **context) -> str:
-    """실행 날짜 결정 (MANUAL_DATE_RANGE > dag_run.conf > yesterday)"""
+def resolve_sale_dates(manual_date_range=None, lookback_days=None, **context) -> str:
+    """실행 날짜 결정 (MANUAL_DATE_RANGE > conf > lookback > yesterday)"""
     if manual_date_range is not None:
         if not (isinstance(manual_date_range, (tuple, list)) and len(manual_date_range) == 2):
             raise ValueError(f"MANUAL_DATE_RANGE 형식 오류: {manual_date_range!r}")
         date_from, date_to = str(manual_date_range[0]), str(manual_date_range[1])
         source = "MANUAL_DATE_RANGE"
     else:
-        conf = context.get("dag_run").conf or {}
-        date_from = conf.get("sale_date_from")
-        date_to   = conf.get("sale_date_to")
+        conf = (getattr(context.get("dag_run"), "conf", None) or {})
+        sale_date = conf.get("sale_date")
+        date_from = sale_date or conf.get("sale_date_from")
+        date_to   = sale_date or conf.get("sale_date_to")
         source = "dag_run.conf"
 
     if date_from or date_to:
@@ -360,6 +361,10 @@ def resolve_sale_dates(manual_date_range=None, **context) -> str:
         while cur <= dt_to:
             sale_dates.append(cur.strftime("%Y-%m-%d"))
             cur += timedelta(days=1)
+    elif lookback_days:
+        today = datetime.now()
+        sale_dates = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, lookback_days + 1)]
+        source = f"lookback {lookback_days}일"
     else:
         sale_dates = [(datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")]
         source = "yesterday(기본)"
@@ -647,3 +652,35 @@ def write_log(**context) -> str:
     except Exception as e:
         logger.error(f"log.parquet 쓰기 실패 (DAG 계속 진행): {e}")
         return f"log.parquet 쓰기 실패: {e}"
+
+
+def verify_missing(**context) -> str:
+    """수집 후 raw 파일 존재 여부로 누락 날짜 확인 (로그만, 재수집 없음)."""
+    sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates") or []
+    if not sale_dates:
+        return "검증 스킵 (sale_dates 없음)"
+
+    brand_dir = RAW_UNIONPOS_SALES / "brand=도리당"
+    missing = []
+    for date_str in sale_dates:
+        ym = date_str[:7]
+        found = False
+        if brand_dir.exists():
+            for store_dir in brand_dir.iterdir():
+                csv_path = store_dir / f"ym={ym}" / "unionpos_receipt_list.csv"
+                if not csv_path.exists():
+                    continue
+                try:
+                    df = pd.read_csv(csv_path, dtype=str, usecols=["sale_date"])
+                    if date_str in df["sale_date"].values:
+                        found = True
+                        break
+                except Exception:
+                    pass
+        if not found:
+            missing.append(date_str)
+
+    if missing:
+        logger.warning("UnionPOS 수집 후 누락 날짜 감지: %s", missing)
+        return f"누락 {len(missing)}건: {missing}"
+    return f"누락 없음: {len(sale_dates)}일 정상 수집"

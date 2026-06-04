@@ -29,6 +29,7 @@ from modules.transform.ai_daily_collection_integrator import (
     rebuild_ai_daily_collection_compat_outputs,
     build_ai_score_sheet,
     build_llm_ai_diagnosis,
+    save_llm_diagnosis_to_db,
     build_ai_sales_alert_html,
     build_ai_sales_alert_trend_chart_png,
     export_daily_summary_csv,
@@ -255,6 +256,13 @@ def send_ai_sales_alert_email_task(**context) -> str:
     # 통합 엑셀에는 룰 기반 AI_진단 시트를 남기되, 이메일 문구는 LLM(Ollama)로 고품질 생성(실패 시 룰 폴백)
     scorecard = build_ai_score_sheet(INTEGRATED_XLSX, target_date=target_date)
     llm_diag = build_llm_ai_diagnosis(scorecard, enable_llm=True)
+
+    try:
+        save_result = save_llm_diagnosis_to_db(scorecard, llm_diag)
+        logger.info("LLM 진단 DB 저장: %s", save_result)
+    except Exception as exc:
+        logger.warning("LLM 진단 DB 저장 실패 (이메일 발송 계속): %s", exc)
+
     scorecard_for_email = dict(scorecard)
     scorecard_for_email.update({k: llm_diag[k] for k in ("situation", "cause", "suggest")})
     scorecard_for_email["llm_used"] = llm_diag.get("llm_used", "N")

@@ -23,6 +23,7 @@ import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
+from modules.transform.utility.notifier import send_telegram
 from modules.transform.utility.schedule import DB_EASYPOS_SALES_TIME
 from modules.transform.pipelines.db.DB_EasyPOS_Sales import (
     resolve_sale_dates,
@@ -40,9 +41,13 @@ logger = logging.getLogger(__name__)
 dag_id = Path(__file__).stem
 
 # 날짜 범위 설정 (None이면 어제만, 설정하면 해당 기간 수집)
-# 런타임 conf(date_from/date_to)가 있으면 conf 우선
+# 런타임 conf(date_from/date_to 또는 sale_date)가 있으면 conf 우선
 DATE_FROM = None   # 예: "2026-04-01"
 DATE_TO   = None   # 예: "2026-04-03"
+
+# LOOKBACK_DAYS: DATE_FROM/DATE_TO/conf 미지정 시 최근 N일 중 raw 파일 없는 날만 수집
+# None → 어제 1일만, int → 최근 N일 raw 파일 존재 확인 후 누락분만 수집
+LOOKBACK_DAYS: int | None = 7
 
 _ALERT_EMAILS = ["a17019@kakao.com"]
 
@@ -72,6 +77,18 @@ def _on_failure_callback(context):
             f"로그: {ti.log_url}"
         ),
     )
+    try:
+        _ti = context.get('task_instance')
+        _exc = context.get('exception', '알 수 없음')
+        _rd = getattr(_ti, 'execution_date', None)
+        _ed = _rd.strftime('%Y-%m-%d %H:%M') if _rd else ''
+        _retry = getattr(_ti, 'try_number', 1) - 1
+        send_telegram(
+            f"DAG: {_ti.dag_id}\nTask: {_ti.task_id}\n재시도: {_retry}회차\n"
+            f"실행일시: {_ed}\n에러: {_exc}\n로그: {_ti.log_url}\n해결해라"
+        )
+    except Exception:
+        pass
 
 
 def _on_retry_callback(context):
@@ -117,7 +134,7 @@ with DAG(
     t1 = PythonOperator(
         task_id="resolve_dates",
         python_callable=resolve_sale_dates,
-        op_kwargs={"dag_date_from": DATE_FROM, "dag_date_to": DATE_TO},
+        op_kwargs={"dag_date_from": DATE_FROM, "dag_date_to": DATE_TO, "lookback_days": LOOKBACK_DAYS},
     )
 
     t2 = PythonOperator(

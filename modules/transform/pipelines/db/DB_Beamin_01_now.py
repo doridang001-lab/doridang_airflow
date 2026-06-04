@@ -200,12 +200,12 @@ def collect_now_for_driver(driver, account_id: str, store_list: list[dict]) -> N
             logger.info("매장 선택 시도: %s", store_info)
             if not select_store_by_id(driver, store_info["store_id"]):
                 logger.warning("매장 선택 실패: %s", store_info)
-                continue
+                raise RuntimeError(f"store selection failed: {store_info['store_id']}")
 
             logger.info("매장 데이터 로드 대기: %s", store_info["store"])
             if not wait_for_metrics_data(driver, timeout=45):
                 logger.warning("매장 데이터 로드 타임아웃: %s", store_info["store"])
-                continue
+                raise RuntimeError(f"metrics load timeout: {store_info['store_id']}")
 
             try:
                 dom_info = driver.execute_script(r"""

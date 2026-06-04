@@ -195,6 +195,9 @@ def _transform_easypos_df(raw: pd.DataFrame) -> pd.DataFrame:
 
     # order_id (receipt_no + sale_date + order_time)
     df["order_id"] = df["receipt_no"].astype(str) + "_" + df["sale_date"].astype(str) + "_" + df["order_time"].astype(str)
+    _empty_rcpt = (df["receipt_no"].astype(str).str.strip() == "").sum()
+    if _empty_rcpt:
+        logger.warning("easypos: receipt_no 빈값 %d행 — order_id 중복 위험", _empty_rcpt)
 
     # item_seq: order_id 내 순번(1부터)
     df["item_seq"] = df.groupby("order_id").cumcount().add(1).astype(int).astype(str)

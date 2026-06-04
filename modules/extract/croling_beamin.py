@@ -28,12 +28,14 @@ stats_df = run_baemin_crawling(account_df, mode="stats")
 ============================================================================
 """
 
+import socket
 import subprocess
 import time
 import random
 import re
 import shutil
 import os
+import signal
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List
@@ -46,6 +48,7 @@ from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
+from modules.transform.utility.selenium_uc import launch_uc_chrome
 
 
 # ============================================================================
@@ -161,6 +164,7 @@ def human_type(element, text: str):
 
 def clean_chrome_profile(account_id: str):
     """크롬 프로필 폴더 삭제"""
+    import subprocess as _sp
     profile_path = CHROME_PROFILE_DIR / account_id
     
     if not profile_path.exists():
@@ -169,8 +173,18 @@ def clean_chrome_profile(account_id: str):
     try:
         shutil.rmtree(profile_path)
         log(f"프로필 삭제 완료", account_id)
-    except OSError as e:
-        raise Exception(f"프로필 삭제 실패 - 브라우저를 수동으로 닫아주세요: {e}")
+    except OSError:
+        # Chrome 프로세스가 파일 점유 중 → 강제 종료 후 재시도
+        try:
+            _sp.run(
+                ["pkill", "-f", f"chrome_profiles/{account_id}"],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+        time.sleep(2.0)
+        shutil.rmtree(profile_path, ignore_errors=True)
+        log(f"프로필 삭제 완료 (강제 종료 후 재시도)", account_id)
 
 
 def convert_account_df_to_list(account_df: pd.DataFrame) -> List[Dict]:
@@ -254,6 +268,9 @@ def _ensure_xvfb_display() -> str:
     이미 실행 중이면 재사용. 실패 시 빈 문자열 반환.
     """
     display = ":99"
+    # 이미 :99 디스플레이가 떠 있으면 재사용 (매 launch마다 중복 Xvfb spawn → 프로세스 churn 방지)
+    if Path("/tmp/.X11-unix/X99").exists():
+        return display
     try:
         # Popen: 백그라운드 실행 (run은 프로세스 종료까지 블로킹 → 사용 불가)
         subprocess.Popen(
@@ -275,6 +292,7 @@ def launch_browser(account_id: str):
     배민 봇 탐지가 headless 모드를 감지해 metrics API를 차단하므로
     Xvfb 가상 디스플레이로 실제 브라우저처럼 실행한다.
     """
+    _reap_zombie_children()          # 이전 launch가 남긴 좀비 회수 (cannot-connect 누적 방지)
     clean_chrome_cache(account_id)   # 세션 유지 + 캐시만 정리 (OOM 방지)
 
     # Xvfb 가상 디스플레이 설정
@@ -297,9 +315,9 @@ def launch_browser(account_id: str):
     if not display:
         options.add_argument('--headless=new')   # Xvfb 없을 때만 헤드리스
     options.add_argument('--no-sandbox')
+    options.add_argument('--no-zygote')           # Chrome 148+ Docker 크래시 방지
     options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--disable-gpu')
-    options.add_argument('--disable-software-rasterizer')
     options.add_argument('--disable-blink-features=AutomationControlled')
     options.add_argument('--disk-cache-size=1')           # 캐시 최소화 (OOM 방지)
     options.add_argument('--disable-extensions')
@@ -319,9 +337,12 @@ def launch_browser(account_id: str):
     options.add_argument(f'--user-data-dir={profile_path.absolute()}')
     
     try:
-        chrome_ver = _detect_chrome_major_version()
-        log(f"Chrome 감지 버전: {chrome_ver}", account_id)
-        driver = uc.Chrome(options=options, version_main=chrome_ver)
+        driver = launch_uc_chrome(
+            options,
+            account_id=account_id,
+            chrome_bin=os.getenv("CHROME_BIN", "/usr/bin/google-chrome"),
+            log_fn=lambda msg: log(msg, account_id),
+        )
         log(f"브라우저 실행 성공", account_id)
         return driver
     except Exception as e:
@@ -357,8 +378,22 @@ def login_baemin(driver, account_id: str, password: str) -> bool:
         random_delay("page_load")
         log("  로그인 페이지 로드 완료", account_id)
     except WebDriverException as e:
-        log(f"  [실패] 로그인 페이지 이동 실패: {e}", account_id)
-        return False
+        if _is_network_error(e):
+            log(f"  로그인 중 인터넷 끊김, 복구 대기", account_id)
+            if wait_for_internet():
+                try:
+                    driver.get(LOGIN_URL)
+                    random_delay("page_load")
+                    log("  로그인 페이지 로드 완료 (재연결 후)", account_id)
+                except WebDriverException as e2:
+                    log(f"  [실패] 재연결 후 로그인 이동 실패: {e2}", account_id)
+                    return False
+            else:
+                log(f"  [실패] 인터넷 복구 실패", account_id)
+                return False
+        else:
+            log(f"  [실패] 로그인 페이지 이동 실패: {e}", account_id)
+            return False
 
     # 세션 재사용으로 이미 로그인된 경우 (프로필 쿠키 유효 → self.baemin.com/ 리다이렉트)
     if is_on_success_page(driver.current_url):
@@ -920,10 +955,49 @@ def human_click(driver, element):
     ).click().perform()
 
 
+_NETWORK_ERR_KEYWORDS = (
+    "net::ERR_INTERNET_DISCONNECTED",
+    "net::ERR_NAME_NOT_RESOLVED",
+    "net::ERR_NETWORK_CHANGED",
+    "net::ERR_CONNECTION_RESET",
+    "net::ERR_CONNECTION_TIMED_OUT",
+    "Failed to establish a new connection",
+    "Max retries exceeded",
+)
+
+
+def _is_network_error(exc) -> bool:
+    """예외가 인터넷 단절로 인한 것인지 판단."""
+    return any(kw in str(exc) for kw in _NETWORK_ERR_KEYWORDS)
+
+
+def wait_for_internet(max_wait_sec: int = 300, check_interval: int = 10) -> bool:
+    """인터넷 연결 복구를 기다린다 (최대 max_wait_sec초).
+
+    8.8.8.8:53 (Google DNS) TCP 연결로 인터넷 상태 확인.
+    복구되면 True, 타임아웃이면 False.
+    """
+    deadline = time.time() + max_wait_sec
+    log("인터넷 연결 끊김 감지 — 복구 대기 중 (최대 5분)")
+    while time.time() < deadline:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5)
+            s.connect(("8.8.8.8", 53))
+            s.close()
+            log("인터넷 연결 복구 확인")
+            return True
+        except OSError:
+            time.sleep(check_interval)
+    log(f"인터넷 {max_wait_sec}초 내 복구 실패")
+    return False
+
+
 def wait_for_page(driver, css_selector: str, timeout: int = 60) -> bool:
     """CSS 셀렉터 요소가 나타날 때까지 대기.
 
     타임아웃 시 새로고침 후 1회 재시도.
+    인터넷 단절 감지 시 복구될 때까지 대기 후 재시도.
     브라우저 크래시(WebDriverException) 시 False 반환.
     반환: True=성공, False=실패.
     """
@@ -940,9 +1014,23 @@ def wait_for_page(driver, css_selector: str, timeout: int = 60) -> bool:
                     driver.refresh()
                     time.sleep(random.uniform(3.0, 5.0))
                 except WebDriverException as e:
-                    log(f"새로고침 중 브라우저 크래시: {e}")
-                    return False
+                    if _is_network_error(e):
+                        log(f"새로고침 중 인터넷 끊김")
+                        if not wait_for_internet():
+                            return False
+                        try:
+                            driver.refresh()
+                            time.sleep(random.uniform(3.0, 5.0))
+                        except WebDriverException:
+                            pass  # 다음 attempt에서 재시도
+                    else:
+                        log(f"새로고침 중 브라우저 크래시: {e}")
+                        return False
         except WebDriverException as e:
+            if _is_network_error(e):
+                if wait_for_internet():
+                    continue  # 인터넷 복구 → 현재 attempt 재시도
+                return False
             log(f"브라우저 연결 끊김 (attempt={attempt}): {e}")
             return False
         except Exception as e:
@@ -981,6 +1069,9 @@ def logout_baemin(driver, account_id: str):
 
     실패해도 warn만 (driver.quit()은 호출 측에서 항상 실행).
     """
+    if driver is None:
+        log("로그아웃 건너뜀: driver 없음", account_id)
+        return
     try:
         driver.get("https://self.baemin.com/settings")
         time.sleep(random.uniform(4.0, 6.0))
@@ -1004,6 +1095,145 @@ def logout_baemin(driver, account_id: str):
         log("로그아웃 완료", account_id)
     except Exception as e:
         log(f"로그아웃 실패 (warn only): {e}", account_id)
+
+
+# ============================================================================
+# 프로세스 누적 차단 (좀비/고아 chrome·chromedriver 정리)
+# ============================================================================
+#
+# undetected_chromedriver는 driver.quit()이 chromedriver 자식 프로세스를 제대로
+# 회수하지 못해 좀비(defunct)·고아 chrome 프로세스가 누적된다. 이 누적이 쌓이면
+# 이후 launch가 "session not created: cannot connect to chrome at 127.0.0.1"으로
+# 실패한다(배민 크래시 1위 원인). 아래 함수들은 "해당 driver의 프로세스만" 정확히
+# 정리하므로 동시 실행 중인 다른 계정 세션에는 영향을 주지 않는다(Phase B 동시성 호환).
+
+
+def _reap_zombie_children() -> int:
+    """현재 프로세스가 부모인 좀비(defunct) 자식들을 회수한다 (자신의 자식만 영향)."""
+    reaped = 0
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            break
+        except Exception:
+            break
+        if pid == 0:
+            break
+        reaped += 1
+    return reaped
+
+
+def _kill_pid_tree(pid) -> None:
+    """주어진 pid와 그 자식(렌더러 등)을 SIGKILL로 종료한다."""
+    if not pid:
+        return
+    try:
+        subprocess.run(["pkill", "-9", "-P", str(pid)], capture_output=True, timeout=5)
+    except Exception:
+        pass
+    try:
+        os.kill(int(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, ValueError):
+        pass
+    except Exception:
+        pass
+
+
+def quit_driver_safely(driver, account_id: str = "SYSTEM") -> None:
+    """driver.quit() + 해당 드라이버의 chrome/chromedriver 프로세스 트리 강제 종료 + 좀비 회수.
+
+    driver의 browser_pid(chrome)와 service.process.pid(chromedriver)만 정확히 죽이므로
+    다른 계정의 동시 실행 세션에 영향이 없다. driver가 None이어도 좀비 회수는 수행.
+    """
+    if driver is None:
+        _reap_zombie_children()
+        return
+
+    browser_pid = getattr(driver, "browser_pid", None)
+    service = getattr(driver, "service", None)
+    service_pid = getattr(getattr(service, "process", None), "pid", None)
+
+    try:
+        driver.quit()
+    except Exception:
+        pass
+
+    _kill_pid_tree(browser_pid)
+    _kill_pid_tree(service_pid)
+
+    n = _reap_zombie_children()
+    if n:
+        log(f"좀비 프로세스 {n}개 회수", account_id)
+
+
+# ============================================================================
+# 드라이버 크래시 감지 / 복구 (combined·shop_change 공용)
+# ============================================================================
+
+# Chrome/chromedriver 세션이 실행·수집 도중 죽었을 때 나타나는 오류 키워드.
+_DRIVER_CRASH_KEYWORDS = (
+    "Remote end closed",
+    "Connection aborted",
+    "RemoteDisconnected",
+    "Connection refused",
+    "Max retries exceeded",
+    "NewConnectionError",
+    "invalid session id",
+    "chrome not reachable",
+    "disconnected",
+    "tab crashed",
+    "session deleted",
+    "cannot connect to chrome",
+    "session not created",
+    "Timed out receiving message from renderer",
+)
+
+
+def is_driver_crash_error(exc: Exception) -> bool:
+    """예외가 Chrome/chromedriver 프로세스 사망(연결 끊김) 계열인지 판별."""
+    msg = str(exc)
+    return any(keyword in msg for keyword in _DRIVER_CRASH_KEYWORDS)
+
+
+def restart_driver_if_dead(driver, account_id: str, password: str):
+    """driver가 죽어있으면 Chrome 재시작 + 재로그인 후 새 driver 반환.
+
+    살아있으면 그대로 반환. 재시작 실패 시 None 반환.
+    """
+    try:
+        _ = driver.current_url  # 살아있는지 확인 (failfast client 덕에 즉시 판별)
+        return driver
+    except Exception:
+        pass
+
+    log(f"Chrome 연결 끊김 감지, 재시작: {account_id}", account_id)
+    quit_driver_safely(driver, account_id)  # 죽은 driver의 잔여 프로세스/좀비 정리
+
+    try:
+        new_driver = launch_browser(account_id)
+        if login_baemin(new_driver, account_id, password):
+            log(f"Chrome 재시작 성공: {account_id}", account_id)
+            return new_driver
+        try:
+            new_driver.quit()
+        except Exception:
+            pass
+    except Exception as e:
+        log(f"Chrome 재시작 실패: {account_id} / {e}", account_id)
+
+    return None
+
+
+def recover_driver_for_stage(driver, account: dict, stage: str):
+    """account dict({account_id, password})를 받아 단계 라벨과 함께 복구."""
+    account_id = account["account_id"]
+    recovered = restart_driver_if_dead(driver, account_id, account["password"])
+    if recovered is None:
+        log(f"Chrome 복구 실패 ({stage}): {account_id}", account_id)
+        return None
+    log(f"Chrome 복구 성공 ({stage}): {account_id}", account_id)
+    return recovered
 
 
 # ============================================================================
