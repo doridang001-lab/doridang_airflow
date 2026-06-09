@@ -45,7 +45,7 @@ DAILY_TARGET = {
 # ──────────────────────────────────────────────────────────────
 MARKETING_DAILY_TARGET = {
     "플레이스_유입":   800,      # 명/일
-    "홍보물_배포":    100,       # 건/일
+    "홍보물_배포":    300,       # 건/일
     "쿠폰_회수":        7,       # 건/일
     "인스타_노출":  3_334,       # 회/일
     "당근_노출":    3_334,       # 회/일
@@ -106,8 +106,10 @@ def build_targets() -> tuple[dict, dict, dict]:
     # 일단위 트래킹용 일목표 (DB_Hall_Daily_Excel 전달)
     daily_tracking_target = {
         "sale":          DAILY_TARGET["sale"],           # 일 매출
+        "lunch_sale":    DAILY_TARGET["lunch_sale"],     # 점심 일 매출
         "lunch_orders":  DAILY_TARGET["lunch_orders"],   # 점심 영수건수
         "lunch_aov":     DAILY_TARGET["lunch_aov"],      # 점심 테이블단가
+        "dinner_sale":   DAILY_TARGET["dinner_sale"],    # 저녁 일 매출
         "dinner_orders": DAILY_TARGET["dinner_orders"],  # 저녁 영수건수
         "dinner_aov":    DAILY_TARGET["dinner_aov"],     # 저녁 테이블단가
         "place":         MARKETING_DAILY_TARGET["플레이스_유입"],

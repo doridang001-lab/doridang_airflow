@@ -76,14 +76,3 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
-// ===================================================================================
-// 무인 자동 시작용 알람 (선택): 윈도우 작업 스케줄러 대신 크롬이 항상 켜져 있을 때 사용.
-// alarm 발화 시 runner 페이지를 열어 자동 수집을 시작한다.
-// (기본 권장 트리거는 윈도우 작업 스케줄러 → runner.html?run=coupang&auto=1)
-// ===================================================================================
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'daily_coupang') {
-    const url = chrome.runtime.getURL('runner.html?run=coupang&auto=1');
-    chrome.tabs.create({ url, active: true });
-  }
-});

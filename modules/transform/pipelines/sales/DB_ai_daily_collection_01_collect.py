@@ -7,6 +7,7 @@ toorder 종합보고서(일별매출보고서) 수집 파이프라인.
 
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -102,12 +103,7 @@ def _load_ai_daily_collection_grp_df(src_xlsx: Path) -> tuple[pd.DataFrame, str 
     if not src_xlsx.exists():
         raise FileNotFoundError(f"원본 입력 파일이 없습니다: {src_xlsx}")
 
-    xls = pd.ExcelFile(src_xlsx, engine="openpyxl")
-    sheet = _pick_grp_sheet(xls.sheet_names)
-
-    grp_df = pd.read_excel(src_xlsx, sheet_name=sheet, engine="openpyxl")
-    grp_df = _clean_excel_table(grp_df)
-    grp_df = _drop_total_rows_and_cols(grp_df)
+    grp_df = _load_grp_df_from_xls(src_xlsx)
 
     date_col = _pick_first_existing_col(
         grp_df,
@@ -414,12 +410,7 @@ def _upsert_ai_daily_collection_excel(src_xlsx: Path, dst_xlsx: Path) -> None:
     if not src_xlsx.exists():
         raise FileNotFoundError(f"원본 엑셀 파일이 없습니다: {src_xlsx}")
 
-    xls = pd.ExcelFile(src_xlsx, engine="openpyxl")
-    sheet = _pick_grp_sheet(xls.sheet_names)
-
-    grp_df = pd.read_excel(src_xlsx, sheet_name=sheet, engine="openpyxl")
-    grp_df = _clean_excel_table(grp_df)
-    grp_df = _drop_total_rows_and_cols(grp_df)
+    grp_df = _load_grp_df_from_xls(src_xlsx)
 
     date_col = _pick_first_existing_col(
         grp_df,
@@ -450,14 +441,90 @@ def _upsert_ai_daily_collection_excel(src_xlsx: Path, dst_xlsx: Path) -> None:
             store_df.to_excel(writer, index=False, sheet_name="매장별")
 
 
-def _pick_grp_sheet(sheet_names: list[str]) -> str:
+def _pick_grp_sheet(sheet_names: list[str]) -> list[str]:
     for cand in GRP_SHEET_CANDIDATES:
         if cand in sheet_names:
-            return cand
+            return [cand]
     for name in sheet_names:
         if "grp" in str(name).lower():
-            return name
+            return [name]
+    채널_sheets = sorted(
+        [n for n in sheet_names if "채널별(일)매출보고서" in str(n)],
+        key=str,
+    )
+    if 채널_sheets:
+        return 채널_sheets
     raise ValueError(f"grp 시트를 찾지 못했습니다. sheet_names={sheet_names}")
+
+
+def _load_channel_daily_df(src_xlsx: Path, sheets: list[str]) -> pd.DataFrame:
+    """
+    Parse '채널별(일)매출보고서' sheet format (single-date report).
+
+    Structure:
+      Row 0: report title
+      Row 1: date range  (e.g. "2026-06-08 ~ 2026-06-08")
+      Row 2: column headers
+      Row 3+: one row per store
+
+    Only sheet (1) is used — sheet (2) is a transposed pivot.
+    A '일자' column is injected from the date in row 1.
+    """
+    target_sheets = [s for s in sheets if "(1)" in s] or [sheets[0]]
+
+    frames = []
+    for sheet in target_sheets:
+        df_raw = pd.read_excel(src_xlsx, sheet_name=sheet, engine="openpyxl", header=None)
+        if len(df_raw) < 4:
+            continue
+
+        date_text = str(df_raw.iloc[1, 0]).strip()
+        m = re.search(r"\d{4}-\d{2}-\d{2}", date_text)
+        extracted_date = m.group(0) if m else None
+
+        seen: dict[str, int] = {}
+        headers = []
+        for i, v in enumerate(df_raw.iloc[2]):
+            col = str(v).strip() if pd.notna(v) else f"_col_{i}"
+            if col in seen:
+                seen[col] += 1
+                col = f"{col}_{seen[col]}"
+            else:
+                seen[col] = 0
+            headers.append(col)
+
+        df_data = df_raw.iloc[3:].copy()
+        df_data.columns = headers
+        df_data = df_data.reset_index(drop=True)
+        df_data = _clean_excel_table(_drop_total_rows_and_cols(df_data))
+
+        if extracted_date:
+            df_data["일자"] = extracted_date
+
+        frames.append(df_data)
+
+    if not frames:
+        raise ValueError(f"채널별(일) 시트에서 데이터를 읽지 못했습니다: {src_xlsx}")
+
+    return pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+
+
+def _load_grp_df_from_xls(src_xlsx: Path) -> pd.DataFrame:
+    xls = pd.ExcelFile(src_xlsx, engine="openpyxl")
+    sheets = _pick_grp_sheet(xls.sheet_names)
+
+    if all("채널별(일)매출보고서" in str(s) for s in sheets):
+        return _load_channel_daily_df(src_xlsx, sheets)
+
+    frames = [
+        _clean_excel_table(
+            _drop_total_rows_and_cols(
+                pd.read_excel(src_xlsx, sheet_name=s, engine="openpyxl")
+            )
+        )
+        for s in sheets
+    ]
+    return pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
 
 
 def _clean_excel_table(df: pd.DataFrame) -> pd.DataFrame:

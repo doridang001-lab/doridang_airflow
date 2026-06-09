@@ -24,6 +24,7 @@ from modules.transform.utility.schedule import DB_UNIFIED_REVIEW_TIME
 from modules.transform.pipelines.db.DB_UnifiedReview import (
     run_review as pipeline_run_review,
     backfill_review as pipeline_backfill_review,
+    build_daily_review_count as pipeline_count_reviews,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,19 @@ def build_review_mart(**context) -> str:
     return pipeline_run_review(mode=mode, days=LOOKBACK_DAYS, target_date=sale_date)
 
 
+def count_daily_reviews(**context) -> str:
+    dag_run = context.get("dag_run")
+    conf    = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+
+    if conf.get("backfill"):
+        mode, sale_date = "all", None
+    else:
+        mode      = context["ti"].xcom_pull(task_ids="resolve_mode", key="mode") or "lookback"
+        sale_date = context["ti"].xcom_pull(task_ids="resolve_mode", key="sale_date")
+
+    return pipeline_count_reviews(mode=mode, days=LOOKBACK_DAYS, target_date=sale_date)
+
+
 with DAG(
     dag_id=dag_id,
     schedule=DB_UNIFIED_REVIEW_TIME,
@@ -122,4 +136,9 @@ with DAG(
         python_callable=build_review_mart,
     )
 
-    t1 >> t2
+    t3 = PythonOperator(
+        task_id="count_daily_reviews",
+        python_callable=count_daily_reviews,
+    )
+
+    t1 >> t2 >> t3

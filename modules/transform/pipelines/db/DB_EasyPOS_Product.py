@@ -98,7 +98,7 @@ def _add_nexacro_init_script(context) -> None:
     )
 
 
-def _navigate_to_product_search(page: Page, mf: Frame) -> Frame:
+def _navigate_to_product_search(page: Page, mf: Frame, *, _reload_retry: bool = False) -> Frame:
     """기초정보 → 상품조회 화면으로 이동."""
     # 상단 '기초정보' 메뉴 클릭
     try:
@@ -218,6 +218,13 @@ def _navigate_to_product_search(page: Page, mf: Frame) -> Frame:
         time.sleep(2.0)
 
     _debug_dump(page, "easypos_product_menu_not_found")
+
+    # grdLeft가 계속 비어있으면 페이지 새로고침 후 1회 재시도
+    if not _reload_retry:
+        logger.warning("상품조회 메뉴 탐색 전체 실패 — 페이지 새로고침 후 재로그인 1회 재시도")
+        mf = _login(page)
+        return _navigate_to_product_search(page, mf, _reload_retry=True)
+
     raise RuntimeError(f"EasyPOS 좌측 메뉴에서 '상품조회'를 찾지 못했습니다. 메뉴샘플={menu_snapshot}")
 
 

@@ -45,7 +45,7 @@ def _toorder_baemin_by_store(target_date: str) -> dict:
         return {}
     try:
         df = pd.read_csv(csv_path, encoding="utf-8-sig")
-        mask = df["플랫폼명"].str.contains("배민|배달의민족", na=False)
+        mask = df["플랫폼명"].isin(["배달의민족", "배민1"])
         by_store = (
             df.loc[mask]
             .groupby("매장명")["매출액"]

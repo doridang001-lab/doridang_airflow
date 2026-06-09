@@ -254,6 +254,36 @@ def resolve_llm_output_dir() -> Path:
 	return Path.home() / "OneDrive - 주식회사 도리당" / "data" / "llm"
 
 
+def resolve_dashboard_db() -> Path:
+	"""실시간 대시보드 산출물 저장 경로.
+
+	우선순위:
+	1) 환경변수 `DASHBOARD_DB`
+	2) Windows 로컬 OneDrive 경로
+	3) 컨테이너 마운트 경로 `/opt/airflow/dashboard`
+	4) Fallback
+	"""
+	env_path = os.getenv("DASHBOARD_DB")
+	if env_path:
+		p = Path(env_path)
+		p.mkdir(parents=True, exist_ok=True)
+		return p
+
+	if platform.system() == "Windows":
+		p = Path.home() / "OneDrive - 주식회사 도리당" / "data" / "dashboard"
+		p.mkdir(parents=True, exist_ok=True)
+		return p
+
+	container_mount = Path("/opt/airflow/dashboard")
+	if container_mount.parent.exists():
+		container_mount.mkdir(parents=True, exist_ok=True)
+		return container_mount
+
+	p = Path.home() / "OneDrive - 주식회사 도리당" / "data" / "dashboard"
+	p.mkdir(parents=True, exist_ok=True)
+	return p
+
+
 def resolve_raw_okpos_sales() -> Path:
 	env_path = os.getenv("RAW_OKPOS_SALES")
 	if env_path:
@@ -290,13 +320,15 @@ POLICY_CONSOLIDATED_CSV = ANALYTICS_DB / "policy" / "policy_consolidated_latest.
 REPORT_SALES_DB = resolve_report_sales_db()
 MART_DB = resolve_mart_db()
 LLM_OUTPUT_DIR = resolve_llm_output_dir()
+DASHBOARD_DB = resolve_dashboard_db()
 ITEM_MASTER_CHECKPOINT_DIR = ANALYTICS_DB / "item_master_checkpoints"
 RAW_OKPOS_SALES = resolve_raw_okpos_sales()
 RAW_UNIONPOS_SALES = resolve_raw_unionpos_sales()
-FIN_PRODUCT_CSV_PATH = ANALYTICS_DB / "fin_product" / "fin_product_grp.csv"
-FIN_PRODUCT_REVIEW_CSV_PATH = ANALYTICS_DB / "fin_product" / "fin_product_review.csv"
-FIN_PRODUCT_ALIAS_CSV_PATH = ANALYTICS_DB / "fin_product" / "fin_product_alias.csv"
-POSFEED_WHITELIST_CSV_PATH = ANALYTICS_DB / "fin_product" / "fin_product_posfeed_whitelist.csv"
+FIN_PRODUCT_CSV_PATH = MART_DB / "fin_product_grp.csv"
+FIN_PRODUCT_REVIEW_CSV_PATH = MART_DB / "fin_product_review.csv"
+FIN_PRODUCT_ALIAS_CSV_PATH = MART_DB / "fin_product_alias.csv"
+FIN_PRODUCT_MART_CSV_PATH = MART_DB / "fin_product_mart.csv"
+POSFEED_WHITELIST_CSV_PATH = MART_DB / "fin_product_posfeed_whitelist.csv"
 
 STORE_SALES_TARGET_DIR = ANALYTICS_DB / "store_sales_target"
 STORE_SALES_TARGET_CSV = STORE_SALES_TARGET_DIR / "target.csv"

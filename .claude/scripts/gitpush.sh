@@ -1,37 +1,153 @@
 #!/bin/bash
-# Git push automation script
+set -euo pipefail
 
-echo "📋 Git Status:"
-git status
+# Git push 안전 스크립트
+# Usage:
+#   ./gitpush.sh "커밋 메시지"   → 브랜치 자동 생성 + push + gh pr create
+#   ./gitpush.sh                  → 메시지 자동 추론 + 위와 동일
+#   ./gitpush.sh --create-branch  → (하위 호환) 브랜치 생성 후 push (PR 없음)
 
-echo -e "\n✅ Staging all changes..."
-git add .
+function slugify_ascii() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
+}
 
-echo -e "\n📝 Creating commit..."
-CHANGED_FILES=$(git diff --cached --name-only)
-SUMMARY=$(echo "$CHANGED_FILES" | head -3 | paste -sd, -)
+function branch_slug() {
+    local msg="$1"
+    # 공백→하이픈, 한글·영문·숫자·하이픈·언더스코어만 허용, 40자 제한
+    echo "$msg" | sed 's/ /-/g' | sed 's/[^가-힣a-zA-Z0-9_-]//g' | cut -c1-40
+}
 
-# 커밋 메시지 생성
+function suggest_branch_prefix() {
+    local changes="$1"
+    local first
+    first=$(echo "$changes" | head -n1)
+    if [[ "$first" == docs/* ]]; then echo "docs"
+    elif [[ "$first" == dags/* ]]; then echo "feat"
+    elif [[ "$first" == modules/* ]]; then echo "feat"
+    elif [[ "$first" == scripts/* || "$first" == .claude/* ]]; then echo "chore"
+    elif [[ "$first" == requirements* || "$first" == pyproject* ]]; then echo "chore"
+    else echo "chore"
+    fi
+}
+
+function auto_commit_message() {
+    local changes="$1"
+    if echo "$changes" | grep -q "^requirements"; then
+        echo "chore: update dependencies"
+    elif echo "$changes" | grep -q "^dags/"; then
+        echo "feat: update DAG configurations"
+    elif echo "$changes" | grep -q "^modules/"; then
+        echo "feat: update modules"
+    elif echo "$changes" | grep -q "^docs/"; then
+        echo "docs: update documentation"
+    else
+        echo "chore: update files"
+    fi
+}
+
+# ── 인수 파싱 ──────────────────────────────────────────────
+LEGACY_MODE=false
+USER_MSG=""
+
+if [ "${1:-}" == "--create-branch" ]; then
+    LEGACY_MODE=true
+elif [ -n "${1:-}" ]; then
+    USER_MSG="$1"
+fi
+
+# ── 저장소 확인 ───────────────────────────────────────────
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "⚠️ 현재 디렉터리는 Git 저장소가 아닙니다."
+    exit 1
+fi
+
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+CHANGED_FILES=$(git status --porcelain --untracked-files=normal | awk '{print $2}' | uniq | sed '/^$/d')
+
 if [ -z "$CHANGED_FILES" ]; then
-    echo "No changes to commit"
+    echo "✅ 변경된 파일이 없습니다."
     exit 0
 fi
 
-# 변경 타입 판단
-if echo "$CHANGED_FILES" | grep -q "^requirements"; then
-    COMMIT_MSG="chore: update dependencies"
-elif echo "$CHANGED_FILES" | grep -q "^dags/"; then
-    COMMIT_MSG="feat: update DAG configurations"
-elif echo "$CHANGED_FILES" | grep -q "^modules/"; then
-    COMMIT_MSG="feat: update modules"
+echo "📋 변경된 파일:"
+echo "$CHANGED_FILES" | head -n10
+TOTAL=$(echo "$CHANGED_FILES" | wc -l | tr -d ' ')
+[ "$TOTAL" -gt 10 ] && echo "  ... 외 $((TOTAL - 10))개"
+
+# ── 커밋 메시지 결정 ──────────────────────────────────────
+if [ -z "$USER_MSG" ]; then
+    COMMIT_MSG=$(auto_commit_message "$CHANGED_FILES")
 else
-    COMMIT_MSG="chore: update files ($SUMMARY)"
+    COMMIT_MSG="$USER_MSG"
 fi
 
-echo "💬 Commit message: $COMMIT_MSG"
+# ── 레거시 모드 (--create-branch) ──────────────────────────
+if [ "$LEGACY_MODE" = true ]; then
+    if [[ "$CURRENT_BRANCH" =~ ^(main|master)$ ]]; then
+        PREFIX=$(suggest_branch_prefix "$CHANGED_FILES")
+        FIRST_FILE=$(echo "$CHANGED_FILES" | head -n1 | xargs basename | sed -E 's/\.[^.]+$//')
+        SLUG=$(slugify_ascii "$FIRST_FILE")
+        NEW_BRANCH="$PREFIX/$SLUG-changes"
+        git checkout -b "$NEW_BRANCH"
+        CURRENT_BRANCH="$NEW_BRANCH"
+        echo "✅ 브랜치 생성: $CURRENT_BRANCH"
+    fi
+    git add .
+    git commit -m "$COMMIT_MSG"
+    UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || true)
+    if [ -z "$UPSTREAM" ]; then
+        git push --set-upstream origin "$CURRENT_BRANCH"
+    else
+        git push
+    fi
+    echo "✨ Done! 브랜치: $CURRENT_BRANCH"
+    exit 0
+fi
+
+# ── 일반 모드: 항상 새 브랜치 생성 ──────────────────────────
+DATE=$(date +%m%d)
+PREFIX=$(suggest_branch_prefix "$CHANGED_FILES")
+SLUG=$(branch_slug "$COMMIT_MSG")
+NEW_BRANCH="$PREFIX/${SLUG}-${DATE}"
+
+if [[ "$CURRENT_BRANCH" =~ ^(main|master)$ ]]; then
+    git checkout -b "$NEW_BRANCH"
+    echo "✅ 브랜치 생성: $NEW_BRANCH"
+else
+    # 이미 feature 브랜치에 있으면 그대로 사용
+    NEW_BRANCH="$CURRENT_BRANCH"
+    echo "ℹ️  현재 브랜치 사용: $NEW_BRANCH"
+fi
+
+echo ""
+echo "📝 스테이징 및 커밋..."
+git add .
 git commit -m "$COMMIT_MSG"
 
-echo -e "\n🚀 Pushing to remote..."
-git push
+echo ""
+echo "🚀 Push..."
+UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || true)
+if [ -z "$UPSTREAM" ]; then
+    git push --set-upstream origin "$NEW_BRANCH"
+else
+    git push
+fi
 
-echo -e "\n✨ Done!"
+# ── PR 생성 ───────────────────────────────────────────────
+echo ""
+echo "🔗 PR 생성 중..."
+
+FILES_LIST=$(echo "$CHANGED_FILES" | head -n20 | sed 's/^/- /')
+[ "$TOTAL" -gt 20 ] && FILES_LIST="$FILES_LIST\n- ... 외 $((TOTAL - 20))개"
+
+PR_URL=$(gh pr create \
+    --title "$COMMIT_MSG" \
+    --body "$(printf "## 변경 사항\n\n%s\n\n---\n*Auto-generated by /gitpush*" "$FILES_LIST")" \
+    --base main \
+    --head "$NEW_BRANCH" 2>&1)
+
+echo ""
+echo "✨ PR 생성 완료!"
+echo "$PR_URL"
+echo ""
+echo "위 PR을 확인 후 '머지해줘'라고 하시면 main에 병합합니다."

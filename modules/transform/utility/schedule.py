@@ -15,7 +15,7 @@ SMP_FDAM_CS_TIME     = "5 9 * * *"      # 매일 09:05 실행
 
 SMP_DELIVERY_ALERT_TIME  = "40 9 * * 1,2,3,4,5"  # 매주 월~금 09:40 실행
 SMP_CLOSING_RATE_TIME    = "0 9 * * 1"             # 매주 월요일 09:00 실행
-SMP_DAG_MONITORING_TIME = "30 16 * * *"  # 매일 16:30 실행 (KST)
+SMP_DAG_MONITORING_TIME = "*/5 * * * *"  # 5분마다 실행 (KST)
 SMP_POLICY_TIME  = "0 10 * * *"   # 매일 10:00 실행 (KST)
 SMP_CHICKEN_PRICE_TIME  = "10 9 * * *"   # 매일 09:10 실행 (KST)
 
@@ -49,13 +49,15 @@ DB_TOORDER_STORE_PLATFORM_TIME = "10 9 * * *"  # 매일 09:10 실행 (SMD_TOORDE
 
 DB_UNIFIED_REVIEW_TIME         = "33 9 * * *"  # 매일 09:33 실행 (ToOrderVoc Transform 9:30 이후)
 
-SMD_BAEMIN_COLLECT_TIME = "47 8 * * *"  # 매일 KST 08:55 (UTC 23:55 전날)
+SMD_BAEMIN_COLLECT_TIME = "15 9 * * *"  # 매일 KST 09:15 실행 (토더 매출 수집 완료 후)
 
-SMP_MORNING_BRIEFING_TIME = "50 8 * * 1,2,3,4,5"  # 매주 월~금 08:50 실행 (KST)
+SMP_MORNING_BRIEFING_TIME = "47 8 * * 1,2,3,4,5"  # 매주 월~금 08:47 실행 (KST)
 
 SMD_STORE_SALES_TIME = "0 11 * * *"  # 매일 11:00 실행 (POS 수집 완료 후)
 
-DB_HALL_SALES_TARGET_TIME = "55 10 * * 1"  # 매주 월요일 10:55 (UnifiedSales 10:30 시작 +25분)
+DB_HALL_SALES_TARGET_TIME = "5 10 * * 1"  # 매주 월요일 10:05 (UnifiedSales 10:30 시작 +25분)
+
+DB_TOORDER_MENU_TIME = "5 11 * * *"  # 매일 11:05 실행 (메뉴별 판매량 분석)
 
 
 # ============================================================

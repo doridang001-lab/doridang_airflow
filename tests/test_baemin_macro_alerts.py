@@ -2,6 +2,8 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from modules.transform.pipelines.db import DB_Beamin_03_shop_change as shop_change
@@ -22,9 +24,9 @@ def test_collect_shop_change_sends_partial_failure_alert():
          patch.object(shop_change, "_send_email_alert") as mock_email, \
          patch.object(shop_change, "send_telegram") as mock_telegram:
         mock_time.sleep.return_value = None
-        result = shop_change.collect_shop_change([account])
+        with pytest.raises(RuntimeError, match="partial failure"):
+            shop_change.collect_shop_change([account])
 
-    assert "store_fail=1" in result
     mock_email.assert_called_once()
     mock_telegram.assert_called_once()
     alert_body = mock_email.call_args.args[1]

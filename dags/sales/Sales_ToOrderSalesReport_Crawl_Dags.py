@@ -2,13 +2,15 @@
 투오더 종합보고서 일일 자동 다운로드 DAG
 
 처리 흐름:
-1. dag_run.conf 유무에 따라 단일(전일) 또는 범위 날짜 리스트 결정
+1. dag_run.conf 유무에 따라 날짜 리스트 결정
 2. 날짜 리스트에 해당하는 종합보고서 크롤링 다운로드
-3. 다운로드된 파일을 LOCAL_DB/toorder_sales_report 로 이동
+3. 다운로드된 파일을 ANALYTICS_DB/toorder_daily_sales/ 로 변환·저장
 
 conf 키:
-    start_date (str): 범위 시작일 "YYYY-MM-DD" (end_date와 함께 지정)
-    end_date   (str): 범위 종료일 "YYYY-MM-DD" (start_date와 함께 지정)
+    없음            → lookback 모드: 최근 LOOKBACK_DAYS일 중 CSV 없는 날짜만 수집
+    sale_date (str) → 정정 모드: 해당 날짜 1일 강제 덮어쓰기 "YYYY-MM-DD"
+    backfill (bool) → 전체 백필: BACKFILL_START ~ 어제 중 누락 날짜 전체 수집
+    start_date (str) + end_date (str) → 범위 모드: 지정 구간 전체 수집
 
 실행 시각: 매일 09:00 (KST)
 """
@@ -38,6 +40,21 @@ logger = logging.getLogger(__name__)
 TOORDER_ID = "doridang15"
 TOORDER_PW = "ehfl5233!"
 
+LOOKBACK_DAYS = 7
+BACKFILL_START = "2026-01-01"
+
+
+# ============================================================
+# 내부 유틸리티
+# ============================================================
+
+def _get_missing_dates(since: str, until: str) -> list:
+    """since ~ until 사이에서 CSV가 없는 날짜 리스트를 반환한다."""
+    dest = ANALYTICS_DB / "toorder_daily_sales"
+    existing = {p.stem[-8:] for p in dest.glob("toorder_daily_sales_*.csv")}
+    all_dates = generate_date_range(since, until)
+    return [d for d in all_dates if d.replace("-", "") not in existing]
+
 
 # ============================================================
 # 태스크 함수
@@ -45,16 +62,26 @@ TOORDER_PW = "ehfl5233!"
 
 def get_target_dates(**context) -> list:
     """
-    dag_run.conf 유무에 따라 처리할 날짜 리스트를 결정하고 XCom에 push한다.
+    dag_run.conf에 따라 처리할 날짜 리스트를 결정하고 XCom에 push한다.
 
-    conf에 start_date / end_date가 모두 있으면 범위 모드,
-    없으면 KST 기준 전일 날짜 1건으로 동작한다.
-
-    XCom key: date_list
+    - conf 없음        → lookback: 최근 LOOKBACK_DAYS일 중 누락 날짜만
+    - sale_date        → 정정 모드: 해당 1일 강제 수집
+    - backfill=true    → 전체 백필: BACKFILL_START ~ 어제 중 누락 날짜
+    - start_date+end_date → 범위 모드: 지정 구간 전체
     """
     conf = context.get("dag_run").conf or {}
+    kst = pendulum.timezone("Asia/Seoul")
+    yesterday = pendulum.now(kst).subtract(days=1).format("YYYY-MM-DD")
 
-    if conf.get("start_date") and conf.get("end_date"):
+    if conf.get("backfill"):
+        date_list = _get_missing_dates(BACKFILL_START, yesterday)
+        logger.info("[backfill 모드] %s ~ %s 중 누락 %d일", BACKFILL_START, yesterday, len(date_list))
+
+    elif conf.get("sale_date"):
+        date_list = [conf["sale_date"]]
+        logger.info("[정정 모드] 대상 날짜: %s", conf["sale_date"])
+
+    elif conf.get("start_date") and conf.get("end_date"):
         date_list = generate_date_range(conf["start_date"], conf["end_date"])
         logger.info(
             "[범위 모드] %s ~ %s: %d일",
@@ -62,11 +89,14 @@ def get_target_dates(**context) -> list:
             conf["end_date"],
             len(date_list),
         )
+
     else:
-        kst = pendulum.timezone("Asia/Seoul")
-        yesterday = pendulum.now(kst).subtract(days=1).format("YYYY-MM-DD")
-        date_list = [yesterday]
-        logger.info("[일별 모드] 대상 날짜: %s", yesterday)
+        since = pendulum.now(kst).subtract(days=LOOKBACK_DAYS).format("YYYY-MM-DD")
+        date_list = _get_missing_dates(since, yesterday)
+        logger.info("[lookback 모드] 최근 %d일 중 누락 %d일", LOOKBACK_DAYS, len(date_list))
+
+    if not date_list:
+        logger.info("수집 대상 없음 (모든 날짜 CSV 존재)")
 
     context["ti"].xcom_push(key="date_list", value=date_list)
     return date_list

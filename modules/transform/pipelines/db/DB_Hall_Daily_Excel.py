@@ -6,7 +6,8 @@
   - MART_DB/unified_sales_grp/unified_sales_*.parquet  (판매 실적, 자동)
   - MART_DB/hall_sales_target/hall_marketing_target.csv (마케팅, 기준일자 join)
 출력:
-  - MART_DB/hall_sales_target/hall_weekly_report.xlsx  (고정명, 매 실행 덮어씀)
+  - MART_DB/hall_sales_target/hall_daily_report.xlsx  (고정명, 월별 시트)
+  - MART_DB/hall_sales_target/hall_daily_report_6m.xlsx 등 월별 파일
 
 구조:
   [제목] 일단위 트래킹 (매일 입력)
@@ -19,13 +20,15 @@
 
 import calendar
 import logging
-from datetime import date, timedelta
+from datetime import date
+from pathlib import Path
 
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+from modules.transform.pipelines.db.DB_Hall_Sales_Target import classify_hall_time_slots
 from modules.transform.utility.paths import MART_DB
 
 logger = logging.getLogger(__name__)
@@ -75,24 +78,9 @@ def _c(ws, row, col, val, font=None, fill=None, align=None, fmt=None, border=Tru
     return cell
 
 
-def _extract_time_slot(df: pd.DataFrame) -> pd.DataFrame:
-    raw_hour = (
-        df["order_time"].astype(str).str.strip()
-        .str.extract(r"^(\d{2}):", expand=False)
-        .pipe(pd.to_numeric, errors="coerce")
-        .astype("Int64")
-    )
-    raw_hour = raw_hour.where(raw_hour != 0, other=pd.NA)
-    df = df.copy()
-    df["time_slot"] = pd.cut(
-        raw_hour, bins=[5, 15, 23], labels=["점심", "저녁"], right=True,
-    )
-    return df
-
-
 # ── 데이터 로드 ────────────────────────────────────────────────
 
-def _load_sales(ym: str) -> pd.DataFrame:
+def _load_sales(ym: str | None = None) -> pd.DataFrame:
     files = sorted(UNIFIED_ROOT.glob("unified_sales_*.parquet"))
     if not files:
         raise FileNotFoundError(f"unified_sales parquet 없음: {UNIFIED_ROOT}")
@@ -104,11 +92,17 @@ def _load_sales(ym: str) -> pd.DataFrame:
     df["platform"] = df["platform"].fillna("").astype(str).str.strip()
     mask = (
         (df["store"] == STORE_NAME) &
-        (df["platform"] == "홀") &
-        (df["sale_date"].dt.strftime("%Y-%m") == ym)
+        (df["platform"] == "홀")
     )
+    if ym:
+        mask &= df["sale_date"].dt.strftime("%Y-%m") == ym
     df = df[mask].copy()
-    return _extract_time_slot(df)  # 빈 df도 time_slot 컬럼 추가됨
+    return classify_hall_time_slots(df)  # 빈 df도 time_slot 컬럼 추가됨
+
+
+def _to_number(series: pd.Series) -> pd.Series:
+    cleaned = series.fillna("").astype(str).str.replace(",", "", regex=False).str.strip()
+    return pd.to_numeric(cleaned, errors="coerce").fillna(0).astype(int)
 
 
 def _load_marketing(ym: str) -> pd.DataFrame:
@@ -116,12 +110,14 @@ def _load_marketing(ym: str) -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.read_csv(MKT_CSV, dtype=str)
     df = df.rename(columns={"인스타_노출_traget": "인스타_노출_target"})
-    df["기준일자"] = pd.to_datetime(df["기준일자"], errors="coerce").dt.date
-    for col in ["플레이스_유입", "홍보물_배포", "쿠폰_회수율", "인스타_노출", "당근_노출", "네이버_오더"]:
+    df["입력날짜"] = pd.to_datetime(df["입력날짜"], errors="coerce")
+    df["기준일자"] = pd.to_datetime(df["기준일자"], errors="coerce")
+    df["_기준일"] = df["기준일자"].fillna(df["입력날짜"])
+    for col in ["플레이스_유입", "홍보물_배포", "쿠폰_회수건수", "인스타_노출", "당근_노출", "네이버_오더"]:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-    df = df[df["기준일자"].apply(lambda d: d is not None and d.strftime("%Y-%m") == ym if d else False)]
-    df = df.sort_values("기준일자").reset_index(drop=True)
+            df[col] = _to_number(df[col])
+    df = df[df["_기준일"].dt.strftime("%Y-%m") == ym]
+    df = df.sort_values("_기준일").reset_index(drop=True)
     if "홍보물_배포" in df.columns:
         df["홍보물_배포_누적"] = df["홍보물_배포"].cumsum().astype(int)
     return df
@@ -134,8 +130,8 @@ def _daily_rows(sales_df: pd.DataFrame, mkt_df: pd.DataFrame, all_dates: list) -
     mkt_by_date = {}
     if not mkt_df.empty:
         for _, r in mkt_df.iterrows():
-            if r["기준일자"]:
-                mkt_by_date[r["기준일자"]] = r
+            if not pd.isnull(r["_기준일"]):
+                mkt_by_date[r["_기준일"].date()] = r
 
     for d in all_dates:
         day_s  = sales_df[sales_df["sale_date"].dt.date == d]
@@ -148,18 +144,20 @@ def _daily_rows(sales_df: pd.DataFrame, mkt_df: pd.DataFrame, all_dates: list) -
         d_cnt  = int(dinner["order_cnt"].sum())
         d_sale = int(dinner["total_price"].sum())
         d_aov  = d_sale // d_cnt if d_cnt else 0
-        tot    = int(day_s["total_price"].sum())
+        tot    = l_sale + d_sale
 
         m = mkt_by_date.get(d)
         rows.append({
             "date":        d,
             "lunch_cnt":   l_cnt  or None,
+            "lunch_sale":  l_sale or None,
             "lunch_aov":   l_aov  or None,
             "dinner_cnt":  d_cnt  or None,
+            "dinner_sale": d_sale or None,
             "dinner_aov":  d_aov  or None,
             "place":       int(m["플레이스_유입"])    if m is not None else None,
             "leaflet_cum": int(m["홍보물_배포_누적"]) if m is not None and "홍보물_배포_누적" in m.index else None,
-            "coupon":      int(m["쿠폰_회수율"])      if m is not None else None,
+            "coupon":      int(m["쿠폰_회수건수"])      if m is not None else None,
             "insta":       int(m["인스타_노출"])      if m is not None else None,
             "karrot":      int(m["당근_노출"])        if m is not None else None,
             "naver":       int(m["네이버_오더"])      if m is not None else None,
@@ -173,8 +171,10 @@ def _daily_rows(sales_df: pd.DataFrame, mkt_df: pd.DataFrame, all_dates: list) -
 HEADERS = [
     "날짜",
     "점심\n영수건수",
+    "점심\n매출",
     "점심\n테이블단가",
     "저녁\n영수건수",
+    "저녁\n매출",
     "저녁\n테이블단가",
     "플레이스\n유입수",
     "홍보물\n배포(누적)",
@@ -182,26 +182,17 @@ HEADERS = [
     "인스타\n노출",
     "당근\n노출",
     "네이버오더\n건수",
+    "일\n매출",
 ]
 N_COLS = len(HEADERS)
 
-COL_WIDTHS = [7, 8, 11, 8, 11, 9, 11, 7, 8, 8, 10]
+COL_WIDTHS = [7, 8, 12, 11, 8, 12, 11, 9, 11, 7, 8, 8, 10, 12]
 
 
-def _write_excel(rows: list, daily_target: dict, ym: str, monthly_targets: dict) -> None:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = ym  # 예: "2026-06"
-
+def _write_sheet(ws, rows: list, daily_target: dict) -> None:
     # 열 너비
     for i, w in enumerate(COL_WIDTHS, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
-
-    mt = monthly_targets.get(ym, {})
-    day_sale  = daily_target.get("sale", 0)
-    mon_sale  = mt.get("sale", 0)
-    day_sale_man = f"{day_sale / 10_000:.1f}만원"
-    mon_sale_man = f"{mon_sale / 10_000:.0f}만원"
 
     # ── 제목 (row 1) ──────────────────────────────────────────
     ws.merge_cells(f"A1:{get_column_letter(N_COLS)}1")
@@ -211,25 +202,19 @@ def _write_excel(rows: list, daily_target: dict, ym: str, monthly_targets: dict)
     title.alignment = _LEFT
     ws.row_dimensions[1].height = 26
 
-    # ── 부제 (row 2) ──────────────────────────────────────────
-    ws.merge_cells(f"A2:{get_column_letter(N_COLS)}2")
-    sub = ws["A2"]
-    sub.value     = f"매일 수치 직접 입력 (매출 목표: 일 {day_sale_man} / 월 {mon_sale_man})"
-    sub.font      = _SUB_FONT
-    sub.alignment = _LEFT
-    ws.row_dimensions[2].height = 14
-
-    # ── 헤더 (row 3) ──────────────────────────────────────────
+    # ── 헤더 (row 2) ──────────────────────────────────────────
     for i, h in enumerate(HEADERS, 1):
-        _c(ws, 3, i, h, font=_H_FONT, fill=_H_FILL, align=_CTR)
-    ws.row_dimensions[3].height = 30
+        _c(ws, 2, i, h, font=_H_FONT, fill=_H_FILL, align=_CTR)
+    ws.row_dimensions[2].height = 30
 
-    # ── 목표 (row 4) ──────────────────────────────────────────
+    # ── 목표 (row 3) ──────────────────────────────────────────
     goal = [
         "목표",
         daily_target.get("lunch_orders",  0),
+        daily_target.get("lunch_sale",    0),
         daily_target.get("lunch_aov",     0),
         daily_target.get("dinner_orders", 0),
+        daily_target.get("dinner_sale",   0),
         daily_target.get("dinner_aov",    0),
         daily_target.get("place",         0),
         daily_target.get("홍보물_배포",   0),
@@ -237,20 +222,21 @@ def _write_excel(rows: list, daily_target: dict, ym: str, monthly_targets: dict)
         daily_target.get("insta",         0),
         daily_target.get("karrot",        0),
         daily_target.get("naver",         0),
+        daily_target.get("sale",          0),
     ]
     for i, val in enumerate(goal, 1):
         if i == 1:
-            _c(ws, 4, i, val, font=_T_FONT, fill=_T_FILL, align=_CTR)
-        elif i in (3, 5):
-            _c(ws, 4, i, val, font=_T_FONT, fill=_T_FILL, align=_RGHT, fmt="#,##0")
+            _c(ws, 3, i, val, font=_T_FONT, fill=_T_FILL, align=_CTR)
+        elif i in (3, 4, 6, 7, 14):
+            _c(ws, 3, i, val, font=_T_FONT, fill=_T_FILL, align=_RGHT, fmt="#,##0")
         else:
-            _c(ws, 4, i, val, font=_T_FONT, fill=_T_FILL, align=_CTR, fmt="#,##0")
-    ws.row_dimensions[4].height = 18
+            _c(ws, 3, i, val, font=_T_FONT, fill=_T_FILL, align=_CTR, fmt="#,##0")
+    ws.row_dimensions[3].height = 18
 
     # ── 데이터 행 ─────────────────────────────────────────────
     for idx, row in enumerate(rows):
-        r     = 5 + idx
-        is_odd = idx % 2 == 0   # 0-indexed → row 5,7,9... = 홀수 → 흰색
+        r     = 4 + idx
+        is_odd = idx % 2 == 0   # 0-indexed → row 4,6,8... = 흰색
         bg    = None if is_odd else _G_FILL
         d     = row["date"]
         label = f"{d.month}/{d.day}"
@@ -265,23 +251,81 @@ def _write_excel(rows: list, daily_target: dict, ym: str, monthly_targets: dict)
 
         # 점심 영수건수, 테이블단가
         dc(2,  row["lunch_cnt"],  "#,##0")
-        dc(3,  row["lunch_aov"],  "#,##0")
+        dc(3,  row["lunch_sale"], "#,##0", is_sale=True)
+        dc(4,  row["lunch_aov"],  "#,##0")
         # 저녁 영수건수, 테이블단가
-        dc(4,  row["dinner_cnt"], "#,##0")
-        dc(5,  row["dinner_aov"], "#,##0")
+        dc(5,  row["dinner_cnt"], "#,##0")
+        dc(6,  row["dinner_sale"], "#,##0", is_sale=True)
+        dc(7,  row["dinner_aov"], "#,##0")
         # 마케팅
-        dc(6,  row["place"],        "#,##0")
-        dc(7,  row["leaflet_cum"],  "#,##0")
-        dc(8,  row["coupon"],       "#,##0")
-        dc(9,  row["insta"],        "#,##0")
-        dc(10, row["karrot"],       "#,##0")
-        dc(11, row["naver"],        "#,##0")
+        dc(8,  row["place"],        "#,##0")
+        dc(9,  row["leaflet_cum"],  "#,##0")
+        dc(10, row["coupon"],       "#,##0")
+        dc(11, row["insta"],        "#,##0")
+        dc(12, row["karrot"],       "#,##0")
+        dc(13, row["naver"],        "#,##0")
+        dc(14, row["daily_sale"],   "#,##0", is_sale=True)
 
         ws.row_dimensions[r].height = 17
 
-    # ── 저장 ─────────────────────────────────────────────────
+def _save_workbook_replace(wb: Workbook, path: Path) -> None:
+    tmp_path = path.with_name(f".{path.stem}.tmp{path.suffix}")
+    tmp_path.unlink(missing_ok=True)
+    wb.save(tmp_path)
+    tmp_path.chmod(0o666)
+    if path.exists():
+        try:
+            path.chmod(0o666)
+            path.unlink()
+        except PermissionError as e:
+            raise PermissionError(f"파일이 열려 있거나 OneDrive에서 잠겨 있습니다: {path}") from e
+    tmp_path.replace(path)
+    path.chmod(0o666)
+
+
+def _month_file_path(ym: str) -> Path:
+    month = int(ym[5:7])
+    return OUTPUT_XLSX.with_name(f"hall_daily_report_{month}m.xlsx")
+
+
+def _month_dates(ym: str) -> list:
+    year, month = int(ym[:4]), int(ym[5:7])
+    days_in_month = calendar.monthrange(year, month)[1]
+    return [date(year, month, d) for d in range(1, days_in_month + 1)]
+
+
+def _available_months(sales_df: pd.DataFrame) -> list[str]:
+    months = set()
+    if not sales_df.empty:
+        months.update(sales_df["sale_date"].dt.strftime("%Y-%m").dropna().unique())
+    months.add(date.today().strftime("%Y-%m"))
+    return sorted(months, reverse=True)
+
+
+def _build_month_rows(sales_df: pd.DataFrame, ym: str) -> list:
+    month_sales = sales_df[sales_df["sale_date"].dt.strftime("%Y-%m") == ym].copy()
+    mkt_df = _load_marketing(ym)
+    return _daily_rows(month_sales, mkt_df, _month_dates(ym))
+
+
+def _write_excel_files(sales_df: pd.DataFrame, months: list[str], daily_target: dict) -> None:
     OUTPUT_XLSX.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(OUTPUT_XLSX)
+
+    wb = Workbook()
+    del wb[wb.active.title]
+
+    for ym in months:
+        rows = _build_month_rows(sales_df, ym)
+        ws = wb.create_sheet(title=ym)
+        _write_sheet(ws, rows, daily_target)
+
+        month_wb = Workbook()
+        month_ws = month_wb.active
+        month_ws.title = ym
+        _write_sheet(month_ws, rows, daily_target)
+        _save_workbook_replace(month_wb, _month_file_path(ym))
+
+    _save_workbook_replace(wb, OUTPUT_XLSX)
 
 
 # ── 메인 함수 ──────────────────────────────────────────────────
@@ -289,22 +333,14 @@ def _write_excel(rows: list, daily_target: dict, ym: str, monthly_targets: dict)
 def build_daily_tracking_excel(monthly_targets: dict,
                                 marketing_monthly_targets: dict,
                                 daily_target: dict) -> str:
-    today = date.today()
-    ym    = today.strftime("%Y-%m")
-    year, month = today.year, today.month
-    days_in_month = calendar.monthrange(year, month)[1]
-    all_dates = [date(year, month, d) for d in range(1, days_in_month + 1)]
-
-    sales_df = _load_sales(ym)
-    mkt_df   = _load_marketing(ym)
-
-    rows = _daily_rows(sales_df, mkt_df, all_dates)
-    _write_excel(rows, daily_target, ym, monthly_targets)
+    sales_df = _load_sales()
+    months = _available_months(sales_df)
+    _write_excel_files(sales_df, months, daily_target)
 
     win_path = (
         r"C:\Users\민준\OneDrive - 주식회사 도리당"
         r"\data\mart\hall_sales_target\hall_daily_report.xlsx"
     )
-    logger.info("일단위 트래킹 저장 완료 (%s, %d일치)\nWindows: %s",
-                ym, days_in_month, win_path)
-    return f"완료: {ym} ({days_in_month}일) → {win_path}"
+    logger.info("일단위 트래킹 저장 완료 (%s)\nWindows: %s",
+                ", ".join(months), win_path)
+    return f"완료: {', '.join(months)} → {win_path}"

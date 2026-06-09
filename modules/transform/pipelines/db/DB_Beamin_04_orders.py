@@ -55,7 +55,7 @@ class OrdersCollectionInterrupted(RuntimeError):
     """Chrome died mid-collection; partial rows must not be saved as complete."""
 _TABLE_ROW_CSS = "tr.Table_b_r4ax_1dwbr4on[data-index]"
 _MAX_PAGES = 50
-_PAGE_TRANSITION_TIMEOUT = 15
+_PAGE_TRANSITION_TIMEOUT = 25
 _MAX_VALIDATION_RETRY = 2
 _ORDER_COLLECTION_ATTEMPTS = 3
 
@@ -142,12 +142,46 @@ def _validate_collected(rows: list[dict], expected: dict | None) -> dict:
     }
 
 
+def _csv_already_covers(
+    brand: str, store: str, target_date: str, status_label: str, summary: dict
+) -> bool:
+    """기존 CSV의 (날짜 + 주문상태) 합계가 TotalSummary와 일치하면 True."""
+    try:
+        ym = target_date[:7]
+        path = BAEMIN_ORDERS_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}" / f"orders_{ym}.csv"
+        if not path.exists():
+            return False
+        df = pd.read_csv(path, dtype=str)
+        df = df[df["주문시각"].astype(str).str.startswith(target_date)]
+        df = df[df["주문상태"].astype(str) == status_label]
+        count = df["주문번호"].nunique()
+        if count != summary.get("count", -1):
+            return False
+        expected_amount = summary.get("amount") or 0
+        if expected_amount == 0:
+            return count == summary.get("count", -1)
+        for col in ("결제금액", "총결제금액", "상품금액"):
+            if col not in df.columns:
+                continue
+            vals = df[col].astype(str)
+            vals = vals[~vals.isin(["", "nan", "None", "NaN"])]
+            total = vals.str.replace(",", "", regex=False).apply(
+                lambda x: int(x) if x.strip().lstrip("-").isdigit() else 0
+            ).sum()
+            if total == expected_amount:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def _collect_with_retry_on_mismatch(
     driver,
     store_info: dict,
     status_label: str,
     filter_fn,
     max_retry: int = _MAX_VALIDATION_RETRY,
+    target_date: str | None = None,
 ) -> tuple[list[dict], dict]:
     """TotalSummary 검증 포함 수집. 불일치 시 필터 재적용 후 재수집.
 
@@ -165,6 +199,27 @@ def _collect_with_retry_on_mismatch(
     for attempt in range(max_retry + 1):
         try:
             expected = _read_total_summary(driver)
+
+            if attempt == 0 and expected and target_date:
+                if _csv_already_covers(
+                    store_info.get("brand", ""), store_info.get("store", "?"),
+                    target_date, status_label, expected,
+                ):
+                    logger.info(
+                        "기존 CSV 합계 일치, 추출 생략: %s / %s / %s",
+                        store_info.get("store"), target_date, status_label,
+                    )
+                    vr = {
+                        "matched": True, "status": status_label,
+                        "store": store_info.get("store", "?"), "retried": 0,
+                        "actual_count": expected["count"],
+                        "actual_amount": expected.get("amount", 0),
+                        "expected_count": expected["count"],
+                        "expected_amount": expected.get("amount"),
+                        "amount_source": "csv_skip", "amount_candidates": {},
+                    }
+                    return [], vr
+
             rows = _collect_all_pages(driver, store_info)
         except Exception as e:
             if _is_crash(e):
@@ -268,6 +323,7 @@ def collect_orders_for_driver(
 
         rows, vr_normal = _collect_with_retry_on_mismatch(
             driver, store_info, "배달완료", _filter_normal,
+            target_date=target_date,
         )
         validation.append(vr_normal)
 
@@ -297,6 +353,7 @@ def collect_orders_for_driver(
 
                 cancelled_rows, vr_cancelled = _collect_with_retry_on_mismatch(
                     driver, store_info, "주문취소", _filter_cancelled,
+                    target_date=target_date,
                 )
                 validation.append(vr_cancelled)
 
@@ -1078,7 +1135,7 @@ def _collect_all_pages(driver, store_info: dict) -> list[dict]:
         )
 
         try:
-            prev_first_id = _get_first_order_id(driver)
+            prev_sig = _page_signature(driver)
             has_next = _click_next_page(driver, page_num)
         except Exception as e:
             if _is_crash(e):
@@ -1090,11 +1147,22 @@ def _collect_all_pages(driver, store_info: dict) -> list[dict]:
             logger.info("마지막 페이지 도달: %s (%d페이지)", store, page_num)
             break
 
-        if not _wait_for_page_transition(driver, prev_first_id):
-            logger.warning(
-                "%d→%d 페이지 전환 타임아웃, 수집 종료: %s", page_num, page_num + 1, store
-            )
-            break
+        if not _wait_for_page_transition(driver, prev_sig):
+            # 전환 실패 시 즉시 종료하지 말고 next 1회 재클릭 후 재대기 (행 누락 방지)
+            logger.info("%d→%d 페이지 전환 미감지 → next 재클릭 1회: %s", page_num, page_num + 1, store)
+            try:
+                _click_next_page(driver, page_num)
+            except Exception as e:
+                if _is_crash(e):
+                    raise OrdersCollectionInterrupted(
+                        f"Chrome died during page re-click page={page_num}: {e}"
+                    ) from e
+            if not _wait_for_page_transition(driver, prev_sig):
+                logger.warning(
+                    "%d→%d 페이지 전환 타임아웃(재시도 후), 수집 종료: %s",
+                    page_num, page_num + 1, store,
+                )
+                break
 
         time.sleep(random.uniform(0.5, 0.8))
 
@@ -1177,6 +1245,22 @@ def _get_first_order_id(driver) -> str:
     ) or ""
 
 
+def _page_signature(driver) -> str:
+    """현재 페이지 식별자: 첫 주문ID|마지막 주문ID|행수.
+
+    첫 주문ID만 보면 우연히 동일할 때 전환을 놓칠 수 있어, 마지막ID·행수까지 묶어
+    페이지 전환을 더 확실히 감지한다.
+    """
+    return driver.execute_script(
+        """
+        const rows = document.querySelectorAll('tr.Table_b_r4ax_1dwbr4on[data-index]');
+        if (!rows.length) return '';
+        const idOf = (r) => r.querySelector('td[data-td-index="1"]')?.textContent.trim() || '';
+        return idOf(rows[0]) + '|' + idOf(rows[rows.length - 1]) + '|' + rows.length;
+        """
+    ) or ""
+
+
 def _click_next_page(driver, current_page: int) -> bool:
     return driver.execute_script(
         """
@@ -1193,12 +1277,13 @@ def _click_next_page(driver, current_page: int) -> bool:
     )
 
 
-def _wait_for_page_transition(driver, prev_first_id: str) -> bool:
+def _wait_for_page_transition(driver, prev_sig: str) -> bool:
+    """페이지 시그니처(_page_signature)가 바뀌면 전환 완료로 본다."""
     start = time.time()
     while time.time() - start < _PAGE_TRANSITION_TIMEOUT:
         time.sleep(0.3)
-        curr = _get_first_order_id(driver)
-        if curr and curr != prev_first_id:
+        curr = _page_signature(driver)
+        if curr and curr != prev_sig:
             return True
     return False
 

@@ -63,8 +63,14 @@ def _is_driver_crash_error(exc: Exception) -> bool:
     return any(keyword in str(exc) for keyword in _CRASH_KEYWORDS)
 
 _TABLE_CSS = "table[data-atelier-component='Table']"
-_TABLE_TIMEOUT = 35  # seconds
+_TABLE_TIMEOUT = 18  # seconds
+_FAST_EMPTY_TIMEOUT = 8  # seconds
 _PAGE_SETTLE = 4.0   # URL 이동 후 React 렌더링 안정화 대기(초)
+_WOORI_EMPTY_EXPECTED_BRANDS = {"나홀로"}
+
+
+def _woori_empty_is_expected(store_info: dict) -> bool:
+    return store_info.get("brand") in _WOORI_EMPTY_EXPECTED_BRANDS
 
 
 def collect_woori_shop_click(account_list: list[dict]) -> str:
@@ -141,7 +147,7 @@ def collect_woori_shop_click(account_list: list[dict]) -> str:
                     except Exception:
                         pass
 
-                    rows = _extract_table_rows(driver, store_id, store_info["store"], ym)
+                    rows = _extract_table_rows(driver, store_id, f"{store_info['brand']} {store_info['store']}", ym)
 
                     if rows:
                         saved = _save_csv(rows, store_info["brand"], store_info["store"], ym)
@@ -154,7 +160,7 @@ def collect_woori_shop_click(account_list: list[dict]) -> str:
                         )
                     else:
                         logger.warning(
-                            "데이터 없음: store=%s ym=%s", store_info["store"], ym
+                            "데이터 없음: brand=%s store=%s ym=%s", store_info["brand"], store_info["store"], ym
                         )
 
                     time.sleep(random.uniform(1.5, 3.0))
@@ -237,25 +243,59 @@ def _extract_table_rows(driver, store_id: str, store_name: str, ym: str) -> list
                 raise
             return False
 
+    def _ready_empty(d) -> bool:
+        try:
+            state = d.execute_script("""
+                const trs = document.querySelectorAll("table[data-atelier-component='Table'] tbody tr").length;
+                const busy = document.querySelectorAll('[aria-busy="true"], [class*="Loading"], [class*="Spinner"]').length;
+                return {trs, busy, ready: document.readyState};
+            """) or {}
+            return (
+                int(state.get("trs") or 0) == 0
+                and int(state.get("busy") or 0) == 0
+                and state.get("ready") == "complete"
+            )
+        except Exception as e:
+            if _is_driver_crash_error(e):
+                raise
+            return False
+
     try:
-        WebDriverWait(driver, _TABLE_TIMEOUT).until(_has_rows)
+        fast_state = WebDriverWait(driver, _FAST_EMPTY_TIMEOUT).until(
+            lambda d: "rows" if _has_rows(d) else ("empty" if _ready_empty(d) else False)
+        )
+        if fast_state == "empty":
+            try:
+                cur_url = driver.current_url
+                debug_info = driver.execute_script("""
+                    var trs = document.querySelectorAll("table[data-atelier-component='Table'] tbody tr");
+                    return JSON.stringify({tr: trs.length, fast_empty: true});
+                """)
+                logger.info("타임아웃 디버그 URL=%s DOM=%s", cur_url, debug_info)
+            except Exception as _de:
+                logger.info("타임아웃 디버그 실패: %s", _de)
+            logger.info("테이블 빠른 빈값 종료 (store=%s ym=%s): 데이터 없음", store_name, ym)
+            return []
     except TimeoutException:
         try:
-            cur_url = driver.current_url
-            debug_info = driver.execute_script("""
-                var trs = document.querySelectorAll("table[data-atelier-component='Table'] tbody tr");
-                if (!trs.length) return JSON.stringify({tr:0});
-                var cells = trs[0].querySelectorAll('td');
-                var val = cells.length > 0 ? cells[0].innerText.slice(0, 30) : '';
-                var hasClass = !!(cells.length > 0 && cells[0].querySelector('.styles-module__x4Tk'));
-                return JSON.stringify({tr: trs.length, cells: cells.length, val: val, hasClass: hasClass});
-            """)
-            logger.info("타임아웃 디버그 URL=%s DOM=%s", cur_url, debug_info)
-        except Exception as _de:
-            logger.info("타임아웃 디버그 실패: %s", _de)
-        # 빈 테이블은 과거월·광고 미집행 시 정상. WARNING 판단은 호출부(데이터 없음)에 위임.
-        logger.info("테이블 로드 타임아웃 (store=%s ym=%s): 데이터 없음", store_name, ym)
-        return []
+            WebDriverWait(driver, _TABLE_TIMEOUT).until(_has_rows)
+        except TimeoutException:
+            try:
+                cur_url = driver.current_url
+                debug_info = driver.execute_script("""
+                    var trs = document.querySelectorAll("table[data-atelier-component='Table'] tbody tr");
+                    if (!trs.length) return JSON.stringify({tr:0});
+                    var cells = trs[0].querySelectorAll('td');
+                    var val = cells.length > 0 ? cells[0].innerText.slice(0, 30) : '';
+                    var hasClass = !!(cells.length > 0 && cells[0].querySelector('.styles-module__x4Tk'));
+                    return JSON.stringify({tr: trs.length, cells: cells.length, val: val, hasClass: hasClass});
+                """)
+                logger.info("타임아웃 디버그 URL=%s DOM=%s", cur_url, debug_info)
+            except Exception as _de:
+                logger.info("타임아웃 디버그 실패: %s", _de)
+            # 빈 테이블은 과거월·광고 미집행 시 정상. WARNING 판단은 호출부(데이터 없음)에 위임.
+            logger.info("테이블 로드 타임아웃 (store=%s ym=%s): 데이터 없음", store_name, ym)
+            return []
     except Exception as e:
         logger.warning("테이블 대기 중 Chrome 오류 (store=%s ym=%s): %s", store_name, ym, e)
         raise
@@ -404,7 +444,7 @@ def collect_woori_for_driver(driver, store_list: list[dict]) -> None:
 
             _navigate_to_woori_url(driver, store_id, ym, url)
             time.sleep(random.uniform(1.5, 2.5))
-            rows = _extract_table_rows(driver, store_id, store_info["store"], ym)
+            rows = _extract_table_rows(driver, store_id, f"{store_info['brand']} {store_info['store']}", ym)
 
             if not rows:
                 # 1차 재시도: F5 새로고침 후 대기
@@ -414,7 +454,7 @@ def collect_woori_for_driver(driver, store_list: list[dict]) -> None:
                 except Exception:
                     pass
                 time.sleep(5.0)
-                rows = _extract_table_rows(driver, store_id, store_info["store"], ym)
+                rows = _extract_table_rows(driver, store_id, f"{store_info['brand']} {store_info['store']}", ym)
 
             if rows:
                 saved = _save_csv(rows, store_info["brand"], store_info["store"], ym)
@@ -424,8 +464,8 @@ def collect_woori_for_driver(driver, store_list: list[dict]) -> None:
                 )
             else:
                 logger.warning(
-                    "데이터 없음: store=%s ym=%s",
-                    store_info["store"], ym,
+                    "데이터 없음: brand=%s store=%s ym=%s",
+                    store_info["brand"], store_info["store"], ym,
                 )
 
             time.sleep(random.uniform(1.5, 3.0))
@@ -454,7 +494,7 @@ def _existing_woori_row_count(brand: str, store: str, ym: str) -> int:
 
 def _retry_woori_after_empty(driver, store_info: dict, ym: str, url: str) -> list[dict]:
     store_id = store_info["store_id"]
-    store_name = store_info["store"]
+    store_name = f"{store_info['brand']} {store_info['store']}"
 
     logger.info("재시도2 (revisit): %s %s", store_name, ym)
     try:
@@ -462,6 +502,8 @@ def _retry_woori_after_empty(driver, store_info: dict, ym: str, url: str) -> lis
         driver.get("https://self.baemin.com/")
         time.sleep(2.0)
     except Exception as e:
+        if _is_driver_crash_error(e):
+            raise
         logger.warning("홈 복귀 실패 (%s %s): %s", store_name, ym, e)
 
     revisit_url = f"{url}&_ts={int(time.time() * 1000)}"
@@ -495,18 +537,23 @@ def collect_woori_for_driver(driver, store_list: list[dict]) -> None:
 
             _navigate_to_woori_url(driver, store_id, ym, url)
             time.sleep(_PAGE_SETTLE)
-            rows = _extract_table_rows(driver, store_id, store_info["store"], ym)
+            rows = _extract_table_rows(driver, store_id, f"{store_info['brand']} {store_info['store']}", ym)
+            existing_count = _existing_woori_row_count(
+                store_info["brand"], store_info["store"], ym
+            )
 
-            if not rows:
+            if not rows and (ym == previous_month and existing_count > 0):
                 logger.info("재시도1 (F5): %s %s", store_info["store"], ym)
                 try:
                     driver.refresh()
-                except Exception:
-                    pass
+                except Exception as e:
+                    if _is_driver_crash_error(e):
+                        raise
+                    logger.warning("우가클 F5 실패 (%s %s): %s", store_info["store"], ym, e)
                 time.sleep(8.0)
-                rows = _extract_table_rows(driver, store_id, store_info["store"], ym)
+                rows = _extract_table_rows(driver, store_id, f"{store_info['brand']} {store_info['store']}", ym)
 
-            if not rows:
+            if not rows and (ym == previous_month and existing_count > 0):
                 rows = _retry_woori_after_empty(driver, store_info, ym, url)
 
             if rows:
@@ -516,11 +563,11 @@ def collect_woori_for_driver(driver, store_list: list[dict]) -> None:
                     store_info["brand"], store_info["store"], ym, saved,
                 )
             else:
-                existing_count = _existing_woori_row_count(
-                    store_info["brand"], store_info["store"], ym
-                )
-                logger.warning("데이터 없음: store=%s ym=%s", store_info["store"], ym)
-                if ym == previous_month and existing_count > 0:
+                if _woori_empty_is_expected(store_info):
+                    logger.info("우가클 데이터없음(정상): brand=%s store=%s ym=%s", store_info["brand"], store_info["store"], ym)
+                else:
+                    logger.warning("데이터 없음: brand=%s store=%s ym=%s", store_info["brand"], store_info["store"], ym)
+                if ym == previous_month and existing_count > 0 and not _woori_empty_is_expected(store_info):
                     raise RuntimeError(
                         f"woori previous month unexpectedly empty: "
                         f"{store_info['store']} {ym} existing_rows={existing_count}"

@@ -118,3 +118,45 @@ def run_lookback_review(days: int = 30) -> str:
 
 def backfill_review() -> str:
     return run_review(mode="all")
+
+
+def build_daily_review_count(
+    mode: str = "lookback", days: int = 30, target_date: str | None = None
+) -> str:
+    """일별 매장별 리뷰 수 집계 (번호 기준 중복 제거). unified_review_count.parquet upsert 저장."""
+    files = _collect_files(mode=mode, days=days, target_date=target_date)
+    if not files:
+        return f"스킵: 파일 없음 (mode={mode})"
+
+    dfs = []
+    for f in files:
+        try:
+            dfs.append(pd.read_parquet(f, columns=["번호", "작성일자", "매장명", "채널"]))
+        except Exception as e:
+            logger.warning("파일 로드 실패 %s: %s", f.name, e)
+
+    if not dfs:
+        return "스킵: 로드 실패"
+
+    df = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=["번호", "작성일자", "매장명", "채널"])
+    count_df = (
+        df.groupby(["작성일자", "매장명", "채널"], dropna=False)["번호"]
+        .nunique()
+        .reset_index(name="리뷰수")
+    )
+
+    out_path = UNIFIED_REVIEW_MART_DIR / "unified_review_count.parquet"
+    UNIFIED_REVIEW_MART_DIR.mkdir(parents=True, exist_ok=True)
+
+    if out_path.exists() and mode != "all":
+        existing = pd.read_parquet(out_path)
+        new_dates = count_df["작성일자"].unique()
+        existing = existing[~existing["작성일자"].isin(new_dates)]
+        count_df = pd.concat([existing, count_df], ignore_index=True)
+        count_df = count_df.sort_values(["작성일자", "매장명", "채널"]).reset_index(drop=True)
+
+    count_df.to_parquet(out_path, index=False)
+
+    total = int(count_df["리뷰수"].sum())
+    logger.info("일별 리뷰수 집계 완료: %d행, 총 %d건", len(count_df), total)
+    return f"일별 리뷰수 저장: {len(count_df)}행, 총 {total:,}건 (원천 {len(files)}개 파일)"
