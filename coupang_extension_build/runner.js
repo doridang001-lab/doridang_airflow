@@ -27,7 +27,7 @@
   ];
   const DELAY_MIN = 5000, DELAY_MAX = 15000;     // 매장 간 지연(ms)
   const LOGIN_TIMEOUT = 70000;                   // 로그인+리다이렉트 대기(ms)
-  const COLLECT_TIMEOUT = 240000;                // 수집 완료 대기(ms)
+  const COLLECT_TIMEOUT = 300000;                // 수집 완료 대기(ms) — 5분
 
   // ── 상태 ──
   let queue = [];            // [{store, id, pw, _row}]
@@ -386,12 +386,6 @@
 
   const params = new URLSearchParams(location.search);
   const useAll = params.get('all') === '1';
-  const auto = params.get('auto') === '1' || params.get('run') === 'coupang';
 
-  loadQueue(useAll).then(() => {
-    if (auto && queue.length > 0) {
-      log('자동 시작 모드 (윈도우 작업 스케줄러/알람) — 3초 후 시작');
-      setTimeout(runBatch, 3000);
-    }
-  });
+  loadQueue(useAll);
 })();

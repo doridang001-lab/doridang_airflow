@@ -267,7 +267,7 @@ def reclassify_platform(**context) -> str:
 
 with DAG(
     dag_id=dag_id,
-    schedule="30 10 * * *",  # 매일 10:30
+    schedule="20 10 * * *",  # 매일 10:30
     start_date=pendulum.datetime(2026, 1, 1, tz="Asia/Seoul"),
     catchup=False,
     max_active_runs=1,

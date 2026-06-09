@@ -46,7 +46,8 @@ RAW_POSFEED_SALES = ANALYTICS_DB / "posfeed_sales"
 RAW_POSFEED_DETAIL = ANALYTICS_DB / "posfeed_sales_detail"
 POSFEED_SOURCE = "posfeed"
 EXCLUSION_LOG_BASE = ANALYTICS_DB / "posfeed_exclusion_log"
-
+# Posfeed 제외 항목 중 '도리' 포함 알림은 유지하고, 자동으로 Y로 보정합니다.
+_ENABLE_POSFEED_DORI_EXCLUSION_ALERT = True
 # 주문상태 → 정상 처리할 완료 상태 (포장주문도 '배달완료'로 기록됨)
 _COMPLETE_STATUSES = {"배달완료"}
 
@@ -377,6 +378,78 @@ def _save_exclusion_log(excluded: pd.DataFrame, date_str: str, menu_map: dict) -
     save_df.to_csv(str(log_path), index=False, encoding="utf-8-sig")
 
 
+def _auto_fix_dori_whitelist(doridori_df: pd.DataFrame) -> tuple[int, int]:
+    """도리(item_name에 '도리' 포함) 항목을 whitelist에서 Y로 자동 보정.
+
+    - 기존 fin_product_posfeed_whitelist.csv에서 일치하는 normalized item_name이 N이면 Y로 변경
+    - 항목이 존재하지 않으면 새 Y 행을 추가
+    - review_needed는 자동 보정된 항목에 대해 N으로 설정
+    """
+    from modules.transform.utility.paths import POSFEED_WHITELIST_CSV_PATH
+
+    if POSFEED_WHITELIST_CSV_PATH.exists():
+        try:
+            wl_df = pd.read_csv(POSFEED_WHITELIST_CSV_PATH, dtype=str).fillna("")
+        except Exception as exc:
+            logger.warning("도리 자동 보정용 whitelist 로드 실패: %s", exc)
+            return 0, 0
+    else:
+        wl_df = pd.DataFrame(columns=_WHITELIST_COLUMNS)
+
+    if not {"item_name", "is_valid"}.issubset(wl_df.columns):
+        logger.warning("도리 자동 보정 실패: whitelist CSV에 필수 컬럼 없음")
+        return 0, 0
+
+    wl_df = wl_df.reindex(columns=_WHITELIST_COLUMNS, fill_value="")
+    wl_df["_norm_item"] = wl_df["item_name"].fillna("").astype(str).map(_normalize_item_key)
+
+    dori_examples: dict[str, str] = {}
+    for item_name in doridori_df["item_name"].fillna("").astype(str):
+        norm = _normalize_item_key(item_name)
+        if norm:
+            dori_examples.setdefault(norm, item_name)
+
+    if not dori_examples:
+        return 0, 0
+
+    fixed_count = 0
+    for idx, row in wl_df.iterrows():
+        if row["_norm_item"] in dori_examples and row["is_valid"].strip().upper() == "N":
+            wl_df.at[idx, "is_valid"] = "Y"
+            wl_df.at[idx, "review_needed"] = "N"
+            wl_df.at[idx, "classified_by"] = "auto_dori_fix"
+            fixed_count += 1
+
+    added_count = 0
+    existing_norms = set(wl_df["_norm_item"].dropna().astype(str))
+    for norm, example_name in dori_examples.items():
+        if norm not in existing_norms:
+            wl_df = pd.concat(
+                [
+                    wl_df,
+                    pd.DataFrame([
+                        {
+                            "item_name": example_name,
+                            "is_valid": "Y",
+                            "store": "",
+                            "review_needed": "N",
+                            "classified_by": "auto_dori_fix",
+                            "_norm_item": norm,
+                        }
+                    ])
+                ],
+                ignore_index=True,
+            )
+            added_count += 1
+
+    if fixed_count or added_count:
+        wl_df = wl_df.drop(columns=["_norm_item"])
+        wl_df = wl_df.drop_duplicates(subset=["item_name", "store"], keep="first")
+        wl_df.to_csv(POSFEED_WHITELIST_CSV_PATH, index=False, encoding="utf-8-sig")
+
+    return fixed_count, added_count
+
+
 def report_posfeed_exclusions(**context) -> str:
     """posfeed 블랙리스트 제외 내역을 ym별 상세·집계 CSV로 저장.
 
@@ -415,14 +488,23 @@ def report_posfeed_exclusions(**context) -> str:
 
         doridori_df = all_df[all_df["item_name"].str.contains("도리", na=False)]
         if not doridori_df.empty:
-            from modules.transform.utility.mailer import send_email
-            rows_html = "".join(
-                f"<tr><td>{r.get('store','')}</td><td>{r.get('menu_name','')}</td>"
-                f"<td>{r.get('item_name','')}</td>"
-                f"<td>{r.get('sale_date','')}</td><td>{r.get('total_price','')}</td></tr>"
-                for _, r in doridori_df.iterrows()
-            )
-            html = f"""<html><head><meta charset="UTF-8"></head>
+            fixed_count, added_count = _auto_fix_dori_whitelist(doridori_df)
+            if fixed_count or added_count:
+                logger.info(
+                    "[exclusion fix] 도리 포함 항목 자동 보정: 업데이트 %d개, 신규 추가 %d개",
+                    fixed_count,
+                    added_count,
+                )
+
+            if _ENABLE_POSFEED_DORI_EXCLUSION_ALERT:
+                from modules.transform.utility.mailer import send_email
+                rows_html = "".join(
+                    f"<tr><td>{r.get('store','')}</td><td>{r.get('menu_name','')}</td>"
+                    f"<td>{r.get('item_name','')}</td>"
+                    f"<td>{r.get('sale_date','')}</td><td>{r.get('total_price','')}</td></tr>"
+                    for _, r in doridori_df.iterrows()
+                )
+                html = f"""<html><head><meta charset="UTF-8"></head>
 <body style="font-family:'Malgun Gothic',Arial,sans-serif;margin:24px;">
 <h2 style="color:#c0392b;">&#9888; Posfeed 제외 항목 중 "도리" 포함 ({ym})</h2>
 <p>블랙리스트로 제외된 항목 중 <b>"도리"</b>가 포함된 상품명이 발견됐습니다. 검토가 필요합니다.</p>
@@ -433,15 +515,18 @@ def report_posfeed_exclusions(**context) -> str:
   <tbody>{rows_html}</tbody>
 </table>
 </body></html>"""
-            try:
-                send_email(
-                    subject=f"[도리당] Posfeed 제외 항목 검토 필요 - '도리' 포함 ({ym}, {len(doridori_df)}건)",
-                    html_content=html,
-                    to_emails="a17019@kakao.com",
-                )
-                logger.info("[exclusion alert] '도리' 포함 %d건 알림 발송 (ym=%s)", len(doridori_df), ym)
-            except Exception as exc:
-                logger.error("[exclusion alert] 알림 발송 실패: %s", exc)
+                subject_suffix = ""
+                if fixed_count or added_count:
+                    subject_suffix = " (자동 Y 변환 적용)"
+                try:
+                    send_email(
+                        subject=f"[도리당] Posfeed 제외 항목 검토 필요 - '도리' 포함 ({ym}, {len(doridori_df)}건){subject_suffix}",
+                        html_content=html,
+                        to_emails="a17019@kakao.com",
+                    )
+                    logger.info("[exclusion alert] '도리' 포함 %d건 알림 발송 (ym=%s)%s", len(doridori_df), ym, subject_suffix)
+                except Exception as exc:
+                    logger.error("[exclusion alert] 알림 발송 실패: %s", exc)
 
         for col in ("unit_price", "total_price", "qty"):
             if col in all_df.columns:

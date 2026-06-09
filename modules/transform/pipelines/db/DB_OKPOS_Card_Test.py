@@ -56,8 +56,13 @@ def _resolve_sale_date(**context) -> str:
             raise ValueError(f"sale_date must be YYYY-MM-DD: {sale_date}") from exc
         source = "dag_run.conf.sale_date"
     else:
-        sale_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        source = "yesterday"
+        ds = context.get("ds")
+        if ds:
+            sale_date = str(ds)[:10]
+            source = "context.ds"
+        else:
+            sale_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            source = "yesterday"
 
     context["ti"].xcom_push(key="sale_date", value=sale_date)
     logger.info("OKPOS card test sale_date resolved: %s (%s)", sale_date, source)
@@ -806,7 +811,15 @@ def ingest_manual_okpos_card_files(**context) -> str:
 
 
 def validate_okpos_card_lookback(lookback_days: int = 7, min_date: str = OKPOS_CARD_MIN_VALIDATE_DATE, **context) -> str:
-    today = datetime.now().date()
+    # Use the sale_date actually collected (from XCom) as the anchor so validate never checks
+    # dates beyond what the current run downloaded, regardless of when the task executes.
+    ti = context.get("ti")
+    collected = ti.xcom_pull(task_ids="download_okpos_card_test", key="sale_date") if ti else None
+    if collected:
+        today = datetime.strptime(collected, "%Y-%m-%d").date() + timedelta(days=1)
+    else:
+        ds = context.get("ds")
+        today = datetime.strptime(str(ds)[:10], "%Y-%m-%d").date() + timedelta(days=1) if ds else datetime.now().date()
     min_dt = datetime.strptime(min_date, "%Y-%m-%d").date()
     target_dates = [
         (today - timedelta(days=i)).strftime("%Y-%m-%d")

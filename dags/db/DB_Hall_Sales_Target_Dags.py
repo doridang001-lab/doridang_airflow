@@ -17,7 +17,10 @@ from airflow.operators.python import PythonOperator
 
 from modules.transform.utility.schedule import DB_HALL_SALES_TARGET_TIME
 from modules.transform.pipelines.db.DB_Hall_Sales_Target import build_hall_sales_target
-from modules.transform.pipelines.db.DB_Hall_Sales_Excel import build_weekly_report_excel
+from modules.transform.pipelines.db.DB_Hall_Sales_Excel import (
+    append_weekly_ai_log,
+    build_weekly_report_excel,
+)
 from modules.transform.pipelines.db.DB_Hall_Daily_Excel import build_daily_tracking_excel
 # 목표치 계산은 airflow 비의존 헬퍼로 분리 (로컬 Windows 스크립트와 공유)
 from modules.transform.pipelines.db.DB_Hall_Sales_Target_config import build_targets
@@ -67,4 +70,10 @@ with DAG(
         },
     )
 
+    t_llm_log = PythonOperator(
+        task_id="append_weekly_ai_log",
+        python_callable=append_weekly_ai_log,
+    )
+
     t_csv >> [t_excel, t_daily_excel]
+    t_excel >> t_llm_log

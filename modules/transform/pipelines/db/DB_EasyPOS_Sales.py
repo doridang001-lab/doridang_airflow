@@ -1121,11 +1121,17 @@ def _login(page: Page) -> Frame:
     mf = None
     for _fr_attempt in range(5):
         try:
+            if _is_page_closed(page):
+                raise TargetClosedError("NexacroN main frame check failed: page/browser closed")
             mf = _get_main_frame(page)
             time.sleep(1)  # detach 직후 evaluate 실패 방지
             mf.evaluate("1")  # 프레임 살아있는지 확인
             break
+        except TargetClosedError:
+            raise
         except Exception:
+            if _is_page_closed(page):
+                raise TargetClosedError("NexacroN main frame reacquire failed: page/browser closed")
             if _fr_attempt == 4:
                 raise RuntimeError("NexacroN main 프레임 획득 5회 실패")
             logger.warning("NexacroN 프레임 재획득 시도 %d/5", _fr_attempt + 1)
@@ -1150,7 +1156,68 @@ def _login(page: Page) -> Frame:
     # 로그인 버튼 클릭
     mf.query_selector(f"#{_LOGIN_BTN}").click()
     logger.info("로그인 버튼 클릭")
-    time.sleep(5)
+
+    # NexacroN 중복 세션(WebKillSession) 팝업을 즉시 처리하기 위해 폴링 대기.
+    # 기존 time.sleep(5) 방식은 팝업이 0.3~2초 내 닫혀버려 TargetClosedError를 유발함.
+    # 단, _MENU_SALES_BRIEF 감지 즉시 탈출하면 grdLeft 좌측메뉴가 미렌더링 상태이므로
+    # 메뉴 첫 감지 후 최소 4초 대기 후 탈출한다.
+    _DUPE_SESSION_IDS = [
+        "mainframe_childframe_confirmDialog_form_btn_ok",
+        "mainframe_childframe_alertDialog_form_btn_ok",
+    ]
+    _page_force_closed = False
+    _menu_first_seen: float | None = None
+    for _ in range(25):  # 0.4s × 25 = 최대 10초
+        if _is_page_closed(page):
+            _page_force_closed = True
+            break
+        try:
+            _cur_mf = _get_main_frame(page)
+            if _cur_mf.query_selector(f"#{_MENU_SALES_BRIEF}"):
+                if _menu_first_seen is None:
+                    _menu_first_seen = time.time()
+                    logger.info("대시보드 메뉴 감지 — NexacroN 좌측메뉴 초기화 대기 중")
+                if time.time() - _menu_first_seen >= 4.0:
+                    mf = _cur_mf
+                    break
+            for cid in _DUPE_SESSION_IDS:
+                el = _cur_mf.query_selector(f"#{cid}")
+                if el:
+                    _coord_click(page, _cur_mf, cid, "중복세션 확인 팝업")
+                    logger.info("중복 세션 팝업 확인 클릭 완료 — 재렌더링 대기")
+                    mf = _cur_mf
+                    _menu_first_seen = None  # 확인 클릭 후 카운터 초기화
+                    time.sleep(2)
+                    break
+        except Exception:
+            pass
+        time.sleep(0.4)
+
+    # WebKillSession으로 페이지가 강제 종료된 경우 → 재접속 1회 시도
+    # (이전 세션이 정리됐으므로 새 로그인은 대부분 성공함)
+    if _page_force_closed:
+        logger.warning("로그인 후 페이지 강제 종료 감지 (WebKillSession) → 재접속 시도")
+        page.goto(LOGIN_URL, wait_until="networkidle", timeout=60_000)
+        _fr2_deadline = time.time() + 30
+        while time.time() < _fr2_deadline:
+            if any(f.name == "main" for f in page.frames):
+                break
+            time.sleep(1)
+        time.sleep(3)
+        mf = _get_main_frame(page)
+        id_outer = mf.query_selector(f"#{_ID_OUTER}")
+        if id_outer:
+            id_outer.click()
+            time.sleep(0.3)
+        mf.query_selector(f"#{_ID_INPUT}").fill(EASYPOS_ID)
+        pw_outer = mf.query_selector(f"#{_PW_OUTER}")
+        if pw_outer:
+            pw_outer.click()
+            time.sleep(0.3)
+        mf.query_selector(f"#{_PW_INPUT}").fill(EASYPOS_PW)
+        mf.query_selector(f"#{_LOGIN_BTN}").click()
+        logger.info("재로그인 버튼 클릭")
+        time.sleep(6)
 
     # 팝업 닫기 (비밀번호 변경 안내, 광고)
     for popup_id, popup_label in [
@@ -1318,7 +1385,7 @@ def _download_and_save_daily_totals(page: Page, download_dir: Path) -> dict[str,
     return result
 
 
-def _navigate_to_daily_sales(page: Page, mf: Frame) -> Frame:
+def _navigate_to_daily_sales(page: Page, mf: Frame, *, _reload_retry: bool = False) -> Frame:
     """영업속보 → 당일매출내역 메뉴 클릭
 
     진단 결과 확인된 동작 경로:
@@ -1441,6 +1508,12 @@ def _navigate_to_daily_sales(page: Page, mf: Frame) -> Frame:
     if _has_any_selector(mf, ["[id*='grdSalePerDayList']"]):
         logger.info("당일매출내역 메뉴 탐색 실패했으나 그리드 확인 — 계속 진행")
         return mf
+
+    # grdLeft가 계속 비어있으면 페이지 새로고침 후 1회 재시도
+    if not _reload_retry:
+        logger.warning("당일매출내역 메뉴 탐색 전체 실패 — 페이지 새로고침 후 재로그인 1회 재시도")
+        mf = _login(page)
+        return _navigate_to_daily_sales(page, mf, _reload_retry=True)
 
     raise RuntimeError(
         f"당일매출내역 메뉴를 찾을 수 없음 ({_MAX_ATTEMPT}회 시도). "
@@ -1733,29 +1806,50 @@ def collect_receipts(**context) -> str:
     all_rows = []
 
     with sync_playwright() as p:
-        browser = launch_chromium(p, headless=launch_kwargs["headless"], args=launch_kwargs["args"])
-        bctx = browser.new_context(**context_opts)
-        bctx.add_init_script(_NEXACRO_INIT_SCRIPT)
-        page = bctx.new_page()
+        def _open_browser():
+            _browser = launch_chromium(p, headless=launch_kwargs["headless"], args=launch_kwargs["args"])
+            _bctx = _browser.new_context(**context_opts)
+            _bctx.add_init_script(_NEXACRO_INIT_SCRIPT)
+            _page = _bctx.new_page()
+            return _browser, _bctx, _page
+
+        browser, bctx, page = _open_browser()
 
         def _reopen_session(target_date: str):
             nonlocal browser, bctx, page
+            old_browser = browser
+            browser2, bctx2, page2 = _open_browser()
             try:
-                browser.close()
+                _mf = _login(page2)
+                _mf = _navigate_to_daily_sales(page2, _mf)
+                _navigate_by_direct_input(page2, target_date)
+            except Exception:
+                try:
+                    browser2.close()
+                except Exception:
+                    pass
+                raise
+            try:
+                old_browser.close()
             except Exception:
                 pass
-            browser2 = launch_chromium(p, headless=launch_kwargs["headless"], args=launch_kwargs["args"])
-            bctx2 = browser2.new_context(**context_opts)
-            bctx2.add_init_script(_NEXACRO_INIT_SCRIPT)
-            page2 = bctx2.new_page()
-            _mf = _login(page2)
-            _mf = _navigate_to_daily_sales(page2, _mf)
-            _navigate_by_direct_input(page2, target_date)
             logger.info("EasyPOS 세션 재오픈 완료: %s", target_date)
             return browser2, bctx2, page2
 
         try:
-            mf = _login(page)
+            for _init_attempt in range(2):
+                try:
+                    mf = _login(page)
+                    break
+                except (TargetClosedError, RuntimeError) as e:
+                    if _init_attempt == 1:
+                        raise
+                    logger.warning("초기 EasyPOS 로그인 실패 (%s) → 브라우저 재시작", e)
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    browser, bctx, page = _open_browser()
 
             # ── STEP 1: 일자별매출조회 → 엑셀 다운로드 → CSV 저장 (최근 7일 일괄)
             try:

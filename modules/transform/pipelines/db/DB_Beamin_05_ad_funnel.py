@@ -1,15 +1,14 @@
-"""배민 광고 funnel 통계 수집 파이프라인.
+"""Baemin ad funnel metric collection pipeline.
 
-수집 흐름:
-  account_id/password → 매장별 독립 Chrome 세션
-    → stat/advertisement?initialDateOption=MONTH 이동
-    → Filter 버튼(최근 4주) 클릭
-    → 일별(DAILY) 라디오 선택 → 어제(YESTERDAY) 선택 → 적용
-    → 지표 추출 (노출수 / 클릭수 / 주문수 / 주문금액)
-    → CSV append 저장 (upsert by target_date)
-    → Chrome quit
+Flow:
+  account_id/password -> independent Chrome session per store
+    -> open stat/advertisement?initialDateOption=MONTH
+    -> apply DAILY/YESTERDAY filters
+    -> extract impressions/clicks/orders/order amount
+    -> upsert monthly CSV by target_date
+    -> quit Chrome
 
-저장 경로:
+Output:
   analytics/baemin_macro/ad_funnel/
     brand={brand}/store={store}/ym={YYYY-MM}/baemin_ad_funnel.csv
 """
@@ -43,9 +42,308 @@ _AD_URL_TEMPLATE = (
 )
 _FILTER_BTN_CSS   = "button.Filter-module__lRdH"
 _METRIC_LABELS    = ["노출수", "클릭수", "주문수", "주문금액"]
-_COLUMNS          = ["collected_at", "target_date", "store_name"] + _METRIC_LABELS
+_FILTER_LABEL_MAP: dict[int, list[str]] = {
+    0: ["노출수", "클릭수"],
+    1: ["주문수", "주문금액"],
+}
+_YESTERDAY_KO = "\uc5b4\uc81c"
+_STATUS_COLUMN    = "collection_status"
+_COLUMNS          = ["collected_at", "target_date", "store_name", _STATUS_COLUMN] + _METRIC_LABELS
 
 
+def _snapshot_ad_metric_state(driver) -> dict:
+    return driver.execute_script(
+        """
+        const body = document.body ? document.body.textContent : '';
+        const tabs = [...document.querySelectorAll('button[class*="Tab_b_r4ax"]')]
+          .map(b => b.textContent.trim())
+          .filter(Boolean);
+        const vals = [...document.querySelectorAll('span[style*="margin"]')]
+          .map(s => s.textContent.trim())
+          .filter(v => /^[\\d,]+$/.test(v));
+        const busy = document.querySelectorAll('[aria-busy="true"], [class*="Loading"], [class*="Spinner"]').length;
+        return {
+          no_ads: body.includes('등록된 광고가 없') || body.includes('광고를 설정'),
+          tabs,
+          vals,
+          busy,
+          ready: document.readyState,
+        };
+        """
+    ) or {}
+
+
+def _is_blank_selenium_message(reason: str | None) -> bool:
+    text = str(reason or "").strip()
+    return not text or text == "Message:"
+
+
+def _format_metric_state(state: dict | None) -> str:
+    state = state or {}
+    tabs = state.get("tabs") or []
+    vals = state.get("vals") or []
+    return (
+        f"ready={state.get('ready')} "
+        f"busy={state.get('busy')} "
+        f"no_ads={state.get('no_ads')} "
+        f"tabs={tabs[:4]} "
+        f"vals={vals[:4]}"
+    )
+
+
+
+
+def _set_ad_filter_yesterday(driver, store_name: str) -> dict | None:
+    """Apply both filters and return a four-metric dict."""
+    try:
+        btn_count = driver.execute_script(
+            "return document.querySelectorAll('button.Filter-module__lRdH').length;"
+        )
+        if not btn_count:
+            logger.warning("Filter buttons not found: %s", store_name)
+            return None
+        logger.info("Filter buttons found: %d / %s", btn_count, store_name)
+
+        metrics: dict = {}
+        for btn_idx in range(btn_count):
+            vals = _apply_yesterday_to_filter(driver, btn_idx, store_name)
+            if vals is None:
+                logger.warning("Filter[%d] metric extraction failed: %s", btn_idx, store_name)
+                return None
+            for i, label in enumerate(_FILTER_LABEL_MAP.get(btn_idx, [])):
+                if i < len(vals):
+                    metrics[label] = vals[i]
+            time.sleep(0.3)
+
+        filter_texts = driver.execute_script(
+            "return [...document.querySelectorAll('button.Filter-module__lRdH')]"
+            ".map(b => b.textContent.trim());"
+        )
+        logger.info("Filter texts after apply: %s / %s", filter_texts, store_name)
+        if not all(_YESTERDAY_KO in t for t in filter_texts):
+            logger.warning("A Filter button is not on YESTERDAY: %s", filter_texts)
+            return None
+
+        if len(metrics) < 4:
+            logger.warning("Metrics incomplete (%d/4): %s / %s", len(metrics), metrics, store_name)
+            return None
+
+        logger.info("Filter flow completed, metrics extracted: %s / %s", metrics, store_name)
+        return metrics
+
+    except (TimeoutException, Exception) as e:
+        logger.warning("Ad filter setup error (%s): %s", store_name, e)
+        return None
+
+
+def _apply_yesterday_to_filter(driver, btn_idx: int, store_name: str) -> list[str] | None:
+    """Apply DAILY/YESTERDAY on one filter and return its metric values."""
+    clicked = driver.execute_script(
+        """
+        const btns = document.querySelectorAll('button.Filter-module__lRdH');
+        const btn = btns[arguments[0]];
+        if (!btn) return false;
+        btn.click();
+        return btn.textContent.trim().slice(0, 30);
+        """,
+        btn_idx,
+    )
+    if not clicked:
+        logger.warning("Filter[%d] button not found: %s", btn_idx, store_name)
+        return None
+    logger.info("Filter[%d] clicked: %r / %s", btn_idx, clicked, store_name)
+    WebDriverWait(driver, 10).until(
+        EC.presence_of_element_located(
+            (By.CSS_SELECTOR, 'input[name="ad-stats-period-filter"][value="DAILY"]')
+        )
+    )
+
+    daily = driver.execute_script(
+        """
+        const radio = document.querySelector('input[name="ad-stats-period-filter"][value="DAILY"]');
+        if (!radio) return 'not_found';
+        const lbl = document.querySelector('label[for="' + radio.id + '"]');
+        if (lbl) { lbl.click(); return 'label_clicked:' + lbl.textContent.trim(); }
+        radio.click(); return 'radio_fallback';
+        """
+    )
+    if daily == "not_found":
+        logger.warning("Filter[%d] DAILY radio not found: %s", btn_idx, store_name)
+        return None
+    logger.info("Filter[%d] DAILY: %s", btn_idx, daily)
+    time.sleep(2.0)
+
+    WebDriverWait(driver, 10).until(
+        lambda d: d.execute_script(
+            'const r = document.querySelector(\'input[name="period"][value="YESTERDAY"]\');'
+            'return r && r.offsetParent !== null;'
+        )
+    )
+    yest = driver.execute_script(
+        """
+        const radio = document.querySelector('input[name="period"][value="YESTERDAY"]');
+        if (!radio) return 'not_found';
+        const lbl = document.querySelector('label[for="' + radio.id + '"]');
+        if (lbl) { lbl.click(); return 'label_clicked:' + lbl.textContent.trim(); }
+        radio.click(); return 'radio_fallback';
+        """
+    )
+    if yest == "not_found":
+        logger.warning("Filter[%d] YESTERDAY radio not found: %s", btn_idx, store_name)
+        return None
+    logger.info("Filter[%d] YESTERDAY: %s", btn_idx, yest)
+    time.sleep(2.0)
+
+    applied = driver.execute_script(
+        """
+        const btn = [...document.querySelectorAll('button')]
+            .find(b => (b.innerText || b.textContent || '').trim().includes(String.fromCharCode(0xC801, 0xC6A9)));
+        if (!btn) return false;
+        btn.click();
+        return true;
+        """
+    )
+    if not applied:
+        logger.warning("Filter[%d] apply button not found: %s", btn_idx, store_name)
+        return None
+
+    try:
+        WebDriverWait(driver, 15).until(
+            lambda d: _YESTERDAY_KO in (d.execute_script(
+                "const btns = document.querySelectorAll('button.Filter-module__lRdH');"
+                "return btns[arguments[0]]?.textContent || '';",
+                btn_idx,
+            ) or "")
+        )
+    except TimeoutException:
+        logger.warning("Filter[%d] text not changed after apply (15s): %s", btn_idx, store_name)
+        return None
+
+    time.sleep(2.0)  # React data fetch completion is not tied to button text.
+
+    vals: list[str] = driver.execute_script(
+        """
+        const btns = document.querySelectorAll('button.Filter-module__lRdH');
+        const btn = btns[arguments[0]];
+        if (!btn) return [];
+
+        let el = btn.parentElement;
+        for (let i = 0; i < 8; i++) {
+            if (!el || el === document.body) break;
+            const nums = [...el.querySelectorAll('span')]
+                .map(s => s.textContent.trim())
+                .filter(v => /^[\\d,]+$/.test(v));
+            const filters = [...el.querySelectorAll('button.Filter-module__lRdH')];
+            if (filters.length > 1 && nums.length >= (arguments[0] + 1) * 2) {
+                return nums.slice(arguments[0] * 2, arguments[0] * 2 + 2);
+            }
+            if (filters.length <= 1 && nums.length >= 2) return nums.slice(0, 2);
+            el = el.parentElement;
+        }
+
+        return [...document.querySelectorAll('span[style*="margin"]')]
+            .map(s => s.textContent.trim())
+            .filter(v => /^[\\d,]+$/.test(v))
+            .slice(arguments[0] * 2, arguments[0] * 2 + 2);
+        """,
+        btn_idx,
+    ) or []
+
+    logger.info("Filter[%d] vals extracted: %s / %s", btn_idx, vals, store_name)
+    if btn_idx == 1 and len(vals) == 0:
+        logger.info("Filter[%d] no order metrics in DOM, treating as zeroes: %s", btn_idx, store_name)
+        return ["0", "0"]
+    return vals if len(vals) >= 1 else None
+
+def _reload_and_retry_extract(driver, store_id: str, store_name: str) -> dict:
+    logger.info("광고 페이지 새로고침 후 재시도: %s (%s)", store_name, store_id)
+    try:
+        driver.refresh()
+        if not wait_for_page(driver, _FILTER_BTN_CSS, timeout=30):
+            return {
+                "status": "parse_error",
+                "metrics": None,
+                "reason": "refresh wait_for_page failed",
+            }
+        if not _set_ad_filter_yesterday(driver, store_name):
+            return {
+                "status": "parse_error",
+                "metrics": None,
+                "reason": "refresh filter apply failed",
+            }
+        time.sleep(2.0)  # 새로고침 후 React 렌더 안정화 대기
+        return _extract_ad_metrics(driver, store_name)
+    except Exception as exc:
+        return {
+            "status": "parse_error",
+            "metrics": None,
+            "reason": f"refresh retry failed: {exc}",
+        }
+
+
+def _reload_and_collect(driver, store_id: str, store_name: str) -> dict | None:
+    """Refresh page and re-apply filter. Returns metrics dict or None on failure."""
+    logger.info("Reloading ad funnel page for retry: %s (%s)", store_name, store_id)
+    try:
+        driver.refresh()
+        if not wait_for_page(driver, _FILTER_BTN_CSS, timeout=30):
+            return None
+        return _set_ad_filter_yesterday(driver, store_name)
+    except Exception as exc:
+        logger.warning("Reload retry failed (%s): %s", store_name, exc)
+        return None
+
+
+def _collect_ad_funnel_metrics(
+    driver,
+    store_id: str,
+    brand: str,
+    store: str,
+    target_date: str,
+) -> bool:
+    if _snapshot_ad_metric_state(driver).get("no_ads"):
+        saved = _save_ad_funnel_csv(None, brand, store, target_date, status="no_ads")
+        logger.info("No ads (skip): %s / %s -> %s", store, target_date, saved)
+        return True
+
+    metrics = _set_ad_filter_yesterday(driver, store)
+    if metrics is None:
+        metrics = _reload_and_collect(driver, store_id, store)
+    if metrics is None:
+        logger.warning("ad funnel extraction incomplete: %s / %s", store, target_date)
+        return False
+
+    saved = _save_ad_funnel_csv(metrics, brand, store, target_date, status="ok")
+    logger.info("Saved ad funnel CSV: brand=%s store=%s %s", brand, store, saved)
+    return True
+
+
+def _collect_ad_funnel_for_driver_impl(
+    driver,
+    store_info: dict,
+    target_date: str | None = None,
+) -> bool:
+    """Impl: navigate, apply filter, extract and save ad funnel metrics."""
+    if target_date is None:
+        target_date = pendulum.yesterday(KST).format("YYYY-MM-DD")
+
+    store_id = store_info["store_id"]
+    brand = store_info["brand"]
+    store = store_info["store"]
+    logger.info("Ad funnel collection start: %s (%s) / %s", store, store_id, target_date)
+
+    try:
+        driver.set_page_load_timeout(45)
+        driver.get(_AD_URL_TEMPLATE.format(store_id=store_id))
+
+        if not wait_for_page(driver, _FILTER_BTN_CSS, timeout=30):
+            logger.warning("Ad funnel page failed to load, skipping: %s", store)
+            return False
+
+        return _collect_ad_funnel_metrics(driver, store_id, brand, store, target_date)
+    except Exception as exc:
+        logger.warning("Ad funnel collection failed (%s): %s", store, exc)
+        return False
 # ---------------------------------------------------------------------------
 # 공개 함수
 # ---------------------------------------------------------------------------
@@ -55,59 +353,36 @@ def collect_ad_funnel_for_driver(
     store_info: dict,
     target_date: str | None = None,
 ) -> bool:
-    """기존 Chrome 세션으로 단일 매장의 광고 funnel 통계를 수집한다.
-
-    combined.py의 per-store 루프에서 로그인 없이 호출.
-    광고 없는 매장은 True 반환 (정상).
-
-    Returns:
-        True if succeeded (광고 없음 포함), False if failed.
-    """
     if target_date is None:
         target_date = pendulum.yesterday(KST).format("YYYY-MM-DD")
 
     store_id = store_info["store_id"]
-    brand    = store_info["brand"]
-    store    = store_info["store"]
-
-    logger.info("광고 funnel 수집 시작: %s (%s) / %s", store, store_id, target_date)
+    brand = store_info["brand"]
+    store = store_info["store"]
+    logger.info("Ad funnel collection start: %s (%s) / %s", store, store_id, target_date)
 
     try:
         driver.set_page_load_timeout(45)
         driver.get(_AD_URL_TEMPLATE.format(store_id=store_id))
 
         if not wait_for_page(driver, _FILTER_BTN_CSS, timeout=30):
-            logger.warning("광고 통계 페이지 로드 실패, 건너뜀: %s", store)
+            logger.warning("Ad funnel page failed to load, skipping: %s", store)
             return False
 
-        if not _set_ad_filter_yesterday(driver, store):
-            logger.warning("필터 설정 실패, 건너뜀: %s", store)
-            return False
-
-        metrics = _extract_ad_metrics(driver, store)
-        if metrics is None:
-            logger.info("광고 없음 또는 지표 추출 실패: %s / %s", store, target_date)
-            return True
-
-        saved = _save_ad_funnel_csv(metrics, brand, store, target_date)
-        logger.info("저장 완료: brand=%s store=%s → %s", brand, store, saved)
-        return True
-
-    except Exception as e:
-        logger.warning("광고 funnel 수집 실패 (%s): %s", store, e)
+        return _collect_ad_funnel_metrics(driver, store_id, brand, store, target_date)
+    except Exception as exc:
+        logger.warning("Ad funnel collection failed (%s): %s", store, exc)
         return False
-
-
 def collect_ad_funnel_for_account(
     account_id: str,
     password: str,
     store_list: list[dict],
     target_date: str | None = None,
 ) -> list[dict]:
-    """매장별 독립 Chrome 세션으로 광고 funnel 통계를 수집한다.
+    """Collect ad funnel stats per store with independent Chrome sessions.
 
     Returns:
-        수집 실패한 store_info 리스트 (빈 리스트 = 전부 성공).
+        Store info entries that failed collection.
     """
     if target_date is None:
         target_date = pendulum.yesterday(KST).format("YYYY-MM-DD")
@@ -116,10 +391,10 @@ def collect_ad_funnel_for_account(
 
     for store_info in store_list:
         store_id = store_info["store_id"]
-        brand    = store_info["brand"]
-        store    = store_info["store"]
+        brand = store_info["brand"]
+        store = store_info["store"]
 
-        logger.info("광고 funnel 수집 시작: %s (%s) / %s", store, store_id, target_date)
+        logger.info("Ad funnel collection start: %s (%s) / %s", store, store_id, target_date)
 
         succeeded = False
         for attempt in range(2):
@@ -128,38 +403,30 @@ def collect_ad_funnel_for_account(
                 driver = launch_browser(account_id)
 
                 if not login_baemin(driver, account_id, password):
-                    logger.warning("로그인 실패: %s / %s", account_id, store)
+                    logger.warning("Login failed: %s / %s", account_id, store)
                     break
 
                 driver.set_page_load_timeout(45)
                 driver.get(_AD_URL_TEMPLATE.format(store_id=store_id))
 
                 if not wait_for_page(driver, _FILTER_BTN_CSS, timeout=30):
-                    logger.warning("광고 통계 페이지 로드 실패, 건너뜀: %s", store)
+                    logger.warning("Ad funnel page failed to load, skipping: %s", store)
                     if attempt == 0:
                         continue
                     break
 
-                if not _set_ad_filter_yesterday(driver, store):
+                if not _collect_ad_funnel_metrics(driver, store_id, brand, store, target_date):
                     if attempt == 0:
-                        logger.warning("필터 설정 실패, Chrome 재시작 후 재시도: %s", store)
+                        logger.warning("Metric extraction failed, retrying browser: %s", store)
                         continue
-                    logger.warning("필터 설정 최종 실패, 건너뜀: %s", store)
+                    logger.warning("Metric extraction failed after retry, skipping: %s", store)
                     break
 
-                metrics = _extract_ad_metrics(driver, store)
-                if metrics is None:
-                    logger.info("광고 없음 또는 지표 추출 실패: %s / %s", store, target_date)
-                    succeeded = True
-                    break
-
-                saved = _save_ad_funnel_csv(metrics, brand, store, target_date)
-                logger.info("저장 완료: brand=%s store=%s → %s", brand, store, saved)
                 succeeded = True
                 break
 
             except Exception as e:
-                logger.warning("매장 수집 실패 (%s) attempt=%d: %s", store, attempt + 1, e)
+                logger.warning("Store collection failed (%s) attempt=%d: %s", store, attempt + 1, e)
             finally:
                 if driver:
                     try:
@@ -176,225 +443,6 @@ def collect_ad_funnel_for_account(
         time.sleep(random.uniform(0.5, 1.5))
 
     return failed_stores
-
-
-# ---------------------------------------------------------------------------
-# 필터 설정
-# ---------------------------------------------------------------------------
-
-def _set_ad_filter_yesterday(driver, store_name: str) -> bool:
-    """광고 통계 기간 필터 전체를 '일별 → 어제'로 설정한다.
-
-    페이지에 Filter-module__lRdH 버튼이 2개 존재:
-      [0] 노출수·클릭수 담당
-      [1] 주문수·주문금액 담당
-    둘 다 YESTERDAY로 설정해야 전체 지표가 어제 기준으로 갱신된다.
-    """
-    try:
-        # 전체 Filter 버튼 개수 확인
-        btn_count = driver.execute_script(
-            "return document.querySelectorAll('button.Filter-module__lRdH').length;"
-        )
-        if not btn_count:
-            logger.warning("Filter 버튼(Filter-module__lRdH) 미발견: %s", store_name)
-            return False
-        logger.info("Filter 버튼 %d개 발견: %s", btn_count, store_name)
-
-        for btn_idx in range(btn_count):
-            if not _apply_yesterday_to_filter(driver, btn_idx, store_name):
-                logger.warning("Filter[%d] 적용 실패: %s", btn_idx, store_name)
-                return False
-            time.sleep(0.3)
-
-        # 최종 검증: 모든 Filter 버튼 텍스트 확인
-        filter_texts = driver.execute_script(
-            """
-            return [...document.querySelectorAll('button.Filter-module__lRdH')]
-                .map(b => b.textContent.trim());
-            """
-        )
-        logger.info("날짜 필터 최종 확인: %s / %s", filter_texts, store_name)
-        if not all("어제" in t for t in filter_texts):
-            logger.warning("일부 Filter 버튼이 '어제'가 아님: %s", filter_texts)
-            return False
-
-        return True
-
-    except (TimeoutException, Exception) as e:
-        logger.warning("광고 필터 설정 오류 (%s): %s", store_name, e)
-        return False
-
-
-def _apply_yesterday_to_filter(driver, btn_idx: int, store_name: str) -> bool:
-    """지정된 인덱스의 Filter-module__lRdH 버튼을 클릭하고 DAILY → YESTERDAY → 적용."""
-    # 1. btn_idx 번째 Filter 버튼 클릭
-    clicked = driver.execute_script(
-        """
-        const btns = document.querySelectorAll('button.Filter-module__lRdH');
-        const btn = btns[arguments[0]];
-        if (!btn) return false;
-        btn.click();
-        return btn.textContent.trim().slice(0, 30);
-        """,
-        btn_idx,
-    )
-    if not clicked:
-        logger.warning("Filter[%d] 버튼 없음: %s", btn_idx, store_name)
-        return False
-    logger.info("Filter[%d] 클릭: %r / %s", btn_idx, clicked, store_name)
-    # DAILY 라디오 팝업이 나타날 때까지 대기 (고정 1.0s 제거)
-    WebDriverWait(driver, 10).until(
-        EC.presence_of_element_located(
-            (By.CSS_SELECTOR, 'input[name="ad-stats-period-filter"][value="DAILY"]')
-        )
-    )
-
-    # 2. DAILY 라디오 → label.click() (readonly=True)
-    daily = driver.execute_script(
-        """
-        const radio = document.querySelector('input[name="ad-stats-period-filter"][value="DAILY"]');
-        if (!radio) return 'not_found';
-        const lbl = document.querySelector('label[for="' + radio.id + '"]');
-        if (lbl) { lbl.click(); return 'label_clicked:' + lbl.textContent.trim(); }
-        radio.click(); return 'radio_fallback';
-        """
-    )
-    if daily == "not_found":
-        logger.warning("Filter[%d] DAILY 라디오 미발견: %s", btn_idx, store_name)
-        return False
-    logger.info("Filter[%d] DAILY: %s", btn_idx, daily)
-    # DAILY 클릭 후 React 배치 업데이트 완료 대기
-    # checked=True 만으로는 부족 — 렌더 사이클 완료까지 sleep 필수
-    time.sleep(0.5)
-
-    # 3. YESTERDAY 라디오 — visible한지 확인 후 label.click()
-    WebDriverWait(driver, 10).until(
-        lambda d: d.execute_script(
-            "const r = document.querySelector('input[name=\"period\"][value=\"YESTERDAY\"]');"
-            "return r && r.offsetParent !== null;"
-        )
-    )
-    yest = driver.execute_script(
-        """
-        const radio = document.querySelector('input[name="period"][value="YESTERDAY"]');
-        if (!radio) return 'not_found';
-        const lbl = document.querySelector('label[for="' + radio.id + '"]');
-        if (lbl) { lbl.click(); return 'label_clicked:' + lbl.textContent.trim(); }
-        radio.click(); return 'radio_fallback';
-        """
-    )
-    if yest == "not_found":
-        logger.warning("Filter[%d] YESTERDAY 라디오 미발견: %s", btn_idx, store_name)
-        return False
-    logger.info("Filter[%d] YESTERDAY: %s", btn_idx, yest)
-    time.sleep(0.5)  # React YESTERDAY 선택 반영 (0.3 → 0.5)
-
-    # 4. 적용 버튼 클릭 (JS click — headless 환경에서 ActionChains viewport 이탈 방지)
-    applied = driver.execute_script(
-        """
-        const btn = [...document.querySelectorAll('button')]
-            .find(b => b.innerText.trim() === '적용' || b.textContent.trim() === '적용');
-        if (!btn) return false;
-        btn.click();
-        return true;
-        """
-    )
-    if not applied:
-        logger.warning("Filter[%d] 적용 버튼 미발견: %s", btn_idx, store_name)
-        return False
-    # 필터 버튼 텍스트가 "어제"로 바뀔 때까지 대기
-    try:
-        WebDriverWait(driver, 15).until(
-            lambda d: "어제" in (d.execute_script(
-                "const btns = document.querySelectorAll('button.Filter-module__lRdH');"
-                "return btns[arguments[0]]?.textContent || '';",
-                btn_idx,
-            ) or "")
-        )
-    except TimeoutException:
-        logger.warning("Filter[%d] 적용 후 버튼 텍스트 미변경 (15s 초과): %s", btn_idx, store_name)
-        return False
-    return True
-
-
-# ---------------------------------------------------------------------------
-# 지표 추출
-# ---------------------------------------------------------------------------
-
-def _extract_ad_metrics(driver, store_name: str) -> dict | None:
-    """광고 funnel 지표 카드에서 노출수/클릭수/주문수/주문금액을 추출한다.
-
-    탭 버튼(Tab_b_r4ax)과 값 span(style*="margin") 순서를 index로 매핑한다.
-    광고가 없는 매장은 None 반환 (저장 스킵, 정상 처리).
-    Filter[1](주문수·주문금액) React 렌더 지연 대비: 4개 값 모두 로드될 때까지 최대 10초 대기.
-    """
-    try:
-        # 4개 지표 값이 모두 DOM에 나타날 때까지 대기
-        # (Filter[1] 적용 후 주문수·주문금액 렌더 지연 방지)
-        try:
-            WebDriverWait(driver, 10).until(
-                lambda d: (d.execute_script(
-                    "return [...document.querySelectorAll('span[style*=\"margin\"]')]"
-                    ".map(s=>s.textContent.trim()).filter(v=>/^[\\d,]+$/.test(v)).length;"
-                ) or 0) >= 4
-            )
-        except TimeoutException:
-            logger.warning("지표 4개 로드 10초 초과, 현재 상태로 추출 시도: %s", store_name)
-
-        result = driver.execute_script(
-            """
-            const LABELS = ['노출수', '클릭수', '주문수', '주문금액'];
-
-            // 광고 없음 체크
-            const body = document.body.textContent;
-            if (body.includes('등록된 광고가 없') || body.includes('광고를 설정')) {
-                return {status: 'no_ads'};
-            }
-
-            // 탭 버튼 순서 수집
-            const tabs = [...document.querySelectorAll('button[class*="Tab_b_r4ax"]')]
-                .map(b => b.textContent.trim())
-                .filter(t => LABELS.includes(t));
-
-            // 값 span 순서 수집 (style에 "margin" 포함 + 순수 숫자,콤마 패턴)
-            const vals = [...document.querySelectorAll('span[style*="margin"]')]
-                .map(s => s.textContent.trim())
-                .filter(v => /^[\\d,]+$/.test(v));
-
-            if (tabs.length === 0 || vals.length === 0) {
-                return {status: 'not_found', tabs, vals};
-            }
-
-            const metrics = {};
-            tabs.forEach((t, i) => { if (vals[i] !== undefined) metrics[t] = vals[i]; });
-            return {status: 'ok', metrics};
-            """
-        )
-
-        if result["status"] == "no_ads":
-            logger.info("광고 없는 매장: %s", store_name)
-            return None
-
-        if result["status"] == "not_found":
-            logger.warning(
-                "지표 추출 실패 (tabs=%s, vals=%s): %s",
-                result.get("tabs"), result.get("vals"), store_name,
-            )
-            return None
-
-        metrics = result["metrics"]
-        logger.info("지표 추출 완료: %s → %s", store_name, metrics)
-        return metrics
-
-    except Exception as e:
-        logger.warning("지표 추출 오류 (%s): %s", store_name, e)
-        return None
-
-
-# ---------------------------------------------------------------------------
-# 빈값 점검 + 재수집
-# ---------------------------------------------------------------------------
-
 def _validate_and_retry_ad_funnel(
     store_infos: list[dict],
     target_date: str,
@@ -419,12 +467,24 @@ def _validate_and_retry_ad_funnel(
             / "baemin_ad_funnel.csv"
         )
         if not csv_path.exists():
+            empty_stores.append(si)
+            logger.warning("ad_funnel CSV 미생성: %s / %s", store, target_date)
             continue
         df = pd.read_csv(csv_path, dtype=str)
         row = df[df["target_date"] == target_date]
         if row.empty:
+            empty_stores.append(si)
+            logger.warning("ad_funnel target_date 미생성: %s / %s", store, target_date)
             continue
         r = row.iloc[0]
+        status = str(r.get(_STATUS_COLUMN, "")).strip().lower()
+        if status == "no_ads":
+            logger.info("ad_funnel 광고 없음(정상): %s / %s", store, target_date)
+            continue
+        if status and status != "ok":
+            logger.warning("ad_funnel 수집 실패 상태: %s / %s / %s", store, target_date, status)
+            empty_stores.append(si)
+            continue
         if str(r.get("주문수", "")).strip() == "" or str(r.get("주문금액", "")).strip() == "":
             logger.warning("ad_funnel 빈값 발견: %s / %s", store, target_date)
             empty_stores.append(si)
@@ -463,7 +523,19 @@ def _validate_and_retry_ad_funnel(
             continue
         df2 = pd.read_csv(csv_path, dtype=str)
         row2 = df2[df2["target_date"] == target_date]
-        if row2.empty or str(row2.iloc[0].get("주문수", "")).strip() == "":
+        if row2.empty:
+            still_empty.append(si)
+            logger.warning("재수집 후 target_date 미생성: %s / %s", store, target_date)
+            continue
+        status = str(row2.iloc[0].get(_STATUS_COLUMN, "")).strip().lower()
+        if status == "no_ads":
+            logger.info("재수집 성공(광고 없음): %s / %s", store, target_date)
+            continue
+        if status and status != "ok":
+            still_empty.append(si)
+            logger.warning("재수집 후 parse_error 잔존: %s / %s / %s", store, target_date, status)
+            continue
+        if str(row2.iloc[0].get("주문수", "")).strip() == "":
             still_empty.append(si)
             logger.warning("재수집 후에도 빈값 잔존: %s / %s", store, target_date)
         else:
@@ -481,10 +553,12 @@ def _validate_and_retry_ad_funnel(
 # ---------------------------------------------------------------------------
 
 def _save_ad_funnel_csv(
-    metrics: dict,
+    metrics: dict | None,
     brand: str,
     store: str,
     target_date: str,
+    *,
+    status: str = "ok",
 ) -> Path:
     """광고 funnel 지표를 월별 CSV에 upsert 저장한다."""
     ym = target_date[:7]  # "YYYY-MM"
@@ -496,9 +570,10 @@ def _save_ad_funnel_csv(
         "collected_at": pendulum.now(KST).isoformat(),
         "target_date":  target_date,
         "store_name":   store,
+        _STATUS_COLUMN: status,
     }
     for label in _METRIC_LABELS:
-        row[label] = metrics.get(label, "")
+        row[label] = (metrics or {}).get(label, "")
 
     new_df = pd.DataFrame([row], columns=_COLUMNS)
 
@@ -512,3 +587,5 @@ def _save_ad_funnel_csv(
 
     combined.to_csv(out_path, index=False, encoding="utf-8-sig")
     return out_path
+
+

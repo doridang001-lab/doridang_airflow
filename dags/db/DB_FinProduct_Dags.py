@@ -28,6 +28,7 @@ from modules.transform.pipelines.db.DB_FinProduct import (
     send_alert_email,
     finalize_unionpos_pending,
     apply_review_approvals,
+    build_fin_product_mart,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,4 +100,10 @@ with DAG(
         python_callable=apply_review_approvals,
     )
 
-    t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7
+    t8 = PythonOperator(
+        task_id="build_fin_product_mart",
+        python_callable=build_fin_product_mart,
+        trigger_rule="all_done",
+    )
+
+    t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7 >> t8

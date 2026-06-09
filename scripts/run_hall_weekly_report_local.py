@@ -25,6 +25,7 @@ from _base import logger, run_script
 
 from modules.transform.utility.paths import MART_DB
 from modules.transform.pipelines.db.DB_Hall_Sales_Target_config import build_targets
+from modules.transform.pipelines.db.DB_Hall_Sales_Target import build_hall_sales_target
 from modules.transform.pipelines.db.DB_Hall_Sales_Excel import build_weekly_report_excel
 from modules.transform.pipelines.db.DB_Hall_Daily_Excel import build_daily_tracking_excel
 
@@ -46,6 +47,9 @@ def _open_in_excel(path) -> None:
 def main() -> dict:
     monthly_targets, marketing_monthly_targets, daily_tracking_target = build_targets()
 
+    csv_msg = build_hall_sales_target(monthly_targets=monthly_targets)
+    logger.info("매출 CSV: %s", csv_msg)
+
     weekly_msg = build_weekly_report_excel(
         monthly_targets=monthly_targets,
         marketing_monthly_targets=marketing_monthly_targets,
@@ -59,11 +63,9 @@ def main() -> dict:
     )
     logger.info("일간트래킹: %s", daily_msg)
 
-    # 생성 후 자동으로 Excel 실행
+    # 생성 후 주간보고만 자동 실행
     weekly_path = XLSX_DIR / f"hall_weekly_report_{date.today():%y%m%d}.xlsx"
-    daily_path = XLSX_DIR / "hall_daily_report.xlsx"
     _open_in_excel(weekly_path)
-    _open_in_excel(daily_path)
 
     return {
         "meta": {"script": "run_hall_weekly_report_local", "status": "ok"},

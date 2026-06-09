@@ -6,10 +6,9 @@
 출력: MART_DB/hall_sales_target/hall_sale_target.csv
 
 시간대 분류:
-  점심: order_time 06:00 ~ 15:59 (hour 6~15)
-  저녁: order_time 16:00 ~ 23:59 (hour 16~23)
-  미분류(hour=0 or NaN): 전체 합계에만 포함
-  ※ OKPOS는 order_time 미기록 시 "00:00:00" fallback → hour=0은 어느 쪽에도 미분류
+  점심: 06:00 <= order_time < 16:00
+  저녁: 16:00 <= order_time < 24:00
+  order_time이 00:00:00인 취소/조정 행은 같은 날짜의 원 주문번호 시간대로 재배정
 
 집계 기준:
   (기준월, week_start) 2키 groupby → 크로스-먼스 주는 월별로 2행 분리
@@ -44,6 +43,65 @@ def _week_label(ym: str, week_start: pd.Timestamp) -> str:
     return f"{month}월{week_num}주차"
 
 
+def classify_hall_time_slots(df: pd.DataFrame) -> pd.DataFrame:
+    """점심/저녁 시간대를 부여한다.
+
+    OKPOS 취소/조정 행은 order_time이 00:00:00으로 들어올 수 있다. 이 경우 order_id의
+    POS/주문번호를 원 주문과 매칭해 같은 시간대로 넣고, 매칭 실패 시 해당 일자의 매출 비중이
+    큰 시간대로 배정해 점심+저녁 합계가 전체 매출과 일치하도록 한다.
+    """
+    df = df.copy()
+    raw_hour = (
+        df["order_time"].astype(str).str.strip()
+        .str.extract(r"^(\d{2}):", expand=False)
+        .pipe(pd.to_numeric, errors="coerce")
+        .astype("Int64")
+    )
+    raw_hour = raw_hour.where(raw_hour != 0, other=pd.NA)
+    lunch_mask = ((raw_hour >= 6) & (raw_hour < 16)).fillna(False)
+    dinner_mask = ((raw_hour >= 16) & (raw_hour < 24)).fillna(False)
+    df["time_slot"] = pd.NA
+    df.loc[lunch_mask, "time_slot"] = "점심"
+    df.loc[dinner_mask, "time_slot"] = "저녁"
+
+    if "order_id" not in df.columns or df.empty:
+        df["time_slot"] = df["time_slot"].fillna("저녁")
+        return df
+
+    order_parts = (
+        df["order_id"].fillna("").astype(str).str.strip()
+        .str.extract(r"_(\d+)[-_](\d+)_\d{2}:\d{2}:\d{2}$")
+    )
+    df["_slot_pos"] = order_parts[0]
+    df["_slot_seq"] = order_parts[1]
+
+    match_cols = ["sale_date", "_slot_pos", "_slot_seq"]
+    known = df[df["time_slot"].notna() & df["_slot_pos"].notna() & df["_slot_seq"].notna()]
+    if not known.empty:
+        lookup = known.drop_duplicates(match_cols).set_index(match_cols)["time_slot"]
+        missing = df["time_slot"].isna() & df["_slot_pos"].notna() & df["_slot_seq"].notna()
+        if missing.any():
+            keys = pd.MultiIndex.from_frame(df.loc[missing, match_cols])
+            df.loc[missing, "time_slot"] = lookup.reindex(keys).to_numpy()
+
+    remaining = df["time_slot"].isna()
+    if remaining.any():
+        valid = df[df["time_slot"].notna()].copy()
+        if not valid.empty:
+            valid["_abs_sale"] = valid["total_price"].abs()
+            day_default = (
+                valid.groupby(["sale_date", "time_slot"], observed=True)["_abs_sale"].sum()
+                .reset_index()
+                .sort_values(["sale_date", "_abs_sale"])
+                .drop_duplicates("sale_date", keep="last")
+                .set_index("sale_date")["time_slot"]
+            )
+            df.loc[remaining, "time_slot"] = df.loc[remaining, "sale_date"].map(day_default)
+
+    df["time_slot"] = df["time_slot"].fillna("저녁")
+    return df.drop(columns=["_slot_pos", "_slot_seq"], errors="ignore")
+
+
 def _load_hall_df() -> pd.DataFrame:
     files = sorted(UNIFIED_ROOT.glob("unified_sales_*.parquet"))
     if not files:
@@ -67,23 +125,7 @@ def _load_hall_df() -> pd.DataFrame:
     # 기준월: sale_date 기준 월("YYYY-MM") — groupby 키로 사용
     df["기준월"] = df["sale_date"].dt.strftime("%Y-%m")
 
-    # order_time("HH:MM:SS") → hour 추출
-    # 빈값("") or OKPOS fallback("00:00:00") → NaN(미분류)
-    raw_hour = (
-        df["order_time"].astype(str).str.strip()
-        .str.extract(r"^(\d{2}):", expand=False)
-        .pipe(pd.to_numeric, errors="coerce")
-        .astype("Int64")
-    )
-    raw_hour = raw_hour.where(raw_hour != 0, other=pd.NA)  # hour=0 → 미분류
-
-    df["time_slot"] = pd.cut(
-        raw_hour,
-        bins=[5, 15, 23],
-        labels=["점심", "저녁"],
-        right=True,
-    )
-    return df
+    return classify_hall_time_slots(df)
 
 
 def _agg_group(sub: pd.DataFrame, prefix: str) -> pd.DataFrame:

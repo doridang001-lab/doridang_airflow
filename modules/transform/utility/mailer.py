@@ -3,6 +3,10 @@
 Airflow SMTP Connection을 통해 HTML 메일과 inline image를 함께 전송한다.
 """
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def text_to_html(text):
     """일반 텍스트를 HTML로 변환한다."""
@@ -90,13 +94,22 @@ def send_email(
         msg.attach(attachment_part)
 
     try:
-        print(f"메일 발송 시작: 수신={to_list}, 제목={subject}")
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_password)
-            server.send_message(msg)
-        print(f"메일 발송 성공: {len(to_list)}명")
+        logger.info("메일 발송 시작: 수신=%s, 제목=%s", to_list, subject)
+        if int(smtp_port) == 465:
+            # SSL-only 포트: 처음부터 SSL 연결 (starttls 불필요)
+            with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+        else:
+            # STARTTLS 포트 (587 등)
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+        logger.info("메일 발송 성공: %d명", len(to_list))
         return f"메일 발송 완료: {len(to_list)}명"
     except Exception as exc:
-        print(f"메일 발송 실패: {exc}")
+        logger.error("메일 발송 실패: %s", exc)
         raise

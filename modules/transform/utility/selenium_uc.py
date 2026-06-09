@@ -71,7 +71,7 @@ def configure_uc_data_path(data_path: str | None = None) -> str | None:
     드라이버를 생성/패치하려다 권한/HOME 문제로 실패하는 케이스를 방지한다.
 
     - AIRFLOW_HOME 이 있는 경우에만 적용(로컬 영향 최소화)
-    - 기본값은 OS temp (/tmp 등)
+    - 기본값은 AIRFLOW_HOME/uc_data (컨테이너 재시작 시 다운로드 방지)
     - uc.patcher.Patcher.data_path 를 런타임에 덮어써서 다운로드/패치 경로를 고정
     """
     if os.getenv("AIRFLOW_HOME") is None:
@@ -80,7 +80,7 @@ def configure_uc_data_path(data_path: str | None = None) -> str | None:
     desired = (
         data_path
         or os.getenv("UC_DATA_DIR")
-        or os.path.join(tempfile.gettempdir(), "undetected_chromedriver")
+        or os.path.join(os.getenv("AIRFLOW_HOME"), "uc_data")
     )
 
     try:
@@ -186,6 +186,26 @@ def _apply_failfast_client(driver, timeout_sec: int = 30, log_fn: Callable[[str]
         _emit_uc_log(log_fn, f"failfast client config 적용 실패(무시): {err}")
 
 
+def _is_network_launch_error(msg: str) -> bool:
+    """Chrome launch 중 발생한 일시적 DNS/네트워크 오류인지 판별.
+
+    Docker 임베디드 DNS(127.0.0.11)가 부하 시 간헐 드롭하면 undetected_chromedriver의
+    launch-시 네트워크 호출이 'No address associated with hostname' 등으로 실패한다.
+    이는 수 초 내 해소되는 블립이므로 재시도로 흡수한다.
+    """
+    return any(
+        s in msg
+        for s in (
+            "No address associated with hostname",
+            "Name or service not known",
+            "Temporary failure in name resolution",
+            "urlopen error",
+            "Max retries exceeded with url",
+            "Failed to establish a new connection",
+        )
+    )
+
+
 def launch_uc_chrome(
     options: uc.ChromeOptions,
     account_id: str | None = None,
@@ -208,14 +228,41 @@ def launch_uc_chrome(
     kwargs: dict = {"options": options}
     if detected_version is not None:
         kwargs["version_main"] = detected_version
+
+    # 캐시된 chromedriver가 있으면 직접 지정 → UC의 launch-시 네트워크(드라이버 다운로드/버전체크)
+    # 호출을 제거한다. Docker 임베디드 DNS 간헐 드롭 시 launch가 통째로 실패(성공 0/N)하던
+    # 문제를 차단하는 핵심 — 평시 실행을 네트워크 비의존으로 만든다.
+    if data_dir:
+        cached_driver = Path(data_dir) / "undetected_chromedriver"
+        if cached_driver.exists() and os.access(cached_driver, os.X_OK):
+            kwargs["driver_executable_path"] = str(cached_driver)
+            _emit_uc_log(log_fn, f"캐시 드라이버 사용(네트워크 비의존): {cached_driver}")
+
     _emit_uc_log(log_fn, f"launch uc chrome with version_main={detected_version or 'auto'}")
 
-    try:
-        with _uc_launch_lock():
-            driver = uc.Chrome(**kwargs)
-        _apply_failfast_client(driver, log_fn=log_fn)
-        return driver
-    except Exception as exc:
+    # 일시적 DNS/네트워크 오류는 재시도로 흡수 (블립은 수 초 내 해소)
+    last_exc: Exception | None = None
+    for net_attempt in range(3):
+        try:
+            with _uc_launch_lock():
+                driver = uc.Chrome(**kwargs)
+            _apply_failfast_client(driver, log_fn=log_fn)
+            return driver
+        except Exception as exc:
+            last_exc = exc
+            if _is_network_launch_error(str(exc)) and net_attempt < 2:
+                wait = 5.0 * (net_attempt + 1)
+                _emit_uc_log(
+                    log_fn,
+                    f"launch 네트워크 오류, {wait:.0f}s 후 재시도 {net_attempt + 1}/3: {exc}",
+                )
+                time.sleep(wait)
+                continue
+            break
+
+    # 네트워크 재시도로도 해결 안 됨 → 기존 폴백(version mismatch / 바이너리 오염) 처리
+    if True:
+        exc = last_exc
         err_str = str(exc)
 
         # version mismatch: 에러 메시지에서 올바른 버전 추출 후 재시도
@@ -235,7 +282,7 @@ def launch_uc_chrome(
             except Exception:
                 pass
 
-        # RemoteDisconnected / ProtocolError: 바이너리 오염 → 삭제 후 재시도
+        # RemoteDisconnected / ProtocolError: 바이너리 오염 → 삭제 후 재시도(재다운로드)
         if "RemoteDisconnected" in err_str or "Connection aborted" in err_str:
             _emit_uc_log(log_fn, "RemoteDisconnected: UC driver binary 강제 삭제 후 재시도")
             if data_dir:
@@ -246,9 +293,11 @@ def launch_uc_chrome(
                     except Exception:
                         pass
             configure_uc_data_path()
+            # 캐시 삭제 후 재다운로드해야 하므로 driver_executable_path 제거
+            retry_kwargs = {k: v for k, v in kwargs.items() if k != "driver_executable_path"}
             try:
                 with _uc_launch_lock():
-                    driver = uc.Chrome(**kwargs)
+                    driver = uc.Chrome(**retry_kwargs)
                 _apply_failfast_client(driver, log_fn=log_fn)
                 return driver
             except Exception:
@@ -261,4 +310,6 @@ def launch_uc_chrome(
             f"detected version={detected_version or 'auto'} "
             f"original exception={exc}",
         )
-        raise
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("browser launch failed (no exception captured)")

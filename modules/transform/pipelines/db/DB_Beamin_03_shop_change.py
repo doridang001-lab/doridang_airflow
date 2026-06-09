@@ -15,6 +15,8 @@ import logging
 import random
 import re
 import time
+from datetime import UTC, datetime
+from datetime import timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -39,6 +41,7 @@ from modules.extract.croling_beamin import (
 )
 from modules.transform.utility.paths import BAEMIN_SHOP_CHANGE_DB, BAEMIN_SHOP_OPERATION_DB
 from modules.transform.utility.notifier import send_telegram, _send_email_alert
+from modules.transform.pipelines.db.beamin_stability import resolve_stability_profile
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +77,15 @@ CSV_COLUMNS = [
 _MAX_BROWSER_RETRY = 3  # Chrome 크래시 시 재시도 횟수
 
 
+# ⚠️ DEAD CODE 경고 (과거 리팩터 잔재): 아래 함수들은 동일 이름이 파일 뒤쪽에서
+#    재정의되어 Python이 항상 "뒤쪽(live) 정의"를 사용한다. 앞쪽 정의는 호출되지 않는다.
+#    수정 시 반드시 live 정의를 편집할 것:
+#       collect_shop_change       : dead=86  / live=210
+#       _wait_for_item_expanded   : dead=662 / live=1257
+#       _extract_change_rows      : dead=762 / live=1367   (증분수집 R1 적용 위치)
+#       _parse_change_history_item: dead=866 / live=1268
+#       _save_csv                 : dead=1172 / live=1496
+#    (물리 삭제는 작동 코드 손상 위험이 있어 보류 — 마커로 혼동만 차단)
 def _store_collection_sort_key(store_info: dict) -> tuple[int, str, str]:
     return (
         BRAND_COLLECTION_ORDER.get(store_info.get("brand", ""), 99),
@@ -202,7 +214,6 @@ def _flush_shop_change_alerts() -> None:
         lines.append(f"[parse] ... {len(parse_failures) - _SHOP_CHANGE_ALERT_LIMIT} more")
 
     body = "\n".join(lines)
-    _send_email_alert("[Airflow partial] DB_Beamin_Macro_Dags / collect_shop_change", body)
     send_telegram(body)
 
 
@@ -286,9 +297,9 @@ def collect_shop_change(account_list: list[dict]) -> str:
                     store_done = True
                     break
                 except Exception as e:
-                    if _is_driver_crash_error(e) and attempt < _MAX_BROWSER_RETRY:
+                    if attempt < _MAX_BROWSER_RETRY:
                         logger.warning(
-                            "Chrome 크래시 store 재시도 %d/%d %s | %s",
+                            "store 변경이력 수집 중 오류 발생, 재시도 %d/%d %s | %s",
                             attempt + 1,
                             _MAX_BROWSER_RETRY,
                             target_label,
@@ -298,7 +309,7 @@ def collect_shop_change(account_list: list[dict]) -> str:
                         continue
 
                     logger.error(
-                        "store 변경이력 수집 실패 [%s]: %s",
+                        "store 변경이력 수집 최종 실패 [%s]: %s",
                         target_label,
                         e,
                         exc_info=True,
@@ -326,6 +337,8 @@ def collect_shop_change(account_list: list[dict]) -> str:
     summary = f"성공 {success}/{success + fail} 계정 / store_fail={store_fail}"
     _flush_shop_change_alerts()
     logger.info(summary)
+    if fail > 0 or store_fail > 0:
+        raise RuntimeError(f"collect_shop_change partial failure: {summary}")
     return summary
 
 
@@ -1168,6 +1181,179 @@ def _save_operation_csv(rows: list[dict], brand: str, store: str) -> Path:
     return out_path
 
 
+def collect_shop_change(account_list: list[dict], stability_profile: str | None = None) -> dict:
+    profile = resolve_stability_profile(stability_profile)
+    success, fail = 0, 0
+    store_fail = 0
+    metrics = {
+        "profile": profile["name"],
+        "started_at": datetime.now(UTC).isoformat(),
+        "total_accounts": len(account_list),
+        "browser_launch_count": 0,
+        "login_attempt_count": 0,
+        "login_failure_count": 0,
+        "session_recovery_count": 0,
+        "account_wait_sec_total": 0.0,
+        "failed_accounts": [],
+        "failed_stores": [],
+    }
+    _reset_shop_change_alerts()
+
+    for account in account_list:
+        account_id = account["account_id"]
+        driver = None
+        try:
+            metrics["browser_launch_count"] += 1
+            driver = launch_browser(account_id)
+            metrics["login_attempt_count"] += 1
+            if not login_baemin(driver, account_id, account["password"]):
+                metrics["login_failure_count"] += 1
+                raise RuntimeError(f"login failed: {account_id}")
+
+            requested_store_names = [str(account.get("store_name") or "").strip()] if account.get("store_name") else None
+            store_list = _load_shop_change_store_list(
+                driver,
+                account_id,
+                requested_store_names=requested_store_names,
+            )
+            if not store_list:
+                raise RuntimeError(f"no stores to collect: {account_id}")
+
+            for index, store_info in enumerate(store_list, start=1):
+                try:
+                    collect_shop_change_for_driver(driver, [store_info])
+                except Exception as exc:
+                    if _is_driver_crash_error(exc):
+                        metrics["session_recovery_count"] += 1
+                        quit_driver_safely(driver, account_id)
+                        _force_kill_chrome(account_id)
+                        metrics["browser_launch_count"] += 1
+                        driver = launch_browser(account_id)
+                        metrics["login_attempt_count"] += 1
+                        if not login_baemin(driver, account_id, account["password"]):
+                            metrics["login_failure_count"] += 1
+                            raise RuntimeError(f"session recovery login failed: {account_id}") from exc
+                        collect_shop_change_for_driver(driver, [store_info])
+                    else:
+                        store_fail += 1
+                        metrics["failed_stores"].append(
+                            {"account_id": account_id, "store_name": f"{store_info['brand']} {store_info['store']}", "reason": str(exc)}
+                        )
+                        _push_shop_change_alert("collection_failures", _format_store_target(store_info), str(exc))
+
+                if index % int(profile["driver_restart_every_stores"]) == 0:
+                    try:
+                        logout_baemin(driver, account_id)
+                    except Exception:
+                        pass
+                    quit_driver_safely(driver, account_id)
+                    _force_kill_chrome(account_id)
+                    metrics["browser_launch_count"] += 1
+                    driver = launch_browser(account_id)
+                    metrics["login_attempt_count"] += 1
+                    if not login_baemin(driver, account_id, account["password"]):
+                        metrics["login_failure_count"] += 1
+                        raise RuntimeError(f"periodic relogin failed: {account_id}")
+
+            success += 1
+        except Exception as exc:
+            logger.error("collect_shop_change account failure [%s]: %s", account_id, exc, exc_info=True)
+            fail += 1
+            metrics["failed_accounts"].append(account_id)
+            _push_shop_change_alert("collection_failures", account_id, str(exc))
+        finally:
+            if driver is not None:
+                try:
+                    logout_baemin(driver, account_id)
+                except Exception:
+                    pass
+                quit_driver_safely(driver, account_id)
+            _force_kill_chrome(account_id)
+
+        wait_sec = random.uniform(*profile["account_wait_range"])
+        metrics["account_wait_sec_total"] += round(wait_sec, 1)
+        logger.info("다음 계정까지 %.0f초 대기", wait_sec)
+        time.sleep(wait_sec)
+
+    summary = f"성공 {success}/{success + fail} 계정 / store_fail={store_fail}"
+    metrics["ended_at"] = datetime.now(UTC).isoformat()
+    _flush_shop_change_alerts()
+    logger.info(summary)
+    return {"summary": summary, "metrics": metrics}
+
+
+def collect_shop_change_for_driver(driver, store_list: list[dict]) -> None:
+    try:
+        driver.set_page_load_timeout(5)
+        driver.get("about:blank")
+    except Exception:
+        pass
+    try:
+        driver.set_page_load_timeout(25)
+        driver.get(SHOP_CHANGE_URL)
+    except Exception as exc:
+        logger.warning("변경이력 페이지 진입 지연: %s", exc)
+
+    if not wait_for_page(driver, SELECT_CSS, timeout=30):
+        raise RuntimeError("shop_change select load failed")
+
+    page_options = _get_page_options(driver)
+    matched_stores = sorted(
+        _dedupe_store_targets([s for s in store_list if s["store_id"] in page_options]),
+        key=_store_collection_sort_key,
+    )
+    if not matched_stores:
+        logger.info("변경이력 대상 없음: %s", [s.get("store_id") for s in store_list])
+        return
+
+    for index, store_info in enumerate(matched_stores):
+        store_id = store_info["store_id"]
+        target_label = _format_store_target(store_info)
+        logger.info("변경이력 수집 시작: %s", target_label)
+        if index > 0 and not _ensure_shop_change_page(driver, target_label):
+            raise RuntimeError(f"select reload failed: {target_label}")
+
+        sel_elem = driver.find_element(By.CSS_SELECTOR, SELECT_CSS)
+        Select(sel_elem).select_by_value(store_id)
+        time.sleep(1.0)
+        btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, QUERY_BTN_CSS))
+        )
+        human_click(driver, btn)
+        result_state = _wait_for_change_results(driver, target_label)
+        if result_state != "ready":
+            raise RuntimeError(f"query state={result_state}: {target_label}")
+
+        time.sleep(0.5)
+        full_name = _get_full_name(page_options.get(store_id, store_info["store"]))
+        rows = _extract_change_rows(driver, store_info, full_name)
+        if rows:
+            saved = _save_csv(rows, store_info["brand"], store_info["store"])
+            logger.info("저장 완료: %s -> %s (%d건)", target_label, saved, len(rows))
+        else:
+            logger.info("정상 빈값 신호: %s", target_label)
+
+    logger.info("운영시간 수집 시작: %d개 매장", len(matched_stores))
+    for store_info in matched_stores:
+        full_name = _get_full_name(page_options.get(store_info["store_id"], store_info["store"]))
+        op_rows = _collect_one_store_operation(driver, store_info, full_name)
+        if op_rows:
+            _save_operation_csv(op_rows, store_info["brand"], store_info["store"])
+        else:
+            logger.info("운영시간 빈값: %s", _format_store_target(store_info))
+
+    from modules.transform.pipelines.db.DB_Beamin_monthly_operation import compute_monthly_operation  # noqa: PLC0415
+
+    ym = pendulum.now(KST).format("YYYY-MM")
+    for store_info in matched_stores:
+        try:
+            compute_monthly_operation(
+                store_info["brand"], store_info["store"], store_info["store_id"], ym
+            )
+        except Exception as exc:
+            logger.warning("월간 운영 요약 실패 (%s): %s", _format_store_target(store_info), exc)
+
+
 def _save_csv(rows: list[dict], brand: str, store: str) -> Path:
     """upsert 방식으로 CSV 저장 (ym 파티션).
 
@@ -1269,68 +1455,129 @@ def _parse_change_history_item(
 ) -> dict | None:
     title, date_attr, _ = _get_item_summary(item)
     base = {column: "" for column in CSV_COLUMNS}
-    base["?섏쭛?쇱떆"] = iso
-    base["留ㅼ옣紐?"] = full_name
+    base["수집일시"] = iso
+    base["매장명"] = full_name
     base["store_id"] = store_info["store_id"]
-    base["吏??챸"] = area_name
-    base["?遺꾨쪟"] = title
-    base["蹂寃쎌떆媛?"] = date_attr
+    base["지역명"] = area_name
+    base["대분류"] = title
+    base["변경시간"] = date_attr
 
     content_text = _expanded_content_text(item)
     if not content_text:
-        logger.warning("?뺤옣???곸꽭 ?띿뒪???놁쓬: %s -> %s", _format_store_target(store_info), title)
+        logger.warning("확장된 상세 텍스트 없음: %s -> %s", _format_store_target(store_info), title)
         _push_shop_change_alert("parse_failures", _format_store_target(store_info), f"missing detail text: {title}")
         return base
 
     after_text, before_text = _split_after_before_text(content_text)
-    label_category = "遺꾨쪟"
-    label_changed_at = "蹂寃쎌떆媛?"
-    label_worker = "?묒뾽??"
-    base["遺꾨쪟"] = _extract_labeled_value(content_text, label_category)
-    base["蹂寃쎌떆媛?"] = _extract_labeled_value(content_text, label_changed_at) or date_attr
-    base["?묒뾽??"] = _extract_labeled_value(content_text, label_worker)
+    label_category = "분류"
+    label_changed_at = "변경시간"
+    label_worker = "작업자"
+    base["분류"] = _extract_labeled_value(content_text, label_category)
+    base["변경시간"] = _extract_labeled_value(content_text, label_changed_at) or date_attr
+    base["작업자"] = _extract_labeled_value(content_text, label_worker)
 
-    if "?곸뾽?꾩떆以묒?" in title:
+    if "영업임시중지" in title:
         after_d = _parse_business_pause_data(after_text or content_text)
         before_d = _parse_business_pause_data(before_text)
-        base["蹂寃쏀썑_?ъ쑀"] = after_d["reason"]
-        base["蹂寃쏀썑_媛寃뚯쨷吏"] = after_d["store_closure"]
-        base["蹂寃쏀썑_諛곕?諛곕떖"] = after_d["baemin_delivery"]
-        base["蹂寃쎌쟾_?ъ쑀"] = before_d["reason"]
-        base["蹂寃쎌쟾_媛寃뚯쨷吏"] = before_d["store_closure"]
-        base["蹂寃쎌쟾_諛곕?諛곕떖"] = before_d["baemin_delivery"]
-    elif "?대Т??" in title:
+        base["변경후_사유"] = after_d["reason"]
+        base["변경후_가게중지"] = after_d["store_closure"]
+        base["변경후_배민배달"] = after_d["baemin_delivery"]
+        base["변경전_사유"] = before_d["reason"]
+        base["변경전_가게중지"] = before_d["store_closure"]
+        base["변경전_배민배달"] = before_d["baemin_delivery"]
+    elif "휴무일" in title:
         after_h = _parse_holiday_data(after_text or content_text)
         before_h = _parse_holiday_data(before_text)
-        base["蹂寃쏀썑_?뺢린?대Т??"] = after_h["regular"]
-        base["蹂寃쏀썑_?꾩떆?대Т??"] = after_h["temp"]
-        base["蹂寃쎌쟾_?뺢린?대Т??"] = before_h["regular"]
-        base["蹂寃쎌쟾_?꾩떆?대Т??"] = before_h["temp"]
-    elif "?댁쁺?쒓컙" in title:
-        base["蹂寃쏀썑_?댁쁺?쒓컙"] = after_text or content_text
-        base["蹂寃쎌쟾_?댁쁺?쒓컙"] = before_text
+        base["변경후_정기휴무일"] = after_h["regular"]
+        base["변경후_임시휴무일"] = after_h["temp"]
+        base["변경전_정기휴무일"] = before_h["regular"]
+        base["변경전_임시휴무일"] = before_h["temp"]
+    elif "운영시간" in title:
+        base["변경후_운영시간"] = after_text or content_text
+        base["변경전_운영시간"] = before_text
 
     return base
 
 
 def _row_signature(row: dict) -> tuple[str, ...]:
     return (
-        str(row.get("?遺꾨쪟", "")),
-        str(row.get("蹂寃쎌떆媛?", "")),
-        str(row.get("?묒뾽??", "")),
-        str(row.get("蹂寃쏀썑_?댁쁺?쒓컙", "")),
-        str(row.get("蹂寃쎌쟾_?댁쁺?쒓컙", "")),
-        str(row.get("蹂寃쏀썑_?ъ쑀", "")),
-        str(row.get("蹂寃쎌쟾_?ъ쑀", "")),
-        str(row.get("蹂寃쏀썑_?뺢린?대Т??", "")),
-        str(row.get("蹂寃쎌쟾_?뺢린?대Т??", "")),
-        str(row.get("蹂寃쏀썑_?꾩떆?대Т??", "")),
-        str(row.get("蹂寃쎌쟾_?꾩떆?대Т??", "")),
-        str(row.get("蹂寃쏀썑_媛寃뚯쨷吏", "")),
-        str(row.get("蹂寃쎌쟾_媛寃뚯쨷吏", "")),
-        str(row.get("蹂寃쏀썑_諛곕?諛곕떖", "")),
-        str(row.get("蹂寃쎌쟾_諛곕?諛곕떖", "")),
+        str(row.get("대분류", "")),
+        str(row.get("변경시간", "")),
+        str(row.get("작업자", "")),
+        str(row.get("변경후_운영시간", "")),
+        str(row.get("변경전_운영시간", "")),
+        str(row.get("변경후_사유", "")),
+        str(row.get("변경전_사유", "")),
+        str(row.get("변경후_정기휴무일", "")),
+        str(row.get("변경전_정기휴무일", "")),
+        str(row.get("변경후_임시휴무일", "")),
+        str(row.get("변경전_임시휴무일", "")),
+        str(row.get("변경후_가게중지", "")),
+        str(row.get("변경전_가게중지", "")),
+        str(row.get("변경후_배민배달", "")),
+        str(row.get("변경전_배민배달", "")),
     )
+
+
+def _last_collected_date(brand: str, store: str):
+    """이미 저장된 변경이력 CSV(전 ym 파티션)에서 가장 최근 '변경시간' 날짜를 반환.
+
+    증분 수집용 — 저장본이 없으면 None. 매 실행 60일 전체 재스크롤 대신
+    마지막 수집 지점까지만 스크롤하기 위한 기준.
+    """
+    try:
+        paths = list(
+            BAEMIN_SHOP_CHANGE_DB.glob(
+                f"brand={brand}/store={store}/ym=*/shop_change.csv"
+            )
+        )
+    except Exception:
+        return None
+
+    max_date = None
+    for p in paths:
+        try:
+            df = pd.read_csv(p, dtype=str, usecols=["변경시간"])
+        except Exception:
+            continue
+        dates = pd.to_datetime(df["변경시간"], errors="coerce").dropna()
+        if dates.empty:
+            continue
+        d = dates.max().date()
+        if max_date is None or d > max_date:
+            max_date = d
+    return max_date
+
+
+def _existing_change_keys(brand: str, store: str) -> set[tuple[str, str]]:
+    """Return previously saved (date, category) keys for a store.
+
+    CSV의 '변경시간'은 'YYYY-MM-DD HH:MM:SS' 형식이지만, DOM의 date_attr은
+    'YYYY-MM-DD' 날짜만 제공한다. 앞 10자리(날짜)만 추출해 비교하여
+    이미 수집된 항목을 클릭 없이 즉시 스킵할 수 있게 한다.
+    같은 날짜·같은 대분류의 중복 수집은 _row_signature dedup이 방어한다.
+    """
+    keys: set[tuple[str, str]] = set()
+    try:
+        paths = list(
+            BAEMIN_SHOP_CHANGE_DB.glob(
+                f"brand={brand}/store={store}/ym=*/shop_change.csv"
+            )
+        )
+    except Exception:
+        return keys
+
+    for p in paths:
+        try:
+            df = pd.read_csv(p, dtype=str, usecols=["변경시간", "대분류"]).fillna("")
+        except Exception:
+            continue
+        for _, row in df.iterrows():
+            changed_at = str(row.get("변경시간", ""))[:10].strip()
+            category = str(row.get("대분류", "")).strip()
+            if changed_at and category:
+                keys.add((changed_at, category))
+    return keys
 
 
 def _extract_change_rows(driver, store_info: dict, full_name: str) -> list[dict]:
@@ -1340,9 +1587,26 @@ def _extract_change_rows(driver, store_info: dict, full_name: str) -> list[dict]
     target_label = _format_store_target(store_info)
     processed_rows: set[tuple[str, ...]] = set()
     failed_items: set[str] = set()
+    existing_keys = _existing_change_keys(
+        store_info.get("brand", ""), store_info.get("store", "")
+    )
+    skipped_existing: set[tuple[str, str]] = set()
     all_rows: list[dict] = []
     no_new = 0
-    cutoff_date = pendulum.now(KST).subtract(days=_COLLECT_DAYS).date()
+    # 증분 커트오프: 60일 floor와 (마지막 저장 변경일 - 1일 overlap) 중 더 최근.
+    # 저장은 signature dedup이라 overlap 재수집은 무해. 첫 수집만 60일 전체.
+    floor_date = pendulum.now(KST).subtract(days=_COLLECT_DAYS).date()
+    last_saved = _last_collected_date(store_info.get("brand", ""), store_info.get("store", ""))
+    if last_saved is not None:
+        incr_date = last_saved - timedelta(days=1)
+        cutoff_date = max(floor_date, incr_date)
+        logger.info(
+            "증분 커트오프: %s (마지막 저장=%s, 60일floor=%s)",
+            cutoff_date, last_saved, floor_date,
+        )
+    else:
+        cutoff_date = floor_date
+        logger.info("최초 수집 커트오프(60일): %s", cutoff_date)
 
     _scroll_to_top(driver)
     time.sleep(0.3)
@@ -1366,6 +1630,10 @@ def _extract_change_rows(driver, store_info: dict, full_name: str) -> list[dict]
                 if item_key in failed_items or not item_key:
                     continue
                 if not title.strip():
+                    continue
+                summary_key = (str(date_attr or "")[:10].strip(), str(title or "").strip())
+                if summary_key in existing_keys:
+                    skipped_existing.add(summary_key)
                     continue
 
                 # 커트오프 이전 항목 → 정렬 내림차순이므로 이후 항목도 모두 오래됨
@@ -1397,7 +1665,14 @@ def _extract_change_rows(driver, store_info: dict, full_name: str) -> list[dict]
                     human_click(driver, click_target)
                     time.sleep(0.8)
                     if not _wait_for_item_expanded(item):
-                        logger.warning("항목 확장 대기 실패, 파싱 시도: %s -> %s", target_label, item_key)
+                        # 1회 재클릭 후 더 길게 재대기 (확장 전 파싱으로 인한 누락 방지)
+                        try:
+                            human_click(driver, click_target)
+                        except StaleElementReferenceException:
+                            pass
+                        time.sleep(1.0)
+                        if not _wait_for_item_expanded(item, attempts=15, delay=0.3):
+                            logger.warning("항목 확장 대기 실패(재시도 후), 파싱 시도: %s -> %s", target_label, item_key)
 
                 row = _parse_change_history_item(item, iso, store_info, full_name, area_name)
                 if row is None:
@@ -1436,9 +1711,14 @@ def _extract_change_rows(driver, store_info: dict, full_name: str) -> list[dict]
         _scroll_by(driver, 500)
         time.sleep(random.uniform(0.3, 0.5))
 
-    if not all_rows:
+    if not all_rows and not skipped_existing:
         _push_shop_change_alert("parse_failures", target_label, "zero parsed rows")
-    logger.info("변경이력 추출 완료: %s -> %d건", target_label, len(all_rows))
+    logger.info(
+        "변경이력 추출 완료: %s -> 신규 %d건 / 기존스킵 %d건",
+        target_label,
+        len(all_rows),
+        len(skipped_existing),
+    )
     return all_rows
 
 
@@ -1466,5 +1746,5 @@ def _save_csv(rows: list[dict], brand: str, store: str) -> Path:
         combined = new_df.drop(columns=["_sig"])
 
     combined.to_csv(out_path, index=False, encoding="utf-8-sig")
-    logger.info("CSV 蹂묓빀 저장 완료: brand=%s store=%s -> %s (%d건)", brand, store, out_path, len(combined))
+    logger.info("CSV 병합 저장 완료: brand=%s store=%s -> %s (%d건)", brand, store, out_path, len(combined))
     return out_path

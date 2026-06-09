@@ -8,6 +8,7 @@
 """
 
 import logging
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -201,4 +202,77 @@ def validate_coupang_toorder(target_date: str, allowed_stores: set | None = None
         logger.info("총액 일치: %d원", toorder_total)
 
     result["matched"] = matched
+    return result
+
+
+# ============================================================
+# CMG vs ToOrder 검증
+# ============================================================
+
+CMG_MARKETING_DIR = ANALYTICS_DB / "coupang_marketing"
+
+
+def _compare_cmg_once(target_date: str) -> dict:
+    """CMG 파티션 전체매출 vs ToOrder 매출액(플랫폼명=쿠팡이츠) 1회 비교."""
+    # ToOrder
+    date_str = target_date.replace("-", "")
+    toorder_csv = TOORDER_DAILY_DIR / f"toorder_daily_sales_{date_str}.csv"
+    if not toorder_csv.exists():
+        logger.warning("ToOrder CSV 없음: %s", toorder_csv)
+        return {"matched": None, "reason": "toorder 파일 없음"}
+
+    to_df = pd.read_csv(toorder_csv, dtype=str, encoding="utf-8-sig")
+    to_df = to_df[to_df["플랫폼명"].str.strip() == "쿠팡이츠"]
+    to_df["매출액"] = pd.to_numeric(to_df["매출액"], errors="coerce").fillna(0)
+    toorder_by_store: dict = to_df.groupby("매장명")["매출액"].sum().apply(int).to_dict()
+
+    # CMG parquet (ym 기준 파티션)
+    ym = target_date[:7]
+    cmg_files = list(CMG_MARKETING_DIR.glob(f"brand=*/store=*/ym={ym}/data.csv"))
+    if not cmg_files:
+        logger.warning("CMG 파티션 없음: ym=%s", ym)
+        return {"matched": None, "reason": "CMG 파티션 없음"}
+
+    cmg_df = pd.concat([pd.read_csv(f, dtype=str) for f in cmg_files], ignore_index=True)
+    cmg_df = cmg_df[cmg_df.get("조회일자", pd.Series(dtype=str)).str.strip() == target_date]
+    cmg_df["전체매출"] = pd.to_numeric(
+        cmg_df["전체매출"].str.replace(",", "", regex=False), errors="coerce"
+    ).fillna(0)
+    cmg_by_store: dict = cmg_df.groupby("매장명")["전체매출"].sum().apply(int).to_dict()
+
+    all_stores = sorted(set(toorder_by_store) | set(cmg_by_store))
+    store_results = {}
+    mismatches = []
+    for store in all_stores:
+        to_val = int(toorder_by_store.get(store, 0))
+        cmg_val = int(cmg_by_store.get(store, 0))
+        matched = to_val == cmg_val
+        store_results[store] = {"toorder": to_val, "cmg": cmg_val, "matched": matched}
+        if not matched:
+            mismatches.append(store)
+
+    toorder_total = int(sum(toorder_by_store.values()))
+    cmg_total = int(sum(cmg_by_store.values()))
+    logger.info(
+        "CMG검증 %s: ToOrder=%d / CMG=%d / 불일치=%s",
+        target_date, toorder_total, cmg_total, mismatches or "없음",
+    )
+    return {
+        "matched": len(mismatches) == 0,
+        "toorder_total": toorder_total,
+        "cmg_total": cmg_total,
+        "mismatches": mismatches,
+        "store_results": store_results,
+        "target_date": target_date,
+    }
+
+
+def validate_cmg_vs_toorder(target_date: str, retry: int = 1) -> dict:
+    """CMG 파티션 전체매출 vs ToOrder(쿠팡이츠) 비교. 불일치 시 30초 후 1회 재시도."""
+    for attempt in range(retry + 1):
+        result = _compare_cmg_once(target_date)
+        if result.get("matched") is not False or attempt >= retry:
+            return result
+        logger.warning("CMG vs ToOrder 불일치 → 30초 후 재시도 (%d/%d)", attempt + 1, retry)
+        time.sleep(30)
     return result

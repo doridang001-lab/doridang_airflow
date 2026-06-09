@@ -19,12 +19,11 @@ from airflow.operators.python import PythonOperator
 from modules.transform.pipelines.sales.DB_ai_daily_collection_01_collect import (
     run_ai_daily_collection_to_daily_parquet_dir,
 )
+from modules.transform.utility.paths import ANALYTICS_DB
 from modules.transform.utility.schedule import SMD_TOORDER_SALES_REPORT_TIME
 
 
-TARGET_DEST_DIR = Path(
-    r"C:\Users\민준\OneDrive - 주식회사 도리당\data\analytics\toorder_daily_store"
-)
+TARGET_DEST_DIR = ANALYTICS_DB / "toorder_daily_store"
 
 # LOOKBACK_DAYS: conf 미지정 시 최근 N일 중 parquet 없는 날만 수집
 # None → 어제 1일만, int → 최근 N일 중 누락분만

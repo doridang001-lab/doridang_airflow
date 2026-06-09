@@ -24,6 +24,7 @@ from modules.transform.utility.paths import (
     FIN_PRODUCT_CSV_PATH,
     FIN_PRODUCT_REVIEW_CSV_PATH,
     FIN_PRODUCT_ALIAS_CSV_PATH,
+    FIN_PRODUCT_MART_CSV_PATH,
 )
 from modules.transform.utility.mailer import send_email
 
@@ -186,126 +187,6 @@ def _load_review_file() -> pd.DataFrame:
     return df
 
 
-def _write_review_file(pending_latest: pd.DataFrame) -> int:
-    """llm_check=Y(미확정) 상품 목록을 fin_product_review.csv로 내보낸다.
-
-    - 사용자는 review CSV에서 approve=Y로 체크만 하면 됨.
-    - 기존 파일이 있으면 approve/note/checked_at는 유지(상품코드 기준).
-    """
-    if pending_latest.empty:
-        return 0
-
-    # single-file operation: approve=Y is read from fin_product_grp.csv (no fin_product_review.csv)
-    master = _read_master()
-    if master.empty:
-        return "fin_product_grp.csv ë¹„ì–´ìžˆìŒ - ìŠ¤í‚µ"
-    if "ìƒí’ˆì½”ë“œ" not in master.columns:
-        return "fin_product_grp.csv ì»¬ëŸ¼ ë¶€ì¡±(ìƒí’ˆì½”ë“œ) - ìŠ¤í‚µ"
-
-    master["ìƒí’ˆì½”ë“œ"] = master["ìƒí’ˆì½”ë“œ"].fillna("").astype(str).str.strip()
-    if "updated_at" not in master.columns:
-        master["updated_at"] = ""
-    if "llm_check" not in master.columns:
-        master["llm_check"] = "N"
-    if _REVIEW_APPROVE_COL not in master.columns:
-        return f"{_REVIEW_APPROVE_COL} ì»¬ëŸ¼ ì—†ìŒ - ìŠ¤í‚µ"
-    master["llm_check"] = master["llm_check"].fillna("").astype(str).str.strip().str.upper().replace({"": "N"})
-    master[_REVIEW_APPROVE_COL] = master[_REVIEW_APPROVE_COL].fillna("").astype(str).str.strip().str.upper().replace({"": ""})
-
-    latest = (
-        master.copy()
-        .assign(_ts=pd.to_datetime(master["updated_at"], errors="coerce").fillna(pd.Timestamp.min))
-        .sort_values(["ìƒí’ˆì½”ë“œ", "_ts"], na_position="last")
-        .groupby("ìƒí’ˆì½”ë“œ", as_index=False)
-        .last()
-        .drop(columns=["_ts"], errors="ignore")
-    ).set_index("ìƒí’ˆì½”ë“œ")
-
-    approve_codes = latest[(latest[_REVIEW_APPROVE_COL] == "Y") & (latest["llm_check"] == "Y")].index.astype(str).tolist()
-    if not approve_codes:
-        return "approve=Y ì—†ìŒ - ìŠ¤í‚µ"
-
-    rows = []
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    for code in approve_codes:
-        code = str(code).strip()
-        if not code or code not in latest.index:
-            continue
-        base = latest.loc[code].to_dict()
-        base["llm_check"] = "N"
-        base["updated_at"] = now
-        base[_REVIEW_APPROVE_COL] = ""
-        rows.append(base)
-
-    if not rows:
-        return "approve ëŒ€ìƒ ì—†ìŒ(ì´ë¯¸ í™•ì •/ë¯¸ì¡´ìž¬) - ìŠ¤í‚µ"
-
-    df_append = pd.DataFrame(rows)
-    out = pd.concat([master, df_append], ignore_index=True)
-
-    FIN_PRODUCT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
-    try:
-        out.to_csv(tmp, index=False, encoding="utf-8-sig")
-        _safe_replace(tmp, FIN_PRODUCT_CSV_PATH)
-    finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    return f"approve í™•ì • {len(df_append)}ê±´ (llm_check=N append)"
-
-    review = _load_review_file()
-    review_map = {}
-    if not review.empty:
-        review_map = (
-            review.assign(상품코드=review["상품코드"].fillna("").astype(str).str.strip())
-            .groupby("상품코드")
-            .last()
-            .to_dict(orient="index")
-        )
-
-    out = pending_latest.copy()
-    out["상품코드"] = out["상품코드"].fillna("").astype(str).str.strip()
-    out[_REVIEW_APPROVE_COL] = out["상품코드"].map(lambda c: (review_map.get(c, {}) or {}).get(_REVIEW_APPROVE_COL, ""))
-    out["note"] = out["상품코드"].map(lambda c: (review_map.get(c, {}) or {}).get("note", ""))
-    out["checked_at"] = out["상품코드"].map(lambda c: (review_map.get(c, {}) or {}).get("checked_at", ""))
-
-    cols = [
-        "source",
-        "대메뉴",
-        "중메뉴",
-        "상품코드",
-        "상품명",
-        "판매단가",
-        "수동분류",
-        "is_main_candidate",
-        "exclude_check",
-        "llm_check",
-        "updated_at",
-        _REVIEW_APPROVE_COL,
-        "note",
-        "checked_at",
-    ]
-    for c in cols:
-        if c not in out.columns:
-            out[c] = ""
-    out = out[cols].copy()
-
-    FIN_PRODUCT_REVIEW_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = FIN_PRODUCT_REVIEW_CSV_PATH.with_suffix(".tmp")
-    try:
-        out.to_csv(tmp, index=False, encoding="utf-8-sig")
-        _safe_replace(tmp, FIN_PRODUCT_REVIEW_CSV_PATH)
-    finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    return len(out)
-
 
 def _pending_latest(df_master: pd.DataFrame) -> pd.DataFrame:
     """fin_product_grp.csv에서 llm_check=Y인 미확정 상품을 코드별 최신 1행으로 추출."""
@@ -401,15 +282,28 @@ def _read_easypos_xlsx() -> pd.DataFrame:
 
 
 def _mark_is_latest(df: pd.DataFrame) -> pd.DataFrame:
-    """상품코드별 마지막 행에 is_latest=Y, 나머지 N 마킹 (저장 직전 호출)."""
+    """source+상품코드별 updated_at 최대 행에 is_latest=Y, 나머지 N 마킹 (저장 직전 호출)."""
     if df.empty or "상품코드" not in df.columns:
         return df
     df = df.copy()
-    if "updated_at" in df.columns:
-        _ts = pd.to_datetime(df["updated_at"], errors="coerce").fillna(pd.Timestamp.min)
-        df = df.iloc[_ts.argsort().values].reset_index(drop=True)
+    if "source" not in df.columns:
+        df["source"] = ""
+    _grp_keys = ["source", "상품코드"]
     df["is_latest"] = "N"
-    df.loc[df.groupby("상품코드").tail(1).index, "is_latest"] = "Y"
+    if "updated_at" in df.columns:
+        # ISO 형식(YYYY-MM-DD 또는 YYYY-MM-DD HH:MM:SS)은 문자열 사전순 = 시간순
+        # → datetime 파싱 없이 문자열로 비교 (혼합 날짜/datetime 형식 파싱 오류 방지)
+        ts_str = df["updated_at"].fillna("").astype(str).str.strip()
+        latest_idx = (
+            df.assign(_ts=ts_str, _pos=range(len(df)))
+            .sort_values(["_ts", "_pos"])
+            .groupby(_grp_keys)
+            .tail(1)
+            .index
+        )
+        df.loc[latest_idx, "is_latest"] = "Y"
+    else:
+        df.loc[df.groupby(_grp_keys).tail(1).index, "is_latest"] = "Y"
     return df
 
 
@@ -433,6 +327,8 @@ def _read_master() -> pd.DataFrame:
     # 표준_메뉴명 컬럼은 더 이상 사용하지 않음(과거 파일 호환을 위해 존재할 수는 있으나 파이프라인에서는 제거)
     if "표준_메뉴명" in df.columns:
         df = df.drop(columns=["표준_메뉴명"], errors="ignore")
+    if "중복_수동분류" not in df.columns:
+        df["중복_수동분류"] = "N"
 
     # Normalize flags
     df["exclude_check"] = df["exclude_check"].fillna("").astype(str).str.strip().str.upper().replace({"": "N"})
@@ -627,18 +523,24 @@ def detect_product_changes(**context) -> str:
     df_master = _read_master()
     changes = []
 
-    existing_codes = set(df_master["상품코드"].tolist())
+    # source+상품코드 복합 키로 비교 (okpos/001과 easypos/001을 별도로 처리)
+    master_src = df_master["source"].fillna("").astype(str).str.strip()
+    master_code = df_master["상품코드"].fillna("").astype(str).str.strip()
+    existing_keys = set(zip(master_src, master_code))
 
     for _, row in df_new.iterrows():
-        code = row["상품코드"]
-        if code not in existing_codes:
+        code = str(row.get("상품코드", "")).strip()
+        src = str(row.get("source", "")).strip()
+        key = (src, code)
+
+        if key not in existing_keys:
             d = row.to_dict()
             d["_change_type"] = "신규"
             changes.append(d)
         else:
-            prev = df_master[df_master["상품코드"] == code].iloc[-1]
-            keys = list(_CHANGE_KEYS)
-            if any(str(row.get(k, "")).strip() != str(prev.get(k, "")).strip() for k in keys):
+            matching = df_master[(master_src == src) & (master_code == code)]
+            prev = matching.iloc[-1]
+            if any(str(row.get(k, "")).strip() != str(prev.get(k, "")).strip() for k in _CHANGE_KEYS):
                 d = row.to_dict()
                 d["_change_type"] = "변경"
                 changes.append(d)
@@ -649,7 +551,11 @@ def detect_product_changes(**context) -> str:
 
 
 def classify_with_llm(enable_llm: bool = True, **context) -> str:
-    """신규/변경 항목을 LLM으로 분류."""
+    """신규/변경 항목을 LLM으로 분류.
+
+    이미 llm_check=N 확정 분류가 있는 상품코드는 LLM 재분류 없이 기존 분류를 재사용.
+    확정 분류 없는 신규/변경만 LLM 분류 후 _reused_confirmed 플래그로 구분.
+    """
     changes_json = context["ti"].xcom_pull(task_ids="detect_product_changes", key=_XCOM_CHANGES)
     changes = json.loads(changes_json)
 
@@ -657,27 +563,71 @@ def classify_with_llm(enable_llm: bool = True, **context) -> str:
         context["ti"].xcom_push(key=_XCOM_CLASSIFIED, value="[]")
         return "변경 없음 - 분류 스킵"
 
+    df_master = _read_master()
+
+    # 확정 분류 맵 빌드: llm_check=N 행 중 updated_at 최신값의 수동분류 (source+상품코드 복합 키)
+    confirmed_map: dict[tuple, str] = {}
+    if not df_master.empty and "llm_check" in df_master.columns and "상품코드" in df_master.columns:
+        confirmed = df_master[
+            df_master["llm_check"].fillna("").str.upper() != "Y"
+        ].copy()
+        confirmed["상품코드"] = confirmed["상품코드"].fillna("").astype(str).str.strip()
+        confirmed["source"] = confirmed["source"].fillna("").astype(str).str.strip() if "source" in confirmed.columns else ""
+        if not confirmed.empty and "수동분류" in confirmed.columns:
+            confirmed["_ts"] = pd.to_datetime(confirmed.get("updated_at", pd.Series(dtype=str)), errors="coerce")
+            grp = (
+                confirmed[confirmed["상품코드"] != ""]
+                .sort_values("_ts")
+                .groupby(["source", "상품코드"])
+                .last()["수동분류"]
+            )
+            confirmed_map = {k: v for k, v in grp.items()}
+
+    def _confirmed_key(item: dict) -> tuple:
+        return (str(item.get("source", "")).strip(), str(item.get("상품코드", "")).strip())
+
     if not enable_llm:
         classified = []
         for item in changes:
             item = dict(item)
-            item.update({"수동분류": "기타", "is_main_candidate": "N", "llm_error": True})
+            key = _confirmed_key(item)
+            if key in confirmed_map:
+                prev = confirmed_map[key]
+                item.update({"수동분류": prev, "is_main_candidate": "Y" if prev == "메인" else "N",
+                             "llm_error": False, "_reused_confirmed": True})
+            else:
+                item.update({"수동분류": "기타", "is_main_candidate": "N", "llm_error": True})
             classified.append(item)
         context["ti"].xcom_push(key=_XCOM_CLASSIFIED, value=json.dumps(classified, ensure_ascii=False))
-        return f"LLM OFF - 분류 스킵(기타/N): {len(classified)}건"
+        return f"LLM OFF - 분류 스킵: {len(classified)}건"
 
-    df_master = _read_master()
     few_shot = _build_few_shot(df_master)
+    reused_cnt, llm_cnt = 0, 0
 
     classified = []
     for item in changes:
-        result = _classify_one(item, few_shot)
-        item.update(result)
+        item = dict(item)
+        key = _confirmed_key(item)
+        if key in confirmed_map:
+            # 이미 확정 분류 있음 → LLM 재분류 금지
+            prev = confirmed_map[key]
+            item.update({
+                "수동분류": prev,
+                "is_main_candidate": "Y" if prev == "메인" else "N",
+                "llm_error": False,
+                "_reused_confirmed": True,
+            })
+            logger.info("[%s] %s → 확정분류 재사용: %s", item.get("_change_type"), item.get("상품명"), prev)
+            reused_cnt += 1
+        else:
+            result = _classify_one(item, few_shot)
+            item.update(result)
+            logger.info("[%s] %s → LLM: %s", item.get("_change_type"), item.get("상품명"), result["수동분류"])
+            llm_cnt += 1
         classified.append(item)
-        logger.info("[%s] %s → %s", item["_change_type"], item["상품명"], result["수동분류"])
 
     context["ti"].xcom_push(key=_XCOM_CLASSIFIED, value=json.dumps(classified, ensure_ascii=False))
-    return f"LLM 분류 완료: {len(classified)}건"
+    return f"분류 완료: {len(classified)}건 (확정재사용 {reused_cnt}, LLM신규 {llm_cnt})"
 
 
 def update_product_master(**context) -> str:
@@ -686,7 +636,6 @@ def update_product_master(**context) -> str:
     classified = json.loads(classified_json)
 
     if not classified:
-        return "ë³€ê²½ ì—†ìŒ - ì´ë©”ì¼ ìŠ¤í‚µ"
         return "변경 없음 - 업데이트 스킵"
 
     df_master = _read_master()
@@ -701,10 +650,11 @@ def update_product_master(**context) -> str:
 
     new_rows = []
     for item in classified:
-        # 신규 상품만 llm_check=Y (사용자 검토 필요), 변경은 N (자동 반영)
-        llm_check = "Y" if item.get("_change_type") == "신규" else "N"
         code = str(item.get("상품코드", "")).strip()
         exclude_check = exclude_map.get(code, "N") if item.get("_change_type") != "신규" else "N"
+        # 확정 분류 재사용 → 검토 불필요(N), LLM 새 분류(신규/미확정변경) → 검토 필요(Y)
+        reused = item.get("_reused_confirmed", False)
+        llm_check = "N" if reused else "Y"
         new_rows.append({
             "source": item.get("source", SOURCE_CODE),
             "구분": item.get("구분", "홀"),
@@ -719,6 +669,7 @@ def update_product_master(**context) -> str:
             "exclude_check": exclude_check,
             _REVIEW_APPROVE_COL: "",
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "중복_수동분류": "N",
         })
 
     df_append = pd.DataFrame(new_rows)
@@ -746,21 +697,34 @@ def send_alert_email(**context) -> str:
     classified = json.loads(classified_json)
 
     if not classified:
-        # 미확정(pending) 목록만 갱신할 수 있으니, 마스터 기준으로 review 파일 업데이트
-        df_master = _read_master()
-        pending = _pending_latest(df_master)
-        exported = 0
-        return f"변경 없음 - 이메일 스킵 (review {exported}행)"
+        return "변경 없음 - 이메일 스킵"
 
+    # 확정분류 재사용 항목은 이메일 불필요 (이미 확정됨, 리뷰 대상 아님)
+    review_needed = [i for i in classified if not i.get("_reused_confirmed", False)]
+    if not review_needed:
+        logger.info("확정분류 재사용 %d건 - 이메일 스킵", len(classified))
+        return f"확정분류 재사용 {len(classified)}건 - 이메일 스킵"
+
+    # 이메일에는 리뷰 필요 항목만 표시
+    classified = review_needed
     has_llm_error = any(item.get("llm_error") for item in classified)
     신규_cnt = sum(1 for i in classified if i.get("_change_type") == "신규")
     변경_cnt = sum(1 for i in classified if i.get("_change_type") == "변경")
 
     rows_html = ""
     for item in classified:
-        tag_color = "#2196F3" if item.get("_change_type") == "신규" else "#FF9800"
-        tag = item.get("_change_type", "")
+        reused = item.get("_reused_confirmed", False)
+        if reused:
+            tag_color = "#78909C"  # 회색 — 기존 확정 분류 재사용
+            tag = f"{item.get('_change_type', '')}(재사용)"
+        elif item.get("_change_type") == "신규":
+            tag_color = "#2196F3"  # 파랑 — 신규
+            tag = "신규"
+        else:
+            tag_color = "#FF9800"  # 주황 — 변경+LLM 새 분류
+            tag = "변경"
         error_mark = " ⚠️" if item.get("llm_error") else ""
+        review_mark = "" if reused else " 🔍"  # 검토 필요 표시
         rows_html += (
             f"<tr>"
             f'<td style="padding:6px 10px;"><span style="background:{tag_color};color:#fff;'
@@ -770,7 +734,7 @@ def send_alert_email(**context) -> str:
             f"<td style='padding:6px 10px;'>{item.get('상품코드','')}</td>"
             f"<td style='padding:6px 10px;'>{item.get('상품명','')}</td>"
             f"<td style='padding:6px 10px;'>{item.get('판매단가',0):,}원</td>"
-            f"<td style='padding:6px 10px;'>{item.get('수동분류','')}{error_mark}</td>"
+            f"<td style='padding:6px 10px;'>{item.get('수동분류','')}{error_mark}{review_mark}</td>"
             f"<td style='padding:6px 10px;text-align:center;'>{item.get('is_main_candidate','N')}</td>"
             f"</tr>"
         )
@@ -810,22 +774,14 @@ def send_alert_email(**context) -> str:
   </tbody>
 </table>
 <p style="margin-top:20px;font-size:13px;color:#777;">
-  ✅ 신규 상품은 <code>fin_product_review.csv</code>에서 <code>approve=Y</code>로 체크만 하면 다음 실행 때 자동으로 <code>llm_check=N</code> 확정행이 append됩니다.<br>
-  ❌ 분류가 틀리면 <code>fin_product_grp.csv</code>의 <code>수동분류</code>/<code>is_main_candidate</code>를 수정하거나, review의 <code>note</code>에 남긴 뒤 재확인하세요.<br>
-  📄 review 파일 위치: <code>{FIN_PRODUCT_REVIEW_CSV_PATH}</code> (현재 pending {exported}행)
+  ✅ <code>fin_product_grp.csv</code>에서 <code>llm_check=Y</code>인 행을 찾아 <code>approve</code> 컬럼에 <b>Y</b>를 입력 후 저장하면 다음 DAG 실행 시 자동으로 <code>llm_check=N</code> 확정행이 append됩니다.<br>
+  ❌ 분류가 틀리면 같은 행의 <code>수동분류</code>/<code>is_main_candidate</code>도 함께 수정하세요.<br>
+  📄 마스터 파일: <code>{FIN_PRODUCT_CSV_PATH}</code>
 </p>
 </body></html>
 """
 
     subject = f"[상품 마스터] 신규/변경 {len(classified)}건 감지 - 검토 필요"
-    # single-file operation: do not reference fin_product_review.csv in outgoing emails
-    html = html.replace("fin_product_review.csv", "fin_product_grp.csv")
-    html = html.replace("review íŒŒì¼ ìœ„ì¹˜", "grp íŒŒì¼ ìœ„ì¹˜")
-    html = html.replace(str(FIN_PRODUCT_REVIEW_CSV_PATH), str(FIN_PRODUCT_CSV_PATH))
-    html = html.replace("review", "grp")
-    html = html.replace(f" (현재 pending {exported}행)", "")
-    html = html.replace(f" (í˜„ìž¬ pending {exported}í–‰)", "")
-
     file_link = (
         f'<p style="margin-top:16px;">'
         f'<a href="{FIN_PRODUCT_CSV_PATH.as_uri()}"'
@@ -842,63 +798,48 @@ def send_alert_email(**context) -> str:
 
 
 def apply_review_approvals(**context) -> str:
-    """fin_product_review.csv에서 approve=Y로 체크된 상품을 llm_check=N 확정행으로 append."""
+    """fin_product_grp.csv에서 approve=Y, llm_check=Y인 상품을 llm_check=N 확정행으로 append."""
     if not FIN_PRODUCT_CSV_PATH.exists():
         return "fin_product_grp.csv 없음 - 스킵"
-
-    review = _load_review_file()
-    if review.empty:
-        return "review 없음 - 스킵"
-
-    approve = (
-        review.assign(상품코드=review["상품코드"].fillna("").astype(str).str.strip())
-        .query(f"{_REVIEW_APPROVE_COL} == 'Y'")
-        .copy()
-    )
-    if approve.empty:
-        return "approve=Y 없음 - 스킵"
 
     master = _read_master()
     if master.empty:
         return "fin_product_grp.csv 비어있음 - 스킵"
-    if "상품코드" not in master.columns:
-        return "fin_product_grp.csv 컬럼 부족(상품코드) - 스킵"
+
+    for col in ("llm_check", _REVIEW_APPROVE_COL, "is_latest", "상품코드"):
+        if col not in master.columns:
+            return f"컬럼 부족({col}) - 스킵"
 
     master["상품코드"] = master["상품코드"].fillna("").astype(str).str.strip()
-    if "updated_at" not in master.columns:
-        master["updated_at"] = ""
-    if "llm_check" not in master.columns:
-        master["llm_check"] = "N"
+    master["llm_check"] = master["llm_check"].fillna("").astype(str).str.strip().str.upper()
+    master[_REVIEW_APPROVE_COL] = master[_REVIEW_APPROVE_COL].fillna("").astype(str).str.strip().str.upper()
+    master["is_latest"] = master["is_latest"].fillna("").astype(str).str.strip().str.upper()
 
-    # 코드별 최신 1행을 기준으로 확정행을 만든다 (이미 llm_check=N이면 스킵)
-    latest = (
-        master.copy()
-        .assign(_ts=pd.to_datetime(master["updated_at"], errors="coerce").fillna(pd.Timestamp.min))
-        .sort_values(["상품코드", "_ts"], na_position="last")
-        .groupby("상품코드", as_index=False)
-        .last()
-        .drop(columns=["_ts"], errors="ignore")
-    )
-    latest = latest.set_index("상품코드")
+    candidates = master[
+        (master["is_latest"] == "Y") &
+        (master["llm_check"] == "Y") &
+        (master[_REVIEW_APPROVE_COL] == "Y")
+    ]
+    if candidates.empty:
+        return "approve=Y 없음 - 스킵"
 
-    rows = []
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    for code in approve["상품코드"].tolist():
-        code = str(code).strip()
-        if not code or code not in latest.index:
-            continue
-        base = latest.loc[code].to_dict()
-        if str(base.get("llm_check", "")).strip().upper() != "Y":
-            continue
-        base["llm_check"] = "N"
-        base["updated_at"] = now
-        rows.append(base)
+    rows = []
+    for _, row in candidates.iterrows():
+        new_row = row.to_dict()
+        new_row["llm_check"] = "N"
+        new_row[_REVIEW_APPROVE_COL] = ""
+        new_row["updated_at"] = now
+        rows.append(new_row)
 
-    if not rows:
-        return "approve 대상 없음(이미 확정/미존재) - 스킵"
+    # 기존 행의 approve 클리어 (재처리 방지)
+    approved_codes = set(candidates["상품코드"])
+    master_copy = master.copy()
+    mask = master_copy["상품코드"].isin(approved_codes)
+    master_copy.loc[mask, _REVIEW_APPROVE_COL] = ""
 
     df_append = pd.DataFrame(rows)
-    out = pd.concat([master, df_append], ignore_index=True)
+    out = pd.concat([master_copy, df_append], ignore_index=True)
     out = _mark_is_latest(out)
 
     FIN_PRODUCT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -912,26 +853,9 @@ def apply_review_approvals(**context) -> str:
         except Exception:
             pass
 
-    # review의 checked_at 자동 기록(approve=Y인 행만)
-    review = review.copy()
-    review["상품코드"] = review["상품코드"].fillna("").astype(str).str.strip()
-    mask = review["상품코드"].isin([str(r.get("상품코드", "")).strip() for r in rows])
-    if "checked_at" not in review.columns:
-        review["checked_at"] = ""
-    review.loc[mask, "checked_at"] = now
-
-    FIN_PRODUCT_REVIEW_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp2 = FIN_PRODUCT_REVIEW_CSV_PATH.with_suffix(".tmp")
-    try:
-        review.to_csv(tmp2, index=False, encoding="utf-8-sig")
-        _safe_replace(tmp2, FIN_PRODUCT_REVIEW_CSV_PATH)
-    finally:
-        try:
-            tmp2.unlink(missing_ok=True)
-        except Exception:
-            pass
-
+    logger.info("approve 확정: %d건 (llm_check=N append)", len(df_append))
     return f"approve 확정 {len(df_append)}건 (llm_check=N append)"
+
 
 def finalize_unionpos_pending(enable_llm: bool = True, **context) -> str:
     """fin_product_grp.csv에 누적된 unionpos 신규(=llm_check=Y) 상품을 LLM으로 분류하고 확정행(llm_check=N)으로 append."""
@@ -996,3 +920,128 @@ def finalize_unionpos_pending(enable_llm: bool = True, **context) -> str:
 
     logger.info("unionpos pending 확정: %d건", len(df_append))
     return f"unionpos pending 확정 {len(df_append)}건 (llm_check=N append)"
+
+
+def build_fin_product_mart(**context) -> str:
+    """fin_product_grp.csv → fin_product_mart.csv 생성.
+
+    - 컬럼: source, 상품코드, 수동분류 (중복 제거)
+    - 동일 source+상품코드에 수동분류가 2가지 이상이면 이메일 알림 발송.
+    """
+    master = _read_master()
+    if master.empty:
+        logger.warning("fin_product_grp.csv 비어있음 - 마트 생성 스킵")
+        return "스킵: 원천 데이터 없음"
+
+    # is_latest=Y이고 수동분류가 있는 행만 사용
+    df = master.copy()
+    if "is_latest" in df.columns:
+        df = df[df["is_latest"].astype(str).str.upper() == "Y"]
+    if "수동분류" in df.columns:
+        df = df[df["수동분류"].notna() & (df["수동분류"].astype(str).str.strip() != "")]
+
+    if df.empty:
+        logger.warning("is_latest=Y + 수동분류 있는 행 없음")
+        return "스킵: 해당 행 없음"
+
+    df["source"] = df["source"].astype(str).str.strip()
+    df["상품코드"] = df["상품코드"].astype(str).str.strip()
+    df["수동분류"] = df["수동분류"].astype(str).str.strip()
+
+    # 중복 감지: is_latest 필터 없이 llm_check=N 확정 전체 이력 기준
+    # (같은 source+상품코드에 두 개의 확정 분류가 이력에 존재하는 케이스 감지)
+    confirmed_all = master.copy()
+    confirmed_all["source"] = confirmed_all["source"].astype(str).str.strip()
+    confirmed_all["상품코드"] = confirmed_all["상품코드"].astype(str).str.strip()
+    confirmed_all["수동분류"] = confirmed_all["수동분류"].astype(str).str.strip()
+    if "llm_check" in confirmed_all.columns:
+        confirmed_all = confirmed_all[
+            confirmed_all["llm_check"].fillna("").astype(str).str.upper() == "N"
+        ]
+    confirmed_all = confirmed_all[confirmed_all["수동분류"] != ""]
+
+    conflict_df = (
+        confirmed_all.groupby(["source", "상품코드"])["수동분류"]
+        .nunique()
+        .reset_index(name="분류_종류수")
+    )
+    conflicts = conflict_df[conflict_df["분류_종류수"] > 1]
+
+    if not conflicts.empty:
+        detail_rows = []
+        for _, row in conflicts.iterrows():
+            labels = (
+                confirmed_all[
+                    (confirmed_all["source"] == row["source"]) & (confirmed_all["상품코드"] == row["상품코드"])
+                ]["수동분류"]
+                .unique()
+                .tolist()
+            )
+            detail_rows.append(
+                f"  {row['source']} {row['상품코드']} → {', '.join(labels)}"
+            )
+        conflict_body = (
+            "아래 상품코드에 수동분류가 2가지 이상 지정되어 있습니다.\n"
+            "fin_product_grp.csv에서 직접 수정 후 DAG를 재실행해주세요.\n\n"
+            + "\n".join(detail_rows)
+        )
+        logger.warning("수동분류 충돌 %d건:\n%s", len(conflicts), conflict_body)
+        try:
+            from modules.transform.utility.mailer import send_email, text_to_html
+            send_email(
+                subject=f"[fin_product_mart] 수동분류 충돌 {len(conflicts)}건 수정 필요",
+                html_content=text_to_html(conflict_body),
+                to_emails=[ALERT_EMAIL],
+            )
+        except Exception as e:
+            logger.error("충돌 알림 발송 실패: %s", e)
+
+    conflict_keys = set(
+        zip(conflicts["source"].astype(str), conflicts["상품코드"].astype(str))
+    ) if not conflicts.empty else set()
+
+    # fin_product_grp.csv에 중복_수동분류 플래그 write-back
+    if FIN_PRODUCT_CSV_PATH.exists():
+        full_master = _read_master()
+        full_master["_key"] = list(
+            zip(full_master["source"].astype(str), full_master["상품코드"].astype(str))
+        )
+        full_master["중복_수동분류"] = full_master["_key"].apply(
+            lambda k: "Y" if k in conflict_keys else "N"
+        )
+        full_master = full_master.drop(columns=["_key"])
+        tmp_grp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
+        try:
+            full_master.to_csv(tmp_grp, index=False, encoding="utf-8-sig")
+            _safe_replace(tmp_grp, FIN_PRODUCT_CSV_PATH)
+        finally:
+            try:
+                tmp_grp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    # 마트 생성: source+상품코드 기준 중복 제거 (수동분류 충돌 시 첫 번째 값 유지)
+    df["중복_수동분류"] = df.apply(
+        lambda r: "Y" if (str(r["source"]), str(r["상품코드"])) in conflict_keys else "N", axis=1
+    )
+    mart = (
+        df[["source", "상품코드", "수동분류", "중복_수동분류"]]
+        .drop_duplicates(subset=["source", "상품코드"], keep="first")
+        .sort_values(["source", "상품코드"])
+        .reset_index(drop=True)
+    )
+
+    FIN_PRODUCT_MART_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = FIN_PRODUCT_MART_CSV_PATH.with_suffix(".tmp")
+    try:
+        mart.to_csv(tmp, index=False, encoding="utf-8-sig")
+        _safe_replace(tmp, FIN_PRODUCT_MART_CSV_PATH)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    conflict_msg = f", 충돌 {len(conflicts)}건 알림" if not conflicts.empty else ""
+    logger.info("fin_product_mart.csv 저장: %d행%s", len(mart), conflict_msg)
+    return f"마트 생성: {len(mart)}행{conflict_msg}"

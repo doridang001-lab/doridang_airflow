@@ -118,6 +118,17 @@ STORE_SUPPLIER_MAP = {
 }
 
 # ============================================================
+# 구글시트 최종 출력 컬럼 순서 (uploaded_at은 save_to_gsheet에서 자동 추가)
+# ============================================================
+FINAL_COLUMNS = [
+    '접수번호', '등록일', '등록시간', '회사구분', '매장명',
+    'CS구분', '유형', '내용', '유입경로', '매입처',
+    '접수자', '내용.1', '처리일자', '처리자', '진행상태', '비공개메모',
+    '수집일', 'issue_summary', 'issue_type', '담당자',
+    '처리완료율', '처리소요기간',
+]
+
+# ============================================================
 # LLM 분류 허용값 (검증용)
 # ============================================================
 VALID_ISSUE_TYPES = [
@@ -488,6 +499,38 @@ def classify_cs_with_llm(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 # 공통 전처리
 # ============================================================
+def _extract_supplier_from_memo(memo_value) -> str:
+    if not _has_text(memo_value):
+        return ''
+    text = str(memo_value).replace('\r\n', '\n').replace('\r', '\n')
+    match = re.search(r'(?m)^\s*업체\s*[:：]\s*([^\n]*)', text)
+    if not match:
+        return ''
+    return match.group(1).strip()
+
+
+def _apply_supplier_policy(df: pd.DataFrame) -> pd.DataFrame:
+    """매입처는 비공개메모의 '업체:' 값만 저장한다."""
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    if '매입처' not in out.columns:
+        out['매입처'] = ''
+
+    if '비공개메모' not in out.columns:
+        out['매입처'] = ''
+        print("  ⚠️ 비공개메모 컬럼 없음 → 매입처 전체 공백 처리")
+        return out
+
+    before_filled_mask = out['매입처'].apply(_has_text)
+    out['매입처'] = out['비공개메모'].apply(_extract_supplier_from_memo)
+    after_filled = out['매입처'].apply(_has_text).sum()
+    cleared = int((before_filled_mask & ~out['매입처'].apply(_has_text)).sum())
+    print(f"  ✅ 매입처 정책 적용: 업체 메모 입력 {int(after_filled)}건 / 공백 처리 {cleared}건")
+    return out
+
+
 def preprocess_cs_df(df: pd.DataFrame) -> pd.DataFrame:
     target_cols = [
         '접수번호', '등록일', '등록시간', '회사구분', '매장명',
@@ -501,11 +544,7 @@ def preprocess_cs_df(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df[available_cols].copy()
 
-    if '매장명' in df.columns:
-        df['매입처'] = df['매장명'].map(STORE_SUPPLIER_MAP)
-        unmapped = df[df['매입처'].isna()]['매장명'].dropna().unique().tolist()
-        if unmapped:
-            print(f"  ⚠️ 매핑 안된 매장 ({len(unmapped)}개): {unmapped[:5]}")
+    df = _apply_supplier_policy(df)
 
     for col in ['등록일', '처리일자']:
         if col in df.columns:
@@ -561,33 +600,11 @@ def preprocess_cs_df(df: pd.DataFrame) -> pd.DataFrame:
         df['처리완료율'] = ''
 
     # 🆕 처리소요기간 계산 (relay fms 제공값 덮어쓰기)
-    # - 비공개메모 있음: (비공개메모 최초 등장 수집일 - 등록일) → 고정값
-    # - 비공개메모 없음: (수집일 - 등록일) → 매일 증가
+    # - 접수번호에 비공개메모가 한 번이라도 있음: 최초 비공개메모 수집일 - 등록일 → 고정값
+    # - 비공개메모 없음: 오늘(KST) - 등록일 → 매일 증가
     # ※ relay fms 엑셀이 다운로드 당일 기준으로 계산해서 넣어주므로 반드시 재계산
     if {'비공개메모', '등록일', '수집일', '접수번호'}.issubset(df.columns):
-        has_memo = df['비공개메모'].apply(lambda x: pd.notna(x) and str(x).strip() != '')
-        # 현재 배치 내 접수번호별 비공개메모 최초 수집일
-        first_memo_date_elapsed = df[has_memo].groupby('접수번호')['수집일'].min()
-
-        def _calc_elapsed(row):
-            try:
-                reg_dt = pd.to_datetime(row['등록일'], errors='coerce')
-                if pd.isna(reg_dt):
-                    return ''
-                접수번호 = row['접수번호']
-                if pd.notna(row.get('비공개메모')) and str(row.get('비공개메모', '')).strip() != '':
-                    # 비공개메모 있음 → 최초 등장 수집일 기준 (고정값)
-                    first = pd.to_datetime(first_memo_date_elapsed.get(접수번호), errors='coerce')
-                    end_dt = first if not pd.isna(first) else pd.to_datetime(row['수집일'], errors='coerce')
-                else:
-                    # 비공개메모 없음 → 오늘 수집일 기준 (경과일)
-                    end_dt = pd.to_datetime(row['수집일'], errors='coerce')
-                if pd.isna(end_dt):
-                    return ''
-                return int((end_dt - reg_dt).days)
-            except Exception:
-                return ''
-        df['처리소요기간'] = df.apply(_calc_elapsed, axis=1)
+        df['처리소요기간'] = _recalc_elapsed_days(df, df)
         valid = (df['처리소요기간'] != '').sum()
         print(f"  ✅ 처리소요기간 재계산 완료: {valid}건")
     else:
@@ -624,6 +641,133 @@ def preprocess_cs_df(df: pd.DataFrame) -> pd.DataFrame:
         df['응답소요일'] = ''
 
     return df
+
+
+def _has_text(value) -> bool:
+    return pd.notna(value) and str(value).strip() != ''
+
+
+def _parse_legacy_memo_date(value, base_dt) -> pd.Timestamp:
+    """과거 처리내용(내용.1)에 남은 날짜 마커를 비공개메모 입력일 fallback으로 사용."""
+    if not _has_text(value):
+        return pd.NaT
+    text = str(value)
+    m = re.search(r'(?<!\d)(20\d{2})[-./](\d{1,2})[-./](\d{1,2})(?!\d)', text)
+    if m:
+        return pd.to_datetime(f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}", errors='coerce')
+    m = re.search(r'(?<!\d)(\d{2})[.](\d{1,2})[.](\d{1,2})(?!\d)', text)
+    if m:
+        return pd.to_datetime(f"20{int(m.group(1)):02d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}", errors='coerce')
+    if pd.isna(base_dt):
+        return pd.NaT
+    m = re.search(r'(?<!\d)(\d{1,2})\s*월\s*(\d{1,2})\s*일(?!\d)', text)
+    if m:
+        return pd.to_datetime(f"{base_dt.year}-{int(m.group(1)):02d}-{int(m.group(2)):02d}", errors='coerce')
+    return pd.NaT
+
+
+def _infer_registration_date(row) -> pd.Timestamp:
+    """등록일 누락 시 원문에 있는 '14일자' 같은 표현을 수집월 기준으로 복원."""
+    raw = pd.to_datetime(row.get('_reg_dt_raw'), errors='coerce')
+    if pd.notna(raw):
+        return raw
+    base_dt = pd.to_datetime(row.get('_collect_dt'), errors='coerce')
+    if pd.isna(base_dt) or not _has_text(row.get('내용')):
+        return pd.NaT
+    m = re.search(r'(?<!\d)(\d{1,2})\s*일자', str(row.get('내용')))
+    if not m:
+        return pd.NaT
+    return pd.to_datetime(f"{base_dt.year}-{base_dt.month:02d}-{int(m.group(1)):02d}", errors='coerce')
+
+
+def _recalc_elapsed_days(df_target: pd.DataFrame, df_context: pd.DataFrame) -> pd.Series:
+    """
+    처리소요기간을 비공개메모 최초 입력일 기준으로 재계산한다.
+
+    - 접수번호에 비공개메모가 한 번이라도 있으면: 최초 비공개메모 수집일 - 등록일
+    - 아직 비공개메모가 없으면: 오늘(KST) - 등록일
+    """
+    if df_target is None or df_target.empty:
+        return pd.Series(dtype=object)
+
+    ctx = df_context.copy() if df_context is not None and not df_context.empty else df_target.copy()
+    target = df_target.copy()
+
+    for frame in (ctx, target):
+        for col in ['접수번호', '등록일', '비공개메모', '수집일', 'uploaded_at', '내용', '내용.1']:
+            if col not in frame.columns:
+                frame[col] = ''
+        frame['접수번호'] = frame['접수번호'].astype(str).str.strip()
+
+    ctx['_reg_dt_raw'] = pd.to_datetime(ctx['등록일'], errors='coerce')
+    ctx['_collect_dt'] = pd.to_datetime(ctx['수집일'], errors='coerce')
+    uploaded_dt = pd.to_datetime(ctx['uploaded_at'], errors='coerce')
+    ctx['_collect_dt'] = ctx['_collect_dt'].combine_first(uploaded_dt).dt.normalize()
+    ctx['_reg_dt'] = ctx.apply(_infer_registration_date, axis=1)
+
+    reg_date_map = ctx.groupby('접수번호')['_reg_dt'].min()
+    has_memo = ctx['비공개메모'].apply(_has_text)
+    first_memo_date = (
+        ctx[has_memo]
+        .groupby('접수번호')['_collect_dt']
+        .min()
+    )
+    ctx['_legacy_memo_dt'] = ctx.apply(
+        lambda r: _parse_legacy_memo_date(r.get('내용.1'), r.get('_collect_dt')),
+        axis=1
+    )
+    legacy_memo_date = (
+        ctx[ctx['_legacy_memo_dt'].notna()]
+        .groupby('접수번호')['_legacy_memo_dt']
+        .min()
+    )
+    first_memo_date = first_memo_date.combine_first(legacy_memo_date)
+    today_kst = pd.Timestamp.now(tz='Asia/Seoul').normalize().tz_localize(None)
+
+    def _calc(row):
+        try:
+            receipt = str(row.get('접수번호', '')).strip()
+            reg = pd.to_datetime(row.get('등록일'), errors='coerce')
+            if pd.isna(reg):
+                reg = pd.to_datetime(reg_date_map.get(receipt), errors='coerce')
+            if pd.isna(reg):
+                return ''
+
+            first = pd.to_datetime(first_memo_date.get(receipt), errors='coerce')
+            end = first if pd.notna(first) else today_kst
+            if pd.isna(end):
+                return ''
+
+            days = (end.normalize() - reg.normalize()).days
+            return int(days) if days >= 0 else 0
+        except Exception:
+            return ''
+
+    return target.apply(_calc, axis=1)
+
+
+def _update_existing_elapsed_days(ws, df_existing: pd.DataFrame) -> int:
+    """구글시트 기존 행의 처리소요기간을 현재 로직으로 갱신한다."""
+    if df_existing is None or df_existing.empty or '처리소요기간' not in df_existing.columns:
+        return 0
+
+    recalculated = _recalc_elapsed_days(df_existing, df_existing).astype(str)
+    current = df_existing['처리소요기간'].fillna('').astype(str).str.strip()
+    changed = current != recalculated.str.strip()
+    changed_count = int(changed.sum())
+    if changed_count == 0:
+        print("[처리소요기간] 기존 시트 갱신 필요 없음")
+        return 0
+
+    from gspread.utils import rowcol_to_a1
+
+    col_idx = list(df_existing.columns).index('처리소요기간') + 1
+    start_cell = rowcol_to_a1(2, col_idx)
+    end_cell = rowcol_to_a1(len(df_existing) + 1, col_idx)
+    values = [[value] for value in recalculated.tolist()]
+    ws.update(values=values, range_name=f"{start_cell}:{end_cell}")
+    print(f"[처리소요기간] 기존 시트 {changed_count}건 갱신 완료")
+    return changed_count
 
 
 def _extract_service_account_email(credentials_path: str) -> str:
@@ -778,6 +922,9 @@ def _exclude_done_rows(df_cs: pd.DataFrame, df_done: pd.DataFrame, label: str) -
 
 
 def upload_df_to_gsheet(df: pd.DataFrame, label: str = "") -> str:
+    # 최종 컬럼 순서 고정 (불필요한 컬럼 제거, 없는 컬럼은 스킵)
+    df = df[[c for c in FINAL_COLUMNS if c in df.columns]]
+
     print(f"  [구글시트] {label} append 시작: {len(df)}건")
 
     candidates = _credential_candidates()
@@ -974,28 +1121,9 @@ def _recalc_completion_rate(df_new: pd.DataFrame, df_existing: pd.DataFrame) -> 
     df_new_calc['응답소요일'] = df_new_calc.apply(_response_days_recalc, axis=1)
 
     # ── 처리소요기간 (기존+신규 합산 기준으로 최종 확정) ──────────
-    # - 비공개메모 있음: 기존+신규 합산의 접수번호별 최초 수집일 - 등록일 (고정값)
-    # - 비공개메모 없음: 신규 배치의 수집일 - 등록일 (경과일)
-    def _elapsed_days_recalc(row):
-        try:
-            접수번호 = row['접수번호']
-            reg = pd.to_datetime(reg_date_map.get(접수번호), errors='coerce')
-            if pd.isna(reg):
-                return ''
-            if pd.notna(row.get('비공개메모')) and str(row.get('비공개메모', '')).strip() != '':
-                # 비공개메모 있음 → 최초 등장 수집일 기준 고정
-                first = pd.to_datetime(first_memo_date.get(접수번호), errors='coerce')
-                end = first if not pd.isna(first) else pd.to_datetime(row['수집일'], errors='coerce')
-            else:
-                # 비공개메모 없음 → 이 배치의 수집일 기준 경과일
-                end = pd.to_datetime(row['수집일'], errors='coerce')
-            if pd.isna(end):
-                return ''
-            return int((end - reg).days)
-        except Exception:
-            return ''
-
-    df_new_calc['처리소요기간'] = df_new_calc.apply(_elapsed_days_recalc, axis=1)
+    # - 접수번호에 비공개메모가 한 번이라도 있음: 최초 비공개메모 수집일 - 등록일 (고정값)
+    # - 비공개메모 없음: 오늘(KST) - 등록일 (경과일)
+    df_new_calc['처리소요기간'] = _recalc_elapsed_days(df_new_calc, base)
 
     unique_days = df_new_calc['수집일'].dropna().astype(str).unique().tolist()
     answered = (df_new_calc['응답소요일'] != '').sum()
@@ -1048,10 +1176,62 @@ def transform_and_upload(**context):
         ws = sh.worksheet(CS_SHEET_NAME)
         df_existing = pd.DataFrame(ws.get_all_records())
         print(f"[처리완료율] 기존 데이터 {len(df_existing)}건 로드 완료")
+        try:
+            _update_existing_elapsed_days(ws, df_existing)
+        except Exception as update_error:
+            print(f"[처리소요기간] 기존 시트 갱신 실패(신규 업로드는 계속): {update_error}")
     except Exception as e:
         print(f"[처리완료율] 기존 데이터 조회 실패 → 현재 배치 기준으로만 계산: {e}")
 
     df = _recalc_completion_rate(df, df_existing)
+
+    # ✅ 기존 구글시트에 안정적 분류값이 있는 접수번호는 LLM 재분류 결과를 덮어씀
+    # 이유: 같은 내용이라도 날마다 LLM 결과가 달라져 마트에서 issue_type이 바뀌는 것을 방지
+    # '기타'는 재분류 허용 (LLM이 내용 부족으로 분류 실패한 케이스)
+    if df_existing is not None and not df_existing.empty:
+        if 'issue_type' in df_existing.columns and 'issue_summary' in df_existing.columns:
+            existing_good = df_existing[
+                df_existing['issue_type'].notna() &
+                (df_existing['issue_type'].astype(str).str.strip() != '') &
+                (df_existing['issue_type'].astype(str).str.strip() != '기타')
+            ][['접수번호', 'issue_type', 'issue_summary']].copy()
+            existing_good['접수번호'] = existing_good['접수번호'].astype(str).str.strip()
+            existing_good = existing_good.drop_duplicates('접수번호')
+            if not existing_good.empty:
+                issue_type_map    = existing_good.set_index('접수번호')['issue_type'].to_dict()
+                issue_summary_map = existing_good.set_index('접수번호')['issue_summary'].to_dict()
+                num_key = df['접수번호'].astype(str).str.strip()
+                mask = num_key.isin(issue_type_map)
+                df.loc[mask, 'issue_type']    = num_key[mask].map(issue_type_map)
+                df.loc[mask, 'issue_summary'] = num_key[mask].map(issue_summary_map)
+                overridden = int(mask.sum())
+                if overridden:
+                    print(f"[LLM 분류 안정화] 기존 분류 유지 {overridden}건 (재분류 방지)")
+
+    # ✅ 이미 '완료'로 기록된 접수번호는 중복 저장 방지
+    # 구글시트에 이미 '완료' 행이 존재하는 접수번호는 신규 배치에서 제외
+    if df_existing is not None and not df_existing.empty:
+        if '진행상태' in df_existing.columns and '접수번호' in df_existing.columns:
+            already_done_set = set(
+                df_existing[
+                    df_existing['진행상태'].astype(str).str.strip() == '완료'
+                ]['접수번호'].astype(str).str.strip()
+            )
+            if already_done_set:
+                before_cnt = len(df)
+                mask_skip = (
+                    df['진행상태'].astype(str).str.strip().eq('완료') &
+                    df['접수번호'].astype(str).str.strip().isin(already_done_set)
+                )
+                df = df[~mask_skip].copy()
+                excluded_cnt = before_cnt - len(df)
+                if excluded_cnt:
+                    print(f"[완료건 중복 제외] 기존 시트에 이미 완료 기록된 접수번호 {excluded_cnt}건 제외")
+
+    if df.empty:
+        print("[전처리/업로드] 업로드할 신규 데이터 없음 (전부 기완료 건)")
+        context['ti'].xcom_push(key='uploaded_new_file', value=excel_path)
+        return "업로드 건 없음 (기완료 건 전체 제외)"
 
     result = upload_df_to_gsheet(df, label="신규다운로드")
     context['ti'].xcom_push(key='uploaded_new_file', value=excel_path)

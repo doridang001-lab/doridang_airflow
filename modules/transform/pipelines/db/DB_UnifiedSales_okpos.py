@@ -591,22 +591,27 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
     merged["ym"] = merged["sale_date"].str[:7]
     merged["platform"] = (merged[channel_col].fillna("").astype(str).str.strip() if channel_col else "")
 
-    # order_time: OKPOS는 "최초주문"이 결제시각보다 더 자연스러운 주문시각인 경우가 많아 우선 사용.
-    # (없으면 결제시각으로 fallback) — order_id 접미사에 사용하므로 order_id 앞에서 계산한다.
-    time_col = next(
-        (c for c in ("최초주문", "최초주문시각", "결제시각_y", "결제시각_x", "결제시각") if c in merged.columns),
-        None,
-    )
-    merged["order_time"] = merged[time_col].apply(_normalize_time) if time_col else ""
-    if time_col and "_y" in time_col:
-        # item-level 시각은 영수증 내 행마다 달라질 수 있어 order_id가 불안정해짐.
-        # _order_key 기준 첫 비어있지 않은 값으로 통일해 order_id를 안정화한다.
-        merged["order_time"] = merged.groupby("_order_key", sort=False)["order_time"].transform(
-            lambda s: next((v for v in s if v), "")
+    # order_time: OKPOS는 주문서의 "최초주문시각"을 우선 사용하고, 없으면 결제시각으로 fallback.
+    # 병합 후 suffix가 붙은 주문서(_x) 컬럼을 먼저 봐야 item 미매칭 반품도 00:00:00으로 떨어지지 않는다.
+    time_candidates = [
+        c for c in (
+            "최초주문시각_x", "최초주문시각",
+            "최초주문_x", "최초주문",
+            "결제시각_x", "결제시각",
+            "결제시각_y",
         )
-        if "결제시각_x" in merged.columns:
-            empty_mask = merged["order_time"] == ""
-            merged.loc[empty_mask, "order_time"] = merged.loc[empty_mask, "결제시각_x"].apply(_normalize_time)
+        if c in merged.columns
+    ]
+    merged["order_time"] = ""
+    for time_col in time_candidates:
+        normalized = merged[time_col].apply(_normalize_time)
+        empty_mask = merged["order_time"] == ""
+        merged.loc[empty_mask, "order_time"] = normalized[empty_mask]
+
+    # item-level 시각은 영수증 내 행마다 달라질 수 있어 _order_key 기준 첫 값으로 통일한다.
+    merged["order_time"] = merged.groupby("_order_key", sort=False)["order_time"].transform(
+        lambda s: next((v for v in s if v), "")
+    )
 
     # order_id: {포스번호-영수번호}_{order_time} 형식 (예: 1-14_11:00:10).
     # order_time 이 비어있으면 구분자를 '_'로 바꾸고 00:00:00 으로 대체한다 (예: 1_14_00:00:00).

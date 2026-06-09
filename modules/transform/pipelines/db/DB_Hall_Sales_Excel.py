@@ -15,10 +15,10 @@
 
 import calendar
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 SALE_CSV  = MART_DB / "hall_sales_target" / "hall_sale_target.csv"
 MKT_CSV   = MART_DB / "hall_sales_target" / "hall_marketing_target.csv"
 XLSX_DIR  = MART_DB / "hall_sales_target"
+LLM_LOG_MD = XLSX_DIR / "llm_log.md"
 
 # Windows 경로 (로그 안내용)
 _WIN_BASE = r"C:\Users\민준\OneDrive - 주식회사 도리당\data\mart\hall_sales_target"
@@ -119,6 +120,28 @@ def _section(ws, row, title):
     c.alignment = _LEFT
 
 
+def _save_workbook_replace(wb: Workbook, path, allow_unique_fallback: bool = False):
+    tmp_path = path.with_name(f".{path.stem}.tmp{path.suffix}")
+    tmp_path.unlink(missing_ok=True)
+    wb.save(tmp_path)
+    tmp_path.chmod(0o666)
+    try:
+        if path.exists():
+            path.chmod(0o666)
+            path.unlink()
+        tmp_path.replace(path)
+        saved_path = path
+    except PermissionError:
+        if not allow_unique_fallback:
+            raise
+        saved_path = path.with_name(
+            f"{path.stem}_{datetime.now().strftime('%H%M%S')}{path.suffix}"
+        )
+        tmp_path.replace(saved_path)
+    saved_path.chmod(0o666)
+    return saved_path
+
+
 # ── 데이터 로드 ────────────────────────────────────────────────
 
 def _load_sale():
@@ -130,6 +153,11 @@ def _load_sale():
     return df
 
 
+def _to_number(series: pd.Series) -> pd.Series:
+    cleaned = series.fillna("").astype(str).str.replace(",", "", regex=False).str.strip()
+    return pd.to_numeric(cleaned, errors="coerce").fillna(0)
+
+
 def _load_mkt():
     df = pd.read_csv(MKT_CSV, dtype=str)
     df = df.rename(columns={"인스타_노출_traget": "인스타_노출_target"})
@@ -137,9 +165,11 @@ def _load_mkt():
     df["기준일자"] = pd.to_datetime(df["기준일자"], errors="coerce")
     for c in df.columns:
         if c not in ("입력날짜", "기준일자"):
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-    df["_month"] = df["기준일자"].dt.month
-    df["_year"]  = df["기준일자"].dt.year
+            df[c] = _to_number(df[c])
+    # 기준일자가 비어있으면 입력날짜로 fallback
+    df["_기준일"] = df["기준일자"].fillna(df["입력날짜"])
+    df["_month"] = df["_기준일"].dt.month
+    df["_year"]  = df["_기준일"].dt.year
     return df
 
 
@@ -160,7 +190,8 @@ def _ai_diagnose(sale_ctx: str, mkt_ctx: str):
         from modules.transform.utility.qwen_client import query_qwen
 
         sys_prompt = (
-            "F&B 매장 분석가. 2문장 이내, 숫자 포함, 개선점 1가지만. 번호/기호 없이 자연스럽게."
+            "F&B 매장 분석가. 반드시 한국어로만 답변. 2문장 이내, 숫자 포함, "
+            "개선점 1가지만. 번호/기호 없이 자연스럽게."
         )
         sale_diag = query_qwen(
             f"아래 매출 데이터를 2문장으로 요약하세요. 달성률과 가장 취약한 지표, 개선점 1가지.\n\n{sale_ctx}",
@@ -172,9 +203,61 @@ def _ai_diagnose(sale_ctx: str, mkt_ctx: str):
         )
     except Exception as e:
         logger.warning("Ollama 진단 실패 (fallback 사용): %s", e)
-        sale_diag = "⚠ AI 진단 불가 — Ollama 서비스 연결 실패. 수동 분석이 필요합니다."
-        mkt_diag  = "⚠ AI 진단 불가 — Ollama 서비스 연결 실패. 수동 분석이 필요합니다."
+        sale_diag = "⚠ AI 진단 불가 — Ollama 연결 또는 모델 실행 실패. 수동 분석이 필요합니다."
+        mkt_diag  = "⚠ AI 진단 불가 — Ollama 연결 또는 모델 실행 실패. 수동 분석이 필요합니다."
     return sale_diag, mkt_diag
+
+
+def append_weekly_ai_log(log_date: str | None = None) -> str:
+    """최신 주간보고의 AI 진단을 날짜별 Markdown 로그에 누적 저장한다."""
+    report_path = XLSX_DIR / "hall_weekly_report.xlsx"
+    if not report_path.exists():
+        raise FileNotFoundError(f"hall_weekly_report.xlsx 없음: {report_path}")
+
+    wb = load_workbook(report_path, data_only=True)
+    ws = wb.active
+
+    title = str(ws["A1"].value or "").replace("◆", "").strip()
+    period = str(ws["A2"].value or "").replace("기준:", "").strip()
+    diagnostics = {}
+    for row in ws.iter_rows(min_row=1, max_col=2, values_only=True):
+        label = str(row[0] or "").strip()
+        if label in ("매출 진단", "마케팅 진단"):
+            diagnostics[label] = str(row[1] or "").strip()
+
+    if log_date is None:
+        log_date = date.today().strftime("%Y-%m-%d")
+
+    section_key = f"{log_date} | {title} | {period}"
+    marker = f"<!-- hall-ai-log:{section_key} -->"
+    entry = (
+        f"{marker}\n"
+        f"## {section_key}\n\n"
+        f"### 매출 진단\n{diagnostics.get('매출 진단', '')}\n\n"
+        f"### 마케팅 진단\n{diagnostics.get('마케팅 진단', '')}\n\n"
+    )
+
+    if LLM_LOG_MD.exists():
+        content = LLM_LOG_MD.read_text(encoding="utf-8")
+    else:
+        content = "# 홀 주간보고 AI 진단 로그\n\n"
+
+    start = content.find(marker)
+    if start >= 0:
+        next_start = content.find("<!-- hall-ai-log:", start + len(marker))
+        if next_start >= 0:
+            content = content[:start] + entry + content[next_start:]
+        else:
+            content = content[:start] + entry
+    else:
+        if not content.endswith("\n"):
+            content += "\n"
+        content += "\n" + entry
+
+    LLM_LOG_MD.parent.mkdir(parents=True, exist_ok=True)
+    LLM_LOG_MD.write_text(content, encoding="utf-8")
+    logger.info("AI 진단 로그 저장 완료: %s", LLM_LOG_MD)
+    return f"완료: {LLM_LOG_MD}"
 
 
 # ── 메인 함수 ──────────────────────────────────────────────────
@@ -216,9 +299,13 @@ def build_weekly_report_excel(monthly_targets: dict,
 
     # ── 마케팅 ────────────────────────────────────────────────
     mkt_month  = mkt_df[(mkt_df["_year"] == yr) & (mkt_df["_month"] == mon)]
-    mkt_latest = mkt_df.sort_values("입력날짜").iloc[-1]
-    mm  = lambda c: int(mkt_month[c].sum()) if c in mkt_month else 0
-    mw  = lambda c: int(mkt_latest[c])      if c in mkt_latest.index else 0
+    # 이번주 = week_start ~ week_end 범위 합산 (기준일자 fallback 기준)
+    mkt_week = mkt_df[
+        (mkt_df["_기준일"].dt.date >= week_start) &
+        (mkt_df["_기준일"].dt.date <= week_end)
+    ]
+    mm  = lambda c: int(mkt_month[c].sum()) if c in mkt_month.columns else 0
+    mw  = lambda c: int(mkt_week[c].sum())  if c in mkt_week.columns and not mkt_week.empty else 0
     mmt = marketing_monthly_targets.get(ym, {})
     mwt = _mkt_weekly_targets(ym, week_start, marketing_monthly_targets)
 
@@ -236,7 +323,7 @@ def build_weekly_report_excel(monthly_targets: dict,
         f"[{wk_label}]\n"
         f"- 플레이스 유입: {mw('플레이스_유입')}명 / 목표 {mwt.get('플레이스_유입',0)}명\n"
         f"- 홍보물 배포:  {mw('홍보물_배포')}건 / 목표 {mwt.get('홍보물_배포',0)}건\n"
-        f"- 쿠폰 회수:   {mw('쿠폰_회수율')}건 / 목표 {mwt.get('쿠폰_회수',0)}건\n"
+        f"- 쿠폰 회수:   {mw('쿠폰_회수건수')}건 / 목표 {mwt.get('쿠폰_회수',0)}건\n"
         f"- 인스타 노출:  {mw('인스타_노출')}회 / 목표 {mwt.get('인스타_노출',0)}회\n"
         f"- 당근 노출:   {mw('당근_노출')}회 / 목표 {mwt.get('당근_노출',0)}회\n"
         f"- 네이버 오더: {mw('네이버_오더')}건 / 목표 {mwt.get('네이버_오더',0)}건"
@@ -312,7 +399,7 @@ def build_weekly_report_excel(monthly_targets: dict,
     mkt_metrics = [
         ("플레이스 유입", "플레이스_유입", "플레이스_유입", "플레이스_유입"),
         ("홍보물 배포",   "홍보물_배포",   "홍보물_배포",   "홍보물_배포"),
-        ("쿠폰 회수",     "쿠폰_회수율",   "쿠폰_회수율",   "쿠폰_회수"),
+        ("쿠폰 회수",     "쿠폰_회수건수", "쿠폰_회수건수", "쿠폰_회수"),
         ("인스타 노출",   "인스타_노출",   "인스타_노출",   "인스타_노출"),
         ("당근 노출",     "당근_노출",     "당근_노출",     "당근_노출"),
         ("네이버 오더",   "네이버_오더",   "네이버_오더",   "네이버_오더"),
@@ -349,9 +436,9 @@ def build_weekly_report_excel(monthly_targets: dict,
     output_path = XLSX_DIR / f"hall_weekly_report_{today_str}.xlsx"
     latest_path = XLSX_DIR / "hall_weekly_report.xlsx"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(output_path)
-    wb.save(latest_path)   # 고정 파일명 — Excel/PowerBI 참조용
+    output_path = _save_workbook_replace(wb, output_path, allow_unique_fallback=True)
+    _save_workbook_replace(wb, latest_path)   # 고정 파일명 — Excel/PowerBI 참조용
 
-    win_path = rf"{_WIN_BASE}\hall_weekly_report_{today_str}.xlsx"
+    win_path = rf"{_WIN_BASE}\{output_path.name}"
     logger.info("주간보고 저장 완료 (%s)\nWindows: %s", wk_label, win_path)
     return f"완료: {wk_label} → {win_path}"
