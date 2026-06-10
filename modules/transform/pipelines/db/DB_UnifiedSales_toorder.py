@@ -1,15 +1,16 @@
 """
-unified_sales - ToOrder 채널 전용 모듈.
+unified_sales - ToOrder pipeline.
 
-입력:
+Input:
 - ANALYTICS_DB/toorder_daily_store_platform/toorder_store_platform_daily.csv
-  컬럼: date, store, platform, price
+  columns: date, store, platform, price
 
-출력:
+Output:
 - MART_DB/unified_sales_grp/unified_sales_YYMMDD.parquet
 
-처리 방식:
-- 일별 플랫폼 집계 1행 → unified_sales 1행 (order_cnt=1, total_price=price)
+Behavior:
+- One row per store/platform/date becomes one unified_sales row
+- Range tokens such as `YYYY-MM-DD~YYYY-MM-DD` are skipped in backfill
 """
 
 import logging
@@ -37,23 +38,27 @@ TOORDER_CSV = ANALYTICS_DB / "toorder_daily_store_platform" / "toorder_store_pla
 TOORDER_SOURCE = "toorder"
 
 _PLATFORM_MAP = {
-    "배민1":        "배달의민족",
-    "배달의민족":   "배달의민족",
-    "쿠팽이츠":     "쿠팡이츠",
-    "쿠팡이츠":     "쿠팡이츠",
-    "땡겨요":       "땡겨요",
-    "요기요":       "요기요",
-    "네이버":       "네이버주문",
-    "포장":         "포장",
-    "배민 포장":    "배달의민족",
+    "배민1": "배달의민족",
+    "배달의민족": "배달의민족",
+    "쿠팡이츠": "쿠팡이츠",
+    "요기요": "요기요",
+    "땡겨요": "땡겨요",
+    "배민": "배달의민족",
 }
 
-# 플랫폼별 order_type 분류 (미등재 시 기본값 "배달")
 _ORDER_TYPE_MAP = {
-    "네이버주문":   "기타",
+    "배달의민족": "기본",
 }
 
 _BRAND_PREFIXES = {"도리당", "나홀로"}
+
+
+def _is_exact_date(value: str) -> bool:
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+        return True
+    except Exception:
+        return False
 
 
 def _extract_brand(normalized_name: str) -> str:
@@ -66,22 +71,22 @@ def _load_csv() -> pd.DataFrame:
         return pd.DataFrame()
     try:
         df = pd.read_csv(TOORDER_CSV, dtype=str, encoding="utf-8-sig").fillna("")
-    except Exception as e:
-        logger.warning("toorder CSV 로드 실패: %s", e)
+    except Exception as exc:
+        logger.warning("toorder CSV load failed: %s", exc)
         return pd.DataFrame()
     if not {"date", "store", "platform", "price"}.issubset(df.columns):
-        logger.warning("toorder CSV 컬럼 오류 (필요: date, store, platform, price)")
+        logger.warning("toorder CSV columns invalid: expected date, store, platform, price")
         return pd.DataFrame()
     return df
 
 
 def _transform_df(df: pd.DataFrame, date_str: str) -> pd.DataFrame:
-    df = df[df["date"].str.strip() == date_str].copy()
+    df = df[df["date"].astype(str).str.strip() == date_str].copy()
     if df.empty:
         return pd.DataFrame(columns=UNIFIED_COLUMNS)
 
     df["price"] = _to_int_series(df["price"])
-    df = df[df["price"] > 0].copy()  # 매출 없는 행(price=0/빈값) 제외
+    df = df[df["price"] > 0].copy()
     if df.empty:
         return pd.DataFrame(columns=UNIFIED_COLUMNS)
 
@@ -91,48 +96,46 @@ def _transform_df(df: pd.DataFrame, date_str: str) -> pd.DataFrame:
     df = df.drop(columns=["_store_norm"])
 
     df["platform"] = (
-        df["platform"].fillna("").astype(str).str.strip()
-        .map(lambda v: _PLATFORM_MAP.get(v, v))
+        df["platform"].fillna("").astype(str).str.strip().map(lambda v: _PLATFORM_MAP.get(v, v))
     )
 
-    # 같은 (store, platform) 조합 합산 (배민1 + 배달의민족 → 배달의민족 1행)
-    agg_keys = ["brand", "store", "platform"]
     df = (
-        df.groupby(agg_keys, as_index=False)
+        df.groupby(["brand", "store", "platform"], as_index=False)
         .agg(price=("price", "sum"))
     )
 
     store_map = _load_store_map()
-    df["_skey"]  = df["store"].str.strip().str.split().str[-1]
-    df["담당자"]  = df["_skey"].map(lambda k: _lookup_store_meta(store_map, k, "담당자"))
-    df["region"]  = df["_skey"].map(lambda k: _lookup_store_meta(store_map, k, "region"))
+    df["_skey"] = df["store"].str.strip().str.split().str[-1]
+    df["region"] = df["_skey"].map(lambda k: _lookup_store_meta(store_map, k, "region"))
+    df["담당자"] = df["_skey"].map(lambda k: _lookup_store_meta(store_map, k, "담당자"))
     df["실오픈일"] = df["_skey"].map(lambda k: _lookup_store_meta(store_map, k, "실오픈일"))
     df = df.drop(columns=["_skey"])
 
-    df["sale_date"]       = date_str
-    df["ym"]              = date_str[:7]
-    df["source"]          = TOORDER_SOURCE
-    df["order_type"]      = df["platform"].map(lambda v: _ORDER_TYPE_MAP.get(v, "배달"))
-    store_part            = df["store"].fillna("").str.strip()
-    platform_part         = df["platform"].fillna("").str.strip()
-    df["order_id"]        = (
+    df["sale_date"] = date_str
+    df["ym"] = date_str[:7]
+    df["source"] = TOORDER_SOURCE
+    df["order_type"] = df["platform"].map(lambda v: _ORDER_TYPE_MAP.get(v, "배달"))
+
+    store_part = df["store"].fillna("").astype(str).str.strip()
+    platform_part = df["platform"].fillna("").astype(str).str.strip()
+    df["order_id"] = (
         store_part.where(store_part != "", "unknown")
         + "_"
         + platform_part.where(platform_part != "", "unknown")
     )
-    df["order_time"]      = "00:00:00"
-    df["menu_name"]       = ""
-    df["item_seq"]        = "1"
-    df["item_id"]         = ""
-    df["item_name"]       = ""
-    df["qty"]             = "1"
-    df["unit_price"]      = df["price"]
-    df["total_price"]     = df["price"]
+    df["order_time"] = "00:00:00"
+    df["menu_name"] = ""
+    df["item_seq"] = "1"
+    df["item_id"] = ""
+    df["item_name"] = ""
+    df["qty"] = "1"
+    df["unit_price"] = df["price"]
+    df["total_price"] = df["price"]
     df["discount_amount"] = 0
-    df["sale_type"]       = "정상"
-    df["order_cnt"]       = 1
-    df["collected_at"]    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    df["_pk"]             = _make_unified_pk(df)
+    df["sale_type"] = "정상"
+    df["order_cnt"] = 1
+    df["collected_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    df["_pk"] = _make_unified_pk(df)
 
     return df.reindex(columns=UNIFIED_COLUMNS, fill_value="")
 
@@ -140,18 +143,21 @@ def _transform_df(df: pd.DataFrame, date_str: str) -> pd.DataFrame:
 def run_toorder(date_str: str, overwrite: bool = False) -> str:
     df_all = _load_csv()
     if df_all.empty:
-        raise FileNotFoundError(f"toorder CSV 없음: {TOORDER_CSV}")
+        raise FileNotFoundError(f"toorder CSV not found: {TOORDER_CSV}")
+
     df = _transform_df(df_all, date_str)
     if df.empty:
-        return f"SKIP: toorder {date_str} 해당일 데이터 없음"
+        return f"SKIP: toorder {date_str} no matching rows"
+
     saved = _save_unified_daily(df, date_str, overwrite=overwrite)
-    return f"toorder {date_str}: {saved}행 저장"
+    return f"toorder {date_str}: {saved} rows"
 
 
 def run_lookback_toorder(days: int = 7) -> str:
     df_all = _load_csv()
     if df_all.empty:
-        return "SKIP: toorder CSV 없음"
+        return "SKIP: toorder CSV not found"
+
     total = 0
     today = datetime.now()
     for i in range(days):
@@ -160,32 +166,49 @@ def run_lookback_toorder(days: int = 7) -> str:
             result = run_toorder(d, overwrite=True)
             logger.info(result)
             try:
-                total += int(result.split(":")[1].strip().split("행")[0].strip())
+                total += int(result.split(":")[1].strip().split()[0])
             except Exception:
                 pass
         except FileNotFoundError:
             logger.info("toorder lookback skip: %s", d)
-        except Exception as e:
-            logger.warning("toorder lookback error: %s | %s", d, e)
-    return f"toorder lookback({days}일): {total}행 저장"
+        except Exception as exc:
+            logger.warning("toorder lookback error: %s | %s", d, exc)
+
+    return f"toorder lookback({days} days): {total} rows"
 
 
 def backfill_toorder() -> str:
     df_all = _load_csv()
     if df_all.empty:
-        return "SKIP: toorder CSV 없음"
-    dates = sorted({str(d).strip() for d in df_all["date"].dropna().unique() if str(d).strip()})
+        return "SKIP: toorder CSV not found"
+
+    raw_dates = sorted({str(d).strip() for d in df_all["date"].dropna().unique() if str(d).strip()})
+    dates: list[str] = []
+    skipped_ranges: list[str] = []
+    for raw in raw_dates:
+        if _is_exact_date(raw):
+            dates.append(raw)
+            continue
+        if "~" in raw:
+            skipped_ranges.append(raw)
+            continue
+        logger.warning("toorder backfill skip invalid date token: %s", raw)
+
     if not dates:
-        return "SKIP: 유효한 date 없음"
+        return "SKIP: no valid dates"
+    if skipped_ranges:
+        logger.warning("toorder backfill skip range tokens: %s", skipped_ranges[:10])
+
     total = 0
     for date_str in dates:
         try:
             result = run_toorder(date_str, overwrite=True)
             logger.info(result)
             try:
-                total += int(result.split(":")[1].strip().split("행")[0].strip())
+                total += int(result.split(":")[1].strip().split()[0])
             except Exception:
                 pass
-        except Exception as e:
-            logger.warning("toorder backfill 실패: %s | %s", date_str, e)
-    return f"toorder backfill 완료: {len(dates)}일 / {total}행 저장"
+        except Exception as exc:
+            logger.warning("toorder backfill failed: %s | %s", date_str, exc)
+
+    return f"toorder backfill complete: {len(dates)} days / {total} rows"

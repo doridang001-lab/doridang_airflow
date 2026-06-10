@@ -1,5 +1,7 @@
 # DAG 규칙
 
+> Codex 전용 운영 문서(`AGENTS.md`, `docs/codex/**`)는 Claude 작업 규칙으로 사용하지 않는다.
+
 ```mermaid
 graph LR
     01_Extract --> 02_Review --> 03_Transform --> 04_Join

@@ -32,7 +32,7 @@ XLSX_DIR  = MART_DB / "hall_sales_target"
 LLM_LOG_MD = XLSX_DIR / "llm_log.md"
 
 # Windows 경로 (로그 안내용)
-_WIN_BASE = r"C:\Users\민준\OneDrive - 주식회사 도리당\data\mart\hall_sales_target"
+_WIN_BASE = str(XLSX_DIR)
 
 # ── 스타일 상수 ────────────────────────────────────────────────
 _DARK_FILL  = PatternFill("solid", fgColor="1F3864")  # 제목: 진남색
@@ -439,6 +439,6 @@ def build_weekly_report_excel(monthly_targets: dict,
     output_path = _save_workbook_replace(wb, output_path, allow_unique_fallback=True)
     _save_workbook_replace(wb, latest_path)   # 고정 파일명 — Excel/PowerBI 참조용
 
-    win_path = rf"{_WIN_BASE}\{output_path.name}"
+    win_path = str(output_path)
     logger.info("주간보고 저장 완료 (%s)\nWindows: %s", wk_label, win_path)
     return f"완료: {wk_label} → {win_path}"

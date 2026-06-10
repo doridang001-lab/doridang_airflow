@@ -342,6 +342,10 @@ def collect_orders_for_driver(
 
         if wait_for_page(driver, _TABLE_ROW_CSS, timeout=30):
             if _setup_cancel_filter(driver, store_id, store, target_date):
+                logger.info(
+                    "orders collection context: brand=%s store=%s store_id=%s target_date=%s",
+                    brand, store, store_id, target_date,
+                )
                 time.sleep(2.0)
 
                 def _filter_cancelled(d):

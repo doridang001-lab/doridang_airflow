@@ -29,7 +29,7 @@ default_args = {
 
 with DAG(
     dag_id=dag_id,
-    schedule="5 8 * * *", # "매일 오전 8시 5분" -> schedule="5 8 * * *"
+    schedule="5 6 * * *", # "매일 오전 6시 5분" -> schedule="5 6 * * *"
     start_date=pendulum.datetime(2024, 1, 1, tz="Asia/Seoul"),
     catchup=False,
     max_active_runs=1,

@@ -1,0 +1,727 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>배민 매장 대시보드</title>
+  <style>
+    :root {
+      --bg: #0f1116;
+      --panel: #171a23;
+      --panel-2: #11141b;
+      --line: #2a3140;
+      --text: #eef2f7;
+      --muted: #aeb8c7;
+      --green: #2bd46d;
+      --green-bg: rgba(43, 212, 109, 0.18);
+      --red: #ff5f5f;
+      --red-bg: rgba(255, 95, 95, 0.18);
+      --yellow: #f9c74f;
+      --yellow-bg: rgba(249, 199, 79, 0.18);
+      --blue: #4da3ff;
+      --blue-bg: rgba(77, 163, 255, 0.16);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+      background: radial-gradient(circle at top left, #1d2533 0%, var(--bg) 42%);
+      color: var(--text);
+    }
+    .page { padding: 20px; }
+    .header, .summary, .layout > section {
+      background: rgba(23, 26, 35, 0.94);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.25);
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 18px 22px;
+      margin-bottom: 16px;
+    }
+    .title h1 {
+      margin: 0;
+      font-size: 24px;
+      font-weight: 700;
+    }
+    .title p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .header-meta {
+      text-align: right;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .summary {
+      padding: 12px 16px;
+      margin-bottom: 16px;
+    }
+    .progress {
+      height: 10px;
+      background: #202635;
+      border-radius: 999px;
+      overflow: hidden;
+      margin-bottom: 10px;
+    }
+    .progress-bar {
+      height: 100%;
+      width: calc((var(--done) / max(var(--total), 1)) * 100%);
+      background: linear-gradient(90deg, #1ac965, #5ce3a1);
+    }
+    .summary-line {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .summary-line strong { color: var(--text); }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(640px, 1.8fr) minmax(320px, 1fr) minmax(240px, 0.7fr);
+      gap: 16px;
+    }
+    section { min-height: 680px; }
+    .stores-panel, .logs-panel, .filter-panel { padding: 14px; }
+    .panel-title {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 12px;
+    }
+    .panel-title h2 {
+      margin: 0;
+      font-size: 16px;
+    }
+    .panel-title span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+    thead th {
+      text-align: left;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--line);
+    }
+    tbody td {
+      padding: 12px 8px;
+      border-bottom: 1px solid rgba(42, 49, 64, 0.65);
+      vertical-align: middle;
+      font-size: 14px;
+    }
+    tbody tr.selected {
+      background: rgba(43, 212, 109, 0.14);
+      box-shadow: inset 0 0 0 1px rgba(43, 212, 109, 0.75);
+    }
+    .store-name {
+      font-weight: 700;
+      font-size: 16px;
+    }
+    .store-account {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 48px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .badge-완료 { color: var(--green); background: var(--green-bg); }
+    .badge-부분완료 { color: var(--yellow); background: var(--yellow-bg); }
+    .badge-건너뜀 { color: var(--yellow); background: var(--yellow-bg); }
+    .badge-수집중 { color: var(--blue); background: var(--blue-bg); }
+    .badge-실패 { color: var(--red); background: var(--red-bg); }
+    .badge-대기 { color: #c4cad5; background: rgba(196, 202, 213, 0.14); }
+    .mono { font-variant-numeric: tabular-nums; font-family: Consolas, monospace; }
+    .store-section { margin-top: 3px; color: var(--blue); font-size: 11px; }
+    .store-brand-tag { color: #a78bfa; font-size: 11px; font-weight: 700; background: rgba(167,139,250,0.14); padding: 1px 5px; border-radius: 4px; margin-right: 3px; }
+    .store-brand-tag--doridang { color: #ff9f43; background: rgba(255,159,67,0.18); }
+    .store-brand-tag--nahollo { color: #a78bfa; background: rgba(167,139,250,0.14); }
+    .badge-재시도완료 { color: #f9c74f; background: rgba(249,199,79,0.18); }
+    .badge-재시도실패 { color: #ff9c9c; background: rgba(255,95,95,0.18); }
+    .note-cell { max-width: 0; }
+    .note-text {
+      color: var(--muted);
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .note-last {
+      color: #586172;
+      font-size: 11px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      margin-top: 2px;
+    }
+    .detail-card {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      border-radius: 12px;
+      padding: 12px;
+      margin-bottom: 12px;
+      display: grid;
+      gap: 10px;
+    }
+    .detail-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+    }
+    .detail-title {
+      font-size: 16px;
+      font-weight: 700;
+    }
+    .detail-sub {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 4px;
+    }
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .detail-item {
+      border: 1px solid rgba(42, 49, 64, 0.65);
+      border-radius: 10px;
+      padding: 8px 10px;
+      background: rgba(23, 26, 35, 0.72);
+    }
+    .detail-item strong {
+      display: block;
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 6px;
+      font-weight: 600;
+    }
+    .detail-last {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.5;
+      word-break: break-word;
+    }
+    .log-list {
+      height: 560px;
+      overflow: auto;
+      background: #0b0d12;
+      border: 1px solid #1f2634;
+      border-radius: 12px;
+      padding: 10px 14px;
+      font-family: "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    .log-line { margin-bottom: 2px; color: #d8e2f0; display: flex; gap: 6px; align-items: baseline; }
+    .log-line .time { color: #8998ae; font-family: Consolas, monospace; font-size: 12px; flex-shrink: 0; }
+    .log-line .store { color: #7ee081; font-size: 12px; font-weight: 700; flex-shrink: 0; min-width: 48px; }
+    .log-line .msg { word-break: break-all; }
+    .log-line.warn { color: #ff9c9c; }
+    .log-line.section { color: #a8c7fa; font-weight: 700; border-top: 1px solid #1f2634; margin-top: 6px; padding-top: 4px; }
+    .filters {
+      display: grid;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    input[type="search"] {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--text);
+      outline: none;
+    }
+    .chip-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .chip {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--muted);
+      padding: 7px 10px;
+      border-radius: 999px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .chip.active {
+      background: rgba(43, 212, 109, 0.14);
+      color: var(--text);
+      border-color: rgba(43, 212, 109, 0.55);
+    }
+    .store-list {
+      height: 660px;
+      overflow: auto;
+      display: grid;
+      gap: 8px;
+    }
+    .store-pill {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      border-radius: 10px;
+      padding: 10px 12px;
+      cursor: pointer;
+      font-size: 13px;
+      color: var(--text);
+      text-align: left;
+    }
+    .store-pill.selected {
+      background: rgba(43, 212, 109, 0.14);
+      border-color: rgba(43, 212, 109, 0.8);
+    }
+    .store-pill.brand-doridang { box-shadow: inset 3px 0 0 rgba(255,159,67,0.95); }
+    .store-pill.brand-nahollo { box-shadow: inset 3px 0 0 rgba(167,139,250,0.95); }
+    .store-pill-name {
+      display: block;
+      font-weight: 700;
+    }
+    .store-pill-account {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    @media (max-width: 1500px) {
+      .layout { grid-template-columns: 1fr; }
+      section { min-height: auto; }
+      .log-list, .store-list { height: 420px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <div class="title">
+        <h1>배민 매장 실시간 대시보드</h1>
+        <p>DB_Beamin_Macro_Dags · 선택 매장 1개 · 실시간 연결 준비중</p>
+      </div>
+      <div class="header-meta">
+        <div>상태: <strong>RUNNING</strong></div>
+        <div>현재 처리중: <strong>도리당/교대점</strong></div>
+        <div>생성 시각: 2026-06-10 10:54:22</div>
+        <div>예상 완료: -</div>
+      </div>
+    </div>
+
+    <div class="summary" style="--done:0; --total:1;">
+      <div class="progress"><div class="progress-bar"></div></div>
+      <div class="summary-line">
+        <span>진행 <strong>0 / 1</strong></span>
+        <span>성공 <strong>0</strong></span>
+        <span>부분완료 <strong>0</strong></span>
+        <span>실패 <strong>0</strong></span>
+        <span>수집중 <strong>1</strong></span>
+        <span>경과 <strong>00:10</strong></span>
+        <span>평균 <strong>00:10</strong></span>
+        <span>최근 완료 <strong>-</strong></span>
+      </div>
+    </div>
+
+    <div class="layout">
+      <section class="stores-panel">
+        <div class="panel-title">
+          <h2>매장별 상태</h2>
+          <span>now / 우가클 / 주문서 / 마케팅 / 변경이력 / 비고 / 재수집 / 소요</span>
+        </div>
+        <table id="stores-table">
+          <thead>
+            <tr>
+              <th style="width: 56px;">#</th>
+              <th style="width: 38%;">매장명 / 계정</th>
+              <th style="width: 86px;">now</th>
+              <th style="width: 86px;">우가클</th>
+              <th style="width: 92px;">주문서</th>
+              <th style="width: 92px;">마케팅</th>
+              <th style="width: 92px;">변경이력</th>
+              <th style="width: 180px;">비고</th>
+              <th style="width: 96px;">재수집</th>
+              <th style="width: 92px;">소요</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section class="logs-panel">
+        <div class="detail-card" id="selected-store-card"></div>
+        <div class="panel-title">
+          <h2>라이브 로그</h2>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <span id="log-count">0줄</span>
+            <button id="copy-errors-btn" title="WARN 로그 클립보드 복사" style="padding:3px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel-2);color:var(--muted);cursor:pointer;font-size:12px;">오류 복사</button>
+          </div>
+        </div>
+        <div class="log-list" id="log-list"></div>
+      </section>
+
+      <section class="filter-panel">
+        <div class="panel-title">
+          <h2>매장 선택</h2>
+          <span>검색 / 상태 필터</span>
+        </div>
+        <div class="filters">
+          <input id="search" type="search" placeholder="매장명 검색..." />
+          <div class="chip-row" id="filters">
+            <button class="chip active" data-filter="ALL">전체</button>
+            <button class="chip" data-filter="수집중">수집중</button>
+            <button class="chip" data-filter="실패">실패</button>
+            <button class="chip" data-filter="완료">완료</button>
+            <button class="chip" data-filter="부분완료">부분완료</button>
+            <button class="chip" data-filter="대기">대기</button>
+          </div>
+        </div>
+        <div class="store-list" id="store-list"></div>
+      </section>
+    </div>
+  </div>
+
+  <script id="snapshot-json" type="application/json">{"dag_id": "DB_Beamin_Macro_Dags", "snapshot_id": 2, "overview": {"overall_status": "RUNNING", "current_store": "\ub3c4\ub9ac\ub2f9/\uad50\ub300\uc810", "last_completed_store": "-", "total_stores": 1, "completed_count": 0, "success_count": 0, "partial_count": 0, "warning_count": 0, "failure_count": 0, "progress_count": 1, "elapsed_text": "00:10", "avg_duration_text": "00:10", "latest_completed_at": null, "expected_finished_at": null, "snapshot_id": 2}, "stores": [{"seq": 1, "store_name": "\uad50\ub300\uc810", "account_id": "jka905", "brand": "\ub3c4\ub9ac\ub2f9", "orders_status": "\uc218\uc9d1\uc911", "marketing_status": "\ub300\uae30", "now_status": "\ub300\uae30", "woori_status": "\ub300\uae30", "ad_status": "\ub300\uae30", "change_status": "\ub300\uae30", "elapsed_text": "00:10", "note": "-", "selected": true, "retry_status": "", "current_section": "\uc8fc\ubb38\uc11c", "store_key": "\ub3c4\ub9ac\ub2f9/\uad50\ub300\uc810", "store_state": "\uc218\uc9d1\uc911"}], "live_logs": [], "generated_at": "2026-06-10T01:54:22.156039+00:00"}</script>
+  <script>
+    let snapshot = JSON.parse(document.getElementById("snapshot-json").textContent);
+    let connectionMode = "초기 로딩";
+    let eventSource = null;
+    let pollingTimer = null;
+    const tbody = document.querySelector("#stores-table tbody");
+    const logList = document.getElementById("log-list");
+    const storeList = document.getElementById("store-list");
+    const searchInput = document.getElementById("search");
+    const filterButtons = Array.from(document.querySelectorAll("#filters .chip"));
+    const subtitleEl = document.querySelector(".title p");
+    const headerStrongEls = Array.from(document.querySelectorAll(".header-meta strong"));
+    const headerMetaEls = Array.from(document.querySelectorAll(".header-meta div"));
+    const summaryBox = document.querySelector(".summary");
+    const summaryLine = document.querySelector(".summary-line");
+    const detailCard = document.getElementById("selected-store-card");
+    const STORE_SELECTION_KEY = "db_beamin_macro_selected_store";
+
+    function esc(s) {
+      return String(s ?? "-").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+
+    function fmtKst(value) {
+      if (!value) return "-";
+      const parsed = new Date(value);
+      if (Number.isNaN(parsed.getTime())) return String(value);
+      return parsed.toLocaleString("ko-KR", {
+        timeZone: "Asia/Seoul",
+        hour12: false,
+      });
+    }
+
+    function readSelectedStore() {
+      try {
+        return window.localStorage.getItem(STORE_SELECTION_KEY) || "";
+      } catch (_err) {
+        return "";
+      }
+    }
+
+    function writeSelectedStore(storeKey) {
+      selectedStore = storeKey || "";
+      try {
+        window.localStorage.setItem(STORE_SELECTION_KEY, selectedStore);
+      } catch (_err) {
+      }
+    }
+
+    function pickDefaultStore() {
+      const currentStore = snapshot.overview?.current_store;
+      const lastCompletedStore = snapshot.overview?.last_completed_store;
+      return (
+        (snapshot.stores.find((store) => store.store_key === selectedStore) || {}).store_key ||
+        (snapshot.stores.find((store) => store.store_key === currentStore) || {}).store_key ||
+        (snapshot.stores.find((store) => store.store_key === lastCompletedStore) || {}).store_key ||
+        (snapshot.stores.find((store) => store.selected) || snapshot.stores[0] || {}).store_key ||
+        ""
+      );
+    }
+
+    let selectedStore = readSelectedStore() || "";
+    let activeFilter = "ALL";
+
+    function badge(status) {
+      return `<span class="badge badge-${status}">${status}</span>`;
+    }
+
+    function retryCell(status) {
+      if (!status || status === "-") return `<span class="store-account">-</span>`;
+      return `<span class="badge badge-${status}">${status}</span>`;
+    }
+
+    function overallStoreStatus(store) {
+      return store.store_state || "대기";
+    }
+
+    function visibleStores() {
+      const keyword = searchInput.value.trim().toLowerCase();
+      return snapshot.stores.filter((store) => {
+        const status = overallStoreStatus(store);
+        const statusOk = activeFilter === "ALL" || status === activeFilter;
+        const text = `${store.store_name} ${store.account_id} ${store.note}`.toLowerCase();
+        const keywordOk = !keyword || text.includes(keyword);
+        return statusOk && keywordOk;
+      });
+    }
+
+    function noteSummary(store) {
+      const note = store.note || "-";
+      const parts = String(note).split("|").map((s) => s.trim()).filter(Boolean);
+      const errs = parts.filter((p) => p.includes("실패") || p.includes("오류"));
+      if (errs.length) return esc(errs.join(" | "));
+      const infos = parts.filter((p) => p && p !== "-");
+      if (infos.length) return esc(infos[infos.length - 1]);
+      if (store.store_state === "완료") return "전체 완료";
+      if (store.store_state === "부분완료") return "한쪽 수집 완료";
+      if (store.store_state === "수집중") return "수집 진행중";
+      return "-";
+    }
+
+    function selectedStoreRow() {
+      return snapshot.stores.find((store) => store.store_key === selectedStore) || snapshot.stores[0] || null;
+    }
+
+    function logMatchesSelected(entry) {
+      if (!selectedStore) return true;
+      if (entry.store_key === selectedStore) return true;
+      if (entry.store_key && selectedStore.endsWith(`/${entry.store_key}`)) return true;
+      return false;
+    }
+
+    function logsForView() {
+      return snapshot.live_logs.filter((entry) => logMatchesSelected(entry)).slice(-80);
+    }
+
+    function updateOverview() {
+      const overview = snapshot.overview || {};
+      if (subtitleEl) {
+        subtitleEl.textContent = `${snapshot.dag_id || "DB_Beamin_Macro_Dags"} · 선택 매장 ${overview.total_stores || 0}개 · ${connectionMode}`;
+      }
+      if (headerStrongEls[0]) headerStrongEls[0].textContent = overview.overall_status || "-";
+      if (headerStrongEls[1]) headerStrongEls[1].textContent = overview.current_store || "-";
+      if (headerMetaEls[2]) headerMetaEls[2].textContent = `생성 시각: ${fmtKst(snapshot.generated_at)}`;
+      if (headerMetaEls[3]) headerMetaEls[3].textContent = `예상 완료: ${fmtKst(overview.expected_finished_at)}`;
+      if (summaryBox) {
+        summaryBox.style.setProperty("--done", overview.completed_count || 0);
+        summaryBox.style.setProperty("--total", Math.max(overview.total_stores || 0, 1));
+      }
+      if (summaryLine) {
+        summaryLine.innerHTML = `
+          <span>진행 <strong>${overview.completed_count || 0} / ${overview.total_stores || 0}</strong></span>
+          <span>성공 <strong>${overview.success_count || 0}</strong></span>
+          <span>부분완료 <strong>${overview.partial_count || 0}</strong></span>
+          <span>실패 <strong>${overview.failure_count || 0}</strong></span>
+          <span>수집중 <strong>${overview.progress_count || 0}</strong></span>
+          <span>경과 <strong>${overview.elapsed_text || "-"}</strong></span>
+          <span>평균 <strong>${overview.avg_duration_text || "-"}</strong></span>
+          <span>최근 완료 <strong>${fmtKst(overview.latest_completed_at)}</strong></span>
+        `;
+      }
+    }
+
+    function renderSelectedStoreCard() {
+      const store = selectedStoreRow();
+      if (!store) {
+        detailCard.innerHTML = `<div class="detail-last">선택된 매장이 없습니다.</div>`;
+        return;
+      }
+      detailCard.innerHTML = `
+        <div class="detail-head">
+          <div>
+            <div class="detail-title">${esc(store.store_name)}</div>
+            <div class="detail-sub">${esc(store.brand || "-")} · ${esc(store.account_id || "-")}</div>
+          </div>
+          <div>${badge(overallStoreStatus(store))}</div>
+        </div>
+        <div class="detail-grid">
+          <div class="detail-item"><strong>주문서</strong>${badge(store.orders_status || "대기")}</div>
+          <div class="detail-item"><strong>마케팅</strong>${badge(store.marketing_status || "대기")}</div>
+          <div class="detail-item"><strong>now</strong>${badge(store.now_status || "대기")}</div>
+          <div class="detail-item"><strong>우가클</strong>${badge(store.woori_status || "대기")}</div>
+          <div class="detail-item"><strong>광고</strong>${badge(store.ad_status || "대기")}</div>
+          <div class="detail-item"><strong>변경이력</strong>${badge(store.change_status || "대기")}</div>
+        </div>
+        <div class="detail-last">마지막 갱신: ${esc(store.updated_at || "-")} · 소요: ${esc(store.elapsed_text || "-")}</div>
+        <div class="detail-last">현재 구간: ${esc(store.current_section || "-")}</div>
+        <div class="detail-last">마지막 이벤트: ${esc(store.last_event || "-")}</div>
+      `;
+    }
+
+    function renderStores() {
+      const stores = visibleStores();
+      tbody.innerHTML = stores.map((store) => `
+        <tr class="${store.store_key === selectedStore ? "selected" : ""}" data-store="${store.store_key}">
+          <td class="mono">${store.seq}</td>
+          <td>
+            <div class="store-name">${esc(store.store_name)}</div>
+            <div class="store-account"><span class="store-brand-tag store-brand-tag-${(store.brand || "").toLowerCase() === "도리당" ? "-doridang" : ((store.brand || "").toLowerCase() === "나홀로" ? "-nahollo" : "")}">${esc(store.brand || "")}</span> ${esc(store.account_id)}</div>
+            ${store.current_section && store.current_section !== "-" ? `<div class="store-section">• ${esc(store.current_section)}</div>` : ""}
+          </td>
+          <td>${badge(store.now_status || "대기")}</td>
+          <td>${badge(store.woori_status || "대기")}</td>
+          <td>${badge(store.orders_status || "대기")}</td>
+          <td>${badge(store.marketing_status || "대기")}</td>
+          <td>${badge(store.change_status || "대기")}</td>
+          <td class="note-cell"><span class="note-text">${noteSummary(store)}</span></td>
+          <td>${retryCell(store.retry_status || "-")}</td>
+          <td class="mono">${esc(store.elapsed_text || "-")}</td>
+        </tr>
+      `).join("");
+      Array.from(tbody.querySelectorAll("tr")).forEach((row) => {
+        row.addEventListener("click", () => {
+          writeSelectedStore(row.dataset.store);
+          renderAll();
+        });
+      });
+    }
+
+    function renderLogs() {
+      const logs = logsForView();
+      document.getElementById("log-count").textContent = `${logs.length}줄`;
+      logList.innerHTML = logs.map((entry) => {
+        const sec = entry.message && entry.message.startsWith("===");
+        return `<div class="log-line ${entry.level === "WARN" ? "warn" : ""} ${sec ? "section" : ""}">
+          <span class="time">${esc(entry.time)}</span>
+          <span class="store">${esc(entry.store_name)}</span>
+          <span class="msg">${esc(entry.message)}</span>
+        </div>`;
+      }).join("") || '<div class="log-line">선택한 매장 로그가 없습니다.</div>';
+      logList.scrollTop = logList.scrollHeight;
+    }
+
+    function renderStoreList() {
+      const stores = visibleStores();
+      storeList.innerHTML = stores.map((store) => `
+        <button class="store-pill brand-${(store.brand || "").toLowerCase() === "도리당" ? "doridang" : ((store.brand || "").toLowerCase() === "나홀로" ? "nahollo" : "other")} ${store.store_key === selectedStore ? "selected" : ""}" data-store="${store.store_key}">
+          <span class="store-pill-name">${store.store_name}</span>
+          <span class="store-pill-account">${store.brand || "-"} · ${store.store_state || "-"} · ${store.account_id || "-"}</span>
+        </button>
+      `).join("");
+      Array.from(storeList.querySelectorAll(".store-pill")).forEach((button) => {
+        button.addEventListener("click", () => {
+          writeSelectedStore(button.dataset.store);
+          renderAll();
+        });
+      });
+    }
+
+    function applySnapshot(nextSnapshot) {
+      snapshot = nextSnapshot;
+      if (!snapshot.stores.some((store) => store.store_key === selectedStore)) {
+        writeSelectedStore(pickDefaultStore());
+      }
+      renderAll();
+    }
+
+    function isFileMode() {
+      return window.location.protocol === "file:";
+    }
+
+    async function refreshSnapshot() {
+      if (isFileMode()) {
+        window.location.reload();
+        return;
+      }
+      const resp = await fetch(`/api/db-beamin-macro/snapshot?ts=${Date.now()}`, {
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache" },
+      });
+      if (!resp.ok) return;
+      applySnapshot(await resp.json());
+    }
+
+    function ensurePolling(reasonText = "5초 자동 새로고침") {
+      connectionMode = reasonText;
+      if (!pollingTimer) {
+        pollingTimer = window.setInterval(() => {
+          refreshSnapshot().catch(() => {});
+        }, 5000);
+      }
+      updateOverview();
+    }
+
+    function connectRealtime() {
+      if (isFileMode()) {
+        connectionMode = "로컬 파일 모드";
+        updateOverview();
+        return;
+      }
+      if (!("EventSource" in window)) {
+        ensurePolling();
+        return;
+      }
+      eventSource = new EventSource(`/api/db-beamin-macro/events?since=${snapshot.snapshot_id || 0}`);
+      eventSource.addEventListener("snapshot", (event) => {
+        connectionMode = "실시간 연결";
+        applySnapshot(JSON.parse(event.data));
+      });
+      eventSource.onopen = () => {
+        connectionMode = "실시간 연결";
+        updateOverview();
+      };
+      eventSource.onerror = () => {
+        if (eventSource) {
+          eventSource.close();
+          eventSource = null;
+        }
+        ensurePolling();
+      };
+    }
+
+    function renderAll() {
+      selectedStore = selectedStore || pickDefaultStore();
+      updateOverview();
+      renderSelectedStoreCard();
+      renderStores();
+      renderStoreList();
+      renderLogs();
+    }
+
+    searchInput.addEventListener("input", () => renderAll());
+    filterButtons.forEach((button) => {
+      button.addEventListener("click", () => {
+        activeFilter = button.dataset.filter;
+        filterButtons.forEach((item) => item.classList.toggle("active", item === button));
+        renderAll();
+      });
+    });
+
+    renderAll();
+    connectRealtime();
+
+    document.getElementById("copy-errors-btn").addEventListener("click", () => {
+      const errors = logsForView()
+        .filter((e) => e.level === "WARN" || /실패|오류|timeout|error/i.test(e.message))
+        .map((e) => `[${e.time}] ${e.store_name}: ${e.message}`)
+        .join("\n");
+      navigator.clipboard.writeText(errors || "오류 로그 없음").then(() => {
+        const btn = document.getElementById("copy-errors-btn");
+        const prev = btn.textContent;
+        btn.textContent = "복사 완료!";
+        setTimeout(() => { btn.textContent = prev; }, 1500);
+      });
+    });
+  </script>
+</body>
+</html>

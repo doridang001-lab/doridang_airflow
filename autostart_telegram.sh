@@ -40,6 +40,15 @@ for i in $(seq 1 24); do
     sleep 5
 done
 
+# 가상환경 활성화 및 `claude` 실행 파일 존재 확인
+echo "[$(date)] 가상환경 활성화 및 claude 확인"
+source "$VENV"
+if ! command -v claude >/dev/null 2>&1; then
+    echo "[$(date)] ERROR: 'claude' 명령을 찾을 수 없습니다. 자동 재시작을 중지합니다."
+    echo "[$(date)] PATH=", "$PATH"
+    exit 1
+fi
+
 # 중복 Claude 텔레그램 프로세스 제거 (claude-channels-session 외 다른 세션의 claude 종료)
 echo "[$(date)] 중복 Claude 프로세스 확인..."
 CHANNEL_PANE_PID=$(tmux list-panes -t claude-channels-session -F "#{pane_pid}" 2>/dev/null | head -1)

@@ -695,7 +695,18 @@ def _read_and_flatten_excel(excel_path: str) -> pd.DataFrame:
     - level_1이 "Unnamed"면 → level_0만 사용
     - 둘 다 유효 → "{level_1}_{level_0}" 형식으로 결합 (채널 상태 컬럼)
     """
-    df = pd.read_excel(excel_path, header=[0, 1])
+    try:
+        df = pd.read_excel(excel_path, header=[0, 1])
+        logger.info("Excel 멀티레벨 헤더 읽기 성공")
+    except ValueError as e:
+        # 멀티레벨 헤더 실패 시 싱글 헤더로 재시도
+        if "header index" in str(e):
+            logger.warning("멀티레벨 헤더 실패, 싱글 헤더로 재시도: %s", str(e))
+            df = pd.read_excel(excel_path, header=0)
+            # 싱글 헤더를 멀티레벨로 변환 (level_1만 사용)
+            df.columns = pd.MultiIndex.from_arrays([[""] * len(df.columns), df.columns])
+        else:
+            raise
     logger.info("Excel 원본 컬럼: %s", df.columns.tolist())
 
     new_columns = []

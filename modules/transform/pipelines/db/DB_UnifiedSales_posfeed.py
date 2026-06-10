@@ -496,13 +496,25 @@ def report_posfeed_exclusions(**context) -> str:
                     added_count,
                 )
 
-            if _ENABLE_POSFEED_DORI_EXCLUSION_ALERT:
+            # whitelist 재조회 — 이미 is_valid=Y로 수정된 항목은 알림에서 제외
+            try:
+                from modules.transform.utility.paths import POSFEED_WHITELIST_CSV_PATH
+                wl = pd.read_csv(POSFEED_WHITELIST_CSV_PATH, dtype=str).fillna("")
+                wl["_norm"] = wl["item_name"].astype(str).map(_normalize_item_key)
+                still_n = set(wl.loc[wl["is_valid"].str.upper() == "N", "_norm"])
+                still_blocked_df = doridori_df[
+                    doridori_df["item_name"].astype(str).map(_normalize_item_key).isin(still_n)
+                ]
+            except Exception:
+                still_blocked_df = doridori_df
+
+            if _ENABLE_POSFEED_DORI_EXCLUSION_ALERT and not still_blocked_df.empty:
                 from modules.transform.utility.mailer import send_email
                 rows_html = "".join(
                     f"<tr><td>{r.get('store','')}</td><td>{r.get('menu_name','')}</td>"
                     f"<td>{r.get('item_name','')}</td>"
                     f"<td>{r.get('sale_date','')}</td><td>{r.get('total_price','')}</td></tr>"
-                    for _, r in doridori_df.iterrows()
+                    for _, r in still_blocked_df.iterrows()
                 )
                 html = f"""<html><head><meta charset="UTF-8"></head>
 <body style="font-family:'Malgun Gothic',Arial,sans-serif;margin:24px;">
@@ -520,11 +532,11 @@ def report_posfeed_exclusions(**context) -> str:
                     subject_suffix = " (자동 Y 변환 적용)"
                 try:
                     send_email(
-                        subject=f"[도리당] Posfeed 제외 항목 검토 필요 - '도리' 포함 ({ym}, {len(doridori_df)}건){subject_suffix}",
+                        subject=f"[도리당] Posfeed 제외 항목 검토 필요 - '도리' 포함 ({ym}, {len(still_blocked_df)}건){subject_suffix}",
                         html_content=html,
                         to_emails="a17019@kakao.com",
                     )
-                    logger.info("[exclusion alert] '도리' 포함 %d건 알림 발송 (ym=%s)%s", len(doridori_df), ym, subject_suffix)
+                    logger.info("[exclusion alert] '도리' 포함 %d건 알림 발송 (ym=%s)%s", len(still_blocked_df), ym, subject_suffix)
                 except Exception as exc:
                     logger.error("[exclusion alert] 알림 발송 실패: %s", exc)
 

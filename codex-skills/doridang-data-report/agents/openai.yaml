@@ -1,0 +1,4 @@
+interface:
+  display_name: "Doridang Data Report"
+  short_description: "Draft Doridang markdown reports"
+  default_prompt: "Use $doridang-data-report to turn these notes and numbers into the Doridang report markdown format."

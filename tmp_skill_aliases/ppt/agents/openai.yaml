@@ -1,0 +1,4 @@
+interface:
+  display_name: "PPT"
+  short_description: "Create static PowerPoint decks"
+  default_prompt: "Use $ppt to create or revise a Doridang PowerPoint deck from the current source material."

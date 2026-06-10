@@ -21,26 +21,41 @@ import pandas as pd
 
 from modules.transform.ai_daily_collection_integrator import load_ai_daily_collection_detail_df
 from modules.transform.utility.mailer import send_email
-from modules.transform.utility.paths import ANALYTICS_DB, MART_DB
+from modules.transform.utility.paths import (
+    ANALYTICS_DB,
+    COLLECT_DB,
+    LLM_OUTPUT_DIR,
+    LOCAL_DB,
+    MART_DB,
+    ONEDRIVE_DB,
+)
 
 logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
 
 _DOCKER_TO_WIN = [
-    ("/opt/airflow/onedrive_mart",  r"C:\Users\민준\OneDrive - 주식회사 도리당\data\mart"),
-    ("/opt/airflow/analytics",      r"C:\Users\민준\OneDrive - 주식회사 도리당\data\analytics"),
-    ("/opt/airflow/Repository",     r"C:\Users\민준\OneDrive - 주식회사 도리당\Repository"),
-    ("/opt/airflow/Collect_Data",   r"C:\Users\민준\OneDrive - 주식회사 도리당\Collect_Data"),
-    ("/opt/airflow/Local_DB",       r"C:\Local_DB"),
-    ("/opt/airflow/onedrive_llm",   r"C:\Users\민준\OneDrive - 주식회사 도리당\data\llm"),
+    ("/opt/airflow/onedrive_mart", str(MART_DB)),
+    ("/opt/airflow/analytics", str(ANALYTICS_DB)),
+    ("/opt/airflow/Repository", str(ONEDRIVE_DB)),
+    ("/opt/airflow/Collect_Data", str(COLLECT_DB)),
+    ("/opt/airflow/Local_DB", str(LOCAL_DB)),
+    ("/opt/airflow/onedrive_llm", str(LLM_OUTPUT_DIR)),
+]
+_DYNAMIC_DOCKER_TO_WIN = [
+    ("/opt/airflow/onedrive_mart", str(MART_DB)),
+    ("/opt/airflow/analytics", str(ANALYTICS_DB)),
+    ("/opt/airflow/Repository", str(ONEDRIVE_DB)),
+    ("/opt/airflow/Collect_Data", str(COLLECT_DB)),
+    ("/opt/airflow/Local_DB", str(LOCAL_DB)),
+    ("/opt/airflow/onedrive_llm", str(LLM_OUTPUT_DIR)),
 ]
 
 
 def _to_win_file_uri(path: Path) -> tuple[str, str]:
     """Docker 경로를 Windows 경로 문자열과 file:/// URI로 변환한다."""
     posix = path.as_posix()
-    for docker_prefix, win_prefix in _DOCKER_TO_WIN:
+    for docker_prefix, win_prefix in _DYNAMIC_DOCKER_TO_WIN:
         if posix.startswith(docker_prefix):
             rel = posix[len(docker_prefix):]
             win_str = win_prefix + rel.replace("/", "\\")

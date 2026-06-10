@@ -1,23 +1,39 @@
+import os
 from pathlib import Path
 
 from config import WORKSPACE_ROOT
 
 
-INSTRUCTION_FILE_CANDIDATES = [
+CODEX_FILE_CANDIDATES = [
     "AGENTS.md",
     "AIGENDS.MD",
     "AIGEND.MD",
+]
+
+CLAUDE_FILE_CANDIDATES = [
     "CLAUDE.md",
     "CALUDE.MD",
     "CALUDE.ME",
 ]
+
+INSTRUCTION_MODE = os.getenv("LOCAL_AGENT_INSTRUCTION_MODE", "codex_first").strip().lower()
+
+
+def _instruction_file_candidates() -> list[str]:
+    if INSTRUCTION_MODE == "codex_only":
+        return [*CODEX_FILE_CANDIDATES]
+    if INSTRUCTION_MODE == "shared":
+        return [*CODEX_FILE_CANDIDATES, *CLAUDE_FILE_CANDIDATES]
+    if INSTRUCTION_MODE == "claude_first":
+        return [*CLAUDE_FILE_CANDIDATES, *CODEX_FILE_CANDIDATES]
+    return [*CODEX_FILE_CANDIDATES, *CLAUDE_FILE_CANDIDATES]
 
 
 def load_workspace_instructions() -> str:
     root = Path(WORKSPACE_ROOT).resolve()
     loaded = []
 
-    for name in INSTRUCTION_FILE_CANDIDATES:
+    for name in _instruction_file_candidates():
         path = root / name
         if not path.exists():
             continue
@@ -34,7 +50,11 @@ def load_workspace_instructions() -> str:
     if not loaded:
         return ""
 
-    return "\n\nWorkspace instruction files:\n" + "\n\n".join(loaded)
+    header = (
+        "\n\nWorkspace instruction mode: "
+        f"{INSTRUCTION_MODE}\nWorkspace instruction files:\n"
+    )
+    return header + "\n\n".join(loaded)
 
 
 SYSTEM_PROMPT = f"""

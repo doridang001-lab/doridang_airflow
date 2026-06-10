@@ -5,6 +5,11 @@ allowed-tools: Read, Edit, Glob
 
 Review this session for learnings about working with Claude Code in this codebase. Update CLAUDE.md with context that would help future Claude sessions be more effective.
 
+Ignore Codex-only operating docs:
+- Do not read from or update `AGENTS.md`.
+- Do not read from or update `docs/codex/**`.
+- Do not copy Codex-only guidance into any `CLAUDE.md` file.
+
 ## Step 1: Reflect
 
 What context was missing that would have helped Claude work more effectively?

@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from modules.transform.dashboard.db_beamin_macro_dashboard import (  # noqa: E402
+    DashboardService,
     SnapshotBuilder,
     SnapshotStore,
     StoreProgressParser,
@@ -131,9 +132,11 @@ def test_render_dashboard_html_contains_store_dashboard_labels():
         overview={
             "overall_status": "SUCCESS",
             "current_store": "교대점",
+            "last_completed_store": "도리당/교대점",
             "total_stores": 1,
             "completed_count": 1,
             "success_count": 1,
+            "partial_count": 0,
             "warning_count": 0,
             "failure_count": 0,
             "progress_count": 0,
@@ -148,27 +151,100 @@ def test_render_dashboard_html_contains_store_dashboard_labels():
                 "account_id": "jka905",
                 "orders_status": "완료",
                 "marketing_status": "완료",
+                "store_state": "완료",
                 "elapsed_text": "10:00",
                 "note": "-",
                 "selected": True,
                 "store_key": "도리당/교대점",
             }
         ],
-        live_logs=[{"time": "20:20:20", "store_name": "교대점", "level": "INFO", "message": "완료"}],
+        live_logs=[
+            {
+                "time": "20:20:20",
+                "store_name": "교대점",
+                "store_key": "도리당/교대점",
+                "level": "INFO",
+                "message": "완료",
+            }
+        ],
         generated_at=datetime(2026, 6, 5, 2, 0, tzinfo=UTC),
     )
 
-    assert "5초" in html_text
+    assert "실시간 연결 준비중" in html_text
     assert "변경이력" in html_text
     assert "우가클" in html_text
+    assert "부분완료" in html_text
+    assert "selected-store-card" in html_text
     assert "store-brand-tag--doridang" in html_text
     assert "brand-doridang" in html_text
     assert "function logsForView()" in html_text
-    assert "return scoped.slice(-80);" in html_text
+    assert "selectedStore.endsWith" in html_text
     assert 'window.location.protocol === "file:"' in html_text
     assert "window.location.reload();" in html_text
+    assert 'new EventSource(`/api/db-beamin-macro/events?since=${snapshot.snapshot_id || 0}`)' in html_text
     assert "/api/db-beamin-macro/snapshot" in html_text
-    assert "setInterval(refreshSnapshot, 5000)" in html_text
+    assert "window.setInterval" in html_text
+
+
+def test_dashboard_service_wait_for_snapshot_returns_newer_snapshot():
+    class SequencedBuilder:
+        def __init__(self):
+            self.counter = 0
+
+        def build(self, *, now=None):
+            self.counter += 1
+            return {
+                "generated_at": "2026-06-05T02:00:00+00:00",
+                "dag_id": "DB_Beamin_Macro_Dags",
+                "overview": {
+                    "overall_status": "RUNNING",
+                    "current_store": "도리당/교대점",
+                    "last_completed_store": "-",
+                    "total_stores": 1,
+                    "completed_count": 0,
+                    "success_count": 0,
+                    "partial_count": 0,
+                    "warning_count": 0,
+                    "failure_count": 0,
+                    "progress_count": 1,
+                    "elapsed_text": "00:10",
+                    "avg_duration_text": "00:10",
+                    "latest_completed_at": None,
+                    "expected_finished_at": None,
+                },
+                "stores": [
+                    {
+                        "seq": 1,
+                        "store_name": "교대점",
+                        "account_id": "jka905",
+                        "brand": "도리당",
+                        "orders_status": "수집중",
+                        "marketing_status": "대기",
+                        "now_status": "대기",
+                        "woori_status": "대기",
+                        "ad_status": "대기",
+                        "change_status": "대기",
+                        "elapsed_text": "00:10",
+                        "note": "-",
+                        "selected": True,
+                        "retry_status": "",
+                        "current_section": "주문서",
+                        "store_key": "도리당/교대점",
+                        "store_state": "수집중",
+                    }
+                ],
+                "live_logs": [],
+            }
+
+    service = DashboardService(builder=SequencedBuilder(), store=SnapshotStore(root=Path.cwd() / "tmp_test_dashboard"))
+    first = service.refresh_once()
+    next_snapshot = service.wait_for_snapshot(int(first["snapshot_id"]), timeout=0.01)
+    assert next_snapshot is None
+
+    second = service.refresh_once()
+    waited = service.wait_for_snapshot(int(first["snapshot_id"]), timeout=0.01)
+    assert waited is not None
+    assert waited["snapshot_id"] == second["snapshot_id"]
 
 
 def test_parse_change_label_handles_brand_store_storeid():

@@ -957,6 +957,10 @@ def render_dashboard_html(snapshot: dict[str, Any]) -> str:
     }}
 
     async function refreshSnapshot() {{
+      if (window.location.protocol === "file:") {{
+        window.location.reload();
+        return;
+      }}
       try {{
         const response = await fetch("/api/dag-monitoring/snapshot");
         if (!response.ok) return;

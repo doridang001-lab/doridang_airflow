@@ -26,6 +26,13 @@ graph LR
 - `scripts/` - 단발성 분석/검증 스크립트
 - `docs/` - 아키텍처, DB 스키마, 의사결정 기록
 
+## Codex 경계
+- `AGENTS.md`, `docs/codex/**`, `codex-skills/**`는 Codex/로컬 에이전트 전용 운영 문서
+- Claude는 위 경로를 프로젝트 규칙의 우선 출처로 사용하지 않음
+- 같은 주제가 양쪽에 있으면 `CLAUDE.md` 계열만 따름
+- Codex 전용 문서는 Claude 세션 메모, 요약, 자동 개선 대상에 포함하지 않음
+- 사용자가 명시적으로 검토를 요청한 경우에만 읽을 수 있으나 Claude 작업 규칙으로 승격하지 않음
+
 ## 가상환경 규칙
 - Windows: `.venv` → `.\.venv\Scripts\activate`
 - WSL: `.venv_wsl` → `source .venv_wsl/bin/activate`

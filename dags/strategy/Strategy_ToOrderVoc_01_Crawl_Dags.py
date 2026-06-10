@@ -154,7 +154,7 @@ def move_voc_files(patterns, dest_dir, **context):
 with DAG(
     dag_id=dag_file_stem,
     description="투오더 VOC 분석 일일 수집 (전일 데이터)",
-    schedule="30 9 * * *",   # 매일 09:30 KST
+    schedule="30 7 * * *",   # 매일 07:30 KST
     start_date=pendulum.datetime(2025, 1, 1, tz="Asia/Seoul"),
     catchup=False,
     tags=["01_crawling", "toorder", "voc", "daily"],

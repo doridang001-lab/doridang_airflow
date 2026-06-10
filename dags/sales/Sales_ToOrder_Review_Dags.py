@@ -49,7 +49,7 @@ default_args = {
 with DAG(
     dag_id=Path(__file__).stem,
     description="ToOrder VOC analysis daily collection and parquet save",
-    schedule="30 9 * * *",
+    schedule="30 7 * * *",
     start_date=pendulum.datetime(2025, 1, 1, tz="Asia/Seoul"),
     catchup=False,
     tags=["sales", "toorder", "voc", "parquet"],

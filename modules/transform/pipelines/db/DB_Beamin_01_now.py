@@ -92,7 +92,7 @@ def collect_now_stats(account_list: list[dict]) -> str:
                     "\uB9E4\uC7A5 \uB370\uC774\uD130 \uB85C\uB4DC \uB300\uAE30: %s",
                     store_info["store"],
                 )
-                if not wait_for_metrics_data(driver, timeout=45):
+                if not wait_for_metrics_data(driver, timeout=90):
                     logger.warning(
                         "\uB9E4\uC7A5 \uB370\uC774\uD130 \uB85C\uB4DC \uD0C0\uC784\uC544\uC6C3: %s",
                         store_info["store"],
@@ -203,7 +203,7 @@ def collect_now_for_driver(driver, account_id: str, store_list: list[dict]) -> N
                 raise RuntimeError(f"store selection failed: {store_info['store_id']}")
 
             logger.info("매장 데이터 로드 대기: %s", store_info["store"])
-            if not wait_for_metrics_data(driver, timeout=45):
+            if not wait_for_metrics_data(driver, timeout=90):
                 logger.warning("매장 데이터 로드 타임아웃: %s", store_info["store"])
                 raise RuntimeError(f"metrics load timeout: {store_info['store_id']}")
 

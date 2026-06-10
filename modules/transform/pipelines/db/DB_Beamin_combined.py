@@ -449,6 +449,18 @@ def collect_now_and_woori(account_list: list[dict], target_date: str | None = No
                 if filtered_store_list:
                     store_list = filtered_store_list
             store_list.sort(key=_store_collection_sort_key)
+            logger.info(
+                "store option filter detail account=%s requested=%s raw_options=%d selected=%s",
+                account_id,
+                requested_store_name or "<all>",
+                len(raw_options),
+                [f"{s['brand']} {s['store']}#{s['store_id']}" for s in store_list],
+            )
+            logger.info(
+                "selected store list [%s]: %s",
+                requested_store_name or "<all>",
+                [f"{s['brand']} {s['store']}" for s in store_list],
+            )
 
             if not store_list:
                 logger.warning("수집 대상 브랜드 없음: %s (%s)", account_id, raw_options)
@@ -718,6 +730,29 @@ def _parse_store_option(opt: dict) -> dict | None:
     return {"store_id": str(opt["store_id"]), "brand": brand, "store": store}
 
 
+def _split_requested_store_name(requested_store_name: str) -> tuple[str | None, str]:
+    """계정/override 매장명을 (brand, store) 형태로 분해한다."""
+    value = str(requested_store_name or "").strip()
+    for brand in KNOWN_BRANDS:
+        prefix = f"{brand} "
+        if value.startswith(prefix):
+            return brand, value[len(prefix):].strip()
+    return None, value
+
+
+def _filter_store_list_for_request(store_list: list[dict], requested_store_name: str) -> list[dict]:
+    """대표 매장명이 주어지면 같은 지점의 sister brand 옵션까지 함께 남긴다."""
+    _, requested_store = _split_requested_store_name(requested_store_name)
+    if not requested_store:
+        return list(store_list)
+
+    return [
+        store_info
+        for store_info in store_list
+        if requested_store == str(store_info.get("store") or "").strip()
+    ]
+
+
 def collect_now_and_woori(
     account_list: list[dict],
     target_date: str | None = None,
@@ -746,11 +781,11 @@ def collect_now_and_woori(
 
         store_list: list[dict] = []
         try:
-            if _urlparse(bootstrap_driver.current_url).hostname != "self.baemin.com":
+            try:
                 bootstrap_driver.set_page_load_timeout(45)
                 bootstrap_driver.get("https://self.baemin.com/")
-            else:
-                time.sleep(1.0)
+            except Exception as _nav_exc:
+                logger.warning("대시보드 이동 타임아웃 (계속 진행): %s", _nav_exc)
 
             if not wait_for_page(bootstrap_driver, "select[class*='ShopSelect']", timeout=60):
                 metrics["page_timeout_count"] += 1
@@ -764,14 +799,7 @@ def collect_now_and_woori(
                     seen_ids.add(parsed["store_id"])
                     store_list.append(parsed)
             if requested_store_name:
-                store_list = [
-                    store_info
-                    for store_info in store_list
-                    if requested_store_name in (
-                        str(store_info.get("store") or "").strip(),
-                        f"{str(store_info.get('brand') or '').strip()} {str(store_info.get('store') or '').strip()}".strip(),
-                    )
-                ]
+                store_list = _filter_store_list_for_request(store_list, requested_store_name)
             store_list.sort(key=_store_collection_sort_key)
             logger.info("수집 매장 순서: %s", [f"{s['brand']} {s['store']}" for s in store_list])
         except Exception as exc:

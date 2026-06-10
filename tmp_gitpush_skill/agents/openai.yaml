@@ -1,0 +1,4 @@
+interface:
+  display_name: "Gitpush"
+  short_description: "Publish changes with PR workflow"
+  default_prompt: "Use $gitpush to publish the current repo changes with the Doridang branch and PR workflow."

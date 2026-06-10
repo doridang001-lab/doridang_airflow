@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 import pendulum
+import pandas as pd
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.utils.trigger_rule import TriggerRule
@@ -58,6 +59,8 @@ from modules.transform.pipelines.db.DB_Beamin_combined import (
 )
 from modules.transform.utility.schedule import SMD_BAEMIN_COLLECT_TIME
 from modules.transform.pipelines.db.DB_Beamin_Macro_validate import validate_toorder_orders
+from modules.transform.utility.paths import ANALYTICS_DB, COLLECT_DB
+from modules.transform.utility.store_normalize import normalize as normalize_store_names, strip_brand
 
 logger = logging.getLogger(__name__)
 dag_id = Path(__file__).stem
@@ -78,6 +81,24 @@ TARGET_STORES = [
 # None  → 어제 1일만 수집 (기본)
 # int N → 어제부터 N일 전까지 백필 (예: 7 → 어제 포함 최근 7일)
 ORDERS_BACKFILL_DAYS: int | None = None
+MANUAL_BAEMIN_ORDERS_DIR = COLLECT_DB / "영업관리부_수집"
+
+
+def _save_validate_log(target_date: str, section: str, text: str) -> None:
+    """검증 결과를 일자별 .md 파일에 append한다."""
+    try:
+        log_dir = ANALYTICS_DB / "baemin_validate_log"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        ymd = target_date.replace("-", "")
+        log_path = log_dir / f"validate_{ymd}.md"
+        header = f"# 배민 검증 리포트 — {target_date}\n\n" if not log_path.exists() else ""
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(header)
+            f.write(f"## {section}\n")
+            f.write(text.strip())
+            f.write("\n\n")
+    except Exception as exc:
+        logger.warning("검증 로그 저장 실패: %s", exc)
 
 
 def _send_alert(subject: str, body: str) -> None:
@@ -127,6 +148,142 @@ def load_accounts(**context) -> str:
     return f"계정 {len(accounts)}개: {stores}"
 
 
+def _manual_baemin_store_key(raw_store_name: str, fallback_name: str = "") -> str:
+    text = str(raw_store_name or fallback_name or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\[.*?\]\s*", "", text).strip()
+    brand = "나홀로" if "나홀로" in text else ("도리당" if "도리당" in text else "")
+    matches = re.findall(r"[가-힣A-Za-z0-9]+(?:점|지점|분점|직영점)", text)
+    branch = matches[-1] if matches else (text.split()[-1] if text.split() else text)
+    normalized = f"{brand} {branch}".strip() if brand else branch
+    normalized_series = normalize_store_names(pd.Series([normalized]))
+    branch_series = strip_brand(normalized_series)
+    return str(branch_series.iloc[0]).strip()
+
+
+def _manual_baemin_filename_fallback(csv_path: Path) -> str:
+    stem = csv_path.stem
+    stem = re.sub(r"^baemin_orders_", "", stem)
+    stem = re.sub(r"_unknown_\d{8}$", "", stem)
+    return stem.replace("_", " ").strip()
+
+
+def _collect_manual_baemin_orders(target_date: str, base_dir: Path) -> tuple[dict[str, dict], list[str]]:
+    date_prefix = target_date.replace("-", ". ") + "."
+    csv_paths = sorted(base_dir.glob("baemin_orders_*.csv"))
+    store_frames: dict[str, list[pd.DataFrame]] = {}
+    used_files: list[str] = []
+
+    for csv_path in csv_paths:
+        try:
+            df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+        except Exception as exc:
+            logger.warning("manual baemin CSV read failed: %s / %s", csv_path, exc)
+            continue
+        if df.empty:
+            continue
+        fallback_name = _manual_baemin_filename_fallback(csv_path)
+        raw_store_name = ""
+        if "store_name" in df.columns and not df["store_name"].dropna().empty:
+            raw_store_name = str(df["store_name"].dropna().astype(str).iloc[0])
+        store_key = _manual_baemin_store_key(raw_store_name, fallback_name)
+        if not store_key:
+            logger.warning("manual baemin store parse failed: %s / raw=%s", csv_path.name, raw_store_name)
+            continue
+        required = {"주문상태", "주문번호", "주문시각", "결제금액"}
+        if not required.issubset(df.columns):
+            logger.warning("manual baemin CSV missing required columns: %s", csv_path.name)
+            continue
+        filtered = df[
+            (df["주문상태"].astype(str) == "배달완료")
+            & df["주문시각"].astype(str).str.startswith(date_prefix, na=False)
+            & df["결제금액"].astype(str).str.strip().ne("")
+        ][["주문번호", "결제금액"]].copy()
+        if filtered.empty:
+            continue
+        store_frames.setdefault(store_key, []).append(filtered)
+        used_files.append(csv_path.name)
+
+    result: dict[str, dict] = {}
+    for store_key, frames in store_frames.items():
+        combined = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["주문번호"])
+        amount = int(
+            combined["결제금액"]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .pipe(pd.to_numeric, errors="coerce")
+            .fillna(0)
+            .sum()
+        )
+        result[store_key] = {
+            "amount": amount,
+            "orders": int(combined["주문번호"].nunique()),
+        }
+    return result, used_files
+
+
+def precheck_manual_baemin_orders(**context) -> str:
+    dag_run = context.get("dag_run")
+    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
+    manual_dir = Path(str(conf.get("manual_baemin_dir") or MANUAL_BAEMIN_ORDERS_DIR))
+
+    if not manual_dir.exists():
+        msg = f"manual baemin precheck skip: dir missing ({manual_dir})"
+        logger.info(msg)
+        context["ti"].xcom_push(key="manual_precheck_summary", value={"used": False, "reason": msg})
+        return msg
+
+    from modules.transform.pipelines.db.DB_Beamin_Macro_validate import _toorder_baemin_by_store
+
+    manual_by_store, used_files = _collect_manual_baemin_orders(target_date, manual_dir)
+    if not manual_by_store:
+        msg = f"manual baemin precheck skip: no usable files for {target_date} in {manual_dir}"
+        logger.info(msg)
+        context["ti"].xcom_push(
+            key="manual_precheck_summary",
+            value={"used": False, "reason": msg, "files": used_files},
+        )
+        return msg
+
+    toorder_by_store = _toorder_baemin_by_store(target_date)
+    compare_stores = sorted(set(manual_by_store) & set(toorder_by_store))
+    lines = [
+        f"manual baemin precheck [{target_date}] dir={manual_dir}",
+        f"files={len(used_files)} stores={len(manual_by_store)} compare={len(compare_stores)}",
+    ]
+    for store in sorted(manual_by_store):
+        manual_amount = manual_by_store[store]["amount"]
+        manual_orders = manual_by_store[store]["orders"]
+        if store in toorder_by_store:
+            toorder_amount = int(toorder_by_store[store])
+            diff = toorder_amount - manual_amount
+            lines.append(
+                f"  - {store} manual={manual_amount:,} ({manual_orders} orders) / "
+                f"ToOrder={toorder_amount:,} / diff={diff:,}"
+            )
+        else:
+            lines.append(
+                f"  - {store} manual={manual_amount:,} ({manual_orders} orders) / ToOrder=<missing>"
+            )
+    summary = "\n".join(lines)
+    logger.info(summary)
+    context["ti"].xcom_push(
+        key="manual_precheck_summary",
+        value={
+            "used": True,
+            "target_date": target_date,
+            "dir": str(manual_dir),
+            "files": used_files,
+            "stores": manual_by_store,
+            "compared_stores": compare_stores,
+            "summary": summary,
+        },
+    )
+    return summary
+
+
 def collect_all(**context) -> str:
     import random
     import time
@@ -137,18 +294,35 @@ def collect_all(**context) -> str:
 
     dag_run = context.get("dag_run")
     conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date")  # "YYYY-MM-DD" → orders CSV 날짜 라벨 override
+
+    # 수집 날짜 목록 결정
+    # conf target_date 우선, 없으면 ORDERS_BACKFILL_DAYS 기준 (어제부터 N일), 기본은 어제 1일
+    if conf.get("target_date"):
+        dates = [conf["target_date"]]
+    elif ORDERS_BACKFILL_DAYS:
+        yesterday = pendulum.yesterday(KST)
+        dates = [yesterday.subtract(days=i).format("YYYY-MM-DD") for i in range(ORDERS_BACKFILL_DAYS)]
+        logger.info("백필 모드: %d일치 수집 %s ~ %s", len(dates), dates[-1], dates[0])
+    else:
+        dates = [pendulum.yesterday(KST).format("YYYY-MM-DD")]
 
     account_list = context["ti"].xcom_pull(task_ids="load_accounts", key="account_list")
     if not account_list:
         logger.warning("수집 대상 계정 없음")
         return "수집 대상 없음"
-    result = pipeline_collect_all(account_list, target_date=target_date)
-    context["ti"].xcom_push(key="failed", value=result.get("failed", {}))
-    context["ti"].xcom_push(key="validation", value=result.get("validation", []))
-    context["ti"].xcom_push(key="ad_stores", value=result.get("ad_stores", []))
-    context["ti"].xcom_push(key="store_info_per_account", value=result.get("store_info_per_account", []))
-    return result["summary"]
+
+    summaries = []
+    last_result: dict = {}
+    for target_date in dates:
+        logger.info("수집 날짜: %s", target_date)
+        last_result = pipeline_collect_all(account_list, target_date=target_date)
+        summaries.append(f"{target_date}: {last_result['summary']}")
+
+    context["ti"].xcom_push(key="failed", value=last_result.get("failed", {}))
+    context["ti"].xcom_push(key="validation", value=last_result.get("validation", []))
+    context["ti"].xcom_push(key="ad_stores", value=last_result.get("ad_stores", []))
+    context["ti"].xcom_push(key="store_info_per_account", value=last_result.get("store_info_per_account", []))
+    return " | ".join(summaries)
 
 
 def retry_failed(**context) -> str:
@@ -165,6 +339,10 @@ def retry_failed(**context) -> str:
 
 
 def validate_orders(**context) -> str:
+    dag_run = context.get("dag_run")
+    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
+
     validation = context["ti"].xcom_pull(task_ids="collect_all", key="validation") or []
     if not validation:
         logger.info("orders 검증 결과 없음")
@@ -185,13 +363,22 @@ def validate_orders(**context) -> str:
             f"기대={v.get('expected_count')}건/{v.get('expected_amount', 0):,}원 "
             f"(재시도 {v.get('retried', 0)}회)"
         )
+    if missing_brand_stores:
+        lines.append(f"누락브랜드 의심 매장: {', '.join(sorted(set(missing_brand_stores)))}")
+    if missing_brand_stores:
+        lines.append(f"누락브랜드 의심 매장: {', '.join(sorted(set(missing_brand_stores)))}")
+    if missing_brand_stores:
+        lines.append(f"누락브랜드 의심 매장: {', '.join(sorted(set(missing_brand_stores)))}")
     summary = "\n".join(lines)
+    if missing_brand_stores:
+        summary += f"\n누락브랜드 의심 매장: {', '.join(sorted(set(missing_brand_stores)))}"
     logger.info(summary)
 
     if mismatches:
         _send_alert(subject=f"[배민 orders 불일치] {len(mismatches)}건", body=summary)
         send_telegram(summary)
 
+    _save_validate_log(target_date, "orders 검증", summary)
     return summary
 
 
@@ -224,6 +411,7 @@ def validate_ad_funnel(**context) -> str:
         _send_alert(subject=f"[배민 ad_funnel 빈값] {len(still)}건 잔존", body=summary)
         send_telegram(summary)
 
+    _save_validate_log(target_date, "ad_funnel 빈값 점검", summary)
     return summary
 
 
@@ -247,6 +435,8 @@ def validate_toorder(**context) -> str:
     mismatched = result.get("mismatched_stores", [])
     store_results = result.get("store_results", {})
     gap_stores = result.get("toorder_gap_stores", [])
+    missing_brand_stores = result.get("missing_brand_stores", [])
+    missing_brand_stores = result.get("missing_brand_stores", [])
 
     # 요약 헤더
     summary_lines = [
@@ -274,9 +464,10 @@ def validate_toorder(**context) -> str:
     logger.info(summary)
 
     # 비교 매장이 0개면 검증 불가(예: ToOrder CSV 없음) → 허위 '불일치' 알림 보내지 않음
-    if compared > 0 and (not matched or gap_stores):
+    if compared > 0 and (not matched or gap_stores or missing_brand_stores):
         _send_alert(subject=f"[배민↔토더 불일치] {target_date}", body=summary)
 
+    _save_validate_log(target_date, "ToOrder 교차검증", summary)
     return summary
 
 
@@ -879,6 +1070,7 @@ def validate_toorder(**context) -> str:
 
     account_list = context["ti"].xcom_pull(task_ids="load_accounts", key="account_list") or []
     store_info_per_account = context["ti"].xcom_pull(task_ids="collect_all", key="store_info_per_account") or []
+    manual_precheck = context["ti"].xcom_pull(task_ids="precheck_manual_baemin_orders", key="manual_precheck_summary") or {}
 
     result = validate_toorder_orders(account_list, store_info_per_account, target_date)
 
@@ -888,6 +1080,7 @@ def validate_toorder(**context) -> str:
     mismatched = result.get("mismatched_stores", [])
     store_results = result.get("store_results", {})
     gap_stores = result.get("toorder_gap_stores", [])
+    missing_brand_stores = result.get("missing_brand_stores", [])
 
     lines = [
         f"토더 교차검증[{target_date}]: 비교 {compared}개 매장 / "
@@ -897,15 +1090,31 @@ def validate_toorder(**context) -> str:
         if not info.get("toorder_gap") and not info.get("matched"):
             retry_mark = " (재수집후)" if store in retried else ""
             lines.append(f"  - {store} ToOrder={info['toorder']:,} / 배민={info['baemin']:,}{retry_mark}")
+            if info.get("brand_issue"):
+                lines.append(
+                    f"    brand_issue={info.get('brand_issue')} "
+                    f"expected={info.get('expected_brands', [])} "
+                    f"active={info.get('active_brands', [])} "
+                    f"missing={info.get('missing_brands', [])} "
+                    f"stale={info.get('stale_brands', [])}"
+                )
     if gap_stores:
         lines.append(f"ToOrder 값 미수집(계정연결?): {', '.join(gap_stores)}")
+    if missing_brand_stores:
+        lines.append(f"누락브랜드 의심 매장: {', '.join(sorted(set(missing_brand_stores)))}")
+    if manual_precheck.get("used"):
+        lines.append(
+            f"수동사전검증: files={len(manual_precheck.get('files', []))} "
+            f"stores={len((manual_precheck.get('stores') or {}))} "
+            f"compare={len(manual_precheck.get('compared_stores', []))}"
+        )
     summary = "\n".join(lines)
     logger.info(summary)
-    if compared > 0 and (not matched or gap_stores):
+    if compared > 0 and (not matched or gap_stores or missing_brand_stores):
         send_telegram(summary)
-    if mismatched:
+    if mismatched or missing_brand_stores:
         _send_alert(
-            subject=f"[배민 교차검증 불일치] {target_date} {len(mismatched)}개 매장",
+            subject=f"[검증 불일치 {target_date}] mismatch={len(mismatched)} missing_brand={len(sorted(set(missing_brand_stores)))}",
             body=summary,
         )
     return summary
@@ -1151,6 +1360,12 @@ with DAG(
         execution_timeout=timedelta(minutes=2),
     )
 
+    t0 = PythonOperator(
+        task_id="precheck_manual_baemin_orders",
+        python_callable=precheck_manual_baemin_orders,
+        execution_timeout=timedelta(minutes=15),
+    )
+
     t1 = PythonOperator(
         task_id="load_accounts",
         python_callable=load_accounts,
@@ -1194,4 +1409,4 @@ with DAG(
         trigger_rule=TriggerRule.ALL_DONE,
     )
 
-    t_dash >> t1 >> t2 >> t3 >> [t4, t5, t6] >> t7
+    t_dash >> t0 >> t1 >> t2 >> t3 >> [t4, t5, t6] >> t7

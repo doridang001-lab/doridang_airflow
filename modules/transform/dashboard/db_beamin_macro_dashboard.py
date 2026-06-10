@@ -26,7 +26,8 @@ STORE_PROGRESS_FILENAME = "db_beamin_macro_store_progress.json"
 LIVE_LOG_FILENAME = "db_beamin_macro_live_log.json"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8787
-DEFAULT_REFRESH_SECONDS = 5
+DEFAULT_REFRESH_SECONDS = int(os.getenv("BEAMIN_DASHBOARD_REFRESH_SECONDS", "1"))
+SSE_KEEPALIVE_SECONDS = 15
 RECENT_BASELINE_LIMIT = 7
 MAX_LIVE_LOGS = 300
 
@@ -229,6 +230,16 @@ class StoreRow:
 
     def to_payload(self, *, now: datetime, active_run: bool) -> dict[str, Any]:
         store_done = self.orders_status in DONE_BADGES and self.marketing_status in DONE_BADGES
+        if "실패" in {self.orders_status, self.marketing_status}:
+            store_state = "실패"
+        elif "수집중" in {self.orders_status, self.marketing_status}:
+            store_state = "수집중"
+        elif store_done:
+            store_state = "완료"
+        elif self.orders_status in DONE_BADGES or self.marketing_status in DONE_BADGES:
+            store_state = "부분완료"
+        else:
+            store_state = "대기"
         if self.ended_at is not None:
             end = self.ended_at
         elif store_done and self.last_touched_at is not None:
@@ -278,6 +289,9 @@ class StoreRow:
             "current_section": self.current_section or "-",
             "retry_status": self.retry_status,
             "store_key": f"{self.brand}/{self.store_name}",
+            "store_state": store_state,
+            "is_fully_done": store_done,
+            "is_partially_done": store_state == "부분완료",
         }
 
 
@@ -387,7 +401,12 @@ class StoreProgressParser:
         self.logs_root = logs_root or (Path(os.getenv("AIRFLOW_HOME", Path.cwd())) / "logs")
         self.dag_id = dag_id
 
-    def build_store_progress(self, run: dict[str, Any] | None, *, now: datetime) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
+    def build_store_progress(
+        self,
+        run: dict[str, Any] | None,
+        *,
+        now: datetime,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
         if not run:
             return [], [], None
 
@@ -506,7 +525,7 @@ class StoreProgressParser:
         if row.orders_status in DONE_BADGES and row.marketing_status in DONE_BADGES:
             return "완료"
         if row.orders_status in DONE_BADGES or row.marketing_status in DONE_BADGES:
-            return "완료"
+            return "부분완료"
         return "대기"
 
     def _stores_from_logs(
@@ -815,10 +834,13 @@ class StoreProgressParser:
         row.raw_events.append(row.last_event)
 
     def _append_live_log(self, live_logs: list[dict[str, Any]], store_name: str, line: str, *, level: str = "INFO") -> None:
+        store_key = store_name.strip() if store_name else "?"
+        display_name = store_key.split("/", 1)[-1] if "/" in store_key else store_key
         live_logs.append(
             {
                 "time": _parse_time_token(line) or _utc_now().strftime("%H:%M:%S"),
-                "store_name": store_name,
+                "store_name": display_name,
+                "store_key": store_key,
                 "level": level,
                 "message": _as_text(_strip_log_prefix(line), limit=240),
             }
@@ -1291,12 +1313,14 @@ class SnapshotBuilder:
 
         focus_run = active_run or completed_run
         stores, live_logs, current_store = self.parser.build_store_progress(focus_run, now=now)
+        last_completed_store = self._find_last_completed_store(stores)
         summary = self._build_summary(
             active_run=active_run,
             completed_run=completed_run,
             stores=stores,
             recent_runs=recent_runs,
             current_store=current_store,
+            last_completed_store=last_completed_store,
             now=now,
         )
         return {
@@ -1314,6 +1338,7 @@ class SnapshotBuilder:
             "completed_count": summary["completed_count"],
             "total_stores": len(stores),
             "current_store": current_store,
+            "last_completed_store": last_completed_store,
             "overview": summary,
             "stores": stores,
             "live_logs": live_logs,
@@ -1327,6 +1352,7 @@ class SnapshotBuilder:
         stores: list[dict[str, Any]],
         recent_runs: list[dict[str, Any]],
         current_store: str | None,
+        last_completed_store: str | None,
         now: datetime,
     ) -> dict[str, Any]:
         focus_run = active_run or completed_run
@@ -1334,6 +1360,7 @@ class SnapshotBuilder:
         warning_count = 0
         failure_count = 0
         progress_count = 0
+        partial_count = 0
 
         for store in stores:
             status = self._overall_store_status(store)
@@ -1343,6 +1370,9 @@ class SnapshotBuilder:
                 progress_count += 1
             elif status == "경고":
                 warning_count += 1
+            elif status == "부분완료":
+                warning_count += 1
+                partial_count += 1
             elif status == "완료":
                 success_count += 1
 
@@ -1390,11 +1420,13 @@ class SnapshotBuilder:
             "expected_finished_at": _to_iso(expected_finished_at),
             "success_count": success_count,
             "warning_count": warning_count,
+            "partial_count": partial_count,
             "failure_count": failure_count,
             "progress_count": progress_count,
             "completed_count": completed_count,
             "total_stores": len(stores),
             "current_store": current_store or "-",
+            "last_completed_store": last_completed_store or "-",
             "generated_at": _to_iso(now),
         }
 
@@ -1406,9 +1438,22 @@ class SnapshotBuilder:
         note = str(store.get("note") or "")
         if "불일치" in note or "retry" in note.lower():
             return "경고"
-        if store.get("orders_status") in DONE_BADGES or store.get("marketing_status") in DONE_BADGES:
+        if store.get("orders_status") in DONE_BADGES and store.get("marketing_status") in DONE_BADGES:
             return "완료"
+        if store.get("orders_status") in DONE_BADGES or store.get("marketing_status") in DONE_BADGES:
+            return "부분완료"
         return "대기"
+
+    def _find_last_completed_store(self, stores: list[dict[str, Any]]) -> str | None:
+        completed = [
+            store
+            for store in stores
+            if self._overall_store_status(store) in {"완료", "부분완료"} and store.get("updated_at")
+        ]
+        if not completed:
+            return None
+        latest = max(completed, key=lambda store: str(store.get("updated_at") or ""))
+        return str(latest.get("store_key") or "")
 
     def _serialize_run(self, run: dict[str, Any] | None, *, now: datetime) -> dict[str, Any] | None:
         if not run:
@@ -1433,6 +1478,7 @@ def render_dashboard_html(
 ) -> str:
     payload = {
         "dag_id": dag_id,
+        "snapshot_id": overview.get("snapshot_id", 0),
         "overview": overview,
         "stores": stores,
         "live_logs": live_logs,
@@ -1444,7 +1490,6 @@ def render_dashboard_html(
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta http-equiv="refresh" content="60">
   <title>배민 매장 대시보드</title>
   <style>
     :root {{
@@ -1587,6 +1632,7 @@ def render_dashboard_html(
       font-weight: 700;
     }}
     .badge-완료 {{ color: var(--green); background: var(--green-bg); }}
+    .badge-부분완료 {{ color: var(--yellow); background: var(--yellow-bg); }}
     .badge-건너뜀 {{ color: var(--yellow); background: var(--yellow-bg); }}
     .badge-수집중 {{ color: var(--blue); background: var(--blue-bg); }}
     .badge-실패 {{ color: var(--red); background: var(--red-bg); }}
@@ -1614,8 +1660,56 @@ def render_dashboard_html(
       white-space: nowrap;
       margin-top: 2px;
     }}
+    .detail-card {{
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      border-radius: 12px;
+      padding: 12px;
+      margin-bottom: 12px;
+      display: grid;
+      gap: 10px;
+    }}
+    .detail-head {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+    }}
+    .detail-title {{
+      font-size: 16px;
+      font-weight: 700;
+    }}
+    .detail-sub {{
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 4px;
+    }}
+    .detail-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }}
+    .detail-item {{
+      border: 1px solid rgba(42, 49, 64, 0.65);
+      border-radius: 10px;
+      padding: 8px 10px;
+      background: rgba(23, 26, 35, 0.72);
+    }}
+    .detail-item strong {{
+      display: block;
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 6px;
+      font-weight: 600;
+    }}
+    .detail-last {{
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.5;
+      word-break: break-word;
+    }}
     .log-list {{
-      height: 720px;
+      height: 560px;
       overflow: auto;
       background: #0b0d12;
       border: 1px solid #1f2634;
@@ -1699,7 +1793,7 @@ def render_dashboard_html(
     @media (max-width: 1500px) {{
       .layout {{ grid-template-columns: 1fr; }}
       section {{ min-height: auto; }}
-      .log-list, .store-list {{ height: 440px; }}
+      .log-list, .store-list {{ height: 420px; }}
     }}
   </style>
 </head>
@@ -1708,7 +1802,7 @@ def render_dashboard_html(
     <div class="header">
       <div class="title">
         <h1>배민 매장 실시간 대시보드</h1>
-        <p>{html.escape(dag_id)} · 선택 매장 {overview.get("total_stores", 0)}개 · 15초 자동 새로고침</p>
+        <p>{html.escape(dag_id)} · 선택 매장 {overview.get("total_stores", 0)}개 · 실시간 연결 준비중</p>
       </div>
       <div class="header-meta">
         <div>상태: <strong>{html.escape(str(overview.get("overall_status", "-")))}</strong></div>
@@ -1723,7 +1817,7 @@ def render_dashboard_html(
       <div class="summary-line">
         <span>진행 <strong>{overview.get("completed_count", 0)} / {overview.get("total_stores", 0)}</strong></span>
         <span>성공 <strong>{overview.get("success_count", 0)}</strong></span>
-        <span>경고 <strong>{overview.get("warning_count", 0)}</strong></span>
+        <span>부분완료 <strong>{overview.get("partial_count", 0)}</strong></span>
         <span>실패 <strong>{overview.get("failure_count", 0)}</strong></span>
         <span>수집중 <strong>{overview.get("progress_count", 0)}</strong></span>
         <span>경과 <strong>{html.escape(str(overview.get("elapsed_text", "-")))}</strong></span>
@@ -1758,6 +1852,7 @@ def render_dashboard_html(
       </section>
 
       <section class="logs-panel">
+        <div class="detail-card" id="selected-store-card"></div>
         <div class="panel-title">
           <h2>라이브 로그</h2>
           <div style="display:flex;gap:8px;align-items:center;">
@@ -1780,6 +1875,7 @@ def render_dashboard_html(
             <button class="chip" data-filter="수집중">수집중</button>
             <button class="chip" data-filter="실패">실패</button>
             <button class="chip" data-filter="완료">완료</button>
+            <button class="chip" data-filter="부분완료">부분완료</button>
             <button class="chip" data-filter="대기">대기</button>
           </div>
         </div>
@@ -1791,20 +1887,9 @@ def render_dashboard_html(
   <script id="snapshot-json" type="application/json">{payload_json}</script>
   <script>
     let snapshot = JSON.parse(document.getElementById("snapshot-json").textContent);
-    document.querySelector("#stores-table thead").innerHTML = `
-      <tr>
-        <th style="width: 56px;">#</th>
-        <th style="width: 28%;">매장명 / 계정</th>
-        <th style="width: 86px;">now</th>
-        <th style="width: 86px;">우가클</th>
-        <th style="width: 86px;">주문서</th>
-        <th style="width: 86px;">마케팅</th>
-        <th style="width: 92px;">변경이력</th>
-        <th style="width: 180px;">비고</th>
-        <th style="width: 96px;">재수집</th>
-        <th style="width: 92px;">소요</th>
-      </tr>
-    `;
+    let connectionMode = "초기 로딩";
+    let eventSource = null;
+    let pollingTimer = null;
     const tbody = document.querySelector("#stores-table tbody");
     const logList = document.getElementById("log-list");
     const storeList = document.getElementById("store-list");
@@ -1815,50 +1900,8 @@ def render_dashboard_html(
     const headerMetaEls = Array.from(document.querySelectorAll(".header-meta div"));
     const summaryBox = document.querySelector(".summary");
     const summaryLine = document.querySelector(".summary-line");
+    const detailCard = document.getElementById("selected-store-card");
     const STORE_SELECTION_KEY = "db_beamin_macro_selected_store";
-    function readSelectedStore() {{
-      try {{
-        return window.localStorage.getItem(STORE_SELECTION_KEY) || "";
-      }} catch (_err) {{
-        return "";
-      }}
-    }}
-    function writeSelectedStore(storeKey) {{
-      selectedStore = storeKey || "";
-      try {{
-        window.localStorage.setItem(STORE_SELECTION_KEY, selectedStore);
-      }} catch (_err) {{
-      }}
-    }}
-    let selectedStore = readSelectedStore() || (snapshot.stores.find((store) => store.selected) || snapshot.stores[0] || {{}}).store_key || "";
-    let activeFilter = "ALL";
-
-    function badge(status) {{
-      return `<span class="badge badge-${{status}}">${{status}}</span>`;
-    }}
-
-    function retryCell(status) {{
-      if (!status || status === "-") return `<span class="store-account">-</span>`;
-      return `<span class="badge badge-${{status}}">${{status}}</span>`;
-    }}
-
-    function overallStoreStatus(store) {{
-      if (store.orders_status === "실패" || store.marketing_status === "실패") return "실패";
-      if (store.orders_status === "수집중" || store.marketing_status === "수집중") return "수집중";
-      if ((store.orders_status === "완료" || store.orders_status === "건너뜀") || (store.marketing_status === "완료" || store.marketing_status === "건너뜀")) return "완료";
-      return "대기";
-    }}
-
-    function visibleStores() {{
-      const keyword = searchInput.value.trim().toLowerCase();
-      return snapshot.stores.filter((store) => {{
-        const status = overallStoreStatus(store);
-        const statusOk = activeFilter === "ALL" || status === activeFilter;
-        const text = `${{store.store_name}} ${{store.account_id}} ${{store.note}}`.toLowerCase();
-        const keywordOk = !keyword || text.includes(keyword);
-        return statusOk && keywordOk;
-      }});
-    }}
 
     function esc(s) {{
       return String(s ?? "-").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -1874,10 +1917,93 @@ def render_dashboard_html(
       }});
     }}
 
+    function readSelectedStore() {{
+      try {{
+        return window.localStorage.getItem(STORE_SELECTION_KEY) || "";
+      }} catch (_err) {{
+        return "";
+      }}
+    }}
+
+    function writeSelectedStore(storeKey) {{
+      selectedStore = storeKey || "";
+      try {{
+        window.localStorage.setItem(STORE_SELECTION_KEY, selectedStore);
+      }} catch (_err) {{
+      }}
+    }}
+
+    function pickDefaultStore() {{
+      const currentStore = snapshot.overview?.current_store;
+      const lastCompletedStore = snapshot.overview?.last_completed_store;
+      return (
+        (snapshot.stores.find((store) => store.store_key === selectedStore) || {{}}).store_key ||
+        (snapshot.stores.find((store) => store.store_key === currentStore) || {{}}).store_key ||
+        (snapshot.stores.find((store) => store.store_key === lastCompletedStore) || {{}}).store_key ||
+        (snapshot.stores.find((store) => store.selected) || snapshot.stores[0] || {{}}).store_key ||
+        ""
+      );
+    }}
+
+    let selectedStore = readSelectedStore() || "";
+    let activeFilter = "ALL";
+
+    function badge(status) {{
+      return `<span class="badge badge-${{status}}">${{status}}</span>`;
+    }}
+
+    function retryCell(status) {{
+      if (!status || status === "-") return `<span class="store-account">-</span>`;
+      return `<span class="badge badge-${{status}}">${{status}}</span>`;
+    }}
+
+    function overallStoreStatus(store) {{
+      return store.store_state || "대기";
+    }}
+
+    function visibleStores() {{
+      const keyword = searchInput.value.trim().toLowerCase();
+      return snapshot.stores.filter((store) => {{
+        const status = overallStoreStatus(store);
+        const statusOk = activeFilter === "ALL" || status === activeFilter;
+        const text = `${{store.store_name}} ${{store.account_id}} ${{store.note}}`.toLowerCase();
+        const keywordOk = !keyword || text.includes(keyword);
+        return statusOk && keywordOk;
+      }});
+    }}
+
+    function noteSummary(store) {{
+      const note = store.note || "-";
+      const parts = String(note).split("|").map((s) => s.trim()).filter(Boolean);
+      const errs = parts.filter((p) => p.includes("실패") || p.includes("오류"));
+      if (errs.length) return esc(errs.join(" | "));
+      const infos = parts.filter((p) => p && p !== "-");
+      if (infos.length) return esc(infos[infos.length - 1]);
+      if (store.store_state === "완료") return "전체 완료";
+      if (store.store_state === "부분완료") return "한쪽 수집 완료";
+      if (store.store_state === "수집중") return "수집 진행중";
+      return "-";
+    }}
+
+    function selectedStoreRow() {{
+      return snapshot.stores.find((store) => store.store_key === selectedStore) || snapshot.stores[0] || null;
+    }}
+
+    function logMatchesSelected(entry) {{
+      if (!selectedStore) return true;
+      if (entry.store_key === selectedStore) return true;
+      if (entry.store_key && selectedStore.endsWith(`/${{entry.store_key}}`)) return true;
+      return false;
+    }}
+
+    function logsForView() {{
+      return snapshot.live_logs.filter((entry) => logMatchesSelected(entry)).slice(-80);
+    }}
+
     function updateOverview() {{
       const overview = snapshot.overview || {{}};
       if (subtitleEl) {{
-        subtitleEl.textContent = `${{snapshot.dag_id || "DB_Beamin_Macro_Dags"}} · 선택 매장 ${{overview.total_stores || 0}}개 · 5초 자동 새로고침`;
+        subtitleEl.textContent = `${{snapshot.dag_id || "DB_Beamin_Macro_Dags"}} · 선택 매장 ${{overview.total_stores || 0}}개 · ${{connectionMode}}`;
       }}
       if (headerStrongEls[0]) headerStrongEls[0].textContent = overview.overall_status || "-";
       if (headerStrongEls[1]) headerStrongEls[1].textContent = overview.current_store || "-";
@@ -1891,7 +2017,7 @@ def render_dashboard_html(
         summaryLine.innerHTML = `
           <span>진행 <strong>${{overview.completed_count || 0}} / ${{overview.total_stores || 0}}</strong></span>
           <span>성공 <strong>${{overview.success_count || 0}}</strong></span>
-          <span>경고 <strong>${{overview.warning_count || 0}}</strong></span>
+          <span>부분완료 <strong>${{overview.partial_count || 0}}</strong></span>
           <span>실패 <strong>${{overview.failure_count || 0}}</strong></span>
           <span>수집중 <strong>${{overview.progress_count || 0}}</strong></span>
           <span>경과 <strong>${{overview.elapsed_text || "-"}}</strong></span>
@@ -1901,29 +2027,32 @@ def render_dashboard_html(
       }}
     }}
 
-    function noteShort(note) {{
-      if (!note || note === "-") return "-";
-      const parts = note.split("|").map(s => s.trim()).filter(Boolean);
-      const errs = parts.filter(p => p.includes("실패") || p.includes("오류"));
-      if (errs.length) return esc(errs.join(" | "));
-      const last = parts[parts.length - 1];
-      return esc(last || "-");
-    }}
-
-    function noteSummary(store) {{
-      const note = store.note || "-";
-      const parts = String(note).split("|").map(s => s.trim()).filter(Boolean);
-      const errs = parts.filter(p => p.includes("실패") || p.includes("오류"));
-      if (errs.length) return esc(errs.join(" | "));
-      const infos = parts.filter(p => p && p !== "-");
-      if (infos.length) return esc(infos[infos.length - 1]);
-      if (store.now_status === "완료" && store.woori_status === "완료" && store.orders_status === "완료" && store.marketing_status === "완료" && store.change_status === "완료") {{
-        return "전체 성공";
+    function renderSelectedStoreCard() {{
+      const store = selectedStoreRow();
+      if (!store) {{
+        detailCard.innerHTML = `<div class="detail-last">선택된 매장이 없습니다.</div>`;
+        return;
       }}
-      if (store.marketing_status === "수집중" || store.orders_status === "수집중" || store.now_status === "수집중" || store.change_status === "수집중") {{
-        return "수집 진행중";
-      }}
-      return "-";
+      detailCard.innerHTML = `
+        <div class="detail-head">
+          <div>
+            <div class="detail-title">${{esc(store.store_name)}}</div>
+            <div class="detail-sub">${{esc(store.brand || "-")}} · ${{esc(store.account_id || "-")}}</div>
+          </div>
+          <div>${{badge(overallStoreStatus(store))}}</div>
+        </div>
+        <div class="detail-grid">
+          <div class="detail-item"><strong>주문서</strong>${{badge(store.orders_status || "대기")}}</div>
+          <div class="detail-item"><strong>마케팅</strong>${{badge(store.marketing_status || "대기")}}</div>
+          <div class="detail-item"><strong>now</strong>${{badge(store.now_status || "대기")}}</div>
+          <div class="detail-item"><strong>우가클</strong>${{badge(store.woori_status || "대기")}}</div>
+          <div class="detail-item"><strong>광고</strong>${{badge(store.ad_status || "대기")}}</div>
+          <div class="detail-item"><strong>변경이력</strong>${{badge(store.change_status || "대기")}}</div>
+        </div>
+        <div class="detail-last">마지막 갱신: ${{esc(store.updated_at || "-")}} · 소요: ${{esc(store.elapsed_text || "-")}}</div>
+        <div class="detail-last">현재 구간: ${{esc(store.current_section || "-")}}</div>
+        <div class="detail-last">마지막 이벤트: ${{esc(store.last_event || "-")}}</div>
+      `;
     }}
 
     function renderStores() {{
@@ -1933,44 +2062,32 @@ def render_dashboard_html(
           <td class="mono">${{store.seq}}</td>
           <td>
             <div class="store-name">${{esc(store.store_name)}}</div>
-            <div class="store-account"><span class="store-brand-tag store-brand-tag-${{(store.brand || "").toLowerCase() === "???" ? "-doridang" : ((store.brand || "").toLowerCase() === "???" ? "-nahollo" : "")}}">${{esc(store.brand || "")}}</span> ${{esc(store.account_id)}}</div>
-            ${{store.current_section && store.current_section !== "-" ? `<div class="store-section">? ${{esc(store.current_section)}}</div>` : ""}}
+            <div class="store-account"><span class="store-brand-tag store-brand-tag-${{(store.brand || "").toLowerCase() === "도리당" ? "-doridang" : ((store.brand || "").toLowerCase() === "나홀로" ? "-nahollo" : "")}}">${{esc(store.brand || "")}}</span> ${{esc(store.account_id)}}</div>
+            ${{store.current_section && store.current_section !== "-" ? `<div class="store-section">• ${{esc(store.current_section)}}</div>` : ""}}
           </td>
-          <td>${{badge(store.now_status || "??")}}</td>
-          <td>${{badge(store.woori_status || "??")}}</td>
-          <td>${{badge(store.orders_status || "??")}}</td>
-          <td>${{badge(store.marketing_status || "??")}}</td>
-          <td>${{badge(store.change_status || "??")}}</td>
+          <td>${{badge(store.now_status || "대기")}}</td>
+          <td>${{badge(store.woori_status || "대기")}}</td>
+          <td>${{badge(store.orders_status || "대기")}}</td>
+          <td>${{badge(store.marketing_status || "대기")}}</td>
+          <td>${{badge(store.change_status || "대기")}}</td>
           <td class="note-cell"><span class="note-text">${{noteSummary(store)}}</span></td>
           <td>${{retryCell(store.retry_status || "-")}}</td>
-          <td class="mono">${{esc(store.elapsed_text)}}</td>
+          <td class="mono">${{esc(store.elapsed_text || "-")}}</td>
         </tr>
       `).join("");
       Array.from(tbody.querySelectorAll("tr")).forEach((row) => {{
         row.addEventListener("click", () => {{
           writeSelectedStore(row.dataset.store);
-          renderStores();
-          renderStoreList();
-          renderLogs();
+          renderAll();
         }});
       }});
     }}
 
-    function isSection(msg) {{
-      return msg && msg.startsWith("===") && msg.endsWith("===");
-    }}
-
-    function logsForView() {{
-      const scoped = snapshot.live_logs.filter((entry) => !selectedStore || entry.store_name === selectedStore);
-      return scoped.slice(-80);
-    }}
-
     function renderLogs() {{
-      const isErr = (e) => e.level === "WARN" || /실패|오류|timeout|error/i.test(e.message) || (e.message && e.message.startsWith("==="));
       const logs = logsForView();
       document.getElementById("log-count").textContent = `${{logs.length}}줄`;
       logList.innerHTML = logs.map((entry) => {{
-        const sec = isSection(entry.message);
+        const sec = entry.message && entry.message.startsWith("===");
         return `<div class="log-line ${{entry.level === "WARN" ? "warn" : ""}} ${{sec ? "section" : ""}}">
           <span class="time">${{esc(entry.time)}}</span>
           <span class="store">${{esc(entry.store_name)}}</span>
@@ -1985,34 +2102,24 @@ def render_dashboard_html(
       storeList.innerHTML = stores.map((store) => `
         <button class="store-pill brand-${{(store.brand || "").toLowerCase() === "도리당" ? "doridang" : ((store.brand || "").toLowerCase() === "나홀로" ? "nahollo" : "other")}} ${{store.store_key === selectedStore ? "selected" : ""}}" data-store="${{store.store_key}}">
           <span class="store-pill-name">${{store.store_name}}</span>
-          <span class="store-pill-account">${{store.brand || "-"}} ${{store.account_id || "-"}}</span>
+          <span class="store-pill-account">${{store.brand || "-"}} · ${{store.store_state || "-"}} · ${{store.account_id || "-"}}</span>
         </button>
       `).join("");
       Array.from(storeList.querySelectorAll(".store-pill")).forEach((button) => {{
         button.addEventListener("click", () => {{
           writeSelectedStore(button.dataset.store);
-          renderStores();
-          renderStoreList();
-          renderLogs();
+          renderAll();
         }});
       }});
     }}
 
-    searchInput.addEventListener("input", () => {{
-      renderStores();
-      renderStoreList();
-      renderLogs();
-    }});
-
-    filterButtons.forEach((button) => {{
-      button.addEventListener("click", () => {{
-        activeFilter = button.dataset.filter;
-        filterButtons.forEach((item) => item.classList.toggle("active", item === button));
-        renderStores();
-        renderStoreList();
-        renderLogs();
-      }});
-    }});
+    function applySnapshot(nextSnapshot) {{
+      snapshot = nextSnapshot;
+      if (!snapshot.stores.some((store) => store.store_key === selectedStore)) {{
+        writeSelectedStore(pickDefaultStore());
+      }}
+      renderAll();
+    }}
 
     function isFileMode() {{
       return window.location.protocol === "file:";
@@ -2023,36 +2130,77 @@ def render_dashboard_html(
         window.location.reload();
         return;
       }}
-      try {{
-        const resp = await fetch(`/api/db-beamin-macro/snapshot?ts=${{Date.now()}}`, {{
-          cache: "no-store",
-          headers: {{ "Cache-Control": "no-cache" }},
-        }});
-        if (!resp.ok) return;
-        const nextSnapshot = await resp.json();
-        snapshot = nextSnapshot;
-        const hasSelected = snapshot.stores.some((store) => store.store_key === selectedStore);
-        if (!hasSelected) {{
-          writeSelectedStore((snapshot.stores.find((store) => store.selected) || snapshot.stores[0] || {{}}).store_key || "");
-        }}
-        updateOverview();
-        renderStores();
-        renderStoreList();
-        renderLogs();
-      }} catch (_err) {{
-      }}
+      const resp = await fetch(`/api/db-beamin-macro/snapshot?ts=${{Date.now()}}`, {{
+        cache: "no-store",
+        headers: {{ "Cache-Control": "no-cache" }},
+      }});
+      if (!resp.ok) return;
+      applySnapshot(await resp.json());
     }}
 
-    updateOverview();
-    renderStores();
-    renderStoreList();
-    renderLogs();
-    window.setInterval(refreshSnapshot, 5000);
+    function ensurePolling(reasonText = "5초 자동 새로고침") {{
+      connectionMode = reasonText;
+      if (!pollingTimer) {{
+        pollingTimer = window.setInterval(() => {{
+          refreshSnapshot().catch(() => {{}});
+        }}, 5000);
+      }}
+      updateOverview();
+    }}
+
+    function connectRealtime() {{
+      if (isFileMode()) {{
+        connectionMode = "로컬 파일 모드";
+        updateOverview();
+        return;
+      }}
+      if (!("EventSource" in window)) {{
+        ensurePolling();
+        return;
+      }}
+      eventSource = new EventSource(`/api/db-beamin-macro/events?since=${{snapshot.snapshot_id || 0}}`);
+      eventSource.addEventListener("snapshot", (event) => {{
+        connectionMode = "실시간 연결";
+        applySnapshot(JSON.parse(event.data));
+      }});
+      eventSource.onopen = () => {{
+        connectionMode = "실시간 연결";
+        updateOverview();
+      }};
+      eventSource.onerror = () => {{
+        if (eventSource) {{
+          eventSource.close();
+          eventSource = null;
+        }}
+        ensurePolling();
+      }};
+    }}
+
+    function renderAll() {{
+      selectedStore = selectedStore || pickDefaultStore();
+      updateOverview();
+      renderSelectedStoreCard();
+      renderStores();
+      renderStoreList();
+      renderLogs();
+    }}
+
+    searchInput.addEventListener("input", () => renderAll());
+    filterButtons.forEach((button) => {{
+      button.addEventListener("click", () => {{
+        activeFilter = button.dataset.filter;
+        filterButtons.forEach((item) => item.classList.toggle("active", item === button));
+        renderAll();
+      }});
+    }});
+
+    renderAll();
+    connectRealtime();
 
     document.getElementById("copy-errors-btn").addEventListener("click", () => {{
       const errors = logsForView()
-        .filter(e => isErr(e))
-        .map(e => `[${{e.time}}] ${{e.store_name}}: ${{e.message}}`)
+        .filter((e) => e.level === "WARN" || /실패|오류|timeout|error/i.test(e.message))
+        .map((e) => `[${{e.time}}] ${{e.store_name}}: ${{e.message}}`)
         .join("\\n");
       navigator.clipboard.writeText(errors || "오류 로그 없음").then(() => {{
         const btn = document.getElementById("copy-errors-btn");
@@ -2094,7 +2242,9 @@ class DashboardService:
         self.store = store or SnapshotStore()
         self.refresh_seconds = refresh_seconds
         self.snapshot_lock = threading.Lock()
+        self.snapshot_condition = threading.Condition(self.snapshot_lock)
         self.current_snapshot: dict[str, Any] = {}
+        self.snapshot_id = 0
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
 
@@ -2113,9 +2263,25 @@ class DashboardService:
         with self.snapshot_lock:
             return dict(self.current_snapshot)
 
+    def wait_for_snapshot(self, after_snapshot_id: int, timeout: float = SSE_KEEPALIVE_SECONDS) -> dict[str, Any] | None:
+        deadline = time.monotonic() + timeout
+        with self.snapshot_condition:
+            while True:
+                current_id = int(self.current_snapshot.get("snapshot_id") or 0)
+                if current_id > after_snapshot_id:
+                    return dict(self.current_snapshot)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self.snapshot_condition.wait(timeout=remaining)
+
     def refresh_once(self) -> dict[str, Any]:
         now = _utc_now()
         snapshot = self.builder.build(now=now)
+        with self.snapshot_condition:
+            self.snapshot_id += 1
+            snapshot["snapshot_id"] = self.snapshot_id
+            snapshot["overview"]["snapshot_id"] = self.snapshot_id
         snapshot["html"] = render_dashboard_html(
             dag_id=snapshot["dag_id"],
             overview=snapshot["overview"],
@@ -2124,8 +2290,9 @@ class DashboardService:
             generated_at=now,
         )
         self.store.persist(snapshot)
-        with self.snapshot_lock:
+        with self.snapshot_condition:
             self.current_snapshot = dict(snapshot)
+            self.snapshot_condition.notify_all()
         return snapshot
 
     def _run_loop(self) -> None:

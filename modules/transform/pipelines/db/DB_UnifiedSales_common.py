@@ -377,7 +377,10 @@ def _save_unified_daily(df: pd.DataFrame, date_str: str, overwrite: bool = False
             logger.info("변경 없음, 스킵: %s", daily_path)
             return 0
         merged = pd.concat([existing_other_src, df], ignore_index=True)
-        new_count = len(df) - len(existing_same_src)
+        # overwrite=True 로 기존 same-source rows 를 교체할 때 기존 행 수가 더 많으면
+        # 단순 차분은 음수가 될 수 있다. 반환값은 "이번 저장으로 반영된 행 수"로만
+        # 사용하므로 음수는 0으로 클램프한다.
+        new_count = max(0, len(df) - len(existing_same_src))
     else:
         merged = df.copy()
         new_count = len(merged)

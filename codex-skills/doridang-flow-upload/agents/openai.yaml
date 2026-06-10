@@ -1,0 +1,4 @@
+interface:
+  display_name: "Doridang Flow Upload"
+  short_description: "Build Doridang Flow automation"
+  default_prompt: "Use $doridang-flow-upload to implement or fix this Flow posting or subtask automation."

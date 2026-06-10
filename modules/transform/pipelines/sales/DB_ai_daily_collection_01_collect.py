@@ -99,6 +99,27 @@ def _resolve_target_date(target_date: str | None) -> str:
     return pendulum.now("Asia/Seoul").format("YYYY-MM-DD")
 
 
+def _detect_date_column_auto(df: pd.DataFrame) -> str | None:
+    """컬럼을 순회하면서 날짜처럼 보이는 첫 컬럼을 반환 (auto-detection fallback)."""
+    for col in df.columns:
+        col_name = str(col).strip().lower()
+        # 컬럼 이름에 "일", "날짜", "date" 등이 포함되어 있는지 확인
+        if any(kw in col_name for kw in ["일", "날짜", "date", "day"]):
+            return col
+    
+    # 컬럼 이름으로 찾을 수 없으면, 첫 10개 데이터를 보고 날짜 형식인지 확인
+    for col in df.columns:
+        try:
+            samples = df[col].dropna().head(10).astype(str)
+            # 모든 샘플이 날짜 형식처럼 보이는지 확인
+            valid_dates = sum(1 for s in samples if _normalize_parquet_date(s) is not None)
+            if valid_dates > 0 and valid_dates == len(samples):
+                return col
+        except Exception:
+            pass
+    return None
+
+
 def _load_ai_daily_collection_grp_df(src_xlsx: Path) -> tuple[pd.DataFrame, str | None, str | None]:
     if not src_xlsx.exists():
         raise FileNotFoundError(f"원본 입력 파일이 없습니다: {src_xlsx}")
@@ -109,6 +130,10 @@ def _load_ai_daily_collection_grp_df(src_xlsx: Path) -> tuple[pd.DataFrame, str 
         grp_df,
         ["일자", "날짜", "주문일자", "판매일자", "매출일자", "일자(YYYY-MM-DD)"],
     )
+    # 명시적 후보에서 찾을 수 없으면 자동 감지 시도
+    if not date_col:
+        date_col = _detect_date_column_auto(grp_df)
+    
     store_col = _pick_first_existing_col(
         grp_df,
         ["매장", "매장명", "지점", "점포", "브랜드"],
@@ -180,7 +205,12 @@ def _upsert_daily_parquets(
     store_col: str | None,
 ) -> list[Path]:
     if not date_col or date_col not in normalized_df.columns:
-        raise ValueError("일별 parquet 저장에 필요한 날짜 컬럼이 없습니다.")
+        available_cols = ", ".join(sorted(normalized_df.columns.tolist()))
+        raise ValueError(
+            f"일별 parquet 저장에 필요한 날짜 컬럼이 없습니다. "
+            f"찾은 컬럼: [{available_cols}]. "
+            f"다음 중 하나를 포함해야 합니다: 일자, 날짜, 주문일자, 판매일자, 매출일자, 일자(YYYY-MM-DD)"
+        )
 
     work_df = normalized_df.copy()
     work_df[date_col] = work_df[date_col].apply(_normalize_parquet_date)
