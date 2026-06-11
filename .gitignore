@@ -24,6 +24,7 @@ ENV/
 .python-version
 .env
 .env.*
+!.env.example
 .secrets*
 *.pem
 *.key
@@ -122,3 +123,7 @@ Collect_Data/
 
 chrome_profiles/
 ollama_models/
+
+# Local scratch directories
+tmp/
+tmp_airflow/

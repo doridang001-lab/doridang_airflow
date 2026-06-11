@@ -1,5 +1,14 @@
 # Codex Workspace Guide
 
+This file mirrors the Codex-facing workspace rules for tools that look for `CODEX.md`.
+`AGENTS.md` remains the source of truth when the two files differ.
+
+## Team Setup
+- Do not edit `docker-compose.yaml` for personal PC paths.
+- Copy `.env.example` to `.env`, then edit `.env` only.
+- At minimum, set `ONEDRIVE_ROOT` to the team member's local OneDrive path.
+- If missing, create `c:/Local_DB`, `c:/Doridang`, `e:/down`, and `e:/d_down`, or override them in `.env`.
+
 ## Scope
 - This file is for Codex and local coding agents.
 - Claude-specific instructions live in `CLAUDE.md` and `.claude/`.
@@ -15,13 +24,6 @@
 - Use `$doridang-ppt` for static report-to-PowerPoint conversion in the Doridang workflow.
 - Use `$doridang-gitpush` for branch, push, PR, and merge-safe git publishing.
 
-## Team Setup
-- Do not edit `docker-compose.yaml` for personal PC paths.
-- Copy `.env.example` to `.env`, then edit `.env` only.
-- At minimum, set `ONEDRIVE_ROOT` to the team member's local OneDrive path.
-- If missing, create `c:/Local_DB`, `c:/Doridang`, `e:/down`, and `e:/d_down`, or override them in `.env`.
-- `CODEX.md` mirrors these Codex-facing rules for tools that search that filename; `AGENTS.md` is the source of truth.
-
 ## Repo Map
 - `dags/` defines orchestration only; business logic should stay in `modules/`.
 - `modules/transform/pipelines/` contains most business logic.
@@ -33,7 +35,6 @@
 - Keep DAG files thin and move reusable logic into `modules/`.
 - Reuse existing utility modules before adding new helpers.
 - Preserve Windows vs WSL environment separation.
-- When the remaining context budget is around 40%, suggest running `compact` before continuing.
 
 ## Verification
 - Run the smallest relevant validation first.

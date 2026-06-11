@@ -43,6 +43,20 @@ graph LR
 - WSL = 실행/자동화 (`cc` 명령으로 진입, `.venv_wsl` 자동 활성화)
 - WSL 최초 세팅: `bash /mnt/c/airflow/setup_wsl.sh`
 
+## 팀원 최초 설정
+1. `.env.example`을 `.env`로 복사한 뒤 `.env`만 수정한다.
+   ```powershell
+   copy .env.example .env
+   notepad .env
+   ```
+2. `ONEDRIVE_ROOT`를 본인 PC의 OneDrive 경로로 바꾼다.
+   ```env
+   ONEDRIVE_ROOT=c:/Users/팀원계정/OneDrive - 주식회사 도리당
+   ```
+3. `c:/Local_DB`, `c:/Doridang`, `e:/down`, `e:/d_down` 폴더가 없으면 만들거나 `.env`에서 대체 경로로 바꾼다.
+4. 개인 PC 경로 때문에 `docker-compose.yaml`을 직접 수정하지 않는다. 개인 설정은 `.env`에만 둔다.
+5. WSL 세팅 후 `docker compose up -d`로 실행한다.
+
 ## 실행 명령 (WSL)
 ```bash
 docker compose up -d                    # Airflow 컨테이너 시작
