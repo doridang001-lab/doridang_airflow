@@ -337,10 +337,7 @@ def build_daily_tracking_excel(monthly_targets: dict,
     months = _available_months(sales_df)
     _write_excel_files(sales_df, months, daily_target)
 
-    win_path = (
-        r"C:\Users\민준\OneDrive - 주식회사 도리당"
-        r"\data\mart\hall_sales_target\hall_daily_report.xlsx"
-    )
+    win_path = str(OUTPUT_XLSX)
     logger.info("일단위 트래킹 저장 완료 (%s)\nWindows: %s",
                 ", ".join(months), win_path)
     return f"완료: {', '.join(months)} → {win_path}"

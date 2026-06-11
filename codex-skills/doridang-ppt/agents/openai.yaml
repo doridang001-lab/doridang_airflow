@@ -1,0 +1,4 @@
+interface:
+  display_name: "Doridang PPT"
+  short_description: "Build Doridang static PPT decks"
+  default_prompt: "Use $doridang-ppt to turn this report or memo into a Doridang static PowerPoint deck."

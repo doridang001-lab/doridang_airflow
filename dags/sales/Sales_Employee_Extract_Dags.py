@@ -10,6 +10,9 @@ import re
 from pathlib import Path
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -45,6 +48,88 @@ def parse_address(address_str):
     dong = parts[2] if len(parts) > 2 else ''
     
     return sido, sigungu, dong
+
+
+def send_email_alert(subject, body, to_email):
+    """토더 ID/PW null값 감지 시 메일 알림"""
+    try:
+        smtp_server = "smtp.gmail.com"
+        smtp_port = 587
+        sender_email = "airflow.alarm@gmail.com"
+        sender_password = "bgtu jxdz grxj xvwu"  # Gmail App Password
+        
+        msg = MIMEMultipart()
+        msg['From'] = sender_email
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+        
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(sender_email, sender_password)
+            server.send_message(msg)
+        
+        print(f"[메일발송] {to_email} - {subject}")
+        return True
+    except Exception as e:
+        print(f"[메일발송 실패] {to_email}: {e}")
+        return False
+
+
+def check_toder_null_values(df_original):
+    """토더 ID/PW null값 있는 매장 확인 및 메일 알림"""
+    if '토더ID' not in df_original.columns or '토더PW' not in df_original.columns:
+        return
+    
+    # 토더ID 또는 토더PW가 null이고 매장명이 있는 행 찾기
+    null_mask = (df_original['토더ID'].isna() | (df_original['토더ID'].astype(str).str.strip() == '')) | \
+                (df_original['토더PW'].isna() | (df_original['토더PW'].astype(str).str.strip() == ''))
+    
+    null_stores = df_original[null_mask & df_original['매장명'].notna()][['호점', '매장명', '담당자', '토더ID', '토더PW']].copy()
+    
+    if len(null_stores) > 0:
+        print(f"\n[토더계정 알림] null값 감지: {len(null_stores)}건")
+        
+        # 메일 본문 작성
+        html_body = """
+        <html>
+        <body style="font-family: Arial, sans-serif;">
+        <h3 style="color: #d9534f;">⚠ 토더(TORDER) 계정정보 누락 알림</h3>
+        <p>다음 매장에서 토더 ID/PW가 등록되지 않았습니다.</p>
+        <table border="1" cellpadding="10" style="border-collapse: collapse; margin-top: 20px;">
+        <tr style="background-color: #f5f5f5;">
+            <th>호점</th>
+            <th>매장명</th>
+            <th>담당자</th>
+            <th>토더ID</th>
+            <th>토더PW</th>
+        </tr>
+        """
+        
+        for _, row in null_stores.iterrows():
+            toder_id = str(row['토더ID']).strip() if pd.notna(row['토더ID']) else '(없음)'
+            toder_pw = str(row['토더PW']).strip() if pd.notna(row['토더PW']) else '(없음)'
+            html_body += f"""
+        <tr>
+            <td>{row['호점']}</td>
+            <td>{row['매장명']}</td>
+            <td>{row['담당자']}</td>
+            <td>{toder_id}</td>
+            <td>{toder_pw}</td>
+        </tr>
+            """
+        
+        html_body += """
+        </table>
+        <p style="margin-top: 20px; color: #666;">구글시트에서 해당 매장의 토더 ID/PW를 확인하고 등록해주세요.</p>
+        </body>
+        </html>
+        """
+        
+        subject = f"[도리당 매장관리] 토더(TORDER) 계정정보 누락 - {len(null_stores)}건"
+        send_email_alert(subject, html_body, "a17019@kakao.com")
+
 
 
 def load_employee_from_gsheet(**context):
@@ -194,6 +279,9 @@ def load_employee_from_gsheet(**context):
     df_final['매장명'] = normalize_store_names(df_final['매장명'])
 
     
+    # 📧 토더 ID/PW 체크 및 메일 알림 (저장 전)
+    check_toder_null_values(df)
+    
     # CSV 저장 (2개 경로)
     EMPLOYEE_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     
@@ -223,7 +311,7 @@ def load_employee_from_gsheet(**context):
 with DAG(
     dag_id=filename.replace('.py', ''),
     description='B3 시작점 대응 및 담당자 기반 플랫폼 분리 수집',
-    schedule="15 9 * * 2,4,6", # 매주 화 수 금 오전 9시 15분 실행
+    schedule="15 7 * * 2,4,6", # 매주 화 수 금 오전 7시 15분 실행
     start_date=pendulum.datetime(2023, 1, 1, tz="Asia/Seoul"),
     catchup=False,
     tags=['01_employee', 'gsheet', 'load'],

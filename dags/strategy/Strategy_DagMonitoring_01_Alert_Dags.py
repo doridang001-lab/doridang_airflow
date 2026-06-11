@@ -6,7 +6,7 @@ DAG 모니터링 - DAG 실행 현황 점검 및 대시보드 스냅샷 저장 DA
     2. apply_failure_rules    : FAIL/WARN/OK 판정 규칙 적용
     3. save_monitoring_results: OneDrive CSV + dashboard snapshot 저장
 
-스케줄: 5분마다 실행 (SMP_DAG_MONITORING_TIME)
+스케줄: 매일 15:00 실행 (SMP_DAG_MONITORING_TIME)
 """
 
 import importlib
@@ -60,10 +60,16 @@ with DAG(
         execution_timeout=pendulum.duration(minutes=5),
     )
 
+    task_email = PythonOperator(
+        task_id="send_monitoring_alert_email",
+        python_callable=_pipeline.send_monitoring_alert_email,
+        execution_timeout=pendulum.duration(minutes=5),
+    )
+
     task_save = PythonOperator(
         task_id="save_monitoring_results",
         python_callable=save_monitoring_results,
         execution_timeout=pendulum.duration(minutes=5),
     )
 
-    task_collect >> task_rules >> task_save
+    task_collect >> task_rules >> task_email >> task_save

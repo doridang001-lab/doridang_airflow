@@ -100,16 +100,16 @@ x-airflow-common:
     - ./modules:/opt/airflow/modules
     - ./requirements.txt:/opt/airflow/requirements.txt
     - ./.git:/opt/airflow/.git:ro
-    - "c:/Users/민준/OneDrive - 주식회사 도리당/data/dashboard:/opt/airflow/dashboard"
-    - "c:/Users/민준/OneDrive - 주식회사 도리당/Repository:/opt/airflow/Repository"
-    - "c:/Users/민준/OneDrive - 주식회사 도리당/Collect_Data:/opt/airflow/Collect_Data"
-    - "c:/Users/민준/OneDrive - 주식회사 도리당/data/mart:/opt/airflow/onedrive_mart"
-    - "c:/Users/민준/OneDrive - 주식회사 도리당/data/llm:/opt/airflow/onedrive_llm"
-    - "c:/Users/민준/OneDrive - 주식회사 도리당/data/analytics:/opt/airflow/analytics"
-    - "c:/Local_DB:/opt/airflow/Local_DB"
-    - "c:/Doridang:/opt/airflow/Doridang"
-    - e:/down:/opt/airflow/download
-    - e:/d_down:/opt/airflow/manual_download
+    - "${ONEDRIVE_ROOT:-c:/Users/민준/OneDrive - 주식회사 도리당}/data/dashboard:/opt/airflow/dashboard"
+    - "${ONEDRIVE_ROOT:-c:/Users/민준/OneDrive - 주식회사 도리당}/Repository:/opt/airflow/Repository"
+    - "${ONEDRIVE_ROOT:-c:/Users/민준/OneDrive - 주식회사 도리당}/Collect_Data:/opt/airflow/Collect_Data"
+    - "${ONEDRIVE_ROOT:-c:/Users/민준/OneDrive - 주식회사 도리당}/data/mart:/opt/airflow/onedrive_mart"
+    - "${ONEDRIVE_ROOT:-c:/Users/민준/OneDrive - 주식회사 도리당}/data/llm:/opt/airflow/onedrive_llm"
+    - "${ONEDRIVE_ROOT:-c:/Users/민준/OneDrive - 주식회사 도리당}/data/analytics:/opt/airflow/analytics"
+    - "${LOCAL_DB_ROOT:-c:/Local_DB}:/opt/airflow/Local_DB"
+    - "${DORIDANG_ROOT:-c:/Doridang}:/opt/airflow/Doridang"
+    - "${DOWN_DIR:-e:/down}:/opt/airflow/download"
+    - "${D_DOWN_DIR:-e:/d_down}:/opt/airflow/manual_download"
     - ./logs:/opt/airflow/logs
   user: "0:0"
   depends_on:

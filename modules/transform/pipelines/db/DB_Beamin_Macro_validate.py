@@ -45,7 +45,7 @@ def _toorder_baemin_by_store(target_date: str) -> dict:
         return {}
     try:
         df = pd.read_csv(csv_path, encoding="utf-8-sig")
-        mask = df["플랫폼명"].isin(["배달의민족", "배민1"])
+        mask = df["플랫폼명"].isin(["배달의민족", "배민1", "배민 포장"])
         by_store = (
             df.loc[mask]
             .groupby("매장명")["매출액"]
@@ -125,6 +125,64 @@ def sum_baemin_orders_delivered(target_date: str) -> int:
     """배민 orders DB의 배달완료 결제금액 전체 합계 (로깅용)."""
     by_store = _baemin_orders_by_store(target_date)
     return sum(by_store.values())
+
+
+def _expected_brands_by_store(store_info_per_account: list) -> dict[str, set[str]]:
+    expected: dict[str, set[str]] = defaultdict(set)
+    for item in store_info_per_account or []:
+        for store_info in item.get("stores", []) or []:
+            store = str(store_info.get("store") or "").strip()
+            brand = str(store_info.get("brand") or "").strip()
+            if store and brand:
+                expected[store].add(brand)
+    return expected
+
+
+def _inspect_brand_coverage(
+    target_date: str,
+    store_names: set[str],
+    expected_brands: dict[str, set[str]] | None = None,
+) -> dict[str, dict]:
+    """매장별 brand 파티션 존재 여부와 target_date 데이터 존재 여부를 점검한다."""
+    ym = target_date[:7]
+    date_prefix = target_date.replace("-", ". ") + "."
+    result: dict[str, dict] = {}
+
+    for store_name in sorted(store_names):
+        expected = set((expected_brands or {}).get(store_name) or [])
+        existing: set[str] = set()
+        active: set[str] = set()
+        for csv_path in BAEMIN_ORDERS_DB.glob(f"brand=*/store={store_name}/ym={ym}/orders_{ym}.csv"):
+            brand = csv_path.parts[-4][len("brand="):]
+            existing.add(brand)
+            try:
+                df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+            except Exception as exc:
+                logger.warning("brand coverage read failed: %s / %s", csv_path, exc)
+                continue
+            if "주문시각" not in df.columns:
+                continue
+            if df["주문시각"].astype(str).str.startswith(date_prefix, na=False).any():
+                active.add(brand)
+
+        missing = sorted(expected - existing)
+        stale = sorted((expected & existing) - active)
+        issue_type = None
+        if missing:
+            issue_type = "missing_partition"
+        elif stale:
+            issue_type = "stale_partition"
+
+        result[store_name] = {
+            "expected_brands": sorted(expected),
+            "existing_brands": sorted(existing),
+            "active_brands": sorted(active),
+            "missing_brands": missing,
+            "stale_brands": stale,
+            "issue_type": issue_type,
+        }
+
+    return result
 
 
 # ============================================================
@@ -257,6 +315,7 @@ def validate_toorder_orders(
     result: dict = {
         "store_results": {},
         "mismatched_stores": [],
+        "missing_brand_stores": [],
         "retried_stores": [],
         "matched": False,
         "compared_count": 0,
@@ -283,15 +342,32 @@ def validate_toorder_orders(
     else:
         # 폴백: 수집 메타가 없으면 배민 데이터가 있는 매장만 비교 (미수집 매장 제외)
         compare_stores = set(toorder_by_store) & set(baemin_by_store)
+    expected_brands = _expected_brands_by_store(store_info_per_account)
+    brand_coverage = _inspect_brand_coverage(target_date, compare_stores, expected_brands)
     result["compared_count"] = len(compare_stores)
+    logger.info(
+        "brand coverage snapshot before retry: %s",
+        {
+            store: {
+                "expected": info.get("expected_brands", []),
+                "active": info.get("active_brands", []),
+                "missing": info.get("missing_brands", []),
+                "stale": info.get("stale_brands", []),
+                "issue": info.get("issue_type"),
+            }
+            for store, info in brand_coverage.items()
+        },
+    )
     logger.info(
         "비교 매장 수: %d개 (수집=%d, ToOrder=%d, 배민=%d)",
         len(compare_stores), len(collected_stores), len(toorder_by_store), len(baemin_by_store),
     )
 
     mismatched_first: list[str] = []
+    missing_brand_stores: list[str] = []
     toorder_gap_stores: list[str] = []          # ToOrder 계정 연결 끊김 의심 매장
     for store in sorted(compare_stores):
+        coverage = brand_coverage.get(store, {})
         t = toorder_by_store[store]
         b = baemin_by_store.get(store, 0)       # 배민에 없으면 0으로 처리
 
@@ -310,14 +386,36 @@ def validate_toorder_orders(
             continue
 
         matched = t == b
-        result["store_results"][store] = {"toorder": t, "baemin": b, "matched": matched, "toorder_gap": False}
+        result["store_results"][store] = {
+            "toorder": t,
+            "baemin": b,
+            "matched": matched,
+            "toorder_gap": False,
+            "brand_issue": coverage.get("issue_type"),
+            "missing_brands": coverage.get("missing_brands", []),
+            "stale_brands": coverage.get("stale_brands", []),
+            "expected_brands": coverage.get("expected_brands", []),
+            "active_brands": coverage.get("active_brands", []),
+        }
         if not matched:
             mismatched_first.append(store)
+            if coverage.get("issue_type"):
+                missing_brand_stores.append(store)
+                logger.warning(
+                    "brand coverage issue: %s type=%s expected=%s active=%s missing=%s stale=%s",
+                    store,
+                    coverage.get("issue_type"),
+                    coverage.get("expected_brands", []),
+                    coverage.get("active_brands", []),
+                    coverage.get("missing_brands", []),
+                    coverage.get("stale_brands", []),
+                )
             logger.warning("불일치: %s ToOrder=%d / 배민=%d (차이=%d)", store, t, b, t - b)
         else:
             logger.info("일치: %s %d원", store, t)
 
     result["toorder_gap_stores"] = toorder_gap_stores
+    result["missing_brand_stores"] = sorted(set(missing_brand_stores))
 
     # 3. 전부 일치 → 종료
     if not mismatched_first:
@@ -333,18 +431,45 @@ def validate_toorder_orders(
 
     # 5. 재비교
     baemin_after = _baemin_orders_by_store(target_date)
+    brand_coverage_after = _inspect_brand_coverage(target_date, set(mismatched_first), expected_brands)
+    logger.info(
+        "brand coverage snapshot after retry: %s",
+        {
+            store: {
+                "expected": info.get("expected_brands", []),
+                "active": info.get("active_brands", []),
+                "missing": info.get("missing_brands", []),
+                "stale": info.get("stale_brands", []),
+                "issue": info.get("issue_type"),
+            }
+            for store, info in brand_coverage_after.items()
+        },
+    )
     mismatched_final: list[str] = []
     for store in mismatched_first:
         t = toorder_by_store[store]
         b = baemin_after.get(store, 0)
         matched = t == b
-        result["store_results"][store] = {"toorder": t, "baemin": b, "matched": matched}
+        coverage = brand_coverage_after.get(store, {})
+        result["store_results"][store] = {
+            "toorder": t,
+            "baemin": b,
+            "matched": matched,
+            "brand_issue": coverage.get("issue_type"),
+            "missing_brands": coverage.get("missing_brands", []),
+            "stale_brands": coverage.get("stale_brands", []),
+            "expected_brands": coverage.get("expected_brands", []),
+            "active_brands": coverage.get("active_brands", []),
+        }
         if not matched:
             mismatched_final.append(store)
+            if coverage.get("issue_type"):
+                missing_brand_stores.append(store)
             logger.warning("재수집 후 불일치: %s ToOrder=%d / 배민=%d", store, t, b)
         else:
             logger.info("재수집 후 일치: %s %d원", store, t)
 
     result["mismatched_stores"] = mismatched_final
+    result["missing_brand_stores"] = sorted(set(missing_brand_stores))
     result["matched"] = len(mismatched_final) == 0
     return result

@@ -104,11 +104,8 @@ def _resolve_output_dir() -> Path:
     override = os.getenv("TOORDER_VOC_OUTPUT_DIR")
     if override:
         return Path(override)
-    if ANALYTICS_DB:
-        return ANALYTICS_DB / "toorder_review"
-    if os.name == "nt":
-        return Path.home() / "OneDrive - 주식회사 도리당" / "data" / "analytics" / "toorder_review"
-    return Path("/opt/airflow/analytics/toorder_review")
+    return ANALYTICS_DB / "toorder_review"
+
 
 
 def _generate_date_list(lookback_days=None, conf: dict | None = None) -> tuple[str, list[str]]:

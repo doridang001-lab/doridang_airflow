@@ -26,6 +26,13 @@ graph LR
 - `scripts/` - 단발성 분석/검증 스크립트
 - `docs/` - 아키텍처, DB 스키마, 의사결정 기록
 
+## Codex 경계
+- `AGENTS.md`, `docs/codex/**`, `codex-skills/**`는 Codex/로컬 에이전트 전용 운영 문서
+- Claude는 위 경로를 프로젝트 규칙의 우선 출처로 사용하지 않음
+- 같은 주제가 양쪽에 있으면 `CLAUDE.md` 계열만 따름
+- Codex 전용 문서는 Claude 세션 메모, 요약, 자동 개선 대상에 포함하지 않음
+- 사용자가 명시적으로 검토를 요청한 경우에만 읽을 수 있으나 Claude 작업 규칙으로 승격하지 않음
+
 ## 가상환경 규칙
 - Windows: `.venv` → `.\.venv\Scripts\activate`
 - WSL: `.venv_wsl` → `source .venv_wsl/bin/activate`
@@ -35,6 +42,20 @@ graph LR
 - Windows = 개발/수정 (VSCode)
 - WSL = 실행/자동화 (`cc` 명령으로 진입, `.venv_wsl` 자동 활성화)
 - WSL 최초 세팅: `bash /mnt/c/airflow/setup_wsl.sh`
+
+## 팀원 최초 설정
+1. `.env.example`을 `.env`로 복사한 뒤 `.env`만 수정한다.
+   ```powershell
+   copy .env.example .env
+   notepad .env
+   ```
+2. `ONEDRIVE_ROOT`를 본인 PC의 OneDrive 경로로 바꾼다.
+   ```env
+   ONEDRIVE_ROOT=c:/Users/팀원계정/OneDrive - 주식회사 도리당
+   ```
+3. `c:/Local_DB`, `c:/Doridang`, `e:/down`, `e:/d_down` 폴더가 없으면 만들거나 `.env`에서 대체 경로로 바꾼다.
+4. 개인 PC 경로 때문에 `docker-compose.yaml`을 직접 수정하지 않는다. 개인 설정은 `.env`에만 둔다.
+5. WSL 세팅 후 `docker compose up -d`로 실행한다.
 
 ## 실행 명령 (WSL)
 ```bash

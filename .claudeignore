@@ -1,1 +1,4 @@
-"C:\airflow\models"
+models/
+AGENTS.md
+docs/codex/
+codex-skills/

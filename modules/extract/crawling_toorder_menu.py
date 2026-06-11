@@ -12,13 +12,10 @@ import logging
 import os
 import random
 import re
-import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-import urllib.error
 
 import undetected_chromedriver as uc
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
@@ -28,7 +25,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from modules.transform.utility.selenium_uc import configure_uc_data_path
+from modules.transform.utility.selenium_uc import configure_uc_data_path, launch_uc_chrome
 
 logger = logging.getLogger(__name__)
 
@@ -101,65 +98,38 @@ def _fill_react_input(driver, element, value: str, account_id: str, field_name: 
 def _launch_browser(account_id: str, download_dir: Path) -> uc.Chrome:
     """undetected_chromedriver 브라우저 인스턴스를 생성한다."""
     options = uc.ChromeOptions()
-
-    chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/google-chrome")
-    if Path(chrome_bin).exists() and chrome_bin.strip():
-        options.binary_location = chrome_bin
-
     if HEADLESS_MODE:
         options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-
     prefs = {
         "download.default_directory": str(download_dir.absolute()),
         "download.prompt_for_download": False,
         "download.directory_upgrade": True,
         "safebrowsing.enabled": True,
+        "profile.default_content_setting_values.automatic_downloads": 1,
     }
     options.add_experimental_option("prefs", prefs)
 
-    version_main: Optional[int] = None
+    driver = launch_uc_chrome(
+        options=options,
+        account_id=account_id,
+        chrome_bin=os.getenv("CHROME_BIN", "/usr/bin/google-chrome"),
+        log_fn=lambda msg: logger.info("[%s] %s", account_id, msg),
+    )
     try:
-        result = subprocess.run(
-            [chrome_bin, "--version"], capture_output=True, text=True, timeout=5
+        driver.execute_cdp_cmd(
+            "Page.setDownloadBehavior",
+            {
+                "behavior": "allow",
+                "downloadPath": str(download_dir.absolute()),
+            },
         )
-        version_main = int(result.stdout.strip().split()[-1].split(".")[0])
-        logger.info("[%s] Chrome 버전: %s", account_id, version_main)
+        logger.info("[%s] download behavior configured: %s", account_id, download_dir)
     except Exception as exc:
-        logger.warning("[%s] Chrome 버전 감지 실패: %s", account_id, exc)
-
-    _UC_INIT_RETRIES = 3
-    _UC_INIT_RETRY_DELAY = 10
-
-    driver = None
-    for attempt in range(1, _UC_INIT_RETRIES + 1):
-        try:
-            configure_uc_data_path()
-            kwargs: Dict[str, Any] = {"options": options}
-            if version_main:
-                kwargs["version_main"] = version_main
-            driver = uc.Chrome(**kwargs)
-            break
-        except urllib.error.URLError as exc:
-            if attempt < _UC_INIT_RETRIES:
-                logger.warning(
-                    "[%s] ChromeDriver 초기화 네트워크 오류 (시도 %d/%d), %ds 후 재시도: %s",
-                    account_id, attempt, _UC_INIT_RETRIES, _UC_INIT_RETRY_DELAY, exc,
-                )
-                time.sleep(_UC_INIT_RETRY_DELAY)
-            else:
-                raise
-        except Exception as exc:
-            match = re.search(r"Current browser version is (\d+)", str(exc))
-            if not match:
-                raise
-            configure_uc_data_path()
-            driver = uc.Chrome(options=options, version_main=int(match.group(1)))
-            break
-
+        logger.warning("[%s] download behavior configure failed: %s", account_id, exc)
     driver.set_window_size(1920, 1080)
     logger.info("[%s] 브라우저 실행 완료 (headless=%s)", account_id, HEADLESS_MODE)
     return driver
@@ -168,22 +138,36 @@ def _launch_browser(account_id: str, download_dir: Path) -> uc.Chrome:
 def _do_login(driver, account_id: str, password: str) -> bool:
     """투오더 CEO 사이트에 로그인한다."""
     logger.info("[%s] 로그인 시도", account_id)
-    try:
-        driver.get(LOGIN_URL)
-        end_time = time.time() + 15
-        while time.time() < end_time:
-            if driver.execute_script(
-                "return document.querySelector('input[name=\"id\"]') !== null;"
-            ):
-                break
-            time.sleep(0.5)
-        else:
-            logger.error("[%s] React 앱 로드 타임아웃", account_id)
+
+    retry_errors = ("Connection aborted", "RemoteDisconnected", "Connection refused", "NewConnectionError", "MaxRetryError")
+    for attempt in range(1, 4):
+        try:
+            driver.get(LOGIN_URL)
+            end_time = time.time() + 15
+            while time.time() < end_time:
+                if driver.execute_script(
+                    "return document.querySelector('input[name=\"id\"]') !== null;"
+                ):
+                    break
+                time.sleep(0.5)
+            else:
+                logger.error("[%s] React 앱 로드 타임아웃", account_id)
+                return False
+            time.sleep(1.0)
+            break
+        except Exception as exc:
+            err_str = str(exc)
+            if attempt < 3 and any(err in err_str for err in retry_errors):
+                logger.warning(
+                    "[%s] 페이지 이동 실패 (재시도 %d/3): %s",
+                    account_id,
+                    attempt,
+                    err_str,
+                )
+                time.sleep(5)
+                continue
+            logger.error("[%s] 페이지 이동 실패: %s", account_id, exc)
             return False
-        time.sleep(1.0)
-    except Exception as exc:
-        logger.error("[%s] 페이지 이동 실패: %s", account_id, exc)
-        return False
 
     try:
         wait = WebDriverWait(driver, 10)
@@ -249,7 +233,57 @@ NETWORK_ERRORS = (
     "ERR_INTERNET_DISCONNECTED",
     "ERR_CONNECTION_TIMED_OUT",
     "ERR_NETWORK_CHANGED",
+    "Connection aborted",
+    "RemoteDisconnected",
 )
+
+_BROWSER_DEAD_MARKERS = (
+    "Connection refused", "NewConnectionError", "MaxRetryError",
+    "RemoteDisconnected", "Connection aborted",
+)
+
+
+def _is_browser_dead(exc: Exception) -> bool:
+    s = str(exc)
+    return any(m in s for m in _BROWSER_DEAD_MARKERS)
+
+
+def _check_browser_alive(driver) -> bool:
+    try:
+        _ = driver.current_url
+        return True
+    except Exception:
+        return False
+
+
+def _recover_browser(
+    driver,
+    account_id: str,
+    password: str,
+    download_dir: Path,
+    page_url: str,
+    start_date: str,
+    end_date: str,
+) -> Optional[Any]:
+    """브라우저 재시작 후 분석 페이지+날짜 복구. 성공 시 새 driver, 실패 시 None."""
+    if driver:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+    new_driver = _launch_browser(account_id, download_dir)
+    if not _do_login(new_driver, account_id, password):
+        logger.error("[%s] 브라우저 재시작 후 로그인 실패", account_id)
+        return None
+    if not _navigate_to_analysis_page(new_driver, account_id, page_url):
+        logger.error("[%s] 브라우저 재시작 후 페이지 이동 실패", account_id)
+        return None
+    if not _set_date_range(new_driver, account_id, start_date, end_date):
+        logger.error("[%s] 브라우저 재시작 후 날짜 설정 실패", account_id)
+        return None
+    _wait_for_export_btn(new_driver, account_id)
+    logger.info("[%s] 브라우저 재시작 완료", account_id)
+    return new_driver
 
 
 def _navigate_to_analysis_page(
@@ -402,6 +436,288 @@ def _download_export_excel(
     return None
 
 
+def _pick_completed_download(download_dir: Path, since_ts: float, known_names: set[str]) -> Optional[Path]:
+    candidates: List[Path] = []
+    allowed_suffixes = {".xlsx", ".xls", ".csv"}
+    for path in download_dir.glob("*"):
+        if not path.is_file():
+            continue
+        if path.name.endswith(".crdownload"):
+            continue
+        if path.suffix.lower() not in allowed_suffixes:
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if path.name not in known_names or stat.st_mtime >= since_ts:
+            candidates.append(path)
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _wait_for_downloaded_file(
+    download_dir: Path,
+    file_prefix: str,
+    timeout: int,
+    logger_account_id: str,
+    log_prefix: str,
+) -> Optional[Path]:
+    start_ts = time.time()
+    known_names = {p.name for p in download_dir.glob("*") if p.is_file()}
+    stable_path: Optional[Path] = None
+    stable_size: Optional[int] = None
+    stable_hits = 0
+
+    for _ in range(timeout):
+        time.sleep(1)
+        picked = _pick_completed_download(download_dir, start_ts, known_names)
+        if picked is None:
+            continue
+
+        try:
+            size = picked.stat().st_size
+        except OSError:
+            continue
+
+        if stable_path == picked and stable_size == size:
+            stable_hits += 1
+        else:
+            stable_path = picked
+            stable_size = size
+            stable_hits = 1
+
+        if stable_hits < 2:
+            continue
+
+        new_name = download_dir / f"{file_prefix}{picked.suffix}"
+        if new_name.exists():
+            new_name.unlink()
+        picked.rename(new_name)
+        logger.info("[%s] %s 다운로드 완료: %s", logger_account_id, log_prefix, new_name.name)
+        return new_name
+
+    logger.warning("[%s] %s 다운로드 타임아웃: %s", logger_account_id, log_prefix, file_prefix)
+    return None
+
+
+def _wait_for_store_dialog(driver, account_id: str, timeout: int = 15):
+    """메뉴 행 액션 클릭 후 열리는 매장별 상세 dialog를 기다린다."""
+    try:
+        wait = WebDriverWait(driver, timeout)
+        dialog = wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "[role='dialog']"))
+        )
+        wait.until(lambda d: "매장별" in dialog.text and "매장 명" in dialog.text)
+        return dialog
+    except TimeoutException:
+        logger.error("[%s] 매장별 상세 dialog 로딩 타임아웃", account_id)
+        return None
+
+
+def _download_export_excel_from_dialog(
+    driver,
+    dialog,
+    account_id: str,
+    download_dir: Path,
+    file_prefix: str,
+    timeout: int = 60,
+) -> Optional[Path]:
+    """매장별 상세 dialog 내부 내보내기 버튼으로 Excel 다운로드를 수행한다."""
+    wait = WebDriverWait(driver, 10)
+    for attempt in range(1, 3):
+        try:
+            export_btn = wait.until(
+                lambda d: dialog.find_element(By.CSS_SELECTOR, "button[aria-label='내보내기']")
+            )
+            driver.execute_script("arguments[0].click();", export_btn)
+            time.sleep(1.0)
+
+            excel_item = wait.until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, "//li[@role='menuitem'][contains(text(),'Excel로 내보내기')]")
+                )
+            )
+            driver.execute_script("arguments[0].click();", excel_item)
+            logger.info("[%s] dialog Excel 내보내기 클릭: %s (attempt=%d)", account_id, file_prefix, attempt)
+        except Exception as exc:
+            logger.error("[%s] dialog 내보내기 오류 (%s): %s", account_id, file_prefix, exc)
+            return None
+
+        downloaded = _wait_for_downloaded_file(
+            download_dir=download_dir,
+            file_prefix=file_prefix,
+            timeout=timeout,
+            logger_account_id=account_id,
+            log_prefix="dialog",
+        )
+        if downloaded is not None:
+            return downloaded
+
+        try:
+            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+            time.sleep(1.0)
+        except Exception:
+            pass
+
+    return None
+
+
+def _wait_for_downloaded_file_v2(
+    download_dir: Path,
+    file_prefix: str,
+    timeout: int,
+    logger_account_id: str,
+    log_prefix: str,
+) -> Optional[Path]:
+    start_ts = time.time()
+    known_names = {p.name for p in download_dir.glob("*") if p.is_file()}
+    stable_path: Optional[Path] = None
+    stable_size: Optional[int] = None
+    stable_hits = 0
+
+    for _ in range(timeout):
+        time.sleep(1)
+        picked = _pick_completed_download(download_dir, start_ts, known_names)
+        if picked is None:
+            continue
+
+        try:
+            stat = picked.stat()
+        except OSError:
+            continue
+
+        size = stat.st_size
+        if stable_path == picked and stable_size == size:
+            stable_hits += 1
+        else:
+            stable_path = picked
+            stable_size = size
+            stable_hits = 1
+
+        if stable_hits < 2:
+            continue
+
+        new_name = download_dir / f"{file_prefix}{picked.suffix}"
+        if new_name.exists():
+            new_name.unlink()
+        picked.rename(new_name)
+        logger.info("[%s] %s download complete: %s", logger_account_id, log_prefix, new_name.name)
+        return new_name
+
+    recent_files = []
+    for path in sorted(
+        download_dir.glob("*"),
+        key=lambda p: p.stat().st_mtime if p.exists() else 0,
+        reverse=True,
+    )[:5]:
+        try:
+            stat = path.stat()
+            recent_files.append(f"{path.name}|size={int(stat.st_size)}|mtime={int(stat.st_mtime)}")
+        except OSError:
+            continue
+    if recent_files:
+        logger.info("[%s] %s recent download candidates: %s", logger_account_id, log_prefix, recent_files)
+    logger.warning("[%s] %s download timeout: %s", logger_account_id, log_prefix, file_prefix)
+    return None
+
+
+def _find_active_detail_dialog_v2(driver, page_url: str, existing_dialog_count: int = 0):
+    dialogs = driver.find_elements(By.CSS_SELECTOR, "[role='dialog']")
+    if len(dialogs) <= existing_dialog_count:
+        return None
+
+    page_fragment = page_url.rsplit("/", 1)[-1]
+    title_tokens = ["매장별"] if page_fragment == "product-sales-date" else ["하위 메뉴", "옵션별", "매장별"]
+    header_tokens = ["매장 명", "매장명"] if page_fragment == "product-sales-date" else ["메뉴 명", "메뉴명", "하위 옵션", "옵션 명", "옵션명", "판매량 (개)"]
+
+    for dialog in reversed(dialogs):
+        try:
+            if not dialog.is_displayed():
+                continue
+            text = dialog.text or ""
+            has_export = bool(dialog.find_elements(By.CSS_SELECTOR, "button[aria-label='내보내기']"))
+            has_rows = len(dialog.find_elements(By.CSS_SELECTOR, "[role='row']")) > 1
+            if not has_export or not has_rows:
+                continue
+            if page_fragment == "option-sales-date":
+                return dialog
+            if any(token in text for token in title_tokens) or any(token in text for token in header_tokens):
+                return dialog
+        except Exception:
+            continue
+    return None
+
+
+def _wait_for_store_dialog_v2(
+    driver,
+    account_id: str,
+    page_url: str,
+    existing_dialog_count: int = 0,
+    timeout: int = 15,
+):
+    try:
+        wait = WebDriverWait(driver, timeout)
+        dialog = wait.until(lambda d: _find_active_detail_dialog_v2(d, page_url, existing_dialog_count))
+        return dialog
+    except TimeoutException:
+        logger.error("[%s] detail dialog load timeout (%s)", account_id, page_url.rsplit("/", 1)[-1])
+        return None
+
+
+def _download_export_excel_from_dialog_v2(
+    driver,
+    dialog,
+    account_id: str,
+    download_dir: Path,
+    file_prefix: str,
+    timeout: int = 60,
+) -> Optional[Path]:
+    wait = WebDriverWait(driver, 10)
+    export_buttons = dialog.find_elements(By.CSS_SELECTOR, "button[aria-label='내보내기']")
+    if not export_buttons:
+        logger.error("[%s] dialog export button missing: %s", account_id, file_prefix)
+        return None
+
+    export_btn = export_buttons[0]
+    for attempt in range(1, 3):
+        try:
+            driver.execute_script("arguments[0].click();", export_btn)
+            time.sleep(1.0)
+            excel_item = wait.until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, "//li[@role='menuitem'][contains(text(),'Excel로 내보내기')]")
+                )
+            )
+            driver.execute_script("arguments[0].click();", excel_item)
+            logger.info("[%s] dialog Excel export click: %s (attempt=%d)", account_id, file_prefix, attempt)
+        except Exception as exc:
+            logger.error("[%s] dialog export error (%s): %s", account_id, file_prefix, exc)
+            return None
+
+        downloaded = _wait_for_downloaded_file_v2(
+            download_dir=download_dir,
+            file_prefix=file_prefix,
+            timeout=timeout,
+            logger_account_id=account_id,
+            log_prefix="dialog",
+        )
+        if downloaded is not None:
+            return downloaded
+
+        try:
+            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+            time.sleep(1.0)
+        except Exception:
+            pass
+
+    return None
+
+
 def _collect_all_menu_names(driver, account_id: str) -> List[str]:
     """DataGrid를 끝까지 스크롤하며 모든 메뉴명(title 속성)을 순서대로 수집한다."""
     seen: List[str] = []
@@ -441,23 +757,43 @@ def _collect_all_menu_names(driver, account_id: str) -> List[str]:
     return seen
 
 
+def _normalize_menu_name(value: str) -> str:
+    return " ".join(str(value or "").split()).strip()
+
+
 def _scroll_and_find_menu_btn(
-    driver, account_id: str, menu_name: str, row_index: int
+    driver, account_id: str, menu_name: str, row_index: int, page_url: str = MENU_ANALYSIS_URL
 ) -> Optional[Any]:
     """특정 메뉴 행으로 스크롤하고 OpenInNew 버튼 요소를 반환한다."""
-    # 행이 화면 중앙에 오도록 스크롤
-    scroll_top = max(0, (row_index - 2) * DATAGRID_ROW_HEIGHT)
-    driver.execute_script(
-        "var g = document.querySelector('.MuiDataGrid-virtualScroller');"
-        "if(g) g.scrollTop = arguments[0];",
-        scroll_top,
-    )
-    time.sleep(0.8)
+    target_name = _normalize_menu_name(menu_name)
+    base_scroll_top = max(0, (row_index - 2) * DATAGRID_ROW_HEIGHT)
+    scroll_candidates = [base_scroll_top]
+    if page_url.rsplit("/", 1)[-1] == "option-sales-date":
+        scroll_candidates.extend(
+            [
+                max(0, base_scroll_top - DATAGRID_ROW_HEIGHT),
+                base_scroll_top + DATAGRID_ROW_HEIGHT,
+                max(0, base_scroll_top - (DATAGRID_ROW_HEIGHT * 2)),
+            ]
+        )
 
-    cells = driver.find_elements(By.CSS_SELECTOR, "[data-field='productName'] .MuiDataGrid-cellContent")
-    for cell in cells:
-        title = cell.get_attribute("title") or cell.text
-        if title == menu_name:
+    seen_scrolls = set()
+    for scroll_top in scroll_candidates:
+        if scroll_top in seen_scrolls:
+            continue
+        seen_scrolls.add(scroll_top)
+        driver.execute_script(
+            "var g = document.querySelector('.MuiDataGrid-virtualScroller');"
+            "if(g) g.scrollTop = arguments[0];",
+            scroll_top,
+        )
+        time.sleep(1.0 if page_url.rsplit("/", 1)[-1] == "option-sales-date" else 0.8)
+
+        cells = driver.find_elements(By.CSS_SELECTOR, "[data-field='productName'] .MuiDataGrid-cellContent")
+        for cell in cells:
+            title = cell.get_attribute("title") or cell.text
+            if _normalize_menu_name(title) != target_name:
+                continue
             try:
                 row_el = driver.execute_script(
                     "return arguments[0].closest('[role=\"row\"]');", cell
@@ -466,6 +802,34 @@ def _scroll_and_find_menu_btn(
             except Exception as exc:
                 logger.warning("[%s] %s 버튼 탐색 실패: %s", account_id, menu_name, exc)
     return None
+
+
+def _close_detail_dialog(driver, dialog) -> None:
+    try:
+        close_btn = dialog.find_element(
+            By.XPATH, ".//button[.//*[contains(@data-testid,'CloseIcon')]]"
+        )
+        driver.execute_script("arguments[0].click();", close_btn)
+        time.sleep(1.5 if HEADLESS_MODE else 1.0)
+        return
+    except Exception:
+        pass
+
+    try:
+        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+        time.sleep(1.0)
+    except Exception:
+        pass
+
+
+def _reset_detail_grid(driver, account_id: str) -> None:
+    try:
+        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+        time.sleep(0.5)
+    except Exception:
+        pass
+    _click_search(driver, account_id)
+    time.sleep(1.0)
 
 
 def _download_store_detail(
@@ -540,6 +904,153 @@ def _download_store_detail(
     return file_path
 
 
+def _download_store_detail_from_dialog(
+    driver,
+    account_id: str,
+    menu_name: str,
+    row_index: int,
+    download_dir: Path,
+    start_date: str,
+    end_date: str,
+    page_url: str = MENU_ANALYSIS_URL,
+) -> Optional[Path]:
+    """
+    메뉴/옵션 행의 OpenInNew 버튼으로 매장별 상세 dialog를 열고
+    dialog 내부의 내보내기 버튼으로 Excel을 다운로드한다.
+    """
+    btn = _scroll_and_find_menu_btn(driver, account_id, menu_name, row_index)
+    if not btn:
+        logger.warning("[%s] 버튼 없음 스킵: %s", account_id, menu_name)
+        return None
+
+    try:
+        driver.execute_script("arguments[0].click();", btn)
+        time.sleep(1.5)
+    except Exception as exc:
+        logger.error("[%s] OpenInNew 클릭 실패 (%s): %s", account_id, menu_name, exc)
+        return None
+
+    dialog = _wait_for_store_dialog(driver, account_id, timeout=15)
+    if dialog is None:
+        return None
+
+    safe_name = re.sub(r'[\\/:*?"<>|]', "_", menu_name)
+    yymmdd = datetime.now().strftime("%y%m%d")
+    file_path = _download_export_excel_from_dialog(
+        driver, dialog, account_id, download_dir, f"store_{safe_name}_{yymmdd}"
+    )
+
+    try:
+        close_btn = dialog.find_element(
+            By.XPATH, ".//button[.//*[contains(@data-testid,'CloseIcon')]]"
+        )
+        driver.execute_script("arguments[0].click();", close_btn)
+        time.sleep(1.0)
+    except Exception:
+        try:
+            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+            time.sleep(1.0)
+        except Exception:
+            pass
+
+    return file_path
+
+
+def _download_store_detail_from_dialog_v2(
+    driver,
+    account_id: str,
+    menu_name: str,
+    row_index: int,
+    download_dir: Path,
+    start_date: str,
+    end_date: str,
+    page_url: str = MENU_ANALYSIS_URL,
+) -> Optional[Path]:
+    file_path, _, _ = _download_store_detail_attempt_v2(
+        driver=driver,
+        account_id=account_id,
+        menu_name=menu_name,
+        row_index=row_index,
+        download_dir=download_dir,
+        start_date=start_date,
+        end_date=end_date,
+        page_url=page_url,
+    )
+    return file_path
+
+
+def _download_store_detail_attempt_v2(
+    driver,
+    account_id: str,
+    menu_name: str,
+    row_index: int,
+    download_dir: Path,
+    start_date: str,
+    end_date: str,
+    page_url: str = MENU_ANALYSIS_URL,
+) -> Tuple[Optional[Path], Optional[str], Optional[str]]:
+    safe_name = re.sub(r'[\\/:*?"<>|]', "_", menu_name)
+    yymmdd = datetime.now().strftime("%y%m%d")
+    file_prefix = f"store_{safe_name}_{yymmdd}"
+    download_timeout = 120 if HEADLESS_MODE else 60
+    page_fragment = page_url.rsplit("/", 1)[-1]
+
+    for open_attempt in range(1, 3):
+        btn = _scroll_and_find_menu_btn(
+            driver,
+            account_id,
+            menu_name,
+            row_index,
+            page_url=page_url,
+        )
+        if not btn:
+            if page_fragment == "option-sales-date" and open_attempt == 1:
+                _reset_detail_grid(driver, account_id)
+                continue
+            logger.warning("[%s] button not found: %s", account_id, menu_name)
+            return None, "button_not_found", "find_button"
+
+        existing_dialog_count = len(driver.find_elements(By.CSS_SELECTOR, "[role='dialog']"))
+        try:
+            driver.execute_script("arguments[0].click();", btn)
+            time.sleep(2.0 if HEADLESS_MODE else 1.2)
+        except Exception as exc:
+            logger.error("[%s] OpenInNew click failed (%s): %s", account_id, menu_name, exc)
+            return None, "click_failed", "open_detail"
+
+        dialog = _wait_for_store_dialog_v2(
+            driver,
+            account_id,
+            page_url=page_url,
+            existing_dialog_count=existing_dialog_count,
+            timeout=20 if HEADLESS_MODE else 12,
+        )
+        if dialog is None:
+            if open_attempt == 1:
+                _reset_detail_grid(driver, account_id)
+                continue
+            return None, "dialog_timeout", "wait_dialog"
+
+        file_path = _download_export_excel_from_dialog_v2(
+            driver,
+            dialog,
+            account_id,
+            download_dir,
+            file_prefix,
+            timeout=download_timeout,
+        )
+
+        _close_detail_dialog(driver, dialog)
+
+        if file_path is not None:
+            return file_path, None, None
+
+        if open_attempt == 1:
+            _reset_detail_grid(driver, account_id)
+
+    return None, "download_timeout", "download_export"
+
+
 # ============================================================
 # 공개 인터페이스
 # ============================================================
@@ -572,13 +1083,32 @@ def run_toorder_menu_crawl(
         }
     """
     download_dir.mkdir(parents=True, exist_ok=True)
-    result: Dict[str, Any] = {"store_files": [], "menu_names": [], "error": None}
+    result: Dict[str, Any] = {
+        "store_files": [],
+        "menu_names": [],
+        "skipped_details": [],
+        "error": None,
+    }
     driver = None
 
     try:
-        driver = _launch_browser(toorder_id, download_dir)
-
-        if not _do_login(driver, toorder_id, toorder_pw):
+        _MAX_BROWSER_RETRIES = 2
+        for _br_attempt in range(1, _MAX_BROWSER_RETRIES + 1):
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                driver = None
+            driver = _launch_browser(toorder_id, download_dir)
+            if _do_login(driver, toorder_id, toorder_pw):
+                break
+            if _br_attempt < _MAX_BROWSER_RETRIES:
+                logger.warning(
+                    "[%s] 로그인 실패, 브라우저 재시작 (시도 %d/%d)",
+                    toorder_id, _br_attempt, _MAX_BROWSER_RETRIES,
+                )
+        else:
             result["error"] = "로그인 실패"
             return result
 
@@ -626,15 +1156,59 @@ def run_toorder_menu_crawl(
 
         # ── 3. 메뉴별 매장 상세 다운로드
         store_files: List[Tuple[str, Path]] = []
+        skipped_details: List[Dict[str, str]] = []
         for iter_idx, (orig_idx, menu_name) in enumerate(menu_with_idx):
             logger.info(
                 "[%s] [%d/%d] 매장별 수집: %s",
                 toorder_id, iter_idx + 1, len(menu_with_idx), menu_name,
             )
-            path = _download_store_detail(
-                driver, toorder_id, menu_name, orig_idx, download_dir, start_date, end_date,
-                page_url=page_url,
-            )
+            try:
+                path, reason, stage = _download_store_detail_attempt_v2(
+                    driver, toorder_id, menu_name, orig_idx, download_dir, start_date, end_date,
+                    page_url=page_url,
+                )
+            except Exception as exc:
+                if _is_browser_dead(exc):
+                    logger.warning(
+                        "[%s] 브라우저 크래시 감지 (item %d), 재시작: %s",
+                        toorder_id, iter_idx + 1, exc,
+                    )
+                    driver = _recover_browser(
+                        driver, toorder_id, toorder_pw, download_dir,
+                        page_url, start_date, end_date,
+                    )
+                    if driver is None:
+                        result["error"] = "브라우저 재시작 실패"
+                        return result
+                    try:
+                        path, reason, stage = _download_store_detail_attempt_v2(
+                            driver, toorder_id, menu_name, orig_idx, download_dir, start_date, end_date,
+                            page_url=page_url,
+                        )
+                    except Exception as retry_exc:
+                        logger.warning("[%s] 재시도 실패 (skip): %s", toorder_id, retry_exc)
+                        path = None
+                else:
+                    logger.warning(
+                        "[%s] [%d/%d] 수집 스킵: %s",
+                        toorder_id, iter_idx + 1, len(menu_with_idx), exc,
+                    )
+                    path = None
+            else:
+                # driver.back() 후 navigate 실패로 None 반환됐지만 driver 자체가 죽은 경우
+                if path is None and not _check_browser_alive(driver):
+                    logger.warning(
+                        "[%s] 브라우저 무응답 감지 (item %d 복귀 중), 재시작",
+                        toorder_id, iter_idx + 1,
+                    )
+                    driver = _recover_browser(
+                        driver, toorder_id, toorder_pw, download_dir,
+                        page_url, start_date, end_date,
+                    )
+                    if driver is None:
+                        result["error"] = "브라우저 재시작 실패"
+                        return result
+
             if path:
                 store_files.append((menu_name, path))
             time.sleep(random.uniform(0.8, 1.5))
@@ -644,6 +1218,317 @@ def run_toorder_menu_crawl(
             "[%s] 수집 완료: 매장별 %d/%d건 (전체 메뉴 %d개)",
             toorder_id, len(store_files), len(menu_with_idx), len(result["menu_names"]),
         )
+
+    except Exception as exc:
+        result["error"] = str(exc)
+        logger.error("[%s] run_toorder_menu_crawl 오류: %s", toorder_id, exc, exc_info=True)
+
+    finally:
+        if driver:
+            try:
+                driver.quit()
+                logger.info("[%s] 브라우저 종료", toorder_id)
+            except Exception:
+                pass
+
+    return result
+
+
+def download_first_menu_detail_for_debug(
+    toorder_id: str,
+    toorder_pw: str,
+    target_date: str,
+    download_dir: Path,
+    page_url: str = MENU_ANALYSIS_URL,
+) -> Dict[str, Any]:
+    """
+    디버깅용: 지정 날짜의 첫 번째 메뉴 1개만 상세 Excel로 내려받는다.
+
+    Returns:
+        {
+            "menu_name": str | None,
+            "file_path": Path | None,
+            "menu_count": int,
+            "error": str | None,
+        }
+    """
+    download_dir.mkdir(parents=True, exist_ok=True)
+    result: Dict[str, Any] = {
+        "menu_name": None,
+        "file_path": None,
+        "menu_count": 0,
+        "error": None,
+    }
+    driver = None
+
+    try:
+        driver = _launch_browser(toorder_id, download_dir)
+        if not _do_login(driver, toorder_id, toorder_pw):
+            result["error"] = "로그인 실패"
+            return result
+
+        if not _navigate_to_analysis_page(driver, toorder_id, page_url):
+            result["error"] = "분석 페이지 이동 실패"
+            return result
+
+        if not _set_date_range(driver, toorder_id, target_date, target_date):
+            result["error"] = "날짜 설정 실패"
+            return result
+
+        if not _wait_for_export_btn(driver, toorder_id):
+            result["error"] = "DataGrid 로딩 실패"
+            return result
+
+        menu_names = _collect_all_menu_names(driver, toorder_id)
+        result["menu_count"] = len(menu_names)
+        if not menu_names:
+            result["error"] = "메뉴 목록 없음"
+            return result
+
+        menu_name = menu_names[0]
+        file_path = _download_store_detail_from_dialog_v2(
+            driver,
+            toorder_id,
+            menu_name,
+            0,
+            download_dir,
+            target_date,
+            target_date,
+            page_url=page_url,
+        )
+        result["menu_name"] = menu_name
+        result["file_path"] = file_path
+        if file_path is None:
+            result["error"] = "첫 메뉴 상세 다운로드 실패"
+        return result
+
+    except Exception as exc:
+        result["error"] = str(exc)
+        logger.error("[%s] download_first_menu_detail_for_debug 오류: %s", toorder_id, exc, exc_info=True)
+        return result
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+
+def run_toorder_menu_crawl(
+    toorder_id: str,
+    toorder_pw: str,
+    start_date: str,
+    end_date: str,
+    download_dir: Path,
+    target_menus: Optional[List[str]] = None,
+    page_url: str = MENU_ANALYSIS_URL,
+) -> Dict[str, Any]:
+    """
+    ToOrder 메뉴/옵션 상세 분석 파일을 수집한다.
+
+    Returns:
+        {
+            "store_files": [(menu_name, Path), ...],
+            "menu_names": [str, ...],
+            "skipped_details": [{"menu_name": str, "reason": str, "stage": str}],
+            "error": str | None,
+        }
+    """
+    download_dir.mkdir(parents=True, exist_ok=True)
+    result: Dict[str, Any] = {
+        "store_files": [],
+        "menu_names": [],
+        "skipped_details": [],
+        "error": None,
+    }
+    driver = None
+
+    try:
+        max_browser_retries = 2
+        for browser_attempt in range(1, max_browser_retries + 1):
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                driver = None
+
+            driver = _launch_browser(toorder_id, download_dir)
+            if _do_login(driver, toorder_id, toorder_pw):
+                break
+
+            if browser_attempt < max_browser_retries:
+                logger.warning(
+                    "[%s] 로그인 실패, 브라우저 재시작 (%d/%d)",
+                    toorder_id,
+                    browser_attempt,
+                    max_browser_retries,
+                )
+        else:
+            result["error"] = "로그인 실패"
+            return result
+
+        if not _navigate_to_analysis_page(driver, toorder_id, page_url):
+            result["error"] = "분석 페이지 이동 실패"
+            return result
+
+        if not _set_date_range(driver, toorder_id, start_date, end_date):
+            result["error"] = "날짜 설정 실패"
+            return result
+
+        if not _wait_for_export_btn(driver, toorder_id):
+            result["error"] = "DataGrid 로딩 실패"
+            return result
+
+        menu_names = _collect_all_menu_names(driver, toorder_id)
+        if not menu_names:
+            logger.warning("[%s] 메뉴 목록 없음, 상세 수집 생략", toorder_id)
+            return result
+
+        result["menu_names"] = menu_names
+
+        if target_menus is not None:
+            target_set = set(target_menus)
+            menu_with_idx = [
+                (orig_idx, name)
+                for orig_idx, name in enumerate(menu_names)
+                if name in target_set
+            ]
+            logger.info(
+                "[%s] 재시도 모드: %d개 대상 (DataGrid 전체 %d개 중)",
+                toorder_id,
+                len(menu_with_idx),
+                len(menu_names),
+            )
+        else:
+            menu_with_idx = list(enumerate(menu_names))
+
+        driver.execute_script(
+            "var g = document.querySelector('.MuiDataGrid-virtualScroller'); if(g) g.scrollTop = 0;"
+        )
+        time.sleep(0.5)
+
+        store_files: List[Tuple[str, Path]] = []
+        skipped_details: List[Dict[str, str]] = []
+
+        for iter_idx, (orig_idx, menu_name) in enumerate(menu_with_idx):
+            logger.info(
+                "[%s] [%d/%d] 매장별 수집: %s",
+                toorder_id,
+                iter_idx + 1,
+                len(menu_with_idx),
+                menu_name,
+            )
+            reason = None
+            stage = None
+
+            try:
+                path, reason, stage = _download_store_detail_attempt_v2(
+                    driver,
+                    toorder_id,
+                    menu_name,
+                    orig_idx,
+                    download_dir,
+                    start_date,
+                    end_date,
+                    page_url=page_url,
+                )
+            except Exception as exc:
+                if _is_browser_dead(exc):
+                    logger.warning(
+                        "[%s] 브라우저 오류 감지 (item %d), 재시작: %s",
+                        toorder_id,
+                        iter_idx + 1,
+                        exc,
+                    )
+                    driver = _recover_browser(
+                        driver,
+                        toorder_id,
+                        toorder_pw,
+                        download_dir,
+                        page_url,
+                        start_date,
+                        end_date,
+                    )
+                    if driver is None:
+                        result["error"] = "브라우저 재시작 실패"
+                        return result
+
+                    try:
+                        path, reason, stage = _download_store_detail_attempt_v2(
+                            driver,
+                            toorder_id,
+                            menu_name,
+                            orig_idx,
+                            download_dir,
+                            start_date,
+                            end_date,
+                            page_url=page_url,
+                        )
+                    except Exception as retry_exc:
+                        logger.warning("[%s] 재시도 실패 (skip): %s", toorder_id, retry_exc)
+                        path = None
+                        reason = "retry_exception"
+                        stage = "recover_browser"
+                else:
+                    logger.warning(
+                        "[%s] [%d/%d] 수집 스킵: %s",
+                        toorder_id,
+                        iter_idx + 1,
+                        len(menu_with_idx),
+                        exc,
+                    )
+                    path = None
+                    reason = "unexpected_exception"
+                    stage = "collect_loop"
+            else:
+                if path is None and not _check_browser_alive(driver):
+                    logger.warning(
+                        "[%s] 브라우저 무응답 감지 (item %d 복구 중), 재시작",
+                        toorder_id,
+                        iter_idx + 1,
+                    )
+                    driver = _recover_browser(
+                        driver,
+                        toorder_id,
+                        toorder_pw,
+                        download_dir,
+                        page_url,
+                        start_date,
+                        end_date,
+                    )
+                    if driver is None:
+                        result["error"] = "브라우저 재시작 실패"
+                        return result
+
+            if path:
+                store_files.append((menu_name, path))
+            elif reason:
+                skipped_details.append(
+                    {
+                        "menu_name": menu_name,
+                        "reason": reason,
+                        "stage": stage or "",
+                    }
+                )
+
+            time.sleep(random.uniform(0.8, 1.5))
+
+        result["store_files"] = store_files
+        result["skipped_details"] = skipped_details
+        logger.info(
+            "[%s] 수집 완료: 매장별 %d/%d건 (전체 메뉴 %d개)",
+            toorder_id,
+            len(store_files),
+            len(menu_with_idx),
+            len(result["menu_names"]),
+        )
+        if skipped_details:
+            reason_counts: Dict[str, int] = {}
+            for item in skipped_details:
+                skip_reason = item.get("reason", "unknown")
+                reason_counts[skip_reason] = reason_counts.get(skip_reason, 0) + 1
+            logger.info("[%s] skipped detail summary: %s", toorder_id, reason_counts)
 
     except Exception as exc:
         result["error"] = str(exc)

@@ -2,301 +2,245 @@ from pathlib import Path
 import os
 import platform
 
-# 우선순위에 따라 OneDrive 경로 결정
-# 1) 환경변수 지정 (절대경로)
-# 2) 컨테이너 마운트 경로 (/opt/airflow/Repository) 존재 시
-# 3) Windows 로컬 사용자 OneDrive 경로
-# 4) 마지막으로 홈 디렉터리 내 OneDrive 추정 경로
-# from modules.transform.utility.paths import ONEDRIVE_DB, COLLECT_DB, LOCAL_DB, TEMP_D
+
+WINDOWS_ONEDRIVE_FALLBACK = "OneDrive - 주식회사 도리당"
+WINDOWS_ONEDRIVE_ENV_KEYS = (
+    "OneDriveCommercial",
+    "ONEDRIVECOMMERCIAL",
+    "OneDrive",
+    "ONEDRIVE",
+)
+
+
+def _is_windows() -> bool:
+    return platform.system() == "Windows"
+
+
+def _container_mount(path_str: str) -> Path:
+    return Path(path_str)
+
+
+def _windows_onedrive_root_from_env() -> Path | None:
+    for key in WINDOWS_ONEDRIVE_ENV_KEYS:
+        value = (os.getenv(key) or "").strip()
+        if value:
+            return Path(value)
+    return None
+
+
+def get_windows_onedrive_root() -> Path:
+    detected = _windows_onedrive_root_from_env()
+    if detected:
+        return detected
+    return Path.home() / WINDOWS_ONEDRIVE_FALLBACK
+
+
+def _windows_onedrive_path(*parts: str) -> Path:
+    return get_windows_onedrive_root().joinpath(*parts)
+
+
+def _resolve_existing_windows_onedrive_path(*parts: str) -> Path | None:
+    candidate = _windows_onedrive_path(*parts)
+    if candidate.exists():
+        return candidate
+    return None
+
 
 def resolve_onedrive_db() -> Path:
-	# 1) 환경변수 우선
-	env_path = os.getenv("ONEDRIVE_DB")
-	if env_path:
-		p = Path(env_path)
-		# 이전 경로를 사용 중이면 Repository가 있으면 우선 사용
-		repo_mount = Path("/opt/airflow/Repository")
-		if p.as_posix().endswith("/Doridang_DB") and repo_mount.exists():
-			return repo_mount
-		return p
+    env_path = os.getenv("ONEDRIVE_DB")
+    if env_path:
+        p = Path(env_path)
+        repo_mount = _container_mount("/opt/airflow/Repository")
+        if p.as_posix().endswith("/Doridang_DB") and repo_mount.exists():
+            return repo_mount
+        return p
 
-	# 2) 컨테이너(Bind mount) 경로
-	container_mount = Path("/opt/airflow/Repository")
-	if container_mount.exists():
-		return container_mount
+    container_mount = _container_mount("/opt/airflow/Repository")
+    if container_mount.exists():
+        return container_mount
 
-	# 3) Windows 로컬 경로
-	if platform.system() == "Windows":
-		user_home = Path.home()
-		win_onedrive = user_home / "OneDrive - 주식회사 도리당" / "Repository"
-		if win_onedrive.exists():
-			return win_onedrive
+    if _is_windows():
+        existing = _resolve_existing_windows_onedrive_path("Repository")
+        if existing is not None:
+            return existing
+        return _windows_onedrive_path("Repository")
 
-	# 4) 홈 디렉터리 추정
-	fallback = Path.home() / "OneDrive - 주식회사 도리당" / "Repository"
-	return fallback
+    return Path.home() / WINDOWS_ONEDRIVE_FALLBACK / "Repository"
 
 
 def resolve_collect_db() -> Path:
-	# 1) 환경변수 지정
-	env_path = os.getenv("COLLECT_DB")
-	if env_path:
-		return Path(env_path)
-	# 2) 컨테이너 마운트 경로
-	container_mount = Path("/opt/airflow/Collect_Data")
-	if container_mount.exists():
-		return container_mount
-	# 3) Windows 로컬 경로 (OneDrive 내부)
-	if platform.system() == "Windows":
-		user_home = Path.home()
-		win_collect = user_home / "OneDrive - 주식회사 도리당" / "Collect_Data"
-		if win_collect.exists():
-			return win_collect
-	# 4) Fallback
-	return Path.home() / "OneDrive - 주식회사 도리당" / "Collect_Data"
+    env_path = os.getenv("COLLECT_DB")
+    if env_path:
+        return Path(env_path)
+
+    container_mount = _container_mount("/opt/airflow/Collect_Data")
+    if container_mount.exists():
+        return container_mount
+
+    if _is_windows():
+        existing = _resolve_existing_windows_onedrive_path("Collect_Data")
+        if existing is not None:
+            return existing
+        return _windows_onedrive_path("Collect_Data")
+
+    return Path.home() / WINDOWS_ONEDRIVE_FALLBACK / "Collect_Data"
 
 
 def resolve_local_db() -> Path:
-	"""로컬 DB 경로 설정 (충돌 방지를 위한 로컬 저장소)"""
-	# 1) 환경변수 우선 (Docker 컨테이너)
-	env_path = os.getenv("LOCAL_DB")
-	if env_path:
-		p = Path(env_path)
-		p.mkdir(parents=True, exist_ok=True)
-		return p
+    env_path = os.getenv("LOCAL_DB")
+    if env_path:
+        p = Path(env_path)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
 
-	# 2) 컨테이너 마운트 경로
-	container_mount = Path("/opt/airflow/Local_DB")
-	if container_mount.parent.exists():  # /opt/airflow가 있으면 컨테이너 환경
-		container_mount.mkdir(parents=True, exist_ok=True)
-		return container_mount
+    container_mount = _container_mount("/opt/airflow/Local_DB")
+    if container_mount.parent.exists():
+        container_mount.mkdir(parents=True, exist_ok=True)
+        return container_mount
 
-	# 3) Windows 로컬 경로
-	if platform.system() == "Windows":
-		local_db = Path("C:/Local_DB")
-		local_db.mkdir(parents=True, exist_ok=True)
-		return local_db
+    if _is_windows():
+        local_db = Path("C:/Local_DB")
+        local_db.mkdir(parents=True, exist_ok=True)
+        return local_db
 
-	# 4) Fallback - 현재 작업 디렉터리
-	fallback = Path.cwd() / "Local_DB"
-	fallback.mkdir(parents=True, exist_ok=True)
-	return fallback
+    fallback = Path.cwd() / "Local_DB"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
 
 
 def resolve_temp_dir() -> Path:
-	"""임시 작업 디렉터리 경로.
+    env_path = os.getenv("TEMP_DIR")
+    if env_path:
+        p = Path(env_path)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
 
-	우선순위:
-	1) 환경변수 `TEMP_DIR`
-	2) 컨테이너 기본 경로 `/opt/airflow/Doridang/temp`
-	3) Windows 기본 경로 `C:/Doridang/temp`
-	4) 현재 작업 디렉터리 하위 `Doridang/temp`
-	"""
-	# 1) 환경변수 우선
-	env_path = os.getenv("TEMP_DIR")
-	if env_path:
-		p = Path(env_path)
-		p.mkdir(parents=True, exist_ok=True)
-		return p
+    container_default = _container_mount("/opt/airflow/Doridang/temp")
+    if container_default.parent.parent.exists():
+        container_default.mkdir(parents=True, exist_ok=True)
+        return container_default
 
-	# 2) 컨테이너 기본 경로
-	container_default = Path("/opt/airflow/Doridang/temp")
-	if container_default.parent.parent.exists():  # /opt/airflow 존재 시 컨테이너 환경으로 가정
-		container_default.mkdir(parents=True, exist_ok=True)
-		return container_default
+    if _is_windows():
+        win_temp = Path("C:/Local_DB/temp")
+        win_temp.mkdir(parents=True, exist_ok=True)
+        return win_temp
 
-	# 3) Windows 기본 경로
-	if platform.system() == "Windows":
-		win_temp = Path("C:/Local_DB/temp")
-		win_temp.mkdir(parents=True, exist_ok=True)
-		return win_temp
-
-	# 4) Fallback
-	fallback = Path.cwd() / "Doridang" / "temp"
-	fallback.mkdir(parents=True, exist_ok=True)
-	return fallback
+    fallback = Path.cwd() / "Doridang" / "temp"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
 
 
 def resolve_down_dir() -> Path:
-	"""다운로드 기본 디렉터리 경로.
+    env_path = os.getenv("DOWN_DIR")
+    if env_path:
+        p = Path(env_path)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
 
-	우선순위:
-	1) 환경변수 `DOWN_DIR`
-	2) Windows 기본 경로 `E:/down`
-	3) 컨테이너 기본 경로 `/opt/airflow/download`
-	4) 현재 작업 디렉터리 하위 `download`
-	"""
-	# 1) 환경변수 우선
-	env_path = os.getenv("DOWN_DIR")
-	if env_path:
-		p = Path(env_path)
-		p.mkdir(parents=True, exist_ok=True)
-		return p
+    if _is_windows():
+        win_down = Path("E:/down")
+        win_down.mkdir(parents=True, exist_ok=True)
+        return win_down
 
-	# 2) Windows 기본 경로
-	if platform.system() == "Windows":
-		win_down = Path("E:/down")
-		win_down.mkdir(parents=True, exist_ok=True)
-		return win_down
+    container_down = _container_mount("/opt/airflow/download")
+    if container_down.parent.exists():
+        container_down.mkdir(parents=True, exist_ok=True)
+        return container_down
 
-	# 3) 컨테이너 기본 경로
-	container_down = Path("/opt/airflow/download")
-	if container_down.parent.exists():
-		container_down.mkdir(parents=True, exist_ok=True)
-		return container_down
-
-	# 4) Fallback
-	fallback = Path.cwd() / "download"
-	fallback.mkdir(parents=True, exist_ok=True)
-	return fallback
+    fallback = Path.cwd() / "download"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
 
 
 def resolve_analytics_db() -> Path:
-	"""분석/집계 데이터베이스 경로.
+    env_path = os.getenv("ANALYTICS_DB")
+    if env_path:
+        return Path(env_path)
 
-	우선순위:
-	1) 환경변수 `ANALYTICS_DB`
-	2) 컨테이너 마운트 경로 `/opt/airflow/analytics`
-	3) Windows 로컬 OneDrive 경로
-	4) Fallback
-	"""
-	# 1) 환경변수 우선
-	env_path = os.getenv("ANALYTICS_DB")
-	if env_path:
-		return Path(env_path)
+    container_mount = _container_mount("/opt/airflow/analytics")
+    if container_mount.parent.exists():
+        container_mount.mkdir(parents=True, exist_ok=True)
+        return container_mount
 
-	# 2) 컨테이너 마운트 경로
-	container_mount = Path("/opt/airflow/analytics")
-	if container_mount.parent.exists():
-		container_mount.mkdir(parents=True, exist_ok=True)
-		return container_mount
+    if _is_windows():
+        return _windows_onedrive_path("data", "analytics")
 
-	# 3) Windows 로컬 경로
-	if platform.system() == "Windows":
-		user_home = Path.home()
-		win_analytics = user_home / "OneDrive - 주식회사 도리당" / "data" / "analytics"
-		return win_analytics
-
-	# 4) Fallback
-	fallback = Path.home() / "OneDrive - 주식회사 도리당" / "data" / "analytics"
-	return fallback
+    return Path.home() / WINDOWS_ONEDRIVE_FALLBACK / "data" / "analytics"
 
 
 def resolve_report_sales_db() -> Path:
-	"""영업/마케팅 분석 리포트 저장 경로.
+    env_path = os.getenv("REPORT_SALES_DB")
+    if env_path:
+        return Path(env_path)
 
-	우선순위:
-	1) 환경변수 `REPORT_SALES_DB`
-	2) 컨테이너 마운트 경로 `/opt/airflow/report/sales`
-	3) Windows 로컬 OneDrive 경로
-	4) Fallback
-	"""
-	env_path = os.getenv("REPORT_SALES_DB")
-	if env_path:
-		return Path(env_path)
+    container_mount = _container_mount("/opt/airflow/report/sales")
+    if container_mount.parent.parent.exists():
+        container_mount.mkdir(parents=True, exist_ok=True)
+        return container_mount
 
-	container_mount = Path("/opt/airflow/report/sales")
-	if container_mount.parent.parent.exists():
-		container_mount.mkdir(parents=True, exist_ok=True)
-		return container_mount
+    if _is_windows():
+        return _windows_onedrive_path("data", "report", "sales")
 
-	if platform.system() == "Windows":
-		user_home = Path.home()
-		return user_home / "OneDrive - 주식회사 도리당" / "data" / "report" / "sales"
-
-	return Path.home() / "OneDrive - 주식회사 도리당" / "data" / "report" / "sales"
+    return Path.home() / WINDOWS_ONEDRIVE_FALLBACK / "data" / "report" / "sales"
 
 
 def resolve_mart_db() -> Path:
-	"""OneDrive data/mart 경로.
+    env_path = os.getenv("MART_DB")
+    if env_path:
+        return Path(env_path)
 
-	우선순위:
-	1) 환경변수 `MART_DB`
-	2) Windows 로컬 OneDrive 경로
-	3) 컨테이너 마운트 경로 `/opt/airflow/onedrive_mart`
-	4) Fallback
-	"""
-	env_path = os.getenv("MART_DB")
-	if env_path:
-		return Path(env_path)
+    if _is_windows():
+        return _windows_onedrive_path("data", "mart")
 
-	if platform.system() == "Windows":
-		user_home = Path.home()
-		return user_home / "OneDrive - 주식회사 도리당" / "data" / "mart"
+    container_mount = _container_mount("/opt/airflow/onedrive_mart")
+    if container_mount.exists():
+        return container_mount
 
-	container_mount = Path("/opt/airflow/onedrive_mart")
-	if container_mount.exists():
-		return container_mount
-
-	return Path.home() / "OneDrive - 주식회사 도리당" / "data" / "mart"
+    return Path.home() / WINDOWS_ONEDRIVE_FALLBACK / "data" / "mart"
 
 
 def resolve_llm_output_dir() -> Path:
-	"""LLM 분류 결과 저장 경로.
+    env_path = os.getenv("LLM_OUTPUT_DIR")
+    if env_path:
+        return Path(env_path)
 
-	우선순위:
-	1) 환경변수 `LLM_OUTPUT_DIR`
-	2) Windows 로컬 OneDrive 경로
-	3) 컨테이너 마운트 경로 `/opt/airflow/onedrive_llm`
-	4) Fallback
-	"""
-	env_path = os.getenv("LLM_OUTPUT_DIR")
-	if env_path:
-		return Path(env_path)
+    if _is_windows():
+        return _windows_onedrive_path("data", "llm")
 
-	if platform.system() == "Windows":
-		return Path.home() / "OneDrive - 주식회사 도리당" / "data" / "llm"
+    container_mount = _container_mount("/opt/airflow/onedrive_llm")
+    if container_mount.exists():
+        return container_mount
 
-	container_mount = Path("/opt/airflow/onedrive_llm")
-	if container_mount.exists():
-		return container_mount
-
-	return Path.home() / "OneDrive - 주식회사 도리당" / "data" / "llm"
+    return Path.home() / WINDOWS_ONEDRIVE_FALLBACK / "data" / "llm"
 
 
 def resolve_dashboard_db() -> Path:
-	"""실시간 대시보드 산출물 저장 경로.
+    env_path = os.getenv("DASHBOARD_DB")
+    if env_path:
+        return Path(env_path)
 
-	우선순위:
-	1) 환경변수 `DASHBOARD_DB`
-	2) Windows 로컬 OneDrive 경로
-	3) 컨테이너 마운트 경로 `/opt/airflow/dashboard`
-	4) Fallback
-	"""
-	env_path = os.getenv("DASHBOARD_DB")
-	if env_path:
-		p = Path(env_path)
-		p.mkdir(parents=True, exist_ok=True)
-		return p
+    if _is_windows():
+        return _windows_onedrive_path("data", "dashboard")
 
-	if platform.system() == "Windows":
-		p = Path.home() / "OneDrive - 주식회사 도리당" / "data" / "dashboard"
-		p.mkdir(parents=True, exist_ok=True)
-		return p
+    container_mount = _container_mount("/opt/airflow/dashboard")
+    if container_mount.parent.exists():
+        return container_mount
 
-	container_mount = Path("/opt/airflow/dashboard")
-	if container_mount.parent.exists():
-		container_mount.mkdir(parents=True, exist_ok=True)
-		return container_mount
-
-	p = Path.home() / "OneDrive - 주식회사 도리당" / "data" / "dashboard"
-	p.mkdir(parents=True, exist_ok=True)
-	return p
+    return Path.home() / WINDOWS_ONEDRIVE_FALLBACK / "data" / "dashboard"
 
 
 def resolve_raw_okpos_sales() -> Path:
-	env_path = os.getenv("RAW_OKPOS_SALES")
-	if env_path:
-		return Path(env_path)
-	# ANALYTICS_DB 하위에 저장 (컨테이너/Windows 모두 동일 경로 기준)
-	return resolve_analytics_db() / "okpos_sales_raw"
+    env_path = os.getenv("RAW_OKPOS_SALES")
+    if env_path:
+        return Path(env_path)
+    return resolve_analytics_db() / "okpos_sales_raw"
 
 
 def resolve_raw_unionpos_sales() -> Path:
-	env_path = os.getenv("RAW_UNIONPOS_SALES")
-	if env_path:
-		return Path(env_path)
-	return resolve_analytics_db() / "unionpos_sales_raw"
+    env_path = os.getenv("RAW_UNIONPOS_SALES")
+    if env_path:
+        return Path(env_path)
+    return resolve_analytics_db() / "unionpos_sales_raw"
 
 
 ONEDRIVE_DB = resolve_onedrive_db()
@@ -307,7 +251,7 @@ DOWN_DIR = resolve_down_dir()
 ANALYTICS_DB = resolve_analytics_db()
 BAEMIN_MARKETING_DB = ANALYTICS_DB / "baemin_marketing"
 BAEMIN_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "baemin_policy_raw.csv"
-CHICKEN_PRICE_CSV_PATH  = ANALYTICS_DB / "chicken_price" / "chicken_price.csv"
+CHICKEN_PRICE_CSV_PATH = ANALYTICS_DB / "chicken_price" / "chicken_price.csv"
 COUPANG_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "coupang_policy_raw.csv"
 YOGIYO_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "yogiyo_policy_raw.csv"
 DDANGYO_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "ddangyo_policy_raw.csv"
@@ -324,28 +268,28 @@ DASHBOARD_DB = resolve_dashboard_db()
 ITEM_MASTER_CHECKPOINT_DIR = ANALYTICS_DB / "item_master_checkpoints"
 RAW_OKPOS_SALES = resolve_raw_okpos_sales()
 RAW_UNIONPOS_SALES = resolve_raw_unionpos_sales()
-FIN_PRODUCT_CSV_PATH = MART_DB / "fin_product_grp.csv"
-FIN_PRODUCT_REVIEW_CSV_PATH = MART_DB / "fin_product_review.csv"
-FIN_PRODUCT_ALIAS_CSV_PATH = MART_DB / "fin_product_alias.csv"
-FIN_PRODUCT_MART_CSV_PATH = MART_DB / "fin_product_mart.csv"
-POSFEED_WHITELIST_CSV_PATH = MART_DB / "fin_product_posfeed_whitelist.csv"
+FIN_PRODUCT_CSV_PATH = MART_DB / "fin_product" / "fin_product_grp.csv"
+FIN_PRODUCT_REVIEW_CSV_PATH = MART_DB / "fin_product" / "fin_product_review.csv"
+FIN_PRODUCT_ALIAS_CSV_PATH = MART_DB / "fin_product" / "fin_product_alias.csv"
+FIN_PRODUCT_MART_CSV_PATH = MART_DB / "fin_product" / "fin_product_mart.csv"
+POSFEED_WHITELIST_CSV_PATH = MART_DB / "fin_product" / "fin_product_posfeed_whitelist.csv"
 
 STORE_SALES_TARGET_DIR = ANALYTICS_DB / "store_sales_target"
 STORE_SALES_TARGET_CSV = STORE_SALES_TARGET_DIR / "target.csv"
 STORE_SALES_DAILY_ACTUALS_CSV = STORE_SALES_TARGET_DIR / "daily_actuals.csv"
 STORE_SALES_ANALYSIS_CSV = STORE_SALES_TARGET_DIR / "sales_analysis.csv"
 
-BAEMIN_ORDERS_DETAIL_DB      = ANALYTICS_DB / "baemin_macro"
-BAEMIN_METRICS_DB            = BAEMIN_ORDERS_DETAIL_DB / "metrics_now"
-BAEMIN_OUR_STORE_CLICKS_DB   = BAEMIN_ORDERS_DETAIL_DB / "metrics_our_store_clicks"
-BAEMIN_SHOP_CHANGE_DB        = BAEMIN_ORDERS_DETAIL_DB / "shop_change"
-BAEMIN_SHOP_OPERATION_DB     = BAEMIN_ORDERS_DETAIL_DB / "shop_operation"
-BAEMIN_MONTHLY_OPERATION_DB  = BAEMIN_ORDERS_DETAIL_DB / "monthly_operation"
-BAEMIN_ORDERS_DB             = BAEMIN_ORDERS_DETAIL_DB / "orders"
-BAEMIN_AD_FUNNEL_DB          = BAEMIN_ORDERS_DETAIL_DB / "ad_funnel"
+BAEMIN_ORDERS_DETAIL_DB = ANALYTICS_DB / "baemin_macro"
+BAEMIN_METRICS_DB = BAEMIN_ORDERS_DETAIL_DB / "metrics_now"
+BAEMIN_OUR_STORE_CLICKS_DB = BAEMIN_ORDERS_DETAIL_DB / "metrics_our_store_clicks"
+BAEMIN_SHOP_CHANGE_DB = BAEMIN_ORDERS_DETAIL_DB / "shop_change"
+BAEMIN_SHOP_OPERATION_DB = BAEMIN_ORDERS_DETAIL_DB / "shop_operation"
+BAEMIN_MONTHLY_OPERATION_DB = BAEMIN_ORDERS_DETAIL_DB / "monthly_operation"
+BAEMIN_ORDERS_DB = BAEMIN_ORDERS_DETAIL_DB / "orders"
+BAEMIN_AD_FUNNEL_DB = BAEMIN_ORDERS_DETAIL_DB / "ad_funnel"
 
-COUPANG_ORDERS_DETAIL_DB     = ANALYTICS_DB / "coupang_macro"
-COUPANG_ORDERS_DB            = COUPANG_ORDERS_DETAIL_DB / "orders"
+COUPANG_ORDERS_DETAIL_DB = ANALYTICS_DB / "coupang_macro"
+COUPANG_ORDERS_DB = COUPANG_ORDERS_DETAIL_DB / "orders"
 
-UNIFIED_REVIEW_MART_DIR      = MART_DB / "unified_review"
+UNIFIED_REVIEW_MART_DIR = MART_DB / "unified_review"
 TOORDER_REVIEW_ANALYTICS_DIR = ANALYTICS_DB / "toorder_review"

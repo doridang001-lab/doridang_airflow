@@ -1,5 +1,7 @@
 # 모듈 규칙
 
+> Codex 전용 운영 문서(`AGENTS.md`, `docs/codex/**`)는 Claude 작업 규칙으로 사용하지 않는다.
+
 ```mermaid
 graph TD
     DAG[dags/] -->|import| PIP[pipelines/]

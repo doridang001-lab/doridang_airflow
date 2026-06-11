@@ -7,11 +7,19 @@ exec >> "$LOG" 2>&1
 echo "[$(date)] autostart_telegram.sh 시작"
 
 # 환경 변수 설정
-export HOME="/home/myuser"
-export USER="myuser"
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/myuser/.local/bin"
+WSLUSER="${USER:-$(whoami)}"
+export HOME="${HOME:-/home/$WSLUSER}"
+export USER="$WSLUSER"
+_NVM_DIR="$HOME/.nvm/versions/node"
+_NODE_VER="$(ls "$_NVM_DIR" 2>/dev/null | sort -V | tail -1)"
+if [ -n "$_NODE_VER" ] && [ -d "$_NVM_DIR/$_NODE_VER/bin" ]; then
+    _NODE_BIN="$_NVM_DIR/$_NODE_VER/bin"
+else
+    _NODE_BIN="$(dirname "$(command -v node 2>/dev/null || echo /usr/bin/node)")"
+fi
+export PATH="$_NODE_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin:$HOME/.bun/bin"
 
-AIRFLOW_DIR="/mnt/c/airflow"
+AIRFLOW_DIR="${AIRFLOW_DIR:-/mnt/c/airflow}"
 VENV="$AIRFLOW_DIR/.venv_wsl/bin/activate"
 
 # WSL 마운트 대기 (최대 30초)
@@ -40,6 +48,15 @@ for i in $(seq 1 24); do
     sleep 5
 done
 
+# 가상환경 활성화 및 `claude` 실행 파일 존재 확인
+echo "[$(date)] 가상환경 활성화 및 claude 확인"
+source "$VENV"
+if ! command -v claude >/dev/null 2>&1; then
+    echo "[$(date)] ERROR: 'claude' 명령을 찾을 수 없습니다. 자동 재시작을 중지합니다."
+    echo "[$(date)] PATH=", "$PATH"
+    exit 1
+fi
+
 # 중복 Claude 텔레그램 프로세스 제거 (claude-channels-session 외 다른 세션의 claude 종료)
 echo "[$(date)] 중복 Claude 프로세스 확인..."
 CHANNEL_PANE_PID=$(tmux list-panes -t claude-channels-session -F "#{pane_pid}" 2>/dev/null | head -1)
@@ -61,7 +78,7 @@ fi
 if ! tmux has-session -t claude-channels-session 2>/dev/null; then
     echo "[$(date)] claude-channels-session 생성"
     tmux new-session -d -s claude-channels-session -c "$AIRFLOW_DIR" \
-        "bash -c 'source $VENV; while true; do echo \"[재시작: \$(date)]\"; claude --channels plugin:telegram@claude-plugins-official --dangerously-skip-permissions 2>&1 | tee -a /tmp/claude_channels.log; sleep 5; done'"
+        "bash -c 'export PATH=$_NODE_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin:$HOME/.bun/bin; source $VENV; if ! command -v claude >/dev/null 2>&1; then echo \"[ERROR] claude not found in PATH=\$PATH\"; exit 1; fi; while true; do echo \"[재시작: \$(date)]\"; claude --dangerously-skip-permissions; sleep 5; done'"
     echo "[$(date)] claude-channels-session 시작 완료"
 else
     echo "[$(date)] claude-channels-session 이미 실행 중"
@@ -70,7 +87,7 @@ else
         echo "[$(date)] 세션 재시작 (프로세스 없음)"
         tmux kill-session -t claude-channels-session
         tmux new-session -d -s claude-channels-session -c "$AIRFLOW_DIR" \
-            "bash -c 'source $VENV; while true; do echo \"[재시작: \$(date)]\"; claude --channels plugin:telegram@claude-plugins-official --dangerously-skip-permissions 2>&1 | tee -a /tmp/claude_channels.log; sleep 5; done'"
+            "bash -c 'export PATH=$_NODE_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin:$HOME/.bun/bin; source $VENV; if ! command -v claude >/dev/null 2>&1; then echo \"[ERROR] claude not found in PATH=\$PATH\"; exit 1; fi; while true; do echo \"[재시작: \$(date)]\"; claude --dangerously-skip-permissions; sleep 5; done'"
     fi
 fi
 

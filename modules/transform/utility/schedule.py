@@ -10,54 +10,54 @@ DAG에서 사용하는 cron 표현식과 이메일 설정을 관리
 SMD_ORDERS_TIME      = "33 16 * * 1,5"    # 매주 월요일 15:15 실행
 SMD_VISIT_LOG        = "0 12 * * 1,3,5" # 매주 월,수,금 12:00 실행
 
-SMP_TOORDER_VOC_TIME = "30 9 * * *"     # 매일 09:30 실행
-SMP_FDAM_CS_TIME     = "5 9 * * *"      # 매일 09:05 실행
+SMP_TOORDER_VOC_TIME = "30 7 * * *"     # 매일 07:30 실행
+SMP_FDAM_CS_TIME     = "5 7 * * *"      # 매일 07:05 실행
 
-SMP_DELIVERY_ALERT_TIME  = "40 9 * * 1,2,3,4,5"  # 매주 월~금 09:40 실행
-SMP_CLOSING_RATE_TIME    = "0 9 * * 1"             # 매주 월요일 09:00 실행
-SMP_DAG_MONITORING_TIME = "*/5 * * * *"  # 5분마다 실행 (KST)
-SMP_POLICY_TIME  = "0 10 * * *"   # 매일 10:00 실행 (KST)
-SMP_CHICKEN_PRICE_TIME  = "10 9 * * *"   # 매일 09:10 실행 (KST)
+SMP_DELIVERY_ALERT_TIME  = "40 7 * * 1,2,3,4,5"  # 매주 월~금 07:40 실행
+SMP_CLOSING_RATE_TIME    = "0 7 * * 1"             # 매주 월요일 07:00 실행
+SMP_DAG_MONITORING_TIME = "0 15 * * *"  # 매일 15:00 실행 (KST)
+SMP_POLICY_TIME  = "0 8 * * *"   # 매일 08:00 실행 (KST)
+SMP_CHICKEN_PRICE_TIME  = "10 7 * * *"   # 매일 07:10 실행 (KST)
 
 # 정책 수집 DAG 전용 스케줄 (5분 간격, 비중첩)
-SMP_POLICY_BAEMIN_TIME      = "0 10 * * *"   # 매일 10:00
-SMP_POLICY_COUPANG_TIME     = "5 10 * * *"   # 매일 10:05
-SMP_POLICY_YOGIYO_TIME      = "10 10 * * *"  # 매일 10:10
-SMP_POLICY_DDANGYO_TIME     = "15 10 * * *"  # 매일 10:15
-SMP_POLICY_BAEDALTTEUK_TIME = "20 10 * * *"  # 매일 10:20
-SMP_POLICY_MUKKEBI_TIME     = "25 10 * * *"  # 매일 10:25
-SMP_POLICY_BAEDALEUM_TIME   = "30 10 * * *"  # 매일 10:30
-SMP_POLICY_NAVERPLACE_TIME  = "35 10 * * *"  # 매일 10:35
-SMP_POLICY_CONSOLIDATE_TIME = "45 10 * * *"  # 매일 10:45 (수집 완료 후 집계)
+SMP_POLICY_BAEMIN_TIME      = "0 8 * * *"   # 매일 08:00
+SMP_POLICY_COUPANG_TIME     = "5 8 * * *"   # 매일 08:05
+SMP_POLICY_YOGIYO_TIME      = "10 8 * * *"  # 매일 08:10
+SMP_POLICY_DDANGYO_TIME     = "15 8 * * *"  # 매일 08:15
+SMP_POLICY_BAEDALTTEUK_TIME = "20 8 * * *"  # 매일 08:20
+SMP_POLICY_MUKKEBI_TIME     = "25 8 * * *"  # 매일 08:25
+SMP_POLICY_BAEDALEUM_TIME   = "30 8 * * *"  # 매일 08:30
+SMP_POLICY_NAVERPLACE_TIME  = "35 8 * * *"  # 매일 08:35
+SMP_POLICY_CONSOLIDATE_TIME = "45 8 * * *"  # 매일 08:45 (수집 완료 후 집계)
 
 
 
-DB_ITEM_MASTER_TIME          = "50 10 * * *" # 매일 10:50 실행 (UnifiedSales 빌드 후)
-DB_FIN_PRODUCT_TIME          = "35 10 * * *" # 매일 10:35 실행 (OKPOS Product 완료 후)
-DB_POSFEED_SALES_TIME        = "15 9 * * *"  # 매일 09:15 실행
-DB_POSFEED_SALES_DETAIL_TIME = "45 9 * * *"  # 매일 09:45 실행
-DB_OKPOS_SALES_TIME          = "35 9 * * *"  # 매일 09:35 실행
-DB_OKPOS_PRODUCT_TIME        = "20 10 * * *" # 매일 10:20 실행 (OKPOS 상품조회 엑셀)
-DB_EASYPOS_SALES_TIME        = "50 9 * * *"  # 매일 09:50 실행
-DB_UNIONPOS_RECEIPT_TIME     = "55 9 * * *"  # 매일 09:55 실행
+DB_ITEM_MASTER_TIME          = "50 8 * * *" # 매일 08:50 실행 (UnifiedSales 빌드 후)
+DB_FIN_PRODUCT_TIME          = "35 8 * * *" # 매일 08:35 실행 (OKPOS Product 완료 후)
+DB_POSFEED_SALES_TIME        = "15 7 * * *"  # 매일 07:15 실행
+DB_POSFEED_SALES_DETAIL_TIME = "45 7 * * *"  # 매일 07:45 실행
+DB_OKPOS_SALES_TIME          = "35 7 * * *"  # 매일 07:35 실행
+DB_OKPOS_PRODUCT_TIME        = "20 8 * * *" # 매일 08:20 실행 (OKPOS 상품조회 엑셀)
+DB_EASYPOS_SALES_TIME        = "50 7 * * *"  # 매일 07:50 실행
+DB_UNIONPOS_RECEIPT_TIME     = "55 7 * * *"  # 매일 07:55 실행
 
-AI_DAILY_COLLECTION_TIME = "20 9 * * *"  # 매일 09:20 실행 (KST)
+AI_DAILY_COLLECTION_TIME = "20 7 * * *"  # 매일 07:20 실행 (KST)
 
-SMD_TOORDER_SALES_REPORT_TIME = "0 9 * * *"  # 매일 09:00 실행
+SMD_TOORDER_SALES_REPORT_TIME = "0 7 * * *"  # 매일 07:00 실행
 
-DB_TOORDER_STORE_PLATFORM_TIME = "10 9 * * *"  # 매일 09:10 실행 (SMD_TOORDER_SALES_REPORT 이후)
+DB_TOORDER_STORE_PLATFORM_TIME = "10 7 * * *"  # 매일 07:10 실행 (SMD_TOORDER_SALES_REPORT 이후)
 
-DB_UNIFIED_REVIEW_TIME         = "33 9 * * *"  # 매일 09:33 실행 (ToOrderVoc Transform 9:30 이후)
+DB_UNIFIED_REVIEW_TIME         = "33 7 * * *"  # 매일 07:33 실행 (ToOrderVoc Transform 7:30 이후)
 
-SMD_BAEMIN_COLLECT_TIME = "15 9 * * *"  # 매일 KST 09:15 실행 (토더 매출 수집 완료 후)
+SMD_BAEMIN_COLLECT_TIME = "15 7 * * *"  # 매일 KST 07:15 실행 (토더 매출 수집 완료 후)
 
-SMP_MORNING_BRIEFING_TIME = "47 8 * * 1,2,3,4,5"  # 매주 월~금 08:47 실행 (KST)
+SMP_MORNING_BRIEFING_TIME = "47 6 * * 1,2,3,4,5"  # 매주 월~금 06:47 실행 (KST)
 
-SMD_STORE_SALES_TIME = "0 11 * * *"  # 매일 11:00 실행 (POS 수집 완료 후)
+SMD_STORE_SALES_TIME = "0 9 * * *"  # 매일 09:00 실행 (POS 수집 완료 후)
 
-DB_HALL_SALES_TARGET_TIME = "5 10 * * 1"  # 매주 월요일 10:05 (UnifiedSales 10:30 시작 +25분)
+DB_HALL_SALES_TARGET_TIME = "5 8 * * 1"  # 매주 월요일 08:05 (UnifiedSales 08:20 시작 전)
 
-DB_TOORDER_MENU_TIME = "5 11 * * *"  # 매일 11:05 실행 (메뉴별 판매량 분석)
+DB_TOORDER_MENU_TIME = "0 7 * * *"  # 매일 07:00 실행 (메뉴별 판매량 분석)
 
 
 # ============================================================
