@@ -12,12 +12,16 @@ Airflow DAG 실패/재시도 알림 유틸리티
 """
 
 import logging
+import json
+from datetime import datetime
+from pathlib import Path
 import urllib.request
 import urllib.parse
 
 logger = logging.getLogger(__name__)
 
 _ALERT_EMAILS = ["a17019@kakao.com"]
+HEAL_QUEUE_PATH = Path("C:/airflow/logs/heal_queue.jsonl")
 
 # Telegram 메시지 끝에 붙는 트리거 문구 — Claude가 자동으로 오류 해결 시도
 _TELEGRAM_TRIGGER = "해결해라"
@@ -60,25 +64,45 @@ def _send_email_alert(subject: str, body: str) -> None:
         logger.error("이메일 알림 발송 실패: %s", e)
 
 
+def _append_heal_queue(entry: dict) -> None:
+    try:
+        HEAL_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with HEAL_QUEUE_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        logger.info("heal_queue 기록 완료: %s", HEAL_QUEUE_PATH)
+    except Exception as e:
+        logger.warning("heal_queue 기록 실패 (무시): %s", e)
+
+
 def on_failure_callback(context) -> None:
     """Task 최종 실패 시 이메일 + Telegram 알림."""
     ti             = context.get("task_instance")
     execution_date = ti.execution_date.strftime("%Y-%m-%d %H:%M")
     exception      = context.get("exception", "알 수 없음")
-    retry_number   = ti.try_number - 1
 
     subject = f"[Airflow 실패] {ti.dag_id} / {ti.task_id}"
     body = (
-        f"DAG: {ti.dag_id}\n"
-        f"Task: {ti.task_id}\n"
-        f"재시도: {retry_number}회차\n"
-        f"실행일시: {execution_date}\n"
-        f"에러: {exception}\n"
-        f"로그: {ti.log_url}"
+        f"[DAG 실패]\n"
+        f"dag_id={ti.dag_id}\n"
+        f"task_id={ti.task_id}\n"
+        f"run_id={ti.run_id}\n"
+        f"try_number={ti.try_number}\n"
+        f"execution_date={execution_date}\n"
+        f"log_url={ti.log_url}\n"
+        f"error={exception}"
     )
 
     _send_email_alert(subject, body)
     send_telegram(f"{body}\n{_TELEGRAM_TRIGGER}")
+    _append_heal_queue({
+        "dag_id": ti.dag_id,
+        "task_id": ti.task_id,
+        "run_id": ti.run_id,
+        "try_number": ti.try_number,
+        "error": str(exception),
+        "ts": datetime.utcnow().isoformat(),
+        "claimed_by": None,
+    })
 
 
 def on_retry_callback(context) -> None:
@@ -89,11 +113,14 @@ def on_retry_callback(context) -> None:
     retry_number   = ti.try_number - 1
 
     body = (
-        f"DAG: {ti.dag_id}\n"
-        f"Task: {ti.task_id}\n"
-        f"재시도: {retry_number}회차\n"
-        f"실행일시: {execution_date}\n"
-        f"에러: {exception}\n"
-        f"로그: {ti.log_url}"
+        f"[DAG 재시도]\n"
+        f"dag_id={ti.dag_id}\n"
+        f"task_id={ti.task_id}\n"
+        f"run_id={ti.run_id}\n"
+        f"try_number={ti.try_number}\n"
+        f"retry_number={retry_number}\n"
+        f"execution_date={execution_date}\n"
+        f"log_url={ti.log_url}\n"
+        f"error={exception}"
     )
     send_telegram(body)
