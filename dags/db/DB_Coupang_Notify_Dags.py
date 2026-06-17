@@ -22,6 +22,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 
 from modules.transform.utility.mailer import send_email
+from modules.transform.utility.notifier import on_failure_callback
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,7 @@ with DAG(
     default_args={
         "retries": 1,
         "retry_delay": timedelta(minutes=2),
+    "on_failure_callback": on_failure_callback,
     },
     tags=["coupang", "notify", "email"],
 ) as dag:

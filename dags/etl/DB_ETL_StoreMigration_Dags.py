@@ -26,6 +26,7 @@ from modules.transform.pipelines.etl.DB_ETL_StoreMigration import (
     scan_legacy_partitions,
     migrate_partitions,
 )
+from modules.transform.utility.notifier import on_failure_callback
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ default_args = {
     "depends_on_past": False,
     "email_on_failure": False,
     "email_on_retry": False,
+    "on_failure_callback": on_failure_callback,
 }
 
 

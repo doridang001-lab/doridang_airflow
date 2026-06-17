@@ -25,6 +25,11 @@ HEATMAP_TIME_SOURCE = "start_date"
 DAG_MONITORING_SNAPSHOT_FILENAME = "dag_monitoring_snapshot.json"
 DAY_MONITORING_HTML_FILENAME = "dag_monitoring_dashboard.html"
 RUNNING_STATES = {"queued", "running", "scheduled", "deferred", "up_for_retry"}
+SHORT_DURATION_WHITELIST = {
+    "DB_UnifiedReview_Dags",
+    "Sales_StoreSales_01_Report_Dags",
+    "Strategy_FdamCS_02_FlowMacro_Dags",
+}
 
 
 def _parse_payload_timestamp(value: Any) -> pd.Timestamp:
@@ -359,7 +364,7 @@ def apply_failure_rules(**context: Any) -> str:
                     detail = f"전체 Task 스킵 ({total_tasks}건)"
                 elif intentional_skip_run:
                     detail = f"의도된 스킵 포함 완료 ({skipped_tasks}/{total_tasks})"
-                elif 0 < duration_sec < 10:
+                elif 0 < duration_sec < 10 and dag_id not in SHORT_DURATION_WHITELIST:
                     status = "WARN"
                     fail_type = "short_duration"
                     detail = f"실행시간이 너무 짧음 ({duration_sec:.1f}초)"

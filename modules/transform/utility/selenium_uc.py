@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Callable
 
 import undetected_chromedriver as uc
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +107,31 @@ def _emit_uc_log(log_fn: Callable[[str], None] | None, message: str) -> None:
         log_fn(message)
     else:
         logger.info(message)
+
+
+def _resolve_chromedriver_binary() -> str | None:
+    env_path = os.getenv("CHROMEDRIVER_PATH")
+    candidates = [env_path] if env_path else []
+    candidates.extend(
+        [
+            "/usr/local/bin/chromedriver",
+            "/usr/bin/chromedriver",
+            "chromedriver",
+        ]
+    )
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        expanded = os.path.abspath(os.path.expanduser(candidate))
+        if os.path.exists(expanded):
+            return expanded
+
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+
+    return None
 
 
 def _resolve_chrome_binary(chrome_bin: str | None = None) -> str | None:
@@ -206,11 +233,34 @@ def _is_network_launch_error(msg: str) -> bool:
     )
 
 
+def _launch_standard_chrome(
+    *,
+    options,
+    chrome_binary: str | None,
+    detected_version: int | None,
+    log_fn: Callable[[str], None] | None = None,
+):
+    chromedriver_binary = _resolve_chromedriver_binary()
+    if not chromedriver_binary:
+        raise RuntimeError("standard chromedriver not found")
+
+    _emit_uc_log(
+        log_fn,
+        "fallback to standard chromedriver "
+        f"driver={chromedriver_binary} chrome={chrome_binary or 'auto'} version={detected_version or 'auto'}",
+    )
+    service = Service(executable_path=chromedriver_binary)
+    driver = webdriver.Chrome(service=service, options=options)
+    _apply_failfast_client(driver, log_fn=log_fn)
+    return driver
+
+
 def launch_uc_chrome(
     options: uc.ChromeOptions,
     account_id: str | None = None,
     chrome_bin: str | None = None,
     log_fn: Callable[[str], None] | None = None,
+    prefer_standard: bool = False,
 ):
     chrome_binary = _resolve_chrome_binary(chrome_bin)
     detected_version = _detect_chrome_major_version(chrome_binary)
@@ -220,6 +270,14 @@ def launch_uc_chrome(
 
     _emit_uc_log(log_fn, f"resolved chrome binary={chrome_binary or 'auto'}")
     _emit_uc_log(log_fn, f"detected chrome major version={detected_version or 'auto'}")
+
+    if prefer_standard:
+        return _launch_standard_chrome(
+            options=options,
+            chrome_binary=chrome_binary,
+            detected_version=detected_version,
+            log_fn=log_fn,
+        )
 
     data_dir = configure_uc_data_path()
     if data_dir:
@@ -310,6 +368,15 @@ def launch_uc_chrome(
             f"detected version={detected_version or 'auto'} "
             f"original exception={exc}",
         )
+        try:
+            return _launch_standard_chrome(
+                options=options,
+                chrome_binary=chrome_binary,
+                detected_version=detected_version,
+                log_fn=log_fn,
+            )
+        except Exception as fallback_exc:
+            _emit_uc_log(log_fn, f"standard chromedriver fallback failed: {fallback_exc}")
         if last_exc is not None:
             raise last_exc
         raise RuntimeError("browser launch failed (no exception captured)")

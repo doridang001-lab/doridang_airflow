@@ -40,6 +40,7 @@ from modules.transform.utility.paths import (
     BAEMIN_SHOP_CHANGE_DB,
     BAEMIN_SHOP_OPERATION_DB,
 )
+from modules.transform.pipelines.db.beamin_store_io import find_tables, read_file, read_table
 
 logger = logging.getLogger(__name__)
 KST = pendulum.timezone("Asia/Seoul")
@@ -224,18 +225,15 @@ def _load_change_df_for_ym(brand: str, store: str, store_id: str, ym: str) -> pd
     ym 시간 필터는 적용하지 않음 — 정기휴무 상태가 이전 달에 설정되었어도 올바르게 참조되도록.
     ym별 시간 필터링은 호출부(임시중지 ym 필터 등)에서 처리.
     """
-    direct = BAEMIN_SHOP_CHANGE_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}" / "shop_change.csv"
-    if direct.exists():
-        df = pd.read_csv(direct, dtype=str).fillna("")
-        return _filter_by_store_id(df, store_id)
+    direct = BAEMIN_SHOP_CHANGE_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}" / "shop_change"
+    direct_df = read_table(direct)
+    if direct_df is not None:
+        return _filter_by_store_id(direct_df.fillna(""), store_id)
 
-    # 폴백: 가장 최신 ym CSV에서 store_id 필터만 적용 (시간 필터 없음)
+    # 폴백: 가장 최신 ym 파일에서 store_id 필터만 적용 (시간 필터 없음)
     base = BAEMIN_SHOP_CHANGE_DB / f"brand={brand}" / f"store={store}"
-    for ym_dir in sorted(base.glob("ym=*"), reverse=True):
-        csv = ym_dir / "shop_change.csv"
-        if not csv.exists():
-            continue
-        df = pd.read_csv(csv, dtype=str).fillna("")
+    for csv in find_tables(base, "ym=*/shop_change")[::-1]:
+        df = read_file(csv).fillna("")
         if "변경시간" not in df.columns:
             continue
         result = _filter_by_store_id(df, store_id)
@@ -263,10 +261,11 @@ def _get_daily_hours_by_weekday(brand: str, store: str, store_id: str, ym: str) 
 
     우선순위: shop_operation(store_id 필터) → shop_change 운영시간 히스토리 scan.
     """
-    # 1) shop_operation.csv (store_id 필터링)
-    op_csv = BAEMIN_SHOP_OPERATION_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}" / "shop_operation.csv"
-    if op_csv.exists():
-        df = pd.read_csv(op_csv, dtype=str).fillna("")
+    # 1) shop_operation (store_id 필터링)
+    op_stem = BAEMIN_SHOP_OPERATION_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}" / "shop_operation"
+    op_df = read_table(op_stem)
+    if op_df is not None:
+        df = op_df.fillna("")
         if "store_id" in df.columns:
             df = df[df["store_id"].astype(str) == str(store_id)]
         if not df.empty:
@@ -275,17 +274,16 @@ def _get_daily_hours_by_weekday(brand: str, store: str, store_id: str, ym: str) 
                 return h
 
     # 2) 현재 ym shop_change 운영시간 변경 (store_id 필터)
-    ch_csv = BAEMIN_SHOP_CHANGE_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}" / "shop_change.csv"
-    if ch_csv.exists():
-        h = _extract_weekday_hours_from_change_csv(ch_csv, store_id)
+    ch_paths = find_tables(BAEMIN_SHOP_CHANGE_DB, f"brand={brand}/store={store}/ym={ym}/shop_change")
+    if ch_paths:
+        h = _extract_weekday_hours_from_change_csv(ch_paths[0], store_id)
         if h:
             return h
 
     # 3) 히스토리 scan (최신 ym 우선)
     base = BAEMIN_SHOP_CHANGE_DB / f"brand={brand}" / f"store={store}"
-    for ym_dir in sorted(base.glob("ym=*"), reverse=True):
-        csv = ym_dir / "shop_change.csv"
-        if not csv.exists() or ym_dir.name == f"ym={ym}":
+    for csv in find_tables(base, "ym=*/shop_change")[::-1]:
+        if csv.parent.name == f"ym={ym}":
             continue
         h = _extract_weekday_hours_from_change_csv(csv, store_id)
         if h:
@@ -295,7 +293,7 @@ def _get_daily_hours_by_weekday(brand: str, store: str, store_id: str, ym: str) 
 
 
 def _extract_weekday_hours_from_change_csv(csv_path: Path, store_id: str) -> dict[int, float]:
-    df = pd.read_csv(csv_path, dtype=str).fillna("")
+    df = read_file(csv_path).fillna("")
     if "store_id" in df.columns:
         df = df[df["store_id"].astype(str) == str(store_id)]
     rows = df[df.get("대분류", pd.Series(dtype=str)).str.contains("운영시간", na=False)]

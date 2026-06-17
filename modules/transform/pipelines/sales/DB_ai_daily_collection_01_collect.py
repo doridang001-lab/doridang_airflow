@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shutil
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -32,6 +33,31 @@ DOWNLOAD_DIR = DEFAULT_DOWNLOAD_DIR
 CONSOLIDATED_XLSX = DEST_DIR / "종합보고서_일별매출보고서_통합.xlsx"
 DEFAULT_CONSOLIDATED_FILENAME = "종합보고서_일별매출보고서_통합.xlsx"
 CONSOLIDATED_XLSX = DEFAULT_DEST_DIR / DEFAULT_CONSOLIDATED_FILENAME
+
+def _xlsx_validation_error(path: Path) -> str | None:
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = set(zf.namelist())
+    except (OSError, zipfile.BadZipFile) as exc:
+        return f"xlsx zip open failed: {type(exc).__name__}: {exc}"
+
+    missing = [name for name in ("[Content_Types].xml", "xl/workbook.xml") if name not in names]
+    if missing:
+        preview = ", ".join(sorted(names)[:5])
+        return f"xlsx required parts missing: {missing}; members={preview}"
+    return None
+
+
+def _quarantine_invalid_xlsx(path: Path, reason: str) -> Path:
+    quarantine_dir = path.parent / "_invalid_xlsx"
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    target = quarantine_dir / path.name
+    if target.exists():
+        target = quarantine_dir / f"{path.stem}_invalid_{pendulum.now('Asia/Seoul').format('YYYYMMDD_HHmmss')}{path.suffix}"
+    path.rename(target)
+    marker = target.with_suffix(target.suffix + ".reason.txt")
+    marker.write_text(reason, encoding="utf-8")
+    return target
 
 GRP_SHEET_CANDIDATES = [
     "종합보고서_일별매출보고서_grp",
@@ -265,6 +291,11 @@ def _ingest_existing_files_to_daily_parquet(dest_dir: Path) -> list[Path]:
     for src_xlsx in sorted(dest_dir.glob("*.xlsx")):
         if src_xlsx.name.startswith("~$") or src_xlsx.name.endswith("_raw.xlsx"):
             continue
+        invalid_reason = _xlsx_validation_error(src_xlsx)
+        if invalid_reason:
+            quarantined = _quarantine_invalid_xlsx(src_xlsx, invalid_reason)
+            logger.warning("Invalid ToOrder daily xlsx quarantined: %s -> %s | %s", src_xlsx, quarantined, invalid_reason)
+            continue
         logger.info("수동 xlsx parquet 변환 시작: %s", src_xlsx)
         day_paths = _ingest_xlsx_to_daily_parquet(src_xlsx, dest_dir)
         saved_paths.extend(day_paths)
@@ -314,6 +345,11 @@ def run_ai_daily_collection_to_daily_parquet_dir(
 
     shutil.move(str(src), str(dest))
     logger.info("다운로드 xlsx 이동: %s", dest)
+
+    invalid_reason = _xlsx_validation_error(dest)
+    if invalid_reason:
+        quarantined = _quarantine_invalid_xlsx(dest, invalid_reason)
+        raise RuntimeError(f"Downloaded ToOrder report is not a valid xlsx: {quarantined} | {invalid_reason}")
 
     saved_paths.extend(_ingest_xlsx_to_daily_parquet(dest, resolved_dest_dir))
     raw_dest = _rename_to_raw(dest)

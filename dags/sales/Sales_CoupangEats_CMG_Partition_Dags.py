@@ -20,6 +20,7 @@ from modules.transform.pipelines.sales.SMD_CoupangEats_CMG_Partition import (
     load_coupangeats_cmg_partition,
 )
 from modules.transform.utility.paths import ANALYTICS_DB
+from modules.transform.utility.notifier import on_failure_callback
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ default_args = {
     'retries': 2,
     'retry_delay': timedelta(minutes=5),
     'email_on_failure': False,
+    "on_failure_callback": on_failure_callback,
 }
 
 dag = DAG(

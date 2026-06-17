@@ -30,6 +30,7 @@ from modules.transform.pipelines.db.DB_FinProduct import (
     apply_review_approvals,
     build_fin_product_mart,
 )
+from modules.transform.utility.notifier import on_failure_callback
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ default_args = {
     "depends_on_past": False,
     "email_on_failure": False,
     "email_on_retry": False,
+    "on_failure_callback": on_failure_callback,
 }
 
 with DAG(

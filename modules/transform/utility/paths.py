@@ -265,6 +265,7 @@ REPORT_SALES_DB = resolve_report_sales_db()
 MART_DB = resolve_mart_db()
 LLM_OUTPUT_DIR = resolve_llm_output_dir()
 DASHBOARD_DB = resolve_dashboard_db()
+COLLECTION_COMPARE_PATH = MART_DB / "collection_compare" / "collection_compare.parquet"
 ITEM_MASTER_CHECKPOINT_DIR = ANALYTICS_DB / "item_master_checkpoints"
 RAW_OKPOS_SALES = resolve_raw_okpos_sales()
 RAW_UNIONPOS_SALES = resolve_raw_unionpos_sales()

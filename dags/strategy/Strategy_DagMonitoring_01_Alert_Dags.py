@@ -17,6 +17,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 
 from modules.transform.utility.schedule import SMP_DAG_MONITORING_TIME
+from modules.transform.utility.notifier import on_failure_callback
 
 # ============================================================
 # 파이프라인 모듈 동적 임포트
@@ -45,6 +46,7 @@ with DAG(
         "retry_delay": pendulum.duration(minutes=5),
         "email_on_failure": False,
         "email_on_retry": False,
+    "on_failure_callback": on_failure_callback,
     },
 ) as dag:
 

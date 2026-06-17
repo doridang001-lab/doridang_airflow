@@ -40,6 +40,7 @@ from modules.extract.croling_beamin import (
     wait_for_page,
 )
 from modules.transform.utility.paths import BAEMIN_SHOP_CHANGE_DB, BAEMIN_SHOP_OPERATION_DB
+from modules.transform.pipelines.db.beamin_store_io import find_tables, read_file, read_table, write_table
 from modules.transform.utility.notifier import send_telegram, _send_email_alert
 from modules.transform.pipelines.db.beamin_stability import resolve_stability_profile
 
@@ -1526,10 +1527,8 @@ def _last_collected_date(brand: str, store: str):
     마지막 수집 지점까지만 스크롤하기 위한 기준.
     """
     try:
-        paths = list(
-            BAEMIN_SHOP_CHANGE_DB.glob(
-                f"brand={brand}/store={store}/ym=*/shop_change.csv"
-            )
+        paths = find_tables(
+            BAEMIN_SHOP_CHANGE_DB, f"brand={brand}/store={store}/ym=*/shop_change"
         )
     except Exception:
         return None
@@ -1537,7 +1536,7 @@ def _last_collected_date(brand: str, store: str):
     max_date = None
     for p in paths:
         try:
-            df = pd.read_csv(p, dtype=str, usecols=["변경시간"])
+            df = read_file(p, columns=["변경시간"])
         except Exception:
             continue
         dates = pd.to_datetime(df["변경시간"], errors="coerce").dropna()
@@ -1559,17 +1558,15 @@ def _existing_change_keys(brand: str, store: str) -> set[tuple[str, str]]:
     """
     keys: set[tuple[str, str]] = set()
     try:
-        paths = list(
-            BAEMIN_SHOP_CHANGE_DB.glob(
-                f"brand={brand}/store={store}/ym=*/shop_change.csv"
-            )
+        paths = find_tables(
+            BAEMIN_SHOP_CHANGE_DB, f"brand={brand}/store={store}/ym=*/shop_change"
         )
     except Exception:
         return keys
 
     for p in paths:
         try:
-            df = pd.read_csv(p, dtype=str, usecols=["변경시간", "대분류"]).fillna("")
+            df = read_file(p, columns=["변경시간", "대분류"]).fillna("")
         except Exception:
             continue
         for _, row in df.iterrows():
@@ -1725,15 +1722,13 @@ def _extract_change_rows(driver, store_info: dict, full_name: str) -> list[dict]
 def _save_csv(rows: list[dict], brand: str, store: str) -> Path:
     """Override earlier implementation to preserve same-timestamp multi-row changes."""
     ym = pendulum.now(KST).format("YYYY-MM")
-    out_dir = BAEMIN_SHOP_CHANGE_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "shop_change.csv"
+    stem = BAEMIN_SHOP_CHANGE_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}" / "shop_change"
 
     new_df = pd.DataFrame(rows, columns=CSV_COLUMNS).astype(str)
     new_df["_sig"] = new_df.apply(lambda row: str(_row_signature(row)), axis=1)
 
-    if out_path.exists():
-        existing = pd.read_csv(out_path, dtype=str)
+    existing = read_table(stem)
+    if existing is not None:
         for col in CSV_COLUMNS:
             if col not in existing.columns:
                 existing[col] = ""
@@ -1745,6 +1740,9 @@ def _save_csv(rows: list[dict], brand: str, store: str) -> Path:
     else:
         combined = new_df.drop(columns=["_sig"])
 
-    combined.to_csv(out_path, index=False, encoding="utf-8-sig")
-    logger.info("CSV 병합 저장 완료: brand=%s store=%s -> %s (%d건)", brand, store, out_path, len(combined))
+    out_path = write_table(combined, stem)
+    logger.info(
+        "변경이력 병합 저장 완료: brand=%s store=%s -> %s (%d건)",
+        brand, store, out_path, len(combined),
+    )
     return out_path

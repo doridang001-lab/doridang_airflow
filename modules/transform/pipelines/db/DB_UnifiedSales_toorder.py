@@ -2,23 +2,20 @@
 unified_sales - ToOrder pipeline.
 
 Input:
-- ANALYTICS_DB/toorder_daily_store_platform/toorder_store_platform_daily.csv
+- ANALYTICS_DB/toorder_daily_store_platform/toorder_store_platform_daily.parquet
   columns: date, store, platform, price
 
 Output:
 - MART_DB/unified_sales_grp/unified_sales_YYMMDD.parquet
-
-Behavior:
-- One row per store/platform/date becomes one unified_sales row
-- Range tokens such as `YYYY-MM-DD~YYYY-MM-DD` are skipped in backfill
 """
 
 import logging
 from datetime import datetime, timedelta
+from functools import lru_cache
 
 import pandas as pd
 
-from modules.transform.utility.paths import ANALYTICS_DB
+from modules.transform.utility.paths import ANALYTICS_DB, RAW_OKPOS_SALES
 from modules.transform.utility.store_normalize import (
     normalize as _normalize_store_names,
     strip_brand as _strip_brand,
@@ -34,23 +31,38 @@ from modules.transform.pipelines.db.DB_UnifiedSales_common import (
 
 logger = logging.getLogger(__name__)
 
-TOORDER_CSV = ANALYTICS_DB / "toorder_daily_store_platform" / "toorder_store_platform_daily.csv"
+TOORDER_PARQUET = ANALYTICS_DB / "toorder_daily_store_platform" / "toorder_store_platform_daily.parquet"
 TOORDER_SOURCE = "toorder"
 
 _PLATFORM_MAP = {
-    "배민1": "배달의민족",
-    "배달의민족": "배달의민족",
-    "쿠팡이츠": "쿠팡이츠",
-    "요기요": "요기요",
-    "땡겨요": "땡겨요",
-    "배민": "배달의민족",
+    "\ubc30\ubbfc1": "\ubc30\ub2ec\uc758\ubbfc\uc871",
+    "\ubc30\ub2ec\uc758\ubbfc\uc871": "\ubc30\ub2ec\uc758\ubbfc\uc871",
+    "\ucfe0\ud321\uc774\uce20": "\ucfe0\ud321\uc774\uce20",
+    "\uc694\uae30\uc694": "\uc694\uae30\uc694",
+    "\ub561\uaca8\uc694": "\ub561\uaca8\uc694",
+    "\ubc30\ubbfc": "\ubc30\ub2ec\uc758\ubbfc\uc871",
 }
 
 _ORDER_TYPE_MAP = {
-    "배달의민족": "기본",
+    "\ubc30\ub2ec\uc758\ubbfc\uc871": "\uae30\ubcf8",
 }
 
-_BRAND_PREFIXES = {"도리당", "나홀로"}
+_BRAND_PREFIXES = {"\ub3c4\ub9ac\ub2f9", "\ud558\ud504\ub85c"}
+
+
+@lru_cache(maxsize=1)
+def _okpos_store_names() -> frozenset[str]:
+    names: set[str] = set()
+    base = RAW_OKPOS_SALES
+    if not base.exists():
+        return frozenset()
+
+    for path in base.glob("brand=*/store=*"):
+        if path.is_dir():
+            store_name = path.name.split("store=", 1)[-1].strip()
+            if store_name and store_name.endswith("\uc810"):
+                names.add(store_name)
+    return frozenset(names)
 
 
 def _is_exact_date(value: str) -> bool:
@@ -66,16 +78,16 @@ def _extract_brand(normalized_name: str) -> str:
     return parts[0] if parts and parts[0] in _BRAND_PREFIXES else ""
 
 
-def _load_csv() -> pd.DataFrame:
-    if not TOORDER_CSV.exists():
+def _load_parquet() -> pd.DataFrame:
+    if not TOORDER_PARQUET.exists():
         return pd.DataFrame()
     try:
-        df = pd.read_csv(TOORDER_CSV, dtype=str, encoding="utf-8-sig").fillna("")
+        df = pd.read_parquet(TOORDER_PARQUET).fillna("")
     except Exception as exc:
-        logger.warning("toorder CSV load failed: %s", exc)
+        logger.warning("toorder parquet load failed: %s", exc)
         return pd.DataFrame()
     if not {"date", "store", "platform", "price"}.issubset(df.columns):
-        logger.warning("toorder CSV columns invalid: expected date, store, platform, price")
+        logger.warning("toorder parquet columns invalid: expected date, store, platform, price")
         return pd.DataFrame()
     return df
 
@@ -95,6 +107,16 @@ def _transform_df(df: pd.DataFrame, date_str: str) -> pd.DataFrame:
     df["store"] = _strip_brand(df["_store_norm"])
     df = df.drop(columns=["_store_norm"])
 
+    okpos_stores = _okpos_store_names()
+    if okpos_stores:
+        before = len(df)
+        df = df[~df["store"].astype(str).str.strip().isin(okpos_stores)].copy()
+        dropped = before - len(df)
+        if dropped:
+            logger.info("toorder: okpos 매장 중복 제외 %d행 (stores=%s)", dropped, sorted(okpos_stores))
+    if df.empty:
+        return pd.DataFrame(columns=UNIFIED_COLUMNS)
+
     df["platform"] = (
         df["platform"].fillna("").astype(str).str.strip().map(lambda v: _PLATFORM_MAP.get(v, v))
     )
@@ -107,14 +129,14 @@ def _transform_df(df: pd.DataFrame, date_str: str) -> pd.DataFrame:
     store_map = _load_store_map()
     df["_skey"] = df["store"].str.strip().str.split().str[-1]
     df["region"] = df["_skey"].map(lambda k: _lookup_store_meta(store_map, k, "region"))
-    df["담당자"] = df["_skey"].map(lambda k: _lookup_store_meta(store_map, k, "담당자"))
-    df["실오픈일"] = df["_skey"].map(lambda k: _lookup_store_meta(store_map, k, "실오픈일"))
+    df["\ub2f4\ub2f9\uc790"] = df["_skey"].map(lambda k: _lookup_store_meta(store_map, k, "\ub2f4\ub2f9\uc790"))
+    df["\uc624\ud508\uc77c"] = df["_skey"].map(lambda k: _lookup_store_meta(store_map, k, "\uc624\ud508\uc77c"))
     df = df.drop(columns=["_skey"])
 
     df["sale_date"] = date_str
     df["ym"] = date_str[:7]
     df["source"] = TOORDER_SOURCE
-    df["order_type"] = df["platform"].map(lambda v: _ORDER_TYPE_MAP.get(v, "배달"))
+    df["order_type"] = df["platform"].map(lambda v: _ORDER_TYPE_MAP.get(v, "\ubc30\ub2ec"))
 
     store_part = df["store"].fillna("").astype(str).str.strip()
     platform_part = df["platform"].fillna("").astype(str).str.strip()
@@ -132,7 +154,7 @@ def _transform_df(df: pd.DataFrame, date_str: str) -> pd.DataFrame:
     df["unit_price"] = df["price"]
     df["total_price"] = df["price"]
     df["discount_amount"] = 0
-    df["sale_type"] = "정상"
+    df["sale_type"] = "\uc815\uc0c1"
     df["order_cnt"] = 1
     df["collected_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     df["_pk"] = _make_unified_pk(df)
@@ -141,74 +163,13 @@ def _transform_df(df: pd.DataFrame, date_str: str) -> pd.DataFrame:
 
 
 def run_toorder(date_str: str, overwrite: bool = False) -> str:
-    df_all = _load_csv()
-    if df_all.empty:
-        raise FileNotFoundError(f"toorder CSV not found: {TOORDER_CSV}")
-
-    df = _transform_df(df_all, date_str)
-    if df.empty:
-        return f"SKIP: toorder {date_str} no matching rows"
-
-    saved = _save_unified_daily(df, date_str, overwrite=overwrite)
-    return f"toorder {date_str}: {saved} rows"
+    logger.info("toorder 채널 비활성화: unified_sales 적재 제외 (%s)", date_str)
+    return f"SKIP: toorder 채널 비활성화 (unified_sales 제외) {date_str}"
 
 
 def run_lookback_toorder(days: int = 7) -> str:
-    df_all = _load_csv()
-    if df_all.empty:
-        return "SKIP: toorder CSV not found"
-
-    total = 0
-    today = datetime.now()
-    for i in range(days):
-        d = (today - timedelta(days=i)).strftime("%Y-%m-%d")
-        try:
-            result = run_toorder(d, overwrite=True)
-            logger.info(result)
-            try:
-                total += int(result.split(":")[1].strip().split()[0])
-            except Exception:
-                pass
-        except FileNotFoundError:
-            logger.info("toorder lookback skip: %s", d)
-        except Exception as exc:
-            logger.warning("toorder lookback error: %s | %s", d, exc)
-
-    return f"toorder lookback({days} days): {total} rows"
+    return "SKIP: toorder 채널 비활성화 (unified_sales 제외)"
 
 
 def backfill_toorder() -> str:
-    df_all = _load_csv()
-    if df_all.empty:
-        return "SKIP: toorder CSV not found"
-
-    raw_dates = sorted({str(d).strip() for d in df_all["date"].dropna().unique() if str(d).strip()})
-    dates: list[str] = []
-    skipped_ranges: list[str] = []
-    for raw in raw_dates:
-        if _is_exact_date(raw):
-            dates.append(raw)
-            continue
-        if "~" in raw:
-            skipped_ranges.append(raw)
-            continue
-        logger.warning("toorder backfill skip invalid date token: %s", raw)
-
-    if not dates:
-        return "SKIP: no valid dates"
-    if skipped_ranges:
-        logger.warning("toorder backfill skip range tokens: %s", skipped_ranges[:10])
-
-    total = 0
-    for date_str in dates:
-        try:
-            result = run_toorder(date_str, overwrite=True)
-            logger.info(result)
-            try:
-                total += int(result.split(":")[1].strip().split()[0])
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.warning("toorder backfill failed: %s | %s", date_str, exc)
-
-    return f"toorder backfill complete: {len(dates)} days / {total} rows"
+    return "SKIP: toorder 채널 비활성화 (unified_sales 제외)"

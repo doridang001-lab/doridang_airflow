@@ -250,6 +250,12 @@ def build_cs_issue_mart(df_raw: pd.DataFrame) -> pd.DataFrame:
     # - 비공개메모 없음: 오늘(KST) - 등록일 (매일 증가)
     def _calc_duration(row) -> object:
         try:
+            try:
+                if int(str(row.get('접수번호', '')).strip()) < 215:
+                    return None
+            except (ValueError, TypeError):
+                pass
+
             reg = pd.to_datetime(row['등록일'], errors='coerce')
             if pd.isna(reg):
                 return None
@@ -329,7 +335,9 @@ def validate_mart(df: pd.DataFrame) -> bool:
     # 3) 처리소요기간은 등록일 기준으로 산출되어야 함
     reg_dt = pd.to_datetime(df['등록일'], errors='coerce')
     has_reg = reg_dt.notna()
-    no_dur_with_reg = has_reg & df['처리소요기간'].isna()
+    old_num = pd.to_numeric(df['접수번호'], errors='coerce')
+    legacy_mask = old_num < 215
+    no_dur_with_reg = has_reg & df['처리소요기간'].isna() & ~legacy_mask
     if no_dur_with_reg.sum() > 0:
         print(f"[validate] ⚠️  등록일 있는데 처리소요기간 없음: {no_dur_with_reg.sum()}건")
         ok = False

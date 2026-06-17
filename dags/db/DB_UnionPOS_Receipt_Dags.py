@@ -10,7 +10,7 @@ UnionPOS 영수증 원본 자동 수집 DAG
   - unionpos_receipt_list.csv  : 영수증 헤더
   - unionpos_receipt_items.csv : 영수증 상세품목
 
-스케줄: 매일 09:55 (DB_UNIONPOS_RECEIPT_TIME)
+스케줄: 매일 07:55 (DB_UNIONPOS_RECEIPT_TIME)
 인증: UnionPOS ID/PW (파이프라인 상수)
 """
 
@@ -22,7 +22,7 @@ import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-from modules.transform.utility.notifier import send_telegram
+from modules.transform.utility.notifier import enqueue_heal_task, send_telegram
 from modules.transform.utility.schedule import DB_UNIONPOS_RECEIPT_TIME
 from modules.transform.pipelines.db.DB_UnionPOS_Receipt import (
     resolve_sale_dates,
@@ -64,6 +64,7 @@ def _on_failure_callback(context):
     except Exception as e:
         logger.error(f"실패 알림 발송 실패: {e}")
     send_telegram(body + "\n해결해라")
+    enqueue_heal_task(context)
 
 
 default_args = {
@@ -106,7 +107,6 @@ with DAG(
     t4 = PythonOperator(
         task_id="verify_missing",
         python_callable=verify_missing,
-        trigger_rule="all_done",
     )
 
-    t1 >> t2 >> t3 >> t4
+    t1 >> t2 >> t4 >> t3

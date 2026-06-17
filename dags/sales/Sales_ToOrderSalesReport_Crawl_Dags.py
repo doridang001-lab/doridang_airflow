@@ -30,6 +30,7 @@ from modules.extract.crawling_toorder_sales_report import (
 )
 from modules.transform.utility.paths import ANALYTICS_DB, DOWN_DIR
 from modules.transform.utility.schedule import SMD_TOORDER_SALES_REPORT_TIME
+from modules.transform.utility.notifier import on_failure_callback
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +240,7 @@ with DAG(
     default_args={
         "retries": 1,
         "retry_delay": pendulum.duration(minutes=5),
+    "on_failure_callback": on_failure_callback,
     },
 ) as dag:
 

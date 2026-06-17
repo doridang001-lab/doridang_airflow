@@ -22,6 +22,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.utils.trigger_rule import TriggerRule
 from modules.transform.utility.schedule import SMP_POLICY_CONSOLIDATE_TIME
+from modules.transform.utility.notifier import on_failure_callback
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -104,6 +105,7 @@ with DAG(
         "retries": 1,
         "retry_delay": pendulum.duration(minutes=5),
         "email_on_failure": False,
+    "on_failure_callback": on_failure_callback,
     },
 ) as dag:
 

@@ -32,17 +32,23 @@ from airflow.utils.trigger_rule import TriggerRule
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from modules.transform.utility.paths import DOWN_DIR
+from modules.transform.utility.paths import DOWN_DIR, TEMP_DIR
 from modules.transform.utility.io import SMP_FDAM_CS_TIME
 from modules.load.load_gsheet import save_to_gsheet
 from modules.transform.utility.store_name_mapping import normalize_store_names, normalize_for_join
+from modules.transform.utility.notifier import on_failure_callback
 
 filename = os.path.basename(__file__)
+
+
+def _now_kst() -> dt.datetime:
+    return dt.datetime.now(tz=pendulum.timezone("Asia/Seoul"))
 
 # ============================================================
 # ✅ 경로 / 접속정보 / 시트 설정
 # ============================================================
 DOWNLOAD_DIR        = str(DOWN_DIR)
+PREPARED_BATCH_DIR = TEMP_DIR / "fdam_cs_staging"
 CREDENTIALS_PATH    = "/opt/airflow/config/rare-ethos-483607-i5-45c9bec5b193.json"
 FALLBACK_CREDENTIALS_PATH = "/opt/airflow/config/glowing-palace-465904-h6-7f82df929812.json"
 # 진행상황(완료) 표기용 컨트롤 시트 (알림/Flow 업로드 중단 조건)
@@ -551,7 +557,7 @@ def preprocess_cs_df(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.to_datetime(df[col], errors='coerce').dt.strftime('%Y-%m-%d')
             df[col] = df[col].replace({'NaT': '', 'None': ''})
 
-    df['수집일'] = dt.datetime.now().strftime('%Y-%m-%d')
+    df['수집일'] = _now_kst().strftime('%Y-%m-%d')
     # ※ uploaded_at 은 save_to_gsheet 에서 자동 추가됨 → 여기서 추가하지 않음
 
     for col in df.select_dtypes(include=[np.floating]).columns:
@@ -975,6 +981,14 @@ def upload_df_to_gsheet(df: pd.DataFrame, label: str = "") -> str:
 # ============================================================
 # Task 1: 기존 파일 glob → append
 # ============================================================
+def _build_prepared_batch_path(context) -> Path:
+    dag_run = context.get('dag_run')
+    run_id = getattr(dag_run, 'run_id', '') or context['ti'].run_id
+    safe_run_id = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(run_id))
+    PREPARED_BATCH_DIR.mkdir(parents=True, exist_ok=True)
+    return PREPARED_BATCH_DIR / f"fdam_cs_{safe_run_id}.pkl"
+
+
 def load_existing_files(**context):
     print(f"\n{'='*60}")
     print(f"[기존파일 적재] DOWNLOAD_DIR: {DOWNLOAD_DIR}")
@@ -1060,7 +1074,7 @@ def _recalc_completion_rate(df_new: pd.DataFrame, df_existing: pd.DataFrame) -> 
     df_new_calc = df_new.copy()
 
     if '수집일' not in df_new_calc.columns:
-        df_new_calc['수집일'] = dt.datetime.now().strftime('%Y-%m-%d')
+        df_new_calc['수집일'] = _now_kst().strftime('%Y-%m-%d')
 
     # 기존 데이터에 수집일이 없으면 uploaded_at(YYYY-MM-DD HH:MM:SS)에서 날짜 추출해 보정
     if df_existing is not None and not df_existing.empty:
@@ -1140,7 +1154,7 @@ def _recalc_completion_rate(df_new: pd.DataFrame, df_existing: pd.DataFrame) -> 
     return df_new_calc
 
 
-def transform_and_upload(**context):
+def _legacy_transform_and_upload(**context):
     import gspread
     from google.oauth2.service_account import Credentials
 
@@ -1242,6 +1256,195 @@ def transform_and_upload(**context):
 # ============================================================
 # Task 4: 처리 지연 CS 이메일 알림
 # ============================================================
+def transform_cs_data(**context):
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    ti = context['ti']
+    excel_path = ti.xcom_pull(task_ids='download_cs_excel', key='new_cs_file')
+
+    print(f"\n{'='*60}")
+    print(f"[transform] source file: {excel_path}")
+
+    if not excel_path or not os.path.exists(excel_path):
+        raise FileNotFoundError(f"missing excel file: {excel_path}")
+
+    ti.xcom_push(key='source_excel_file', value=excel_path)
+    ti.xcom_push(key='uploaded_new_file', value=excel_path)
+
+    df_raw = pd.read_excel(excel_path)
+    print(f"[transform] raw rows: {len(df_raw)}")
+    df = preprocess_cs_df(df_raw)
+
+    if df.empty:
+        print("[transform] no rows to upload")
+        ti.xcom_push(key='prepared_cs_file', value=None)
+        return "no rows to upload"
+
+    print("[transform] loading existing sheet data for derived fields...")
+    df_existing = None
+    try:
+        scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        candidates = _credential_candidates()
+        if not candidates:
+            raise RuntimeError("no available service account credentials")
+        creds = Credentials.from_service_account_file(candidates[0], scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_url(CS_GSHEET_URL)
+        ws = sh.worksheet(CS_SHEET_NAME)
+        df_existing = pd.DataFrame(ws.get_all_records())
+        print(f"[transform] loaded existing sheet rows: {len(df_existing)}")
+        try:
+            _update_existing_elapsed_days(ws, df_existing)
+        except Exception as update_error:
+            print(f"[transform] existing elapsed-day refresh failed: {update_error}")
+    except Exception as e:
+        print(f"[transform] existing sheet load failed; continue with batch-only metrics: {e}")
+
+    df = _recalc_completion_rate(df, df_existing)
+
+    df_existing_for_transform = df_existing
+    if df_existing_for_transform is not None and not df_existing_for_transform.empty:
+        receipt_col_existing = _pick_column(
+            df_existing_for_transform,
+            ['접수번호', '경로번호', '번호', '접수 번호', '경로 번호', '접수ID', '경로ID']
+        )
+        receipt_col_current = _pick_column(
+            df,
+            ['접수번호', '경로번호', '번호', '접수 번호', '경로 번호', '접수ID', '경로ID']
+        )
+        status_col_existing = _pick_column(
+            df_existing_for_transform,
+            ['진행상태', '진행 상태', '상태', '완료여부']
+        )
+        status_col_current = _pick_column(
+            df,
+            ['진행상태', '진행 상태', '상태', '완료여부']
+        )
+
+        if (
+            'issue_type' in df_existing_for_transform.columns and
+            'issue_summary' in df_existing_for_transform.columns and
+            receipt_col_existing and
+            receipt_col_current
+        ):
+            existing_good = df_existing_for_transform[
+                df_existing_for_transform['issue_type'].notna() &
+                (df_existing_for_transform['issue_type'].astype(str).str.strip() != '') &
+                (df_existing_for_transform['issue_type'].astype(str).str.strip() != '기타')
+            ][[receipt_col_existing, 'issue_type', 'issue_summary']].copy()
+            existing_good[receipt_col_existing] = existing_good[receipt_col_existing].astype(str).str.strip()
+            existing_good = existing_good.drop_duplicates(receipt_col_existing)
+            if not existing_good.empty:
+                issue_type_map = existing_good.set_index(receipt_col_existing)['issue_type'].to_dict()
+                issue_summary_map = existing_good.set_index(receipt_col_existing)['issue_summary'].to_dict()
+                num_key = df[receipt_col_current].astype(str).str.strip()
+                mask = num_key.isin(issue_type_map)
+                df.loc[mask, 'issue_type'] = num_key[mask].map(issue_type_map)
+                df.loc[mask, 'issue_summary'] = num_key[mask].map(issue_summary_map)
+                overridden = int(mask.sum())
+                if overridden:
+                    print(f"[transform] reused existing issue classification for {overridden} rows")
+
+        if (
+            receipt_col_existing and
+            receipt_col_current and
+            status_col_existing and
+            status_col_current
+        ):
+            already_done_set = set(
+                df_existing_for_transform[
+                    df_existing_for_transform[status_col_existing].astype(str).str.strip() == '완료'
+                ][receipt_col_existing].astype(str).str.strip()
+            )
+            if already_done_set:
+                before_cnt = len(df)
+                mask_skip = (
+                    df[status_col_current].astype(str).str.strip().eq('완료') &
+                    df[receipt_col_current].astype(str).str.strip().isin(already_done_set)
+                )
+                df = df[~mask_skip].copy()
+                excluded_cnt = before_cnt - len(df)
+                if excluded_cnt:
+                    print(f"[transform] excluded already-completed rows: {excluded_cnt}")
+
+    # legacy section below has legacy-encoded column literals; keep it disabled to avoid historical drift errors.
+    df_existing = None
+
+    if df_existing is not None and not df_existing.empty:
+        if 'issue_type' in df_existing.columns and 'issue_summary' in df_existing.columns:
+            existing_good = df_existing[
+                df_existing['issue_type'].notna() &
+                (df_existing['issue_type'].astype(str).str.strip() != '') &
+                (df_existing['issue_type'].astype(str).str.strip() != '湲고?')
+            ][['?묒닔踰덊샇', 'issue_type', 'issue_summary']].copy()
+            existing_good['?묒닔踰덊샇'] = existing_good['?묒닔踰덊샇'].astype(str).str.strip()
+            existing_good = existing_good.drop_duplicates('?묒닔踰덊샇')
+            if not existing_good.empty:
+                issue_type_map = existing_good.set_index('?묒닔踰덊샇')['issue_type'].to_dict()
+                issue_summary_map = existing_good.set_index('?묒닔踰덊샇')['issue_summary'].to_dict()
+                num_key = df['?묒닔踰덊샇'].astype(str).str.strip()
+                mask = num_key.isin(issue_type_map)
+                df.loc[mask, 'issue_type'] = num_key[mask].map(issue_type_map)
+                df.loc[mask, 'issue_summary'] = num_key[mask].map(issue_summary_map)
+                overridden = int(mask.sum())
+                if overridden:
+                    print(f"[transform] reused existing issue classification for {overridden} rows")
+
+    if df_existing is not None and not df_existing.empty:
+        if '吏꾪뻾?곹깭' in df_existing.columns and '?묒닔踰덊샇' in df_existing.columns:
+            already_done_set = set(
+                df_existing[
+                    df_existing['吏꾪뻾?곹깭'].astype(str).str.strip() == '?꾨즺'
+                ]['?묒닔踰덊샇'].astype(str).str.strip()
+            )
+            if already_done_set:
+                before_cnt = len(df)
+                mask_skip = (
+                    df['吏꾪뻾?곹깭'].astype(str).str.strip().eq('?꾨즺') &
+                    df['?묒닔踰덊샇'].astype(str).str.strip().isin(already_done_set)
+                )
+                df = df[~mask_skip].copy()
+                excluded_cnt = before_cnt - len(df)
+                if excluded_cnt:
+                    print(f"[transform] excluded already-completed rows: {excluded_cnt}")
+
+    if df.empty:
+        print("[transform] no new rows remain after filtering")
+        ti.xcom_push(key='prepared_cs_file', value=None)
+        return "no new rows remain after filtering"
+
+    prepared_path = _build_prepared_batch_path(context)
+    df.to_pickle(prepared_path)
+    ti.xcom_push(key='prepared_cs_file', value=str(prepared_path))
+    print(f"[transform] staged rows={len(df)} path={prepared_path}")
+    return str(prepared_path)
+
+
+def upload_cs_to_gsheet(**context):
+    ti = context['ti']
+    prepared_path = ti.xcom_pull(task_ids='transform_cs_data', key='prepared_cs_file')
+    excel_path = ti.xcom_pull(task_ids='transform_cs_data', key='source_excel_file')
+
+    print(f"\n{'='*60}")
+    print(f"[upload] staged file: {prepared_path}")
+
+    if excel_path:
+        ti.xcom_push(key='uploaded_new_file', value=excel_path)
+
+    if not prepared_path:
+        print("[upload] skipped; nothing staged for upload")
+        return "upload skipped (no staged rows)"
+
+    if not os.path.exists(prepared_path):
+        raise FileNotFoundError(f"missing staged file: {prepared_path}")
+
+    df = pd.read_pickle(prepared_path)
+    result = upload_df_to_gsheet(df, label="?좉퇋?ㅼ슫濡쒕뱶")
+    print("[upload] complete")
+    return result
+
+
 def _build_overdue_email_html(df: pd.DataFrame, today_str: str) -> str:
     """처리 지연 CS 알림 HTML 이메일 본문 생성"""
     from html import escape
@@ -1767,11 +1970,16 @@ def cleanup_files(**context):
     files_to_delete.extend(existing_files)
 
     new_file = (
-        ti.xcom_pull(task_ids='transform_and_upload', key='uploaded_new_file')
+        ti.xcom_pull(task_ids='upload_cs_to_gsheet', key='uploaded_new_file')
+        or ti.xcom_pull(task_ids='transform_cs_data', key='uploaded_new_file')
         or ti.xcom_pull(task_ids='download_cs_excel',  key='new_cs_file')
     )
     if new_file:
         files_to_delete.append(new_file)
+
+    prepared_file = ti.xcom_pull(task_ids='transform_cs_data', key='prepared_cs_file')
+    if prepared_file:
+        files_to_delete.append(prepared_file)
 
     if not files_to_delete:
         print(f"[파일 삭제] 삭제할 파일 없음")
@@ -1948,6 +2156,7 @@ with DAG(
         'depends_on_past': False,
         'email_on_failure': False,
         'email_on_retry': False,
+    "on_failure_callback": on_failure_callback,
     },
     tags=['01_extract', '03_gsheet', 'relay_cs', '매장cs', 'llm_v3'],
 ) as dag:
@@ -1964,10 +2173,18 @@ with DAG(
         execution_timeout=pd.Timedelta(minutes=15),
     )
 
-    t3_upload = PythonOperator(
-        task_id='transform_and_upload',
-        python_callable=transform_and_upload,
+    t3_transform = PythonOperator(
+        task_id='transform_cs_data',
+        python_callable=transform_cs_data,
         execution_timeout=pd.Timedelta(minutes=30),
+    )
+
+    t4_upload = PythonOperator(
+        task_id='upload_cs_to_gsheet',
+        python_callable=upload_cs_to_gsheet,
+        retries=3,
+        retry_delay=pd.Timedelta(minutes=2),
+        execution_timeout=pd.Timedelta(minutes=10),
     )
 
     t5_alert = PythonOperator(
@@ -1990,4 +2207,4 @@ with DAG(
         execution_timeout=pd.Timedelta(minutes=5),
     )
 
-    t1_load_existing >> t2_download >> t3_upload >> t5_alert >> t4_cleanup >> t6_check_freshness
+    t1_load_existing >> t2_download >> t3_transform >> t4_upload >> t5_alert >> t4_cleanup >> t6_check_freshness

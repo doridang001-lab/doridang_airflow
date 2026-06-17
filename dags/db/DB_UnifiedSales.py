@@ -20,7 +20,8 @@ import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-from modules.transform.utility.notifier import send_telegram
+from modules.transform.utility.notifier import enqueue_heal_task, send_telegram
+from modules.transform.utility.schedule import DB_UNIFIED_SALES_TIME
 from modules.transform.pipelines.db.DB_UnifiedSales import (
     backfill_okpos as pipeline_backfill_okpos,
     backfill_unionpos as pipeline_backfill_unionpos,
@@ -43,11 +44,6 @@ from modules.transform.pipelines.db.DB_UnifiedSales_posfeed import (
     run_posfeed as pipeline_run_posfeed,
     run_lookback_posfeed as pipeline_lookback_posfeed,
     sync_posfeed_blacklist as pipeline_sync_posfeed_blacklist,
-)
-from modules.transform.pipelines.db.DB_UnifiedSales_toorder import (
-    backfill_toorder as pipeline_backfill_toorder,
-    run_toorder as pipeline_run_toorder,
-    run_lookback_toorder as pipeline_lookback_toorder,
 )
 from modules.transform.pipelines.db.DB_UnifiedSales_validate import (
     validate_sales,
@@ -85,6 +81,7 @@ def _on_failure_callback(context):
     )
     _send_alert(subject=f"[Airflow 실패] {ti.dag_id} / {ti.task_id}", body=body)
     send_telegram(body + "\n해결해라")
+    enqueue_heal_task(context)
 
 
 default_args = {
@@ -99,8 +96,8 @@ default_args = {
 # LOOKBACK_DAYS:
 # - int  : 최근 N일 누락분 보충
 # - None : 전체 소스 CSV 백필
-LOOKBACK_DAYS: int | None = None
-
+# LOOKBACK_DAYS: int | None = 7
+LOOKBACK_DAYS: int | None = 7  # 전체 백필 모드 (주의: 실행 시점 기준으로 소스 CSV 전체를 다시 처리하므로 오래 걸릴 수 있음)
 
 def resolve_date(**context) -> str:
     """conf['sale_date'] → XCom push (정정 모드). 없으면 None push."""
@@ -221,22 +218,6 @@ def build_posfeed(**context) -> str:
     return pipeline_lookback_posfeed(days=LOOKBACK_DAYS)
 
 
-def build_toorder(**context) -> str:
-    """toorder CSV → unified_sales 저장."""
-    dag_run = context.get("dag_run")
-    conf    = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-
-    if conf.get("backfill"):
-        return pipeline_backfill_toorder()
-
-    sale_date = context["ti"].xcom_pull(task_ids="resolve_date", key="sale_date")
-    if sale_date:
-        return pipeline_run_toorder(sale_date, overwrite=True)
-    if LOOKBACK_DAYS is None:
-        return pipeline_backfill_toorder()
-    return pipeline_lookback_toorder(days=LOOKBACK_DAYS)
-
-
 def report_posfeed_exclusions(**context) -> str:
     """posfeed 블랙리스트 제외 내역을 ym별 상세·집계 CSV로 저장."""
     return pipeline_report_posfeed_exclusions(**context)
@@ -267,12 +248,12 @@ def reclassify_platform(**context) -> str:
 
 with DAG(
     dag_id=dag_id,
-    schedule="20 8 * * *",  # 매일 08:20
+    schedule=DB_UNIFIED_SALES_TIME,
     start_date=pendulum.datetime(2026, 1, 1, tz="Asia/Seoul"),
     catchup=False,
     max_active_runs=1,
     default_args=default_args,
-    tags=["db", "toorder", "okpos", "unionpos", "easypos", "posfeed", "unified_sales"],
+    tags=["db", "okpos", "unionpos", "easypos", "posfeed", "unified_sales"],
 ) as dag:
 
     t1 = PythonOperator(
@@ -303,11 +284,6 @@ with DAG(
     t5a = PythonOperator(
         task_id="build_posfeed",
         python_callable=build_posfeed,
-    )
-
-    t5a2 = PythonOperator(
-        task_id="build_toorder",
-        python_callable=build_toorder,
     )
 
     t5a3 = PythonOperator(
@@ -346,4 +322,4 @@ with DAG(
     )
 
     # 순차 실행: 같은 날짜 parquet에 동시 write 방지
-    t1 >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5a2 >> t5b >> t5c >> t6 >> t7 >> t8 >> t9
+    t1 >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5b >> t5c >> t6 >> t7 >> t8 >> t9

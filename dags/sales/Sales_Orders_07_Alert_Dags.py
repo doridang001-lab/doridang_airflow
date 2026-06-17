@@ -39,6 +39,7 @@ from modules.transform.pipelines.sales.SMD_07_store_ordesr_alert import (
     send_alert_email,
     upload_llm_to_gsheet,
 )
+from modules.transform.utility.notifier import on_failure_callback
 
 # 파일명
 filename = os.path.basename(__file__)
@@ -60,6 +61,7 @@ with DAG(
         'depends_on_past': False,
         'email_on_failure': False,
         'email_on_retry': False,
+    "on_failure_callback": on_failure_callback,
     },
     tags=['alert', 'email', '알림'],
 ) as dag:

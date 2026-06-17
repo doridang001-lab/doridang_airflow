@@ -22,6 +22,7 @@ from airflow.operators.python import PythonOperator
 from modules.transform.utility.schedule import SMD_STORE_SALES_TIME
 from modules.transform.pipelines.sales.SMD_store_sales_daily_actuals import run_daily_actuals
 from modules.transform.pipelines.sales.SMD_store_sales_analysis import run_analysis
+from modules.transform.utility.notifier import on_failure_callback
 
 filename = os.path.basename(__file__)
 
@@ -38,6 +39,7 @@ with DAG(
         "depends_on_past": False,
         "email_on_failure": False,
         "email_on_retry": False,
+    "on_failure_callback": on_failure_callback,
     },
     tags=["sales", "analysis", "매출분석", "LLM"],
 ) as dag:

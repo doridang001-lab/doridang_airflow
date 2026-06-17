@@ -22,6 +22,7 @@ filename = os.path.basename(__file__)
 from modules.transform.utility.paths import LOCAL_DB, ONEDRIVE_DB
 from modules.extract.extract_gsheet import extract_gsheet
 from modules.transform.utility.store_name_mapping import normalize_store_names
+from modules.transform.utility.notifier import on_failure_callback
 
 # 설정
 DEFAULT_CREDENTIALS_PATH = r"/opt/airflow/config/rare-ethos-483607-i5-45c9bec5b193.json"
@@ -315,6 +316,11 @@ with DAG(
     start_date=pendulum.datetime(2023, 1, 1, tz="Asia/Seoul"),
     catchup=False,
     tags=['01_employee', 'gsheet', 'load'],
+    default_args={
+        "retries": 1,
+        "email_on_failure": False,
+        "on_failure_callback": on_failure_callback,
+    },
 ) as dag:
     
     load_employee_task = PythonOperator(

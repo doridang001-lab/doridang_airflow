@@ -2,7 +2,7 @@
 
 ## Before Editing
 - Confirm whether the change belongs in `dags/` or in `modules/transform/pipelines/`.
-- Check naming and schedule conventions in `dags/CLAUDE.md`.
+- Check naming and schedule conventions in root `AGENTS.md`.
 - Identify existing helpers in `modules/transform/utility/`.
 
 ## During Editing

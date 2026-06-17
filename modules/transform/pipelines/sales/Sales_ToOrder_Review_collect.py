@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 import os
@@ -32,6 +32,9 @@ DEFAULT_TOORDER_ID = "doridang15"
 MAX_DATE_ATTEMPTS = 5
 BACKOFF_SECONDS = (5, 10, 20, 20, 20)
 DOWNLOAD_WAIT_SECONDS = 120
+DOWNLOAD_EXTENSIONS = (".xlsx", ".xls", ".csv")
+DOWNLOAD_IN_PROGRESS_EXTENSIONS = (".crdownload", ".part", ".tmp")
+TOPIC_REQUIRED_MESSAGE = "토픽을 선택해주세요."
 
 
 class StageError(RuntimeError):
@@ -100,6 +103,56 @@ def _parse_date_str(date_str: str, field_name: str) -> datetime:
         raise AirflowException(f"`{field_name}` must be YYYY-MM-DD format: {date_str}") from exc
 
 
+def _select_order_date_series(df: pd.DataFrame) -> pd.Series | None:
+    candidates = ("target_date",)
+    for column_name in candidates:
+        if column_name in df.columns:
+            return df[column_name].astype(str).str[:10]
+    return None
+
+
+def _validate_snapshot(new_path: Path, prev_path: Path, drop_tol: float = 0.05) -> dict[str, Any]:
+    """Validate saved snapshot vs previous snapshot by per-date row count drop."""
+    new_df = pd.read_parquet(new_path)
+    new_date_series = _select_order_date_series(new_df)
+    if new_date_series is None:
+        raise AirflowException(f"missing date column in {new_path.name}")
+
+    if not prev_path.exists():
+        return {
+            "ok": True,
+            "suspicious": [],
+            "total_new": int(len(new_df)),
+            "total_prev": 0,
+            "total_shrink": False,
+        }
+
+    prev_df = pd.read_parquet(prev_path)
+    prev_date_series = _select_order_date_series(prev_df)
+    if prev_date_series is None:
+        raise AirflowException(f"missing date column in {prev_path.name}")
+
+    new_counts = new_date_series.value_counts()
+    prev_counts = prev_date_series.value_counts()
+
+    suspicious: list[tuple[str, int, int]] = []
+    for target_date in prev_counts.index.intersection(new_counts.index):
+        prev_count = int(prev_counts[target_date])
+        new_count = int(new_counts[target_date])
+        if prev_count > 0 and new_count < prev_count * (1 - drop_tol):
+            suspicious.append((target_date, prev_count, new_count))
+
+    total_shrink = len(new_df) < len(prev_df)
+    ok = (not suspicious) and (not total_shrink)
+    return {
+        "ok": ok,
+        "suspicious": suspicious,
+        "total_new": int(len(new_df)),
+        "total_prev": int(len(prev_df)),
+        "total_shrink": total_shrink,
+    }
+
+
 def _resolve_output_dir() -> Path:
     override = os.getenv("TOORDER_VOC_OUTPUT_DIR")
     if override:
@@ -109,19 +162,25 @@ def _resolve_output_dir() -> Path:
 
 
 def _generate_date_list(lookback_days=None, conf: dict | None = None) -> tuple[str, list[str]]:
-    """conf > lookback_days 순서로 수집 날짜 목록 결정."""
+    """conf > lookback_days 우선순위로 수집 날짜 목록을 결정한다."""
     conf = conf or {}
     start_date = conf.get("start_date")
     end_date = conf.get("end_date")
+    sale_date = conf.get("sale_date")
 
     if start_date or end_date:
         if not start_date or not end_date:
-            raise AirflowException("conf 수동 실행 시 start_date + end_date 모두 필요.")
+            raise AirflowException("conf 수동 실행 시 start_date + end_date 모두 필요합니다.")
         start_dt = _parse_date_str(str(start_date), "start_date")
         end_dt = _parse_date_str(str(end_date), "end_date")
         if start_dt > end_dt:
             raise AirflowException(f"start_date > end_date: {start_dt.date()} > {end_dt.date()}")
         mode = "manual_range"
+    elif sale_date:
+        target_dt = _parse_date_str(str(sale_date), "sale_date")
+        start_dt = target_dt
+        end_dt = target_dt
+        mode = "manual_date"
     else:
         kst = pendulum.timezone("Asia/Seoul")
         end_dt = datetime.combine(pendulum.now(kst).subtract(days=1).date(), datetime.min.time())
@@ -146,7 +205,15 @@ def _generate_date_list(lookback_days=None, conf: dict | None = None) -> tuple[s
     return mode, date_list
 
 
-# ── 브라우저 유틸 ────────────────────────────────────────────────────────
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+# 브라우저 유틸
 
 def _get_chrome_version() -> Optional[int]:
     chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/google-chrome")
@@ -259,6 +326,131 @@ def _set_date(driver, account_id: str, target_date: str) -> None:
     time.sleep(1.5)
 
 
+def _contains_text(driver, message: str) -> bool:
+    try:
+        raw = (driver.page_source or "").replace(" ", "").replace("\n", "").replace("\r", "")
+        normalized_message = message.replace(" ", "")
+        return normalized_message in raw
+    except Exception:
+        return False
+
+
+def _select_topic_row(driver, account_id: str) -> bool:
+    """토픽 그리드에서 첫 토픽 행을 클릭해 선택을 시도."""
+    row_selectors = [
+        "div.MuiDataGrid-main [role='row'][data-id][aria-rowindex]",
+        "div.MuiDataGrid-main div[role='row'][data-id]",
+        "div.MuiDataGrid-virtualScroller [role='row'][data-id]",
+    ]
+
+    for selector in row_selectors:
+        try:
+            rows = driver.find_elements(By.CSS_SELECTOR, selector)
+        except Exception:
+            continue
+
+        for row in rows:
+            if not row.is_displayed():
+                continue
+
+            row_id = (row.get_attribute("data-id") or "").strip()
+            if row_id in {"", "__total__"}:
+                continue
+            if TOPIC_REQUIRED_MESSAGE in (row.text or ""):
+                continue
+            if not row.text.strip():
+                continue
+
+            targets = row.find_elements(By.CSS_SELECTOR, "button[role='checkbox'], [role='checkbox'], input[type='checkbox']")
+            if targets:
+                target = targets[0]
+            else:
+                cells = row.find_elements(By.CSS_SELECTOR, "div[role='cell']")
+                if not cells:
+                    target = row
+                else:
+                    target = cells[0]
+
+            try:
+                if not target.is_displayed():
+                    continue
+            except Exception:
+                pass
+
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
+                time.sleep(0.3)
+                driver.execute_script("arguments[0].click();", target)
+                _log(account_id, None, "topic", f"selected row id={row_id}")
+                return True
+            except Exception:
+                continue
+
+    return False
+
+
+def _find_topic_grid_checkbox(driver) -> Any:
+    checkbox_selectors = [
+        "div.MuiDataGrid-main input[type='checkbox']",
+        "div.MuiDataGrid-virtualScroller input[type='checkbox']",
+        "input[type='checkbox'][aria-label*='선택']",
+    ]
+    for selector in checkbox_selectors:
+        try:
+            checks = driver.find_elements(By.CSS_SELECTOR, selector)
+        except Exception:
+            continue
+        for checkbox in checks:
+            try:
+                if checkbox.is_displayed():
+                    return checkbox
+            except Exception:
+                continue
+    return None
+
+
+def _ensure_topic_selected(driver, account_id: str, target_date: str) -> None:
+    if not _contains_text(driver, TOPIC_REQUIRED_MESSAGE):
+        return
+
+    _log(account_id, target_date, "topic", "topic required message detected")
+
+    for attempt in range(1, 4):
+        _log(account_id, target_date, "topic", f"recover attempt {attempt}")
+
+        if _select_topic_row(driver, account_id):
+            # 선택 직후 그리드가 갱신되기까지 대기
+            time.sleep(1.5)
+            if not _contains_text(driver, TOPIC_REQUIRED_MESSAGE):
+                _log(account_id, target_date, "topic", "topic selected")
+                return
+
+            # 토픽선택 뒤에도 메시지가 남아있으면 검색을 한 번 더 실행
+            try:
+                _click_search(driver, account_id, target_date)
+            except Exception:
+                pass
+
+            time.sleep(1.5)
+            if not _contains_text(driver, TOPIC_REQUIRED_MESSAGE):
+                _log(account_id, target_date, "topic", "topic selected")
+                return
+
+        checkbox = _find_topic_grid_checkbox(driver)
+        if checkbox is not None:
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", checkbox)
+                driver.execute_script("arguments[0].click();", checkbox)
+                time.sleep(1.5)
+                if not _contains_text(driver, TOPIC_REQUIRED_MESSAGE):
+                    _log(account_id, target_date, "topic", "topic checkbox selected")
+                    return
+            except Exception:
+                pass
+
+    raise RuntimeError("topic selection recovery failed")
+
+
 def _click_search(driver, account_id: str, target_date: str) -> None:
     _log(account_id, target_date, "click_search", "click search")
     selectors = [
@@ -281,42 +473,125 @@ def _click_search(driver, account_id: str, target_date: str) -> None:
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", search_button)
     time.sleep(0.5)
     driver.execute_script("arguments[0].click();", search_button)
+    time.sleep(1.0)
+    _ensure_topic_selected(driver, account_id, target_date)
     time.sleep(random.uniform(3.0, 5.0))
 
 
 def _wait_for_download(driver, account_id: str, target_date: str, download_dir: Path) -> Path:
     _log(account_id, target_date, "download", "click export and wait for xlsx")
+    _ensure_topic_selected(driver, account_id, target_date)
+    start_ts = time.time()
     before_files = set(download_dir.glob("*"))
-    wait = WebDriverWait(driver, 10)
-    export_button = wait.until(
-        EC.element_to_be_clickable((By.XPATH, "//button[contains(., '전체 토픽 내보내기')]"))
+
+    def _normalize(text: str) -> str:
+        return "".join((text or "").split())
+
+    export_keywords = (
+        "전체토픽내보내기",
+        "전체데이터내보내기",
+        "내보내기",
+        "엑셀",
+        "download",
+        "export",
+        "다운로드",
+        "xlsx",
     )
+
+    candidates = []
+    for candidate in driver.find_elements(By.CSS_SELECTOR, "button"):
+        if not candidate.is_displayed():
+            continue
+        raw_text = candidate.text or ""
+        compact = _normalize(raw_text)
+        if not compact:
+            continue
+        compact_lower = compact.lower()
+        if any(keyword in compact for keyword in export_keywords):
+            candidates.append((candidate, raw_text, 0))
+            continue
+        aria = (candidate.get_attribute("aria-label") or "").lower()
+        title = (candidate.get_attribute("title") or "").lower()
+        if any(keyword in aria for keyword in ("내보내기", "download", "export", "엑셀", "다운로드", "xlsx")):
+            candidates.append((candidate, raw_text, 1))
+            continue
+        if any(keyword in title for keyword in ("내보내기", "download", "export", "엑셀", "다운로드", "xlsx")):
+            candidates.append((candidate, raw_text, 1))
+
+    export_button = None
+    exact_match = None
+    for candidate, raw_text, _prio in candidates:
+        compact = _normalize(raw_text)
+        if "토픽" in compact and "내보내기" in raw_text:
+            exact_match = candidate
+            break
+    if exact_match is not None:
+        export_button = exact_match
+    elif candidates:
+        sorted_candidates = sorted(candidates, key=lambda item: item[2])
+        export_button = sorted_candidates[0][0]
+
+    if export_button is None:
+        raise RuntimeError("export button not found")
+
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", export_button)
     time.sleep(0.5)
-    driver.execute_script("arguments[0].click();", export_button)
-    time.sleep(1.5)
+    try:
+        export_button.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", export_button)
 
-    elapsed = 0
-    while elapsed < DOWNLOAD_WAIT_SECONDS:
+    before_names = {path.name for path in before_files}
+    deadline = time.time() + DOWNLOAD_WAIT_SECONDS
+    downloaded_path: Path | None = None
+    stable_ticks = 0
+    last_size = None
+    while time.time() < deadline:
         time.sleep(1.0)
-        elapsed += 1
-        buttons = driver.find_elements(By.XPATH, "//button[contains(., '전체 토픽 내보내기')]")
-        if buttons and buttons[0].get_attribute("disabled") is None:
-            break
+        now_files = [path for path in download_dir.iterdir() if path.is_file()]
+        in_progress = [
+            path.name
+            for path in now_files
+            if any(path.name.endswith(ext) for ext in DOWNLOAD_IN_PROGRESS_EXTENSIONS)
+        ]
 
-    time.sleep(2.0)
-    after_files = set(download_dir.glob("*"))
-    candidates = sorted(
-        (
-            path for path in (after_files - before_files)
-            if path.is_file() and not path.name.endswith(".crdownload")
-        ),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
+        candidates = []
+        for path in now_files:
+            if path.name in before_names:
+                continue
+            if path.suffix.lower() not in DOWNLOAD_EXTENSIONS:
+                continue
+            if path.name.endswith(".crdownload"):
+                continue
+            if path.stat().st_mtime < start_ts - 1:
+                continue
+            candidates.append(path)
+
+        if candidates:
+            newest = sorted(candidates, key=lambda path: path.stat().st_mtime, reverse=True)[0]
+            size = newest.stat().st_size
+            if size > 0 and in_progress == []:
+                if downloaded_path == newest and last_size == size:
+                    stable_ticks += 1
+                    if stable_ticks >= 3:
+                        return newest
+                else:
+                    downloaded_path = newest
+                    last_size = size
+                    stable_ticks = 1
+                continue
+            downloaded_path = newest
+            last_size = size
+            stable_ticks = 0
+            continue
+
+        stable_ticks = 0
+        downloaded_path = None
+
+    context_files = [path.name for path in sorted(download_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)[:5]]
+    raise RuntimeError(
+        f"downloaded xlsx not found. seen in_progress={in_progress} latest_files={context_files}"
     )
-    if not candidates:
-        raise RuntimeError("downloaded file not found")
-    return candidates[0]
 
 
 def _read_voc_excel(excel_path: Path, account_id: str, target_date: str) -> pd.DataFrame:
@@ -355,7 +630,7 @@ def _collect_account_session(
     attempt: int,
     temp_dir: Path,
 ) -> dict[str, Any]:
-    """로그인 1회 후 dates_to_collect 전체 수집. 반환: {date -> df | Exception}"""
+    """단일 계정 기준 dates_to_collect 전체 수집. 반환: {date -> df | Exception}"""
     shared_dl_dir = temp_dir / f"attempt_{attempt}"
     shared_dl_dir.mkdir(parents=True, exist_ok=True)
     driver = None
@@ -382,6 +657,13 @@ def _collect_account_session(
                 results[target_date] = df
             except Exception as exc:
                 logger.warning("[TOORDER_VOC][%s][%s] date failed: %s", account_id, target_date, exc)
+                debug_png = shared_dl_dir / f"{target_date}_attempt{attempt}.png"
+                debug_html = shared_dl_dir / f"{target_date}_attempt{attempt}.html"
+                try:
+                    driver.save_screenshot(str(debug_png))
+                    debug_html.write_text(driver.page_source, encoding="utf-8")
+                except Exception:
+                    pass
                 results[target_date] = exc
 
         return results
@@ -393,13 +675,21 @@ def _collect_account_session(
                 pass
 
 
-# ── Task callables ────────────────────────────────────────────────────────
+# Task callables
 
 def t1_prepare(lookback_days=None, **context: Any) -> str:
-    """날짜 계산 + 계정 확인 + 이미 저장된 날짜 skip → XCom."""
+    """수집 대상 계산 + 스킵 목록 계산 + XCom에 수집 대상/스킵 정보를 저장."""
     ti = context["ti"]
     dag_run = context.get("dag_run")
     conf = (dag_run.conf or {}) if dag_run and dag_run.conf else {}
+    force_recollect = _truthy(conf.get("force_recollect"))
+    explicit_manual_dates = (
+        conf.get("start_date") is not None
+        or conf.get("end_date") is not None
+        or conf.get("sale_date") is not None
+    )
+    if explicit_manual_dates and "force_recollect" not in conf:
+        force_recollect = True
 
     mode, date_list = _generate_date_list(lookback_days=lookback_days, conf=conf)
     account_df = _resolve_account_df()
@@ -410,9 +700,9 @@ def t1_prepare(lookback_days=None, **context: Any) -> str:
     skipped_dates = []
     for target_date in date_list:
         expected_path = output_dir / f"toorder_voc_{target_date.replace('-', '')}.parquet"
-        if expected_path.exists():
+        if expected_path.exists() and not force_recollect:
             skipped_dates.append(target_date)
-            logger.info("[TOORDER_VOC] skip %s — already saved", target_date)
+            logger.info("[TOORDER_VOC] %s 이미 저장되어 있어 skip", target_date)
         else:
             dates_to_collect.append(target_date)
 
@@ -422,19 +712,20 @@ def t1_prepare(lookback_days=None, **context: Any) -> str:
     ti.xcom_push(key="account_records", value=account_records)
     ti.xcom_push(key="output_dir", value=str(output_dir))
     ti.xcom_push(key="mode", value=mode)
+    ti.xcom_push(key="force_recollect", value=force_recollect)
 
-    logger.info("[TOORDER_VOC] mode=%s total=%d skip=%d collect=%d", mode, len(date_list), len(skipped_dates), len(dates_to_collect))
+    logger.info("[TOORDER_VOC] mode=%s total=%d skip=%d collect=%d force_recollect=%s", mode, len(date_list), len(skipped_dates), len(dates_to_collect), force_recollect)
     return f"mode={mode} total={len(date_list)} skip={len(skipped_dates)} collect={len(dates_to_collect)}"
 
 
 def t2_collect(**context: Any) -> str:
-    """브라우저 세션 — 로그인 1회 후 날짜별 다운로드·파싱 → TEMP_DIR 임시 parquet 저장."""
+    """실제 수집 날짜를 실행하고 TEMP_DIR에 parquet 임시 파일을 저장."""
     ti = context["ti"]
     dates_to_collect: list[str] = ti.xcom_pull(task_ids="t1_prepare", key="dates_to_collect") or []
     account_records: list[dict] = ti.xcom_pull(task_ids="t1_prepare", key="account_records") or []
 
     if not dates_to_collect:
-        logger.info("[TOORDER_VOC] 수집할 날짜 없음 — skip")
+        logger.info("[TOORDER_VOC] 수집 대상이 없어 skip")
         ti.xcom_push(key="temp_parquet_map", value={})
         ti.xcom_push(key="failed_dates", value=[])
         return "수집 대상 없음"
@@ -477,7 +768,7 @@ def t2_collect(**context: Any) -> str:
                     failure_details.append(detail)
                     still_failed.append(target_date)
                 else:
-                    # DataFrame → 임시 parquet 저장
+                # DataFrame 임시 parquet 저장
                     tmp_path = session_temp_dir / f"tmp_{target_date.replace('-', '')}.parquet"
                     result.to_parquet(tmp_path, index=False)
                     temp_parquet_map[target_date] = str(tmp_path)
@@ -502,15 +793,15 @@ def t2_collect(**context: Any) -> str:
 
 
 def t3_save(**context: Any) -> str:
-    """임시 parquet → 최종 output_dir 이동 + 정리."""
+    """Move temp parquet to final output dir."""
     ti = context["ti"]
     temp_parquet_map: dict[str, str] = ti.xcom_pull(task_ids="t2_collect", key="temp_parquet_map") or {}
     output_dir = Path(ti.xcom_pull(task_ids="t1_prepare", key="output_dir"))
 
     if not temp_parquet_map:
-        logger.info("[TOORDER_VOC] 저장할 parquet 없음")
+        logger.info("[TOORDER_VOC] no parquet to save")
         ti.xcom_push(key="saved_parquet_paths", value=[])
-        return "저장 대상 없음"
+        return "no saved parquet"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     saved_paths: list[str] = []
@@ -520,10 +811,65 @@ def t3_save(**context: Any) -> str:
         final_path = output_dir / f"toorder_voc_{target_date.replace('-', '')}.parquet"
         shutil.move(str(tmp_path), str(final_path))
         saved_paths.append(str(final_path))
-        logger.info("[TOORDER_VOC] saved %s → %s", target_date, final_path)
+        logger.info("[TOORDER_VOC] saved %s => %s", target_date, final_path)
 
     ti.xcom_push(key="saved_parquet_paths", value=saved_paths)
     ti.xcom_push(key="toorder_voc_paths", value=saved_paths)
 
-    logger.info("[TOORDER_VOC] 최종 저장 완료: %d개", len(saved_paths))
+    logger.info("[TOORDER_VOC] save done: %d files", len(saved_paths))
     return f"saved={len(saved_paths)}"
+
+
+def t4_validate(**context: Any) -> str:
+    """Validate snapshots after save by comparing each file with D-1 snapshot."""
+    ti = context["ti"]
+    saved_parquet_paths: list[str] = ti.xcom_pull(task_ids="t3_save", key="saved_parquet_paths") or []
+    if not saved_parquet_paths:
+        logger.info("[TOORDER_VOC] no snapshots to validate")
+        return "no snapshots to validate"
+
+    output_dir = Path(ti.xcom_pull(task_ids="t1_prepare", key="output_dir") or str(_resolve_output_dir()))
+    date_file_re = re.compile(r"^toorder_voc_(\\d{8})\\.parquet$")
+    validation_results: list[dict[str, Any]] = []
+    failed = 0
+
+    for new_path_str in saved_parquet_paths:
+        new_path = Path(new_path_str)
+        match = date_file_re.match(new_path.name)
+        if not match:
+            message = f"invalid filename format: {new_path.name}"
+            logger.warning("[TOORDER_VOC][validate] %s", message)
+            failed += 1
+            validation_results.append({
+                "path": new_path_str,
+                "ok": False,
+                "suspicious": [],
+                "total_new": 0,
+                "total_prev": 0,
+                "total_shrink": False,
+                "error": message,
+            })
+            continue
+
+        target_date = datetime.strptime(match.group(1), "%Y%m%d")
+        prev_path = output_dir / f"toorder_voc_{(target_date - timedelta(days=1)).strftime('%Y%m%d')}.parquet"
+        result = _validate_snapshot(new_path, prev_path)
+        result.update({
+            "path": str(new_path),
+            "prev_path": str(prev_path),
+        })
+        validation_results.append(result)
+        if not result["ok"]:
+            failed += 1
+            logger.warning(
+                "[TOORDER_VOC][validate] failed: %s, suspicious=%s",
+                new_path.name,
+                result["suspicious"],
+            )
+
+    ti.xcom_push(key="snapshot_validation", value=validation_results)
+    if failed:
+        raise AirflowException(f"[TOORDER_VOC][validate] {failed} snapshot validation failed")
+
+    logger.info("[TOORDER_VOC] validate done: %d files", len(validation_results))
+    return f"validated={len(validation_results)}"

@@ -39,6 +39,7 @@ def _latest_successful_execution_date(dt, **context):
 
 from modules.transform.utility.paths import LOCAL_DB
 from modules.load.load_gsheet import save_to_gsheet
+from modules.transform.utility.notifier import on_failure_callback
 
 # ============================================================
 # 설정
@@ -261,6 +262,7 @@ with DAG(
         'depends_on_past': False,
         'email_on_failure': False,
         'email_on_retry': False,
+    "on_failure_callback": on_failure_callback,
     },
     tags=['03_gsheet', 'upload', 'alerts'],
 ) as dag:

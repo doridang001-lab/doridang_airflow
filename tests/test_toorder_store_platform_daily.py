@@ -6,60 +6,55 @@ import pandas as pd
 from modules.transform.pipelines.sales import DB_Toorder_store_platform_daily as pipeline
 
 
-MANUAL_PREFIX = "종합보고서_일별매출보고서"
+DATEDETAIL_PREFIX = "종합보고서_일별상세_매출보고서"
 
 
-def _make_manual_xlsx(path: Path, *, store: str, price: int, receipts: int) -> None:
+def _make_datedetail_xlsx(
+    path: Path,
+    *,
+    sheet_date: str = "2026-05-11",
+    store: str = "Store A",
+    platform: str = "배민",
+    price: int = 100,
+    receipts: int = 1,
+) -> None:
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.cell(2, 1).value = "2026-05-11"
-    ws.cell(4, 1).value = "row"
-    ws.cell(4, 2).value = store
-    ws.cell(4, 6).value = price
-    ws.cell(4, 42).value = receipts
-    ws.cell(4, 48).value = 0
+    ws.title = sheet_date
+    ws.cell(3, 6).value = store
+    ws.cell(7, 1).value = platform
+    ws.cell(7, 6).value = price
+    ws.cell(7, 9).value = receipts
+    ws.cell(8, 1).value = "합계"
     wb.save(path)
 
 
-def test_ingest_manual_files_reads_all_matching_reports_and_renames(tmp_path):
+def test_find_pending_datedetail_file_matches_month_and_ignores_archived(tmp_path):
     keep = tmp_path / "ignore.xlsx"
+    raw = tmp_path / f"{DATEDETAIL_PREFIX}_2026-05_raw.xlsx"
+    bak = tmp_path / f"{DATEDETAIL_PREFIX}_2026-05_bak_010101.xlsx"
+    temp = tmp_path / f"~${DATEDETAIL_PREFIX}_2026-05.xlsx"
+    target = tmp_path / f"{DATEDETAIL_PREFIX}_2026-05.xlsx"
+
     keep.write_text("x", encoding="utf-8")
+    _make_datedetail_xlsx(raw)
+    _make_datedetail_xlsx(bak)
+    _make_datedetail_xlsx(temp)
+    _make_datedetail_xlsx(target)
 
-    first = tmp_path / f"{MANUAL_PREFIX}.xlsx"
-    second = tmp_path / f"{MANUAL_PREFIX} (1).xlsx"
-    raw = tmp_path / f"{MANUAL_PREFIX}_raw.xlsx"
-    bak = tmp_path / f"{MANUAL_PREFIX}_bak_010101.xlsx"
-    temp = tmp_path / f"~${MANUAL_PREFIX}.xlsx"
-
-    _make_manual_xlsx(first, store="Store A", price=100, receipts=1)
-    _make_manual_xlsx(second, store="Store A", price=200, receipts=2)
-    _make_manual_xlsx(raw, store="Store A", price=300, receipts=3)
-    _make_manual_xlsx(bak, store="Store A", price=400, receipts=4)
-    _make_manual_xlsx(temp, store="Store A", price=500, receipts=5)
-
-    dfs = pipeline._ingest_manual_files(tmp_path, fallback_store_name="Fallback")
-    merged = pd.concat(dfs, ignore_index=True)
-
-    assert len(dfs) == 2
-    assert sorted(merged["price"].tolist()) == [100, 200]
-    assert not first.exists()
-    assert not second.exists()
-    assert (tmp_path / f"{MANUAL_PREFIX}_raw.xlsx").exists()
-    assert (tmp_path / f"{MANUAL_PREFIX} (1)_raw.xlsx").exists()
-    assert bak.exists()
-    assert temp.exists()
-    assert keep.exists()
+    assert pipeline._find_pending_datedetail_file(tmp_path, "2026-05") == target
+    assert pipeline._find_pending_datedetail_file(tmp_path, "2026-06") is None
 
 
-def test_upsert_csv_keeps_last_duplicate_key(tmp_path):
-    csv_path = tmp_path / "toorder_store_platform_daily.csv"
+def test_upsert_parquet_keeps_last_duplicate_key(tmp_path):
+    parquet_path = tmp_path / "toorder_store_platform_daily.parquet"
     old_df = pd.DataFrame(
         [
             {"date": "2026-05-11", "store": "Store A", "platform": "배민", "price": 100, "receipts_num": 1},
             {"date": "2026-05-11", "store": "Store B", "platform": "배민", "price": 50, "receipts_num": 1},
         ]
     )
-    pipeline._upsert_csv(old_df, csv_path)
+    pipeline._upsert_parquet(old_df, parquet_path)
 
     new_df = pd.DataFrame(
         [
@@ -67,46 +62,61 @@ def test_upsert_csv_keeps_last_duplicate_key(tmp_path):
             {"date": "2026-05-12", "store": "Store A", "platform": "쿠팡이츠", "price": 300, "receipts_num": 3},
         ]
     )
-    pipeline._upsert_csv(new_df, csv_path)
+    pipeline._upsert_parquet(new_df, parquet_path)
 
-    result = pd.read_csv(csv_path, dtype=str).sort_values(["date", "store", "platform"]).reset_index(drop=True)
+    result = pd.read_parquet(parquet_path).sort_values(["date", "store", "platform"]).reset_index(drop=True)
 
     assert len(result) == 3
     replaced = result[(result["date"] == "2026-05-11") & (result["store"] == "Store A") & (result["platform"] == "배민")]
-    assert replaced.iloc[0]["price"] == "200"
-    assert replaced.iloc[0]["receipts_num"] == "2"
+    assert int(replaced.iloc[0]["price"]) == 200
+    assert int(replaced.iloc[0]["receipts_num"]) == 2
 
 
-def test_run_toorder_store_platform_daily_merges_manual_and_downloaded_rows(tmp_path, monkeypatch):
+def test_run_toorder_store_platform_daily_uses_pending_datedetail_and_writes_parquet(tmp_path, monkeypatch):
     manual_dir = tmp_path / "manual"
     dest_dir = tmp_path / "dest"
     manual_dir.mkdir()
 
-    manual_path = manual_dir / f"{MANUAL_PREFIX}.xlsx"
-    _make_manual_xlsx(manual_path, store="Manual Store", price=111, receipts=11)
+    pending_path = manual_dir / f"{DATEDETAIL_PREFIX}_2026-05.xlsx"
+    _make_datedetail_xlsx(pending_path, store="Manual Store", price=111, receipts=11)
 
-    def _fake_run_crawling_single_date(**kwargs):
-        downloaded_path = manual_dir / "종합보고서_일별매출보고서_260511.xlsx"
-        _make_manual_xlsx(downloaded_path, store="API Store", price=222, receipts=22)
-        return {
-            "success": True,
-            "file": str(downloaded_path),
-            "date": kwargs["target_date"],
-            "error": None,
-        }
+    def _unexpected_download(**_kwargs):
+        raise AssertionError("pending datedetail workbook should avoid download")
 
-    monkeypatch.setattr(pipeline, "run_crawling_single_date", _fake_run_crawling_single_date)
+    monkeypatch.setattr(pipeline, "run_crawling_datedetail_months", _unexpected_download)
 
-    csv_path = pipeline.run_toorder_store_platform_daily(
-        sale_dates=["2026-05-11"],
-        dest_dir=dest_dir,
-        manual_dir=manual_dir,
-        store_name="API Store",
+    parquet_path = Path(
+        pipeline.run_toorder_store_platform_daily(
+            date_from="2026-05-11",
+            date_to="2026-05-11",
+            dest_dir=dest_dir,
+            manual_dir=manual_dir,
+        )
     )
 
-    result = pd.read_csv(csv_path, dtype=str).sort_values(["store", "platform"]).reset_index(drop=True)
+    result = pd.read_parquet(parquet_path).sort_values(["store", "platform"]).reset_index(drop=True)
 
-    assert len(result) == 2
-    assert set(result["store"]) == {"API Store", "Manual Store"}
-    assert (manual_dir / f"{MANUAL_PREFIX}_raw.xlsx").exists()
-    assert (manual_dir / "종합보고서_일별매출보고서_260511_raw.xlsx").exists()
+    assert parquet_path.name == "toorder_store_platform_daily.parquet"
+    assert len(result) == 1
+    assert result.iloc[0]["store"] == "Manual Store"
+    assert int(result.iloc[0]["price"]) == 111
+    assert not pending_path.exists()
+    assert (manual_dir / f"{DATEDETAIL_PREFIX}_2026-05_raw.xlsx").exists()
+
+
+def test_cleanup_datedetail_xlsx_deletes_only_datedetail_files(tmp_path):
+    datedetail = tmp_path / f"{DATEDETAIL_PREFIX}_2026-05_raw.xlsx"
+    datedetail_bak = tmp_path / f"{DATEDETAIL_PREFIX}_2026-05_raw_bak_010101.xlsx"
+    other_toorder = tmp_path / "종합보고서_일별매출보고서_2026-05_raw.xlsx"
+    keep = tmp_path / "ignore.xlsx"
+
+    for path in (datedetail, datedetail_bak, other_toorder, keep):
+        path.write_text("x", encoding="utf-8")
+
+    result = pipeline.cleanup_datedetail_xlsx(tmp_path)
+
+    assert result == "deleted=2"
+    assert not datedetail.exists()
+    assert not datedetail_bak.exists()
+    assert other_toorder.exists()
+    assert keep.exists()

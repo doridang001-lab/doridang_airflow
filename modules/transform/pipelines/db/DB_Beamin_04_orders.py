@@ -32,6 +32,7 @@ from modules.extract.croling_beamin import (
     wait_for_page,
 )
 from modules.transform.utility.paths import BAEMIN_ORDERS_DB
+from modules.transform.pipelines.db.beamin_store_io import read_table, write_table
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ _TABLE_ROW_CSS = "tr.Table_b_r4ax_1dwbr4on[data-index]"
 _MAX_PAGES = 50
 _PAGE_TRANSITION_TIMEOUT = 25
 _MAX_VALIDATION_RETRY = 2
-_ORDER_COLLECTION_ATTEMPTS = 3
+_ORDER_COLLECTION_ATTEMPTS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -148,10 +149,10 @@ def _csv_already_covers(
     """기존 CSV의 (날짜 + 주문상태) 합계가 TotalSummary와 일치하면 True."""
     try:
         ym = target_date[:7]
-        path = BAEMIN_ORDERS_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}" / f"orders_{ym}.csv"
-        if not path.exists():
+        stem = BAEMIN_ORDERS_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}" / f"orders_{ym}"
+        df = read_table(stem)
+        if df is None:
             return False
-        df = pd.read_csv(path, dtype=str)
         df = df[df["주문시각"].astype(str).str.startswith(target_date)]
         df = df[df["주문상태"].astype(str) == status_label]
         count = df["주문번호"].nunique()
@@ -1518,20 +1519,18 @@ _COLUMNS = [
 def _save_orders_csv(rows: list[dict], brand: str, store: str, target_date: str) -> Path:
     """월별 파일로 upsert 저장. 같은 주문번호의 기존 행은 전부 교체."""
     ym = target_date[:7]
-    out_dir = BAEMIN_ORDERS_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"orders_{ym}.csv"
+    stem = BAEMIN_ORDERS_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}" / f"orders_{ym}"
 
     new_df = pd.DataFrame(rows, columns=_COLUMNS).astype(str)
     new_order_ids = set(new_df["주문번호"].unique())
 
-    if out_path.exists():
-        existing = pd.read_csv(out_path, dtype=str)
+    existing = read_table(stem)
+    if existing is not None:
         existing = existing[~existing["주문번호"].isin(new_order_ids)]
         combined = pd.concat([existing, new_df], ignore_index=True)
     else:
         combined = new_df
 
-    combined.to_csv(out_path, index=False, encoding="utf-8-sig")
+    out_path = write_table(combined, stem)
     logger.info("저장 완료: %s (%d행)", out_path, len(combined))
     return out_path

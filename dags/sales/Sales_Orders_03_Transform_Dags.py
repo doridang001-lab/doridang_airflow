@@ -96,6 +96,7 @@ from modules.transform.pipelines.sales.SMD_03_sales_orders_transform import (
 from modules.transform.utility.io import save_to_csv
 from modules.transform.utility.io import sales_cleanup_collected_csvs
 from modules.transform.utility.paths import COLLECT_DB, LOCAL_DB
+from modules.transform.utility.notifier import on_failure_callback
 
 
 
@@ -114,6 +115,7 @@ with DAG(
         'depends_on_past': False,
         'email_on_failure': False,
         'email_on_retry': False,
+    "on_failure_callback": on_failure_callback,
     },
     tags=['sales', 'daily', 'baemin', 'coupang'],
 ) as dag:

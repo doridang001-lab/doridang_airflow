@@ -43,6 +43,7 @@ from modules.transform.pipelines.sales.SMD_01_sales_orders_csv import (
 # CSV 저장 유틸
 from modules.transform.utility.io import append_save_to_csv 
 from modules.transform.utility.paths import COLLECT_DB, LOCAL_DB
+from modules.transform.utility.notifier import on_failure_callback
 
 
 # ============================================================
@@ -60,6 +61,7 @@ with DAG(
         'depends_on_past': False,  # 🚫 이전 실행 실패해도 다음 실행 허용
         'email_on_failure': False,  # 📧 실패 시 이메일 발송 안 함 (중복 방지)
         'email_on_retry': False,  # 📧 재시도 시 이메일 발송 안 함
+    "on_failure_callback": on_failure_callback,
     },
     tags=['sales', 'daily', 'baemin', 'coupang', 'validation'],  # ⭐ validation 태그 추가
 ) as dag:

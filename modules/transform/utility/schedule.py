@@ -13,7 +13,7 @@ SMD_VISIT_LOG        = "0 12 * * 1,3,5" # 매주 월,수,금 12:00 실행
 SMP_TOORDER_VOC_TIME = "30 7 * * *"     # 매일 07:30 실행
 SMP_FDAM_CS_TIME     = "5 7 * * *"      # 매일 07:05 실행
 
-SMP_DELIVERY_ALERT_TIME  = "40 7 * * 1,2,3,4,5"  # 매주 월~금 07:40 실행
+SMP_DELIVERY_ALERT_TIME  = "5 9 * * 1,2,3,4,5"  # 매주 월~금 09:00 실행
 SMP_CLOSING_RATE_TIME    = "0 7 * * 1"             # 매주 월요일 07:00 실행
 SMP_DAG_MONITORING_TIME = "0 15 * * *"  # 매일 15:00 실행 (KST)
 SMP_POLICY_TIME  = "0 8 * * *"   # 매일 08:00 실행 (KST)
@@ -32,7 +32,10 @@ SMP_POLICY_CONSOLIDATE_TIME = "45 8 * * *"  # 매일 08:45 (수집 완료 후 �
 
 
 
-DB_ITEM_MASTER_TIME          = "50 8 * * *" # 매일 08:50 실행 (UnifiedSales 빌드 후)
+DB_COUPANG_MACRO_TIME = "0 9 * * *"  # 매일 09:00 실행 (쿠팡이츠 매크로 적재)
+DB_UNIFIED_SALES_TIME        = "40 8 * * *"  # 매일 09:00 실행 (POS 수집 완료 후)
+DB_ITEM_MASTER_TIME          = "30 9 * * *" # 매일 09:30 실행 (UnifiedSales 빌드 후)
+DB_COLLECTION_COMPARE_TIME   = "0 20 * * *"  # 매일 20:00 실행 (수집 비교 마트)
 DB_FIN_PRODUCT_TIME          = "35 8 * * *" # 매일 08:35 실행 (OKPOS Product 완료 후)
 DB_POSFEED_SALES_TIME        = "15 7 * * *"  # 매일 07:15 실행
 DB_POSFEED_SALES_DETAIL_TIME = "45 7 * * *"  # 매일 07:45 실행
@@ -51,13 +54,14 @@ DB_UNIFIED_REVIEW_TIME         = "33 7 * * *"  # 매일 07:33 실행 (ToOrderVoc
 
 SMD_BAEMIN_COLLECT_TIME = "15 7 * * *"  # 매일 KST 07:15 실행 (토더 매출 수집 완료 후)
 
-SMP_MORNING_BRIEFING_TIME = "47 6 * * 1,2,3,4,5"  # 매주 월~금 06:47 실행 (KST)
+SMP_MORNING_BRIEFING_TIME = "50 6 * * 1,2,3,4,5"  # 매주 월~금 06:47 실행 (KST)
 
 SMD_STORE_SALES_TIME = "0 9 * * *"  # 매일 09:00 실행 (POS 수집 완료 후)
 
-DB_HALL_SALES_TARGET_TIME = "5 8 * * 1"  # 매주 월요일 08:05 (UnifiedSales 08:20 시작 전)
+DB_HALL_SALES_TARGET_TIME = "0 11 * * 1"  # 매주 월요일 11:00 (DB_UnifiedSales grp 갱신 완료 후)
 
 DB_TOORDER_MENU_TIME = "0 7 * * *"  # 매일 07:00 실행 (메뉴별 판매량 분석)
+DB_TOORDER_MENU_LLM_TIME = "30 8 * * *"  # ToOrder menu 수집 완료 후 LLM 분석
 
 
 # ============================================================

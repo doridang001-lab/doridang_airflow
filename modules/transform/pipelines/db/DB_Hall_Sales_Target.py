@@ -21,6 +21,7 @@ from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
+from airflow.exceptions import AirflowException
 
 from modules.transform.utility.paths import MART_DB
 
@@ -218,6 +219,19 @@ def build_hall_sales_target(monthly_targets: dict) -> str:
     df = _load_hall_df()
     if df.empty:
         return "홀 데이터 없음, CSV 미생성"
+
+    required_through = pd.Timestamp(date.today() - timedelta(days=1))
+    max_date = df["sale_date"].max()
+    if pd.isna(max_date) or max_date < required_through:
+        logger.error(
+            "unified_sales_grp 최신성 미달: max=%s < required=%s. "
+            "DB_UnifiedSales 완료 전 실행으로 추정되어 재시도 대기.",
+            max_date,
+            required_through.date(),
+        )
+        raise AirflowException(
+            f"unified_sales_grp 최신성 미달 (max={max_date}, required>={required_through.date()})"
+        )
 
     weekly = _weekly_agg(df)
     if weekly.empty:

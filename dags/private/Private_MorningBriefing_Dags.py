@@ -21,6 +21,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 
 from modules.transform.utility.schedule import SMP_MORNING_BRIEFING_TIME
+from modules.transform.utility.notifier import on_failure_callback
 
 _pipeline = importlib.import_module(
     "modules.transform.pipelines.strategy.morning_briefing_pipeline"
@@ -42,6 +43,7 @@ with DAG(
         "retries": 0,
         "email_on_failure": False,
         "email_on_retry": False,
+    "on_failure_callback": on_failure_callback,
     },
 ) as dag:
 

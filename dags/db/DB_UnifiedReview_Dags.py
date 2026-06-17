@@ -19,7 +19,7 @@ import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-from modules.transform.utility.notifier import send_telegram
+from modules.transform.utility.notifier import enqueue_heal_task, send_telegram
 from modules.transform.utility.schedule import DB_UNIFIED_REVIEW_TIME
 from modules.transform.pipelines.db.DB_UnifiedReview import (
     run_review as pipeline_run_review,
@@ -34,6 +34,14 @@ dag_id = Path(__file__).stem
 _ALERT_EMAILS = ["a17019@kakao.com"]
 
 LOOKBACK_DAYS = 30
+
+
+def _resolve_sale_date(conf: dict) -> str | None:
+    for key in ("sale_date", "target_date", "date"):
+        value = conf.get(key)
+        if value:
+            return str(value).strip()
+    return None
 
 
 def _send_alert(subject: str, body: str) -> None:
@@ -57,6 +65,7 @@ def _on_failure_callback(context):
     )
     _send_alert(subject=f"[Airflow 실패] {ti.dag_id} / {ti.task_id}", body=body)
     send_telegram(body + "\n해결해라")
+    enqueue_heal_task(context)
 
 
 default_args = {
@@ -74,9 +83,10 @@ def resolve_mode(**context) -> str:
     dag_run = context.get("dag_run")
     conf    = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
 
+    sale_date = _resolve_sale_date(conf)
     if conf.get("backfill"):
         mode = "all"
-    elif conf.get("sale_date"):
+    elif sale_date:
         mode = "date"
     else:
         mode = "lookback"
@@ -84,7 +94,7 @@ def resolve_mode(**context) -> str:
     ti = context.get("ti")
     if ti:
         ti.xcom_push(key="mode", value=mode)
-        ti.xcom_push(key="sale_date", value=conf.get("sale_date"))
+        ti.xcom_push(key="sale_date", value=sale_date)
 
     logger.info("모드 결정: %s", mode)
     return f"모드: {mode}"
@@ -93,12 +103,13 @@ def resolve_mode(**context) -> str:
 def build_review_mart(**context) -> str:
     dag_run = context.get("dag_run")
     conf    = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    override_sale_date = _resolve_sale_date(conf)
 
     if conf.get("backfill"):
         return pipeline_backfill_review()
 
     mode      = context["ti"].xcom_pull(task_ids="resolve_mode", key="mode") or "lookback"
-    sale_date = context["ti"].xcom_pull(task_ids="resolve_mode", key="sale_date")
+    sale_date = override_sale_date or context["ti"].xcom_pull(task_ids="resolve_mode", key="sale_date")
 
     return pipeline_run_review(mode=mode, days=LOOKBACK_DAYS, target_date=sale_date)
 
@@ -106,12 +117,13 @@ def build_review_mart(**context) -> str:
 def count_daily_reviews(**context) -> str:
     dag_run = context.get("dag_run")
     conf    = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    override_sale_date = _resolve_sale_date(conf)
 
     if conf.get("backfill"):
         mode, sale_date = "all", None
     else:
         mode      = context["ti"].xcom_pull(task_ids="resolve_mode", key="mode") or "lookback"
-        sale_date = context["ti"].xcom_pull(task_ids="resolve_mode", key="sale_date")
+        sale_date = override_sale_date or context["ti"].xcom_pull(task_ids="resolve_mode", key="sale_date")
 
     return pipeline_count_reviews(mode=mode, days=LOOKBACK_DAYS, target_date=sale_date)
 

@@ -30,6 +30,7 @@ from modules.transform.pipelines.sales.SMD_05_store_ordesr_marketing import (
 
 from modules.transform.utility.io import join_dataframes, sales_cleanup_collected_csvs
 from modules.transform.utility.paths import COLLECT_DB, LOCAL_DB, DOWN_DIR
+from modules.transform.utility.notifier import on_failure_callback
 
 filename = os.path.basename(__file__)
 
@@ -78,6 +79,7 @@ with DAG(
         'depends_on_past': False,
         'email_on_failure': False,
         'email_on_retry': False,
+    "on_failure_callback": on_failure_callback,
     },
     tags=['02_sales', 'crawling', 'coupang'],
 ) as dag:

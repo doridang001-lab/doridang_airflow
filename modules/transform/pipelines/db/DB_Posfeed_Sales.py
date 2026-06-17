@@ -14,6 +14,7 @@ import shutil
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import undetected_chromedriver as uc
@@ -31,6 +32,10 @@ from modules.transform.utility.store_normalize import normalize as _normalize_st
 from modules.load.load_onedrive import onedrive_csv_save
 
 logger = logging.getLogger(__name__)
+
+
+def _kst_now() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Seoul")).replace(tzinfo=None)
 
 # ============================================================
 # 상수 - 계정 / URL
@@ -351,7 +356,7 @@ def _click_download(driver: uc.Chrome, wait: WebDriverWait, target_date: datetim
     """
     from datetime import timedelta as _td
     if target_date is None:
-        target_date = datetime.now() - _td(days=1)
+        target_date = _kst_now() - _td(days=1)
 
     def _ensure_order_page() -> None:
         """주문 목록 페이지 진입 보장 - 로그인 리다이렉트 시 재로그인"""
@@ -604,7 +609,7 @@ def download_posfeed_excel(collect_mode: str = None, **context) -> str:
             downloaded_file = _wait_for_downloaded_file(download_dir, min_mtime=download_start)
             file_path = str(downloaded_file)
             from datetime import timedelta
-            data_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            data_date = (_kst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
             logger.info("✅ 다운로드 완료 | 파일: %s | 데이터 날짜: %s", downloaded_file.name, data_date)
             context['ti'].xcom_push(key='downloaded_file_path', value=file_path)
             return file_path
@@ -639,8 +644,8 @@ def move_to_storage(**context) -> str:
     dest_dir = DOWN_DIR  # E:\down — OneDrive 업로드 후 업로드_temp로 이동됨
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    today = datetime.now().strftime("%Y%m%d")
+    yesterday = (_kst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    today = _kst_now().strftime("%Y%m%d")
 
     # 엑셀 읽기 → 등록날짜 컬럼 추가 → UTF-8 CSV 저장
     # 파일 매직 바이트로 실제 포맷 판별 후 적절한 엔진 선택
@@ -876,7 +881,7 @@ def ingest_manual_csvs(down_dir: Path = DOWN_DIR, **context) -> str:
                         df["주문등록 시각"], errors="coerce"
                     ).dt.strftime("%Y-%m-%d")
                 else:
-                    df["등록날짜"] = datetime.now().strftime("%Y-%m-%d")
+                    df["등록날짜"] = _kst_now().strftime("%Y-%m-%d")
                     logger.warning("등록날짜/주문등록 시각 컬럼 없음 → 오늘 날짜 사용: %s", file_path.name)
 
             required_cols = {"가맹점명", "주문 번호", "가맹점코드"}
@@ -1017,7 +1022,7 @@ def check_monthly_collection(**context) -> str:
     # ── STEP 2: 갭 감지 ──────────────────────────────────────────
     # 파티션에 데이터가 있으면 가장 이른 ym 첫날부터 검사 (step 1과 범위 일치)
     # 데이터가 없으면 어제 하루만 검사
-    today     = datetime.now().date()
+    today     = _kst_now().date()
     yesterday = today - timedelta(days=1)
 
     if summary_rows:
@@ -1182,7 +1187,7 @@ def check_monthly_collection(**context) -> str:
             logger.warning("[재수집] 실패 날짜: %s", fail_dates)
 
     # ── STEP 4: 금액 무결성 검사 (read-only) ────────────────────
-    current_ym = datetime.now().strftime("%Y-%m")
+    current_ym = _kst_now().strftime("%Y-%m")
 
     all_sales_yms: set[str] = set()
     for csv_path in sales_base.glob("brand=*/store=*/ym=*/posfeed_orders.csv"):
@@ -1285,7 +1290,7 @@ def _resolve_missing_scan_range(collect_mode: str, conf: dict) -> tuple[datetime
         single = datetime.strptime(cm, "%Y-%m-%d")
         return (single, single, f"collect_mode 단일일 모드: {cm}")
 
-    yesterday = datetime.now() - timedelta(days=1)
+    yesterday = _kst_now() - timedelta(days=1)
     end_dt = yesterday
     start_dt = yesterday - timedelta(days=_MISSING_LOOKBACK_DAYS - 1)
     return (start_dt, end_dt, f"자동 모드: 최근 {_MISSING_LOOKBACK_DAYS}일 검사")

@@ -19,6 +19,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.utils.trigger_rule import TriggerRule
 from modules.transform.utility.schedule import SMP_CHICKEN_PRICE_TIME
+from modules.transform.utility.notifier import on_failure_callback
 
 # 모듈 경로 설정
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -53,7 +54,8 @@ with DAG(
     default_args={
         "retries": 1,
         "retry_delay": pendulum.duration(minutes=5),
-        "email_on_failure": True, # 실제 운영에서는 True로 설정하고 알림 이메일 주소 구성 필요
+        "email_on_failure": False, # 실제 운영에서는 True로 설정하고 알림 이메일 주소 구성 필요
+    "on_failure_callback": on_failure_callback,
     },
 ) as dag:
 

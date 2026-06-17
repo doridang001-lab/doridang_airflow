@@ -4,7 +4,7 @@ unified_sales 일별/월별 검증 파이프라인.
 검증 방식:
 1. 대상일 1일을 결정한다.
 2. MART_DB/unified_sales_grp/unified_sales_*.parquet 에서 sale_date+store 기준 total_price를 집계한다.
-3. AI daily collection parquet에서 같은 기준으로 집계한다.
+3. ToOrder 일별 store/platform parquet에서 같은 기준으로 집계한다.
 4. outer join 으로 비교하고 오차율 2% 이상 매장을 HTML 테이블로 메일 발송한다.
 5. 일별 결과: MART_DB/unified_sales_grp_error_list/unified_sales_error_YYYY-MM-DD.csv
 6. 월별 결과: MART_DB/unified_sales_grp_error_list/unified_sales_monthly_YYYY-MM.csv
@@ -19,7 +19,6 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from modules.transform.ai_daily_collection_integrator import load_ai_daily_collection_detail_df
 from modules.transform.utility.mailer import send_email
 from modules.transform.utility.paths import (
     ANALYTICS_DB,
@@ -72,7 +71,7 @@ _COL_LABELS = {
     "sale_date": "날짜",
     "ym": "월",
     "store": "매장",
-    "excel_total": "엑셀합계",
+    "excel_total": "토더합계",
     "unified_total": "DB합계",
     "difference": "차이",
     "error_rate": "오차율(%)",
@@ -195,7 +194,7 @@ def _load_parquet_totals(target_date: str) -> pd.DataFrame:
     parts = []
     for file_path in files:
         try:
-            frame = pd.read_parquet(file_path, columns=["sale_date", "source", "store", "platform", "total_price"])
+            frame = pd.read_parquet(file_path, columns=["sale_date", "store", "total_price"])
         except Exception as exc:
             logger.warning("parquet 로드 실패: %s | %s", file_path, exc)
             continue
@@ -211,17 +210,6 @@ def _load_parquet_totals(target_date: str) -> pd.DataFrame:
         return pd.DataFrame(columns=["sale_date", "store", "unified_total"])
 
     df["store"] = df["store"].astype(str).str.strip()
-    df["source"] = df["source"].fillna("").astype(str).str.strip().str.lower()
-    df["platform"] = df["platform"].fillna("").astype(str).str.strip()
-
-    # 법흥리점: 토더(toorder) + 홀 주문 제외
-    beopheung_mask = df["store"] == "법흥리점"
-    exclude_mask = beopheung_mask & (
-        (df["source"] == "toorder") | (df["platform"] == "홀")
-    )
-    df = df[~exclude_mask].copy()
-    logger.info("법흥리점 토더/홀 제외: %d행", int(exclude_mask.sum()))
-
     df["total_price"] = pd.to_numeric(df["total_price"], errors="coerce").fillna(0)
     grouped = (
         df.groupby(["sale_date", "store"], as_index=False)["total_price"]
@@ -233,19 +221,25 @@ def _load_parquet_totals(target_date: str) -> pd.DataFrame:
 
 
 def _load_excel_totals(target_date: str) -> pd.DataFrame:
-    df = load_ai_daily_collection_detail_df(
-        base_dir=ANALYTICS_DB / "ai_daily_collection",
-        target_date=target_date,
-    )
+    path = ANALYTICS_DB / "toorder_daily_store_platform" / "toorder_store_platform_daily.parquet"
+    if not path.exists():
+        logger.warning("토더 parquet 없음: %s", path)
+        return pd.DataFrame(columns=["sale_date", "store", "excel_total"])
+
+    df = pd.read_parquet(path, columns=["date", "store", "price"])
+    df["sale_date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df = df[df["sale_date"] == target_date].copy()
     if df.empty:
-        logger.warning("AI daily collection 데이터 없음: %s", target_date)
+        logger.warning("토더 parquet 데이터 없음: %s", target_date)
         return pd.DataFrame(columns=["sale_date", "store", "excel_total"])
 
     grouped = (
-        df.groupby(["sale_date", "store"], as_index=False)["sales"]
+        df.groupby(["sale_date", "store"], as_index=False)["price"]
         .sum()
-        .rename(columns={"sales": "excel_total"})
+        .rename(columns={"price": "excel_total"})
     )
+    df["store"] = df["store"].astype(str).str.strip()
+    grouped["store"] = grouped["store"].astype(str).str.strip()
     grouped["excel_total"] = grouped["excel_total"].round().astype(int)
     return grouped
 
@@ -342,7 +336,7 @@ def _load_parquet_monthly_totals(target_ym: str) -> pd.DataFrame:
     parts = []
     for file_path in files:
         try:
-            frame = pd.read_parquet(file_path, columns=["sale_date", "source", "store", "platform", "total_price"])
+            frame = pd.read_parquet(file_path, columns=["sale_date", "store", "total_price"])
         except Exception as exc:
             logger.warning("parquet 로드 실패: %s | %s", file_path, exc)
             continue
@@ -359,16 +353,6 @@ def _load_parquet_monthly_totals(target_ym: str) -> pd.DataFrame:
         return pd.DataFrame(columns=["ym", "store", "unified_total"])
 
     df["store"] = df["store"].astype(str).str.strip()
-    df["source"] = df["source"].fillna("").astype(str).str.strip().str.lower()
-    df["platform"] = df["platform"].fillna("").astype(str).str.strip()
-
-    # 법흥리점: 토더(toorder) + 홀 주문 제외
-    beopheung_mask = df["store"] == "법흥리점"
-    exclude_mask = beopheung_mask & (
-        (df["source"] == "toorder") | (df["platform"] == "홀")
-    )
-    df = df[~exclude_mask].copy()
-    logger.info("법흥리점 토더/홀 제외 (월별): %d행", int(exclude_mask.sum()))
     df["total_price"] = pd.to_numeric(df["total_price"], errors="coerce").fillna(0)
     grouped = (
         df.groupby(["ym", "store"], as_index=False)["total_price"]
@@ -380,26 +364,25 @@ def _load_parquet_monthly_totals(target_ym: str) -> pd.DataFrame:
 
 
 def _load_excel_monthly_totals(target_ym: str) -> pd.DataFrame:
-    """AI daily collection 전체 로드 → ym 기준 필터 → store 기준 합산."""
-    df = load_ai_daily_collection_detail_df(
-        base_dir=ANALYTICS_DB / "ai_daily_collection",
-        target_date=None,
-    )
-    if df.empty:
-        logger.warning("AI daily collection 데이터 없음 (월별): %s", target_ym)
+    """ToOrder parquet 전체 로드 → ym 기준 필터 → store 기준 합산."""
+    path = ANALYTICS_DB / "toorder_daily_store_platform" / "toorder_store_platform_daily.parquet"
+    if not path.exists():
+        logger.warning("토더 parquet 없음 (월별): %s", path)
         return pd.DataFrame(columns=["ym", "store", "excel_total"])
 
-    df["ym"] = df["sale_date"].astype(str).str[:7]
+    df = pd.read_parquet(path, columns=["date", "store", "price"])
+    df["ym"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m")
     df = df[df["ym"] == target_ym].copy()
     if df.empty:
+        logger.warning("토더 parquet 데이터 없음 (월별): %s", target_ym)
         return pd.DataFrame(columns=["ym", "store", "excel_total"])
 
     df["store"] = df["store"].astype(str).str.strip()
-    df["sales"] = pd.to_numeric(df["sales"], errors="coerce").fillna(0)
+    df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0)
     grouped = (
-        df.groupby(["ym", "store"], as_index=False)["sales"]
+        df.groupby(["ym", "store"], as_index=False)["price"]
         .sum()
-        .rename(columns={"sales": "excel_total"})
+        .rename(columns={"price": "excel_total"})
     )
     grouped["excel_total"] = grouped["excel_total"].round().astype(int)
     return grouped

@@ -1,4 +1,4 @@
-'''
+﻿'''
 Baemin macro DAG — 배달의민족 계정별 자동 수집
 
 === 수집 흐름 (계정 단위, 단일 브라우저 세션) ===
@@ -76,6 +76,9 @@ _ALERT_EMAILS = ["a17019@kakao.com"]
 
 TARGET_STORES = [
 ]  # exact match; empty list means all stores
+# None: 전체 수집, "상위": 가나다순 상위 절반, "하위": 가나다순 하위 절반(나머지)
+# ex ) COLLECT_RANGE="상위" → 가나다순 상위 절반만 수집
+COLLECT_RANGE: str | None = None
 
 # ─── 주문내역 백필 제어 ────────────────────────────────────────────────────────
 # None  → 어제 1일만 수집 (기본)
@@ -136,16 +139,47 @@ default_args = {
 }
 
 
+def _split_accounts_by_range(accounts: list[dict], collect_range: str | None) -> list[dict]:
+    if not collect_range or not accounts:
+        return accounts
+
+    ordered = sorted(accounts, key=lambda a: str(a.get("store_name", "")))
+    mid = len(ordered) // 2
+
+    if collect_range == "상위":
+        selected = ordered[:mid]
+    elif collect_range == "하위":
+        selected = ordered[mid:]
+    else:
+        logger.warning("알 수 없는 COLLECT_RANGE=%r", collect_range)
+        return accounts
+
+    logger.info(
+        "매장 분할 [%s]: 전체 %d개 -> %d개 (%s ~ %s)",
+        collect_range,
+        len(ordered),
+        len(selected),
+        selected[0]["store_name"] if selected else "-",
+        selected[-1]["store_name"] if selected else "-",
+    )
+    return selected
+
+
 def load_accounts(**context) -> str:
     dag_run = context.get("dag_run")
     conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    stores_override = conf.get("stores")  # e.g. ["도리당 역삼점"] — 테스트·재수집 용
+    stores_override = conf.get("stores")
     target = stores_override if stores_override else TARGET_STORES
     accounts = pipeline_load_accounts(target_stores=target, exact=True)
+
+    if not stores_override:
+        collect_range = conf.get("collect_range", COLLECT_RANGE)
+        accounts = _split_accounts_by_range(accounts, collect_range)
+
     context["ti"].xcom_push(key="account_list", value=accounts)
     stores = [a["store_name"] for a in accounts]
-    logger.info("계정 로드 완료: %d개 -> %s", len(accounts), stores)
-    return f"계정 {len(accounts)}개: {stores}"
+    logger.info("怨꾩젙 濡쒕뱶 ?꾨즺: %d媛?-> %s", len(accounts), stores)
+    return f"怨꾩젙 {len(accounts)}媛? {stores}"
 
 
 def _manual_baemin_store_key(raw_store_name: str, fallback_name: str = "") -> str:
@@ -1410,3 +1444,4 @@ with DAG(
     )
 
     t_dash >> t0 >> t1 >> t2 >> t3 >> [t4, t5, t6] >> t7
+

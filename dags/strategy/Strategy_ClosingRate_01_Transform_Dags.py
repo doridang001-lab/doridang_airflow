@@ -20,6 +20,7 @@ from modules.transform.pipelines.strategy.SMP_closing_rate_snapshot import (
     transform_and_save,
 )
 from modules.transform.utility.schedule import SMP_CLOSING_RATE_TIME
+from modules.transform.utility.notifier import on_failure_callback
 
 with DAG(
     dag_id=Path(__file__).stem,
@@ -34,6 +35,7 @@ with DAG(
         "depends_on_past": False,
         "email_on_failure": False,
         "email_on_retry": False,
+    "on_failure_callback": on_failure_callback,
     },
     tags=["strategy", "monthly", "kpi", "closing_rate"],
 ) as dag:
