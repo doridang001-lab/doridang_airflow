@@ -14,6 +14,7 @@ Output:
 """
 
 import logging
+import re
 import random
 import time
 from pathlib import Path
@@ -93,6 +94,42 @@ def _format_metric_state(state: dict | None) -> str:
 
 
 
+def _extract_filter_vals(driver, btn_idx: int, store_name: str) -> list[str] | None:
+    vals: list[str] = driver.execute_script(
+        """
+        const btns = document.querySelectorAll('button.Filter-module__lRdH');
+        const btn = btns[arguments[0]];
+        if (!btn) return [];
+
+        let el = btn.parentElement;
+        for (let i = 0; i < 8; i++) {
+            if (!el || el === document.body) break;
+            const nums = [...el.querySelectorAll('span')]
+                .map(s => s.textContent.trim())
+                .filter(v => /^[\\d,]+$/.test(v));
+            const filters = [...el.querySelectorAll('button.Filter-module__lRdH')];
+            if (filters.length > 1 && nums.length >= (arguments[0] + 1) * 2) {
+                return nums.slice(arguments[0] * 2, arguments[0] * 2 + 2);
+            }
+            if (filters.length <= 1 && nums.length >= 2) return nums.slice(0, 2);
+            el = el.parentElement;
+        }
+
+        return [...document.querySelectorAll('span[style*="margin"]')]
+            .map(s => s.textContent.trim())
+            .filter(v => /^[\\d,]+$/.test(v))
+            .slice(arguments[0] * 2, arguments[0] * 2 + 2);
+        """,
+        btn_idx,
+    ) or []
+
+    logger.info("Filter[%d] vals extracted: %s / %s", btn_idx, vals, store_name)
+    if len(vals) == 0:
+        logger.info("Filter[%d] no metrics in DOM, treating as zeroes: %s", btn_idx, store_name)
+        return ["0", "0"]
+    return vals
+
+
 def _set_ad_filter_yesterday(driver, store_name: str) -> dict | None:
     """Apply both filters and return a four-metric dict."""
     try:
@@ -134,6 +171,66 @@ def _set_ad_filter_yesterday(driver, store_name: str) -> dict | None:
     except (TimeoutException, Exception) as e:
         logger.warning("Ad filter setup error (%s): %s", store_name, e)
         return None
+
+
+def _set_ad_filter_specific(
+    driver,
+    target_date: str,
+    store_name: str,
+) -> dict | None:
+    """Apply both filters using DAY_MANUAL date picker."""
+    try:
+        btn_count = driver.execute_script(
+            "return document.querySelectorAll('button.Filter-module__lRdH').length;"
+        )
+        if not btn_count:
+            logger.warning("Filter buttons not found: %s", store_name)
+            return None
+        logger.info("Filter buttons found: %d / %s", btn_count, store_name)
+
+        metrics: dict = {}
+        for btn_idx in range(btn_count):
+            vals = _apply_specific_date_to_filter(driver, btn_idx, target_date, store_name)
+            if vals is None:
+                logger.warning("Filter[%d] metric extraction failed: %s", btn_idx, store_name)
+                return None
+            for i, label in enumerate(_FILTER_LABEL_MAP.get(btn_idx, [])):
+                if i < len(vals):
+                    metrics[label] = vals[i]
+            time.sleep(0.3)
+
+        filter_texts = driver.execute_script(
+            "return [...document.querySelectorAll('button.Filter-module__lRdH')]"
+            ".map(b => b.textContent.trim());"
+        )
+        logger.info("Filter texts after apply: %s / %s", filter_texts, store_name)
+
+        target_day = str(pendulum.parse(target_date, tz=KST).day)
+        if not all(target_day in t for t in filter_texts):
+            logger.warning("A Filter button is not on target date(%s): %s", target_date, filter_texts)
+            return None
+
+        if len(metrics) < 4:
+            logger.warning("Metrics incomplete (%d/4): %s / %s", len(metrics), metrics, store_name)
+            return None
+
+        logger.info("Filter flow completed, metrics extracted: %s / %s", metrics, store_name)
+        return metrics
+
+    except (TimeoutException, Exception) as e:
+        logger.warning("Ad filter setup error (%s): %s", store_name, e)
+        return None
+
+
+def _set_ad_filter(
+    driver,
+    target_date: str,
+    store_name: str,
+) -> dict | None:
+    yesterday = pendulum.yesterday(KST).format("YYYY-MM-DD")
+    if target_date == yesterday:
+        return _set_ad_filter_yesterday(driver, store_name)
+    return _set_ad_filter_specific(driver, target_date, store_name)
 
 
 def _apply_yesterday_to_filter(driver, btn_idx: int, store_name: str) -> list[str] | None:
@@ -220,40 +317,227 @@ def _apply_yesterday_to_filter(driver, btn_idx: int, store_name: str) -> list[st
         return None
 
     time.sleep(2.0)  # React data fetch completion is not tied to button text.
+    return _extract_filter_vals(driver, btn_idx, store_name)
 
-    vals: list[str] = driver.execute_script(
+
+def _apply_specific_date_to_filter(
+    driver,
+    btn_idx: int,
+    target_date: str,
+    store_name: str,
+) -> list[str] | None:
+    """Apply DAILY/DAY_MANUAL on one filter and return its metric values."""
+    clicked = driver.execute_script(
         """
         const btns = document.querySelectorAll('button.Filter-module__lRdH');
         const btn = btns[arguments[0]];
-        if (!btn) return [];
-
-        let el = btn.parentElement;
-        for (let i = 0; i < 8; i++) {
-            if (!el || el === document.body) break;
-            const nums = [...el.querySelectorAll('span')]
-                .map(s => s.textContent.trim())
-                .filter(v => /^[\\d,]+$/.test(v));
-            const filters = [...el.querySelectorAll('button.Filter-module__lRdH')];
-            if (filters.length > 1 && nums.length >= (arguments[0] + 1) * 2) {
-                return nums.slice(arguments[0] * 2, arguments[0] * 2 + 2);
-            }
-            if (filters.length <= 1 && nums.length >= 2) return nums.slice(0, 2);
-            el = el.parentElement;
-        }
-
-        return [...document.querySelectorAll('span[style*="margin"]')]
-            .map(s => s.textContent.trim())
-            .filter(v => /^[\\d,]+$/.test(v))
-            .slice(arguments[0] * 2, arguments[0] * 2 + 2);
+        if (!btn) return false;
+        btn.click();
+        return btn.textContent.trim().slice(0, 30);
         """,
         btn_idx,
-    ) or []
+    )
+    if not clicked:
+        logger.warning("Filter[%d] button not found: %s", btn_idx, store_name)
+        return None
+    logger.info("Filter[%d] clicked: %r / %s", btn_idx, clicked, store_name)
+    WebDriverWait(driver, 10).until(
+        EC.presence_of_element_located(
+            (By.CSS_SELECTOR, 'input[name="ad-stats-period-filter"][value="DAILY"]')
+        )
+    )
 
-    logger.info("Filter[%d] vals extracted: %s / %s", btn_idx, vals, store_name)
-    if btn_idx == 1 and len(vals) == 0:
-        logger.info("Filter[%d] no order metrics in DOM, treating as zeroes: %s", btn_idx, store_name)
-        return ["0", "0"]
-    return vals if len(vals) >= 1 else None
+    daily = driver.execute_script(
+        """
+        const radio = document.querySelector('input[name="ad-stats-period-filter"][value="DAILY"]');
+        if (!radio) return 'not_found';
+        const lbl = document.querySelector('label[for="' + radio.id + '"]');
+        if (lbl) { lbl.click(); return 'label_clicked:' + lbl.textContent.trim(); }
+        radio.click(); return 'radio_fallback';
+        """
+    )
+    if daily == "not_found":
+        logger.warning("Filter[%d] DAILY radio not found: %s", btn_idx, store_name)
+        return None
+    logger.info("Filter[%d] DAILY: %s", btn_idx, daily)
+    time.sleep(2.0)
+
+    WebDriverWait(driver, 10).until(
+        lambda d: d.execute_script(
+            'const r = document.querySelector(\'input[name="period"][value="DAY_MANUAL"]\');'
+            'return r && r.offsetParent !== null;'
+        )
+    )
+    manual = driver.execute_script(
+        """
+        const radio = document.querySelector('input[name="period"][value="DAY_MANUAL"]');
+        if (!radio) return 'not_found';
+        const lbl = document.querySelector('label[for="' + radio.id + '"]');
+        if (lbl) { lbl.click(); return 'label_clicked:' + lbl.textContent.trim(); }
+        radio.click(); return 'radio_fallback';
+        """
+    )
+    if manual == "not_found":
+        logger.warning("Filter[%d] DAY_MANUAL radio not found: %s", btn_idx, store_name)
+        return None
+    logger.info("Filter[%d] DAY_MANUAL: %s", btn_idx, manual)
+    time.sleep(0.5)
+
+    dt = pendulum.parse(target_date, tz=KST)
+    target_year = dt.year
+    target_month = dt.month
+    target_day = dt.day
+    day_label = f"{target_day}일"
+
+    clicked = driver.execute_script(
+        """
+        let btn = document.querySelector('[data-atelier-component="DatePicker.Trigger"]');
+        if (!btn) {
+            const wrap = document.querySelector('[class*="DefaultDateFilter"]');
+            btn = wrap && wrap.querySelector('button');
+        }
+        if (btn) { btn.click(); return true; }
+        return false;
+        """
+    )
+    if not clicked:
+        logger.warning("Filter[%d] datepicker trigger not found: %s", btn_idx, store_name)
+        return None
+
+    WebDriverWait(driver, 10).until(
+        lambda d: d.execute_script("return !!document.querySelector('[aria-label$=\"일\"]');")
+    )
+
+    for _ in range(24):
+        text = driver.execute_script(
+            """
+            const h = document.querySelector('[class*="DatePicker"][class*="Header"], [class*="CalendarHeader"]');
+            return h ? h.textContent : null;
+            """
+        )
+        if not text:
+            break
+        match = re.search(r"(\\d{4})[^\\d]+(\\d{1,2})", text)
+        if not match:
+            break
+        ym = (int(match.group(1)), int(match.group(2)))
+        if ym == (target_year, target_month):
+            break
+        if ym > (target_year, target_month):
+            driver.execute_script(
+                """
+                const btns = [...document.querySelectorAll('button')];
+                const prev = btns.find(
+                    b =>
+                        b.getAttribute('aria-label') === '이전달' ||
+                        b.textContent.trim() === '<' ||
+                        b.className.includes('prev') ||
+                        b.className.includes('Prev')
+                );
+                if (prev) prev.click();
+                """
+            )
+            time.sleep(0.3)
+        else:
+            break
+
+    clicked_start = driver.execute_script(
+        """
+        const targetYear = arguments[0];
+        const targetMonth = arguments[1];
+        const dayLabel = arguments[2];
+        const buttons = [...document.querySelectorAll(`button[aria-label="${dayLabel}"]`)];
+        for (const table of [...document.querySelectorAll('table')]) {
+            const caption = table.querySelector('caption');
+            if (!caption) continue;
+            const txt = caption.textContent || '';
+            const m = txt.match(/(\\d{4})[^\\d]+(\\d{1,2})/);
+            if (!m) continue;
+            const year = Number(m[1]);
+            const month = Number(m[2]);
+            if (year === targetYear && month === targetMonth) {
+                const monthBtns = [...table.querySelectorAll(`button[aria-label="${dayLabel}"]`)]
+                    .filter((b) => b.getAttribute('aria-disabled') !== 'true');
+                if (monthBtns.length > 0) {
+                    monthBtns[0].click();
+                    return true;
+                }
+                return false;
+            }
+        }
+        return false;
+        """,
+        target_year,
+        target_month,
+        day_label,
+    )
+    if not clicked_start:
+        logger.warning("Filter[%d] start date button not found/disabled: %s", btn_idx, store_name)
+        return None
+    time.sleep(0.2)
+
+    clicked_end = driver.execute_script(
+        """
+        const targetYear = arguments[0];
+        const targetMonth = arguments[1];
+        const dayLabel = arguments[2];
+        for (const table of [...document.querySelectorAll('table')]) {
+            const caption = table.querySelector('caption');
+            if (!caption) continue;
+            const txt = caption.textContent || '';
+            const m = txt.match(/(\\d{4})[^\\d]+(\\d{1,2})/);
+            if (!m) continue;
+            const year = Number(m[1]);
+            const month = Number(m[2]);
+            if (year === targetYear && month === targetMonth) {
+                const monthBtns = [...table.querySelectorAll(`button[aria-label="${dayLabel}"]`)]
+                    .filter((b) => b.getAttribute('aria-disabled') !== 'true');
+                if (monthBtns.length > 0) {
+                    monthBtns[monthBtns.length - 1].click();
+                    return true;
+                }
+                return false;
+            }
+        }
+        return false;
+        """,
+        target_year,
+        target_month,
+        day_label,
+    )
+    if not clicked_end:
+        logger.warning("Filter[%d] end date button not found/disabled: %s", btn_idx, store_name)
+        return None
+
+    applied = driver.execute_script(
+        """
+        const btn = [...document.querySelectorAll('button')]
+            .find(b => (b.innerText || b.textContent || '').trim().includes(String.fromCharCode(0xC801, 0xC6A9)));
+        if (!btn) return false;
+        btn.click();
+        return true;
+        """
+    )
+    if not applied:
+        logger.warning("Filter[%d] apply button not found: %s", btn_idx, store_name)
+        return None
+
+    try:
+        WebDriverWait(driver, 15).until(
+            lambda d: str(target_day) in (
+                d.execute_script(
+                    "const btns = document.querySelectorAll('button.Filter-module__lRdH');"
+                    "return btns[arguments[0]]?.textContent || '';",
+                    btn_idx,
+                ) or ""
+            )
+        )
+    except TimeoutException:
+        logger.warning("Filter[%d] text not changed after apply (15s): %s", btn_idx, store_name)
+        return None
+
+    time.sleep(2.0)  # React data fetch completion is not tied to button text.
+    return _extract_filter_vals(driver, btn_idx, store_name)
 
 def _reload_and_retry_extract(driver, store_id: str, store_name: str) -> dict:
     logger.info("광고 페이지 새로고침 후 재시도: %s (%s)", store_name, store_id)
@@ -281,14 +565,19 @@ def _reload_and_retry_extract(driver, store_id: str, store_name: str) -> dict:
         }
 
 
-def _reload_and_collect(driver, store_id: str, store_name: str) -> dict | None:
+def _reload_and_collect(
+    driver,
+    store_id: str,
+    store_name: str,
+    target_date: str,
+) -> dict | None:
     """Refresh page and re-apply filter. Returns metrics dict or None on failure."""
     logger.info("Reloading ad funnel page for retry: %s (%s)", store_name, store_id)
     try:
         driver.refresh()
         if not wait_for_page(driver, _FILTER_BTN_CSS, timeout=30):
             return None
-        return _set_ad_filter_yesterday(driver, store_name)
+        return _set_ad_filter(driver, target_date, store_name)
     except Exception as exc:
         logger.warning("Reload retry failed (%s): %s", store_name, exc)
         return None
@@ -306,9 +595,9 @@ def _collect_ad_funnel_metrics(
         logger.info("No ads (skip): %s / %s -> %s", store, target_date, saved)
         return True
 
-    metrics = _set_ad_filter_yesterday(driver, store)
+    metrics = _set_ad_filter(driver, target_date, store)
     if metrics is None:
-        metrics = _reload_and_collect(driver, store_id, store)
+        metrics = _reload_and_collect(driver, store_id, store, target_date)
     if metrics is None:
         logger.warning("ad funnel extraction incomplete: %s / %s", store, target_date)
         return False

@@ -21,6 +21,7 @@ from modules.transform.pipelines.sales.DB_ai_daily_collection_01_collect import 
 )
 from modules.transform.utility.paths import ANALYTICS_DB
 from modules.transform.utility.schedule import SMD_TOORDER_SALES_REPORT_TIME
+from modules.transform.utility.notifier import on_failure_callback
 
 
 TARGET_DEST_DIR = ANALYTICS_DB / "toorder_daily_store"
@@ -68,7 +69,9 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     tags=["db", "toorder", "daily_store", "excel"],
-    default_args={"retries": 1, "retry_delay": pendulum.duration(minutes=5)},
+    default_args={"retries": 1, "retry_delay": pendulum.duration(minutes=5),
+    "on_failure_callback": on_failure_callback,
+    },
 ) as dag:
     PythonOperator(
         task_id="collect_toorder_daily_store",

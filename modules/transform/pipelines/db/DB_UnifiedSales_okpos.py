@@ -32,7 +32,7 @@ OKPOS_BRAND_ROOT = RAW_OKPOS_SALES / "brand=도리당"
 UNMATCHED_ALERT_TO_EMAILS: str | None = None
 
 # 모듈 레벨 캐시 (DAG 실행 단위로 재사용)
-_OKPOS_MONTH_CACHE: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
+_OKPOS_MONTH_CACHE: dict[str, tuple[pd.DataFrame, pd.DataFrame, float]] = {}
 
 # 미매칭 상품코드 누적 (run 종료 시 1회 이메일 발송)
 _PENDING_UNMATCHED: set[str] = set()
@@ -355,13 +355,21 @@ def _resolve_menu_name(merged: pd.DataFrame) -> pd.Series:
     return result
 
 
+def _okpos_month_mtime(ym: str) -> float:
+    paths = list(OKPOS_BRAND_ROOT.glob(f"store=*/ym={ym}/okpos_order.csv"))
+    paths += list(OKPOS_BRAND_ROOT.glob(f"store=*/ym={ym}/okpos_order_item.csv"))
+    return max((path.stat().st_mtime for path in paths), default=0.0)
+
+
 def _load_okpos_month(ym: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """ym='YYYY-MM' 전체 월 데이터 로드 (모듈 레벨 캐시).
     같은 ym을 여러 날짜에서 호출해도 1회만 읽음.
     """
     global _OKPOS_MONTH_CACHE
-    if ym in _OKPOS_MONTH_CACHE:
-        return _OKPOS_MONTH_CACHE[ym]
+    cur_mtime = _okpos_month_mtime(ym)
+    cached = _OKPOS_MONTH_CACHE.get(ym)
+    if cached is not None and cached[2] == cur_mtime:
+        return cached[0], cached[1]
 
     order_dfs: list[pd.DataFrame] = []
     item_dfs: list[pd.DataFrame] = []
@@ -405,7 +413,7 @@ def _load_okpos_month(ym: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         item_df = item_df.drop_duplicates(subset=["_pk"], keep="last").reset_index(drop=True)
 
     logger.info("OKPOS 월 로드: order %d행, item %d행 | ym=%s", len(order_df), len(item_df), ym)
-    _OKPOS_MONTH_CACHE[ym] = (order_df, item_df)
+    _OKPOS_MONTH_CACHE[ym] = (order_df, item_df, cur_mtime)
     return order_df, item_df
 
 
@@ -855,7 +863,7 @@ def run_lookback_okpos(days: int = 7) -> str:
         try:
             order_df, item_df = _load_okpos_by_date(date_str)
         except FileNotFoundError:
-            logger.info("okpos CSV 없음, 스킵: %s", date_str)
+            logger.warning("okpos CSV 없음, 스킵: %s", date_str)
             continue
         df = _transform_okpos_df(order_df, item_df)
         if df.empty:

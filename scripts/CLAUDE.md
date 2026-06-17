@@ -1,28 +1,13 @@
-# 스크립트 규칙
+# script 참조
 
-> Codex 전용 운영 문서(`AGENTS.md`, `docs/codex/**`)는 Claude 작업 규칙으로 사용하지 않는다.
+## 어디를 볼지
+- script runner: @C:\airflow\scripts\_base.py
+- 환경/키배치: @C:\airflow\docs\team-clone-setup.md
+- 경로 상수: @C:\airflow\modules\transform\utility\paths.py
+- 모듈/API 설정: @C:\airflow\modules\CLAUDE.md
 
-```mermaid
-graph LR
-    main["main() → dict"] --> run_script["run_script()"]
-    run_script --> JSON["output/{name}_{timestamp}.json"]
-```
-
-## 목적
-분석/검증용 단발성 스크립트 (DAG 아님), 결과는 `scripts/output/`에 JSON 자동 저장
-
-## 구조
-- `main()` → dict(meta/summary/stats) 반환
-- `_base.run_script()`로 예외 처리 + 저장, logger 필수
-- 경로는 `paths.py` 상수, 필터는 argparse 사용
-
-## 실행
-```bash
-# WSL에서 .venv_wsl 활성화 후
-python scripts/{name}.py [--date YYYY-MM-DD]
-# 결과: scripts/output/{name}_{timestamp}.json 자동 저장
-```
-
-## 참조
-- `scripts/_base.py` - run_script, save_summary
-- `docs/architecture.md` - 아키텍처
+## 규칙
+- `scripts/`는 분석/검증용입니다. DAG runtime 로직을 넣지 않습니다.
+- 가능하면 `main()`이 meta/summary/stats dict를 반환하게 합니다.
+- 표준 runner를 쓰면 결과는 `scripts/output/` JSON으로 저장합니다.
+- 파라미터는 `argparse`를 사용합니다.

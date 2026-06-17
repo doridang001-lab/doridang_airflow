@@ -37,6 +37,7 @@ from modules.transform.ai_daily_collection_integrator import (
 )
 from modules.transform.utility.paths import ANALYTICS_DB, DOWN_DIR
 from modules.transform.utility.mailer import send_email
+from modules.transform.utility.notifier import on_failure_callback
 
 
 DAG_ID = "DB_Sales_Alert_01_Score_AI_Daily_Collection"
@@ -313,7 +314,13 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     tags=["sales", "toorder", "report", "ai_daily_collection"],
-    default_args={"retries": 1, "retry_delay": pendulum.duration(minutes=5)},
+    default_args={
+        "retries": 2,
+        "retry_delay": pendulum.duration(minutes=5),
+        "retry_exponential_backoff": True,
+        "max_retry_delay": pendulum.duration(minutes=20),
+    "on_failure_callback": on_failure_callback,
+    },
 ) as dag:
     t1 = PythonOperator(
         task_id="collect_ai_daily_sales_report",
@@ -350,4 +357,4 @@ with DAG(
         python_callable=cleanup_final_report_files,
     )
 
-    t1 >> t2 >> t3 >> t5 >> t6 >> t7
+    t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7

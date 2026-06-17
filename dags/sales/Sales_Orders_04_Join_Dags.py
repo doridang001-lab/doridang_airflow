@@ -78,6 +78,7 @@ from modules.transform.pipelines.sales.SMD_04_store_orders_amount_join import (
 
 from modules.load.load_df_glob import cleanup_collected_csvs, move_download_files, upload_final_csv
 from modules.transform.utility.paths import LOCAL_DB, COLLECT_DB, DOWN_DIR
+from modules.transform.utility.notifier import on_failure_callback
 
 logger = logging.getLogger(__name__)
 FINAL_REVIEW_CLEANUP_TARGETS = [
@@ -114,6 +115,7 @@ with DAG(
         'depends_on_past': False,
         'email_on_failure': False,
         'email_on_retry': False,
+    "on_failure_callback": on_failure_callback,
     },
     tags=['02_sales', 'crawling', 'toorder', 'baemin'],
 ) as dag:

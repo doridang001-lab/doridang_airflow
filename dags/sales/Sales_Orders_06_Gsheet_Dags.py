@@ -77,6 +77,7 @@ from modules.transform.pipelines.sales.SMD_07_store_ordesr_alert import (
     LLM_COLS,
     add_llm_columns_latest_per_store,
 )
+from modules.transform.utility.notifier import on_failure_callback
 
 
 def _append_llm_columns_for_main_gsheet(df: pd.DataFrame) -> pd.DataFrame:
@@ -365,6 +366,7 @@ with DAG(
         'depends_on_past': False,
         'email_on_failure': False,
         'email_on_retry': False,
+    "on_failure_callback": on_failure_callback,
     },
     tags=['03_gsheet', 'upload', 'alerts'],
 ) as dag:

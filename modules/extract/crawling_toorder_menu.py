@@ -38,6 +38,8 @@ HEADLESS_MODE = os.getenv("AIRFLOW_HOME") is not None
 LOGIN_URL = "https://ceo.toorder.co.kr/auth/login?returnTo=%2Fdashboard"
 MENU_ANALYSIS_URL   = "https://ceo.toorder.co.kr/dashboard/product-analysis/product-sales-date"
 OPTION_ANALYSIS_URL = "https://ceo.toorder.co.kr/dashboard/product-analysis/option-sales-date"
+MENU_ANALYSIS_KIND = "menu"
+OPTION_ANALYSIS_KIND = "option"
 LOGIN_FAIL_URL_PATTERNS = ["/login", "/auth"]
 
 DATAGRID_ROW_HEIGHT = 52   # MUI DataGrid 행 높이 (px)
@@ -118,6 +120,7 @@ def _launch_browser(account_id: str, download_dir: Path) -> uc.Chrome:
         account_id=account_id,
         chrome_bin=os.getenv("CHROME_BIN", "/usr/bin/google-chrome"),
         log_fn=lambda msg: logger.info("[%s] %s", account_id, msg),
+        prefer_standard=os.getenv("AIRFLOW_HOME") is not None,
     )
     try:
         driver.execute_cdp_cmd(
@@ -991,9 +994,10 @@ def _download_store_detail_attempt_v2(
 ) -> Tuple[Optional[Path], Optional[str], Optional[str]]:
     safe_name = re.sub(r'[\\/:*?"<>|]', "_", menu_name)
     yymmdd = datetime.now().strftime("%y%m%d")
-    file_prefix = f"store_{safe_name}_{yymmdd}"
     download_timeout = 120 if HEADLESS_MODE else 60
     page_fragment = page_url.rsplit("/", 1)[-1]
+    analysis_prefix = "option" if page_fragment == "option-sales-date" else "menu"
+    file_prefix = f"{analysis_prefix}_store_{safe_name}_{yymmdd}"
 
     for open_attempt in range(1, 3):
         btn = _scroll_and_find_menu_btn(
@@ -1083,7 +1087,9 @@ def run_toorder_menu_crawl(
         }
     """
     download_dir.mkdir(parents=True, exist_ok=True)
+    analysis_kind = OPTION_ANALYSIS_KIND if page_url == OPTION_ANALYSIS_URL else MENU_ANALYSIS_KIND
     result: Dict[str, Any] = {
+        "analysis_kind": analysis_kind,
         "store_files": [],
         "menu_names": [],
         "skipped_details": [],
@@ -1331,14 +1337,18 @@ def run_toorder_menu_crawl(
             "store_files": [(menu_name, Path), ...],
             "menu_names": [str, ...],
             "skipped_details": [{"menu_name": str, "reason": str, "stage": str}],
+            "aggregate_file": str | None,
             "error": str | None,
         }
     """
     download_dir.mkdir(parents=True, exist_ok=True)
+    analysis_kind = OPTION_ANALYSIS_KIND if page_url == OPTION_ANALYSIS_URL else MENU_ANALYSIS_KIND
     result: Dict[str, Any] = {
+        "analysis_kind": analysis_kind,
         "store_files": [],
         "menu_names": [],
         "skipped_details": [],
+        "aggregate_file": None,
         "error": None,
     }
     driver = None
@@ -1386,6 +1396,22 @@ def run_toorder_menu_crawl(
             return result
 
         result["menu_names"] = menu_names
+
+        if target_menus is None:
+            yymmdd = datetime.now().strftime("%y%m%d")
+            page_kind = "option" if page_url == OPTION_ANALYSIS_URL else "menu"
+            aggregate_path = _download_export_excel(
+                driver,
+                toorder_id,
+                download_dir,
+                f"aggregate_{page_kind}_{yymmdd}",
+            )
+            result["aggregate_file"] = str(aggregate_path) if aggregate_path else None
+            logger.info(
+                "[%s] 집계 Excel 다운로드 %s",
+                toorder_id,
+                "완료" if aggregate_path else "실패(카테고리 보강 없이 진행)",
+            )
 
         if target_menus is not None:
             target_set = set(target_menus)

@@ -27,6 +27,7 @@ from modules.transform.pipelines.sales.SMD_sales_visit_log_02_transform import (
     move_files,
     preprocess_master_tmp_df
 )
+from modules.transform.utility.notifier import on_failure_callback
 
 # ==================================================
 # DAG 정의
@@ -47,6 +48,11 @@ with DAG(
     start_date=pendulum.datetime(2023, 1, 1, tz="Asia/Seoul"),
     catchup=False,
     tags=['02_sales', 'crawling', 'coupang'],
+    default_args={
+        "retries": 1,
+        "email_on_failure": False,
+        "on_failure_callback": on_failure_callback,
+    },
 ) as dag:
     wait_for_smd_01 = ExternalTaskSensor(
         task_id='wait_for_smd_01',

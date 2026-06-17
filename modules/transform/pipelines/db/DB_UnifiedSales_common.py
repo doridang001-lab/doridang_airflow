@@ -614,6 +614,48 @@ def repartition_unified_sales_by_sale_date() -> str:
     return result
 
 
+def purge_source_from_unified_sales(source: str = "toorder") -> str:
+    """Remove all rows of target source from all unified_sales parquet files."""
+    src = str(source).strip().lower()
+    files = sorted(UNIFIED_ROOT.glob("unified_sales_*.parquet")) if UNIFIED_ROOT.exists() else []
+    if not files:
+        msg = f"unified_sales parquet 없음, 스킵 | {UNIFIED_ROOT}"
+        logger.warning(msg)
+        return msg
+
+    total_removed = 0
+    changed_files = 0
+
+    for path in files:
+        try:
+            df = pd.read_parquet(path)
+        except Exception as exc:
+            logger.warning("parquet 로드 실패, 스킵: %s | %s", path, exc)
+            continue
+        if "source" not in df.columns:
+            continue
+
+        mask = df["source"].fillna("").astype(str).str.strip().str.lower() == src
+        removed = int(mask.sum())
+        if removed == 0:
+            continue
+
+        try:
+            df = df[~mask].reset_index(drop=True)
+            df.to_parquet(path, index=False, engine="pyarrow")
+        except Exception as exc:
+            logger.warning("unified_sales parquet 저장 실패, 스킵: %s | %s", path, exc)
+            continue
+
+        total_removed += removed
+        changed_files += 1
+        logger.info("%s 행 제거: %s (%d행)", src, path.name, removed)
+
+    result = f"OK: purge source={src} | files={changed_files} removed={total_removed}"
+    logger.info(result)
+    return result
+
+
 def reclassify_hall_platform(date_str: str, overwrite: bool = True) -> str:
     """unified_sales parquet의 포스/제휴사주문 행을 테이블명 기반으로 재분류."""
     path = _unified_daily_path(date_str)

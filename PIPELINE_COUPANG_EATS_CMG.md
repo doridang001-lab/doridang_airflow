@@ -230,8 +230,8 @@ airflow logs Strategy_CoupangEats_CMG_Partition_Dags load_coupangeats_cmg_partit
 - CSV 파일 인코딩이 UTF-8 with BOM (utf-8-sig)인지 확인
 
 ## 관련 문서
-- `CLAUDE.md` - 프로젝트 규칙
-- `modules/CLAUDE.md` - 모듈 개발 규칙
-- `dags/CLAUDE.md` - DAG 네이밍 규칙
+- `AGENTS.md` - 프로젝트 운영 규칙 원본
+- `modules/AGENTS.md` 또는 루트 `AGENTS.md` - 모듈 개발 규칙 참조
+- `dags/AGENTS.md` 또는 루트 `AGENTS.md` - DAG 네이밍 규칙 참조
 - `modules/transform/utility/paths.py` - 경로 상수
 - `modules/transform/utility/onedrive.py` - OneDrive 백업 유틸

@@ -14,7 +14,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import pendulum
@@ -28,6 +28,7 @@ from modules.extract.crawling_toorder_menu import (
 from modules.extract.crawling_toorder_sales_report import generate_date_range
 from modules.transform.utility.paths import ANALYTICS_DB, DOWN_DIR
 from modules.transform.utility.schedule import DB_TOORDER_MENU_TIME
+from modules.transform.utility.notifier import on_failure_callback
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,14 @@ logger = logging.getLogger(__name__)
 TOORDER_ID = "doridang15"
 TOORDER_PW = os.getenv("TOORDER_PW", "ehfl5233!")
 
-MANUAL_DATE_RANGE = None
+# ============================================================
+# 사용법
+# 1) MANUAL_DATE_RANGE 변수에 [시작일, 종료일] 형식으로 날짜 범위를 지정하면 해당 범위로 수집
+# 2) Airflow UI에서 DAG 실행 시 conf에 date_range 또는 sale_date를 지정할 수 있음
+#    - date_range: 'YYYY-MM-DD~YYYY-MM-DD' 형식으로 범위 지정
+#    - sale_date: 'YYYY-MM-DD' 형식으로 단일 날짜 지정
+# 예시) '2023-06-01~2023-06-07' 수집 -> MANUAL_DATE_RANGE = ['2026-06-01', '2026-06-09']
+MANUAL_DATE_RANGE = None # 수집할 날짜 범위를 직접 지정 (None으로 설정 시 자동으로 전일 수집)
 BACKFILL_DAYS = 7
 EXCEL_HEADER_ROW = 3
 
@@ -43,6 +51,8 @@ TOORDER_MENU_DB = ANALYTICS_DB / "toorder_menu"
 TOORDER_OPTION_DB = ANALYTICS_DB / "toorder_option"
 TOORDER_MENU_DOWN = DOWN_DIR / "toorder_menu"
 TOORDER_OPTION_DOWN = DOWN_DIR / "toorder_option"
+MENU_ANALYSIS_KIND = "menu"
+OPTION_ANALYSIS_KIND = "option"
 
 MENU_GROUP_LABEL = "메뉴별"
 OPTION_GROUP_LABEL = "옵션별"
@@ -70,11 +80,17 @@ def _parse_date_range_conf(date_range: str, kst: pendulum.tz.timezone.Timezone) 
     return generate_date_range(start_date, end_date)
 
 
+def _default_target_date(context: Dict[str, Any], kst: pendulum.tz.timezone.Timezone) -> str:
+    data_interval_end = context.get("data_interval_end")
+    if data_interval_end is not None:
+        return pendulum.instance(data_interval_end).in_timezone(kst).subtract(days=1).format("YYYY-MM-DD")
+    return pendulum.now(kst).subtract(days=1).format("YYYY-MM-DD")
+
+
 def get_target_dates(**context) -> List[str]:
     conf = context.get("dag_run").conf or {}
     kst = pendulum.timezone("Asia/Seoul")
-    today = pendulum.now(kst)
-    yesterday = today.subtract(days=1).format("YYYY-MM-DD")
+    yesterday = _default_target_date(context, kst)
 
     if MANUAL_DATE_RANGE:
         if not isinstance(MANUAL_DATE_RANGE, (list, tuple)) or len(MANUAL_DATE_RANGE) != 2:
@@ -92,7 +108,8 @@ def get_target_dates(**context) -> List[str]:
         date_list = [_normalize_date(conf["sale_date"], kst)]
         logger.info("[sale_date] %s", date_list[0])
     elif conf.get("backfill"):
-        start_date = today.subtract(days=BACKFILL_DAYS).format("YYYY-MM-DD")
+        end_dt = pendulum.parse(yesterday, tz=kst)
+        start_date = end_dt.subtract(days=BACKFILL_DAYS - 1).format("YYYY-MM-DD")
         date_list = generate_date_range(start_date, yesterday)
         logger.info("[backfill] %s ~ %s (%d일)", start_date, yesterday, len(date_list))
     else:
@@ -143,18 +160,29 @@ def _crawl_analysis_for_dates(
         if result.get("error"):
             raise RuntimeError(f"{task_id} {target_date} 수집 실패: {result['error']}")
 
+        category_map: Dict[str, str] = {}
+        aggregate_file = result.get("aggregate_file")
+        if aggregate_file:
+            aggregate_path = Path(str(aggregate_file))
+            if aggregate_path.exists():
+                category_map = _parse_aggregate_for_categories(aggregate_path)
+                aggregate_path.unlink(missing_ok=True)
+
         results_by_date[target_date] = {
+            "analysis_kind": result.get("analysis_kind", MENU_ANALYSIS_KIND if task_id == "crawl_menu" else OPTION_ANALYSIS_KIND),
             "menu_names": result.get("menu_names", []),
             "store_files": [(name, str(path)) for name, path in result.get("store_files", [])],
             "skipped_details": result.get("skipped_details", []),
+            "category_map": category_map,
         }
         logger.info(
-            "[%s] %s 완료 | 전체 %d개, 상세 파일 %d개, 스킵 %d개",
+            "[%s] %s 완료 | 전체 %d개, 상세 파일 %d개, 스킵 %d개, 카테고리 매핑 %d개",
             task_id,
             target_date,
             len(result.get("menu_names", [])),
             len(result.get("store_files", [])),
             len(result.get("skipped_details", [])),
+            len(category_map),
         )
 
     ti.xcom_push(key="results_by_date", value=results_by_date)
@@ -204,6 +232,49 @@ def _find_first_matching_column(columns: List[str], candidates: List[str]) -> st
     return None
 
 
+def _parse_aggregate_for_categories(fpath: Path) -> Dict[str, str]:
+    try:
+        raw_df = pd.read_excel(fpath, header=None, dtype=str)
+    except Exception as exc:
+        logger.warning("[aggregate] Excel 읽기 실패: %s", exc)
+        return {}
+
+    raw_df = raw_df.dropna(how="all").dropna(axis=1, how="all")
+    if raw_df.empty:
+        return {}
+
+    header_row = _find_header_row_by_tokens(raw_df, ("카테고리", "메뉴 명", "메뉴명"))
+    headers = [_normalize_header_cell(v) for v in raw_df.iloc[header_row].tolist()]
+    headers = _flatten_duplicate_headers(headers)
+
+    data_df = raw_df.iloc[header_row + 1 :].copy()
+    data_df.columns = headers
+    data_df = data_df.dropna(how="all").reset_index(drop=True)
+    if data_df.empty:
+        return {}
+
+    columns = list(data_df.columns)
+    category_col = _find_first_matching_column(columns, ["카테고리"])
+    menu_col = _find_first_matching_column(columns, ["메뉴 명", "메뉴명"])
+    if not category_col or not menu_col:
+        logger.warning("[aggregate] 카테고리/메뉴명 컬럼 없음: %s", columns[:10])
+        return {}
+
+    mapping: Dict[str, str] = {}
+    last_category: Optional[str] = None
+    for _, row in data_df.iterrows():
+        category_raw = str(row[category_col]).strip()
+        if category_raw and category_raw.lower() != "nan":
+            last_category = category_raw
+
+        menu_raw = str(row[menu_col]).strip()
+        if menu_raw and menu_raw.lower() != "nan" and last_category:
+            mapping[menu_raw] = last_category
+
+    logger.info("[aggregate] 카테고리 매핑 %d개 추출", len(mapping))
+    return mapping
+
+
 def _find_header_row_by_tokens(raw_df: pd.DataFrame, expected_tokens: tuple[str, ...]) -> int:
     best_row = EXCEL_HEADER_ROW
     best_score = -1
@@ -225,7 +296,7 @@ def _load_store_detail_excel(fpath: Path, menu_name: str, collect_date: str) -> 
 
     header_row = _find_header_row_by_tokens(
         raw_df,
-        ("매장", "판매량", "매출액", "매출비중", "매출 비중", "카테고리"),
+        ("매장", "판매량", "매출액", "카테고리"),
     )
     headers = [_normalize_header_cell(v) for v in raw_df.iloc[header_row].tolist()]
     headers = _flatten_duplicate_headers(headers)
@@ -241,7 +312,6 @@ def _load_store_detail_excel(fpath: Path, menu_name: str, collect_date: str) -> 
     store_col = _find_first_matching_column(columns, ["매장명", "매장 명", "매장"])
     qty_col = _find_first_matching_column(columns, ["판매량", "판매 수량"])
     sales_col = _find_first_matching_column(columns, ["매출액", "매출"])
-    share_col = _find_first_matching_column(columns, ["매출비중", "매출 비중"])
     menu_title_col = _find_first_matching_column(columns, ["메뉴 명", "메뉴명"])
 
     if store_col is None:
@@ -255,7 +325,6 @@ def _load_store_detail_excel(fpath: Path, menu_name: str, collect_date: str) -> 
     parsed["매장명"] = data_df[store_col]
     parsed["판매량"] = data_df[qty_col] if qty_col else pd.NA
     parsed["매출액"] = data_df[sales_col] if sales_col else pd.NA
-    parsed["매출비중"] = data_df[share_col] if share_col else pd.NA
 
     parsed["매장명"] = parsed["매장명"].astype(str).str.strip()
     parsed = parsed[
@@ -291,7 +360,7 @@ def _load_option_detail_excel(fpath: Path, menu_name: str, collect_date: str) ->
 
     header_row = _find_header_row_by_tokens(
         raw_df,
-        ("카테고리", "메뉴", "옵션", "판매량", "매출액", "매출 비중", "매출비중"),
+        ("카테고리", "메뉴", "옵션", "판매량", "매출액"),
     )
     headers = [_normalize_header_cell(v) for v in raw_df.iloc[header_row].tolist()]
     headers = _flatten_duplicate_headers(headers)
@@ -304,32 +373,35 @@ def _load_option_detail_excel(fpath: Path, menu_name: str, collect_date: str) ->
 
     columns = list(data_df.columns)
     category_col = _find_first_matching_column(columns, ["카테고리"])
+    store_col = _find_first_matching_column(columns, ["매장명", "매장 명", "매장"])
     detail_menu_col = _find_first_matching_column(columns, ["메뉴 명", "메뉴명", "하위 메뉴"])
-    option_col = _find_first_matching_column(columns, ["하위 옵션", "옵션 명", "옵션명"])
     qty_col = _find_first_matching_column(columns, ["판매량", "판매 수량"])
     sales_col = _find_first_matching_column(columns, ["매출액", "매출"])
-    share_col = _find_first_matching_column(columns, ["매출비중", "매출 비중"])
 
-    if detail_menu_col is None and option_col is None:
-        raise ValueError(f"옵션 상세 컬럼을 찾지 못했습니다. columns={columns[:12]}")
+    if store_col is not None:
+        raise ValueError(f"옵션 상세가 아니고 매장별 상세로 보입니다. columns={columns[:12]}")
+    if detail_menu_col is None:
+        raise ValueError(f"메뉴명 컬럼을 찾지 못했습니다. columns={columns[:12]}")
+    if qty_col is None or sales_col is None:
+        raise ValueError(f"옵션 상세 수치 컬럼을 찾지 못했습니다. columns={columns[:12]}")
 
     parsed = pd.DataFrame(index=data_df.index)
     parsed["카테고리"] = data_df[category_col] if category_col else pd.NA
-    parsed["수집대상명"] = menu_name
-    parsed["메뉴명"] = data_df[detail_menu_col] if detail_menu_col else menu_name
-    parsed["옵션명"] = data_df[option_col] if option_col else pd.NA
+    parsed["메뉴명"] = menu_name
+    parsed["옵션명"] = data_df[detail_menu_col]
     parsed["판매량"] = data_df[qty_col] if qty_col else pd.NA
     parsed["매출액"] = data_df[sales_col] if sales_col else pd.NA
-    parsed["매출비중"] = data_df[share_col] if share_col else pd.NA
 
-    parsed["메뉴명"] = parsed["메뉴명"].astype(str).str.strip()
     parsed["옵션명"] = parsed["옵션명"].astype(str).str.strip()
     parsed = parsed[
-        parsed["메뉴명"].ne("")
-        & parsed["메뉴명"].ne("nan")
-        & ~parsed["메뉴명"].isin(["합계", "총계", "소계"])
+        parsed["옵션명"].ne("")
+        & parsed["옵션명"].ne("nan")
+        & ~parsed["옵션명"].isin(["합계", "총계", "소계"])
     ].reset_index(drop=True)
     parsed["수집일자"] = collect_date
+    parsed = parsed[
+        ["카테고리", "메뉴명", "옵션명", "판매량", "매출액", "수집일자"]
+    ]
     return parsed
 
 
@@ -349,6 +421,35 @@ def _parse_option_excels(store_files_raw: list, collect_date: str) -> pd.DataFra
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+def _assert_expected_analysis_kind(
+    *,
+    source_task_id: str,
+    target_date: str,
+    result_for_date: Dict[str, Any],
+    expected_kind: str,
+) -> None:
+    actual_kind = str(result_for_date.get("analysis_kind", "")).strip().lower()
+    if actual_kind and actual_kind != expected_kind:
+        raise ValueError(
+            f"{source_task_id} {target_date} analysis kind mismatch: expected={expected_kind}, actual={actual_kind}"
+        )
+
+
+def _apply_category_map(detail_df: pd.DataFrame, category_map: Dict[str, str]) -> pd.DataFrame:
+    if detail_df.empty or not category_map:
+        return detail_df
+    if "카테고리" not in detail_df.columns or "메뉴명" not in detail_df.columns:
+        return detail_df
+
+    category_text = detail_df["카테고리"].astype(str).str.strip()
+    missing_mask = detail_df["카테고리"].isna() | category_text.eq("") | category_text.str.lower().eq("nan")
+    if not missing_mask.any():
+        return detail_df
+
+    detail_df.loc[missing_mask, "카테고리"] = detail_df.loc[missing_mask, "메뉴명"].map(category_map)
+    return detail_df
+
+
 def _save_detail_parquet_for_dates(
     *,
     source_task_id: str,
@@ -356,6 +457,7 @@ def _save_detail_parquet_for_dates(
     output_prefix: str,
     parse_func,
     label: str,
+    expected_kind: str,
     **context,
 ) -> str:
     ti = context["ti"]
@@ -368,12 +470,19 @@ def _save_detail_parquet_for_dates(
     saved_rows = 0
     for target_date in date_list:
         result_for_date = results_by_date.get(target_date, {})
+        _assert_expected_analysis_kind(
+            source_task_id=source_task_id,
+            target_date=target_date,
+            result_for_date=result_for_date,
+            expected_kind=expected_kind,
+        )
         store_files = result_for_date.get("store_files") or []
         if not store_files:
             logger.info("[%s][%s] %s 저장할 상세 데이터 없음", source_task_id, target_date, label)
             continue
 
         detail_df = parse_func(store_files, target_date)
+        detail_df = _apply_category_map(detail_df, result_for_date.get("category_map") or {})
         if detail_df.empty:
             logger.info("[%s][%s] %s 파싱 결과 없음", source_task_id, target_date, label)
             continue
@@ -394,6 +503,7 @@ def save_menu_detail_parquet(**context) -> str:
         output_prefix="toorder_menu_detail",
         parse_func=_parse_store_excels,
         label=MENU_GROUP_LABEL,
+        expected_kind=MENU_ANALYSIS_KIND,
         **context,
     )
 
@@ -405,6 +515,7 @@ def save_option_detail_parquet(**context) -> str:
         output_prefix="toorder_option_detail",
         parse_func=_parse_option_excels,
         label=OPTION_GROUP_LABEL,
+        expected_kind=OPTION_ANALYSIS_KIND,
         **context,
     )
 
@@ -444,6 +555,7 @@ def _retry_missing_for_dates(
     output_prefix: str,
     parse_func,
     compare_column: str,
+    expected_kind: str,
     page_url: str | None = None,
     **context,
 ) -> str:
@@ -456,6 +568,12 @@ def _retry_missing_for_dates(
 
     for target_date in date_list:
         result_for_date = results_by_date.get(target_date, {})
+        _assert_expected_analysis_kind(
+            source_task_id=source_task_id,
+            target_date=target_date,
+            result_for_date=result_for_date,
+            expected_kind=expected_kind,
+        )
         all_names = {str(name).strip() for name in result_for_date.get("menu_names", []) if str(name).strip()}
         if not all_names:
             logger.info("[%s][%s] 비교 대상 없음, 재시도 생략", source_task_id, target_date)
@@ -495,6 +613,7 @@ def _retry_missing_for_dates(
             raise RuntimeError(f"{source_task_id} {target_date} 재시도 실패: {retry_result['error']}")
 
         new_df = parse_func(retry_result.get("store_files", []), target_date)
+        new_df = _apply_category_map(new_df, result_for_date.get("category_map") or {})
         if new_df.empty:
             logger.warning("[%s][%s] 재시도 결과 없음", source_task_id, target_date)
             continue
@@ -530,6 +649,7 @@ def retry_missing_menu(**context) -> str:
         output_prefix="toorder_menu_detail",
         parse_func=_parse_store_excels,
         compare_column="메뉴명",
+        expected_kind=MENU_ANALYSIS_KIND,
         **context,
     )
 
@@ -541,7 +661,8 @@ def retry_missing_option(**context) -> str:
         output_dir=TOORDER_OPTION_DB,
         output_prefix="toorder_option_detail",
         parse_func=_parse_option_excels,
-        compare_column="수집대상명",
+        compare_column="메뉴명",
+        expected_kind=OPTION_ANALYSIS_KIND,
         page_url=OPTION_ANALYSIS_URL,
         **context,
     )
@@ -556,8 +677,9 @@ with DAG(
     max_active_runs=1,
     tags=["01_crawling", "toorder", "detail_analysis", "daily"],
     default_args={
-        "retries": 1,
+        "retries": 5,
         "retry_delay": pendulum.duration(minutes=5),
+    "on_failure_callback": on_failure_callback,
     },
 ) as dag:
     t1 = PythonOperator(task_id="get_target_dates", python_callable=get_target_dates)

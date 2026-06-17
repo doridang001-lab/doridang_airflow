@@ -16,6 +16,7 @@ import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeout
@@ -24,6 +25,10 @@ from modules.transform.utility.paths import RAW_UNIONPOS_SALES
 from modules.transform.utility.playwright_launcher import launch_chromium
 
 logger = logging.getLogger(__name__)
+
+
+def _kst_now() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Seoul")).replace(tzinfo=None)
 
 UNIONPOS_LOGIN_URL   = "https://asp2.unionpos.co.kr/"
 UNIONPOS_RECEIPT_URL = "https://asp2.unionpos.co.kr/v2/sales/detail/receipt2"
@@ -63,7 +68,7 @@ def _set_date_input(page: Page, start: str, end: str) -> None:
 
 
 def _set_date_and_search(page: Page, sale_date: str) -> None:
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    yesterday = (_kst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
     # 날짜 필드가 렌더링될 때까지 대기
     page.wait_for_selector("#startDate", state="visible", timeout=15000)
@@ -200,15 +205,17 @@ def _parse_receipt_items_popup(
         except PlaywrightTimeout:
             logger.warning(f"상세품목 모달 타임아웃 (영수증={receipt_no})")
         finally:
-            try:
-                page.click(".btnReceiptPopupClose", timeout=5000)
-                page.wait_for_selector(".btnReceiptPopupClose", state="hidden", timeout=5000)
-            except PlaywrightTimeout:
+            if not page.is_closed():
                 try:
-                    page.keyboard.press("Escape")
-                    time.sleep(0.5)
+                    page.click(".btnReceiptPopupClose", timeout=5000)
+                    page.wait_for_selector(".btnReceiptPopupClose", state="hidden", timeout=5000)
                 except Exception:
-                    pass
+                    if not page.is_closed():
+                        try:
+                            page.keyboard.press("Escape")
+                            time.sleep(0.5)
+                        except Exception:
+                            pass
 
     return items, log_status
 
@@ -362,11 +369,11 @@ def resolve_sale_dates(manual_date_range=None, lookback_days=None, **context) ->
             sale_dates.append(cur.strftime("%Y-%m-%d"))
             cur += timedelta(days=1)
     elif lookback_days:
-        today = datetime.now()
+        today = _kst_now()
         sale_dates = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, lookback_days + 1)]
         source = f"lookback {lookback_days}일"
     else:
-        sale_dates = [(datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")]
+        sale_dates = [(_kst_now() - timedelta(days=1)).strftime("%Y-%m-%d")]
         source = "yesterday(기본)"
 
     context["ti"].xcom_push(key="sale_dates", value=sale_dates)
@@ -380,8 +387,16 @@ def collect_and_save(**context) -> str:
     if not sale_dates:
         raise ValueError("sale_dates XCom 값이 없습니다.")
 
+    saved_files, status_by_date = _collect_and_save_dates(sale_dates, context)
+    context["ti"].xcom_push(key="saved_files", value=saved_files)
+    context["ti"].xcom_push(key="collection_status_by_date", value=status_by_date)
+    return f"수집 저장 완료: {len(saved_files)}개 파일"
+
+
+def _collect_and_save_dates(sale_dates: list[str], context) -> tuple[list[str], dict[str, str]]:
+    """지정 날짜를 수집하고 저장 파일 목록과 날짜별 수집 상태를 반환."""
     saved_files: list[str] = []
-    last_exc: Exception | None = None
+    status_by_date: dict[str, str] = {}
 
     for attempt in range(1, _RETRY_MAX + 1):
         try:
@@ -399,13 +414,12 @@ def collect_and_save(**context) -> str:
                 try:
                     browser_context = browser.new_context()
                     page = browser_context.new_page()
-                    _collect_session(page, browser_context, sale_dates, saved_files, context)
+                    _collect_session(page, browser_context, sale_dates, saved_files, status_by_date, context)
                 finally:
                     browser.close()
             break  # 성공
 
         except Exception as exc:
-            last_exc = exc
             is_transient = isinstance(exc, PlaywrightTimeout) or _is_network_error(exc)
             if is_transient and attempt < _RETRY_MAX:
                 wait_sec = _RETRY_BASE_WAIT * (3 ** (attempt - 1))
@@ -414,8 +428,7 @@ def collect_and_save(**context) -> str:
             else:
                 raise
 
-    context["ti"].xcom_push(key="saved_files", value=saved_files)
-    return f"수집 저장 완료: {len(saved_files)}개 파일"
+    return saved_files, status_by_date
 
 
 def _is_network_error(exc: Exception) -> bool:
@@ -431,6 +444,7 @@ def _collect_session(
     browser_context: BrowserContext,
     sale_dates: list[str],
     saved_files: list[str],
+    status_by_date: dict[str, str],
     context,
 ) -> None:
     from modules.load.load_onedrive import onedrive_csv_save
@@ -446,6 +460,7 @@ def _collect_session(
         rows_check = page.query_selector_all("#tableList tbody tr")
         if not rows_check:
             logger.info(f"[{sale_date}] 데이터 없음 — 스킵")
+            status_by_date[sale_date] = "no_data"
             continue
 
         all_list_records: list[dict] = []
@@ -470,6 +485,8 @@ def _collect_session(
                 items, log_status = _parse_receipt_items_popup(
                     page, browser_context, onclick, rec["영수증번호"], rec["판매일시"]
                 )
+                if page.is_closed():
+                    raise PlaywrightTimeout("메인 페이지가 닫혔습니다 (팝업 처리 후)")
                 rec["상태"] = log_status
                 if log_status:
                     for it in items:
@@ -488,6 +505,10 @@ def _collect_session(
         logger.info(
             f"[{sale_date}] 수집 완료: 영수증 {len(all_list_records)}건, 품목 {len(all_item_records)}건"
         )
+        if not all_list_records:
+            logger.info(f"[{sale_date}] 조회 성공, 파싱 가능한 영수증 없음 — no_data 처리")
+            status_by_date[sale_date] = "no_data"
+            continue
 
         # ── CSV 저장 ──────────────────────────────────────────────────────
         ym      = sale_date[:7]
@@ -503,10 +524,10 @@ def _collect_session(
                          if r.get("매장명") == store_name or store_name == "unknown"]
             if list_rows:
                 list_df = pd.DataFrame(list_rows)
-                pk_cols = [c for c in list_df.columns if c != "상태"]
                 list_df["sale_date"]    = sale_date
                 list_df["ym"]           = ym
                 list_df["collected_at"] = now_str
+                pk_cols = [c for c in list_df.columns if c not in ("상태", "collected_at")]
                 list_df["_pk"] = list_df[pk_cols].apply(
                     lambda row: hashlib.md5("|".join(row.astype(str)).encode()).hexdigest(), axis=1,
                 )
@@ -555,10 +576,10 @@ def _collect_session(
             item_rows = [r for r in all_item_records if r.get("영수증번호") in receipt_nos]
             if item_rows:
                 item_df = pd.DataFrame(item_rows)
-                pk_cols2 = [c for c in item_df.columns if c != "상태"]
                 item_df["sale_date"]    = sale_date
                 item_df["ym"]           = ym
                 item_df["collected_at"] = now_str
+                pk_cols2 = [c for c in item_df.columns if c not in ("상태", "collected_at")]
                 item_df["_pk"] = item_df[pk_cols2].apply(
                     lambda row: hashlib.md5("|".join(row.astype(str)).encode()).hexdigest(), axis=1,
                 )
@@ -603,10 +624,14 @@ def _collect_session(
                 saved_files.append(str(dest_items))
                 logger.info(f"상세품목 저장: {dest_items.name} | 신규={result2.get('inserted', 0)}")
 
+        status_by_date[sale_date] = "collected"
+
 
 def write_log(**context) -> str:
     """log.parquet 실행 이력 기록"""
     saved_files = context["ti"].xcom_pull(task_ids="collect_and_save", key="saved_files") or []
+    recovered_files = context["ti"].xcom_pull(task_ids="verify_missing", key="recovered_files") or []
+    saved_files = list(dict.fromkeys([*saved_files, *recovered_files]))
     sale_dates  = context["ti"].xcom_pull(task_ids="resolve_dates",    key="sale_dates")  or []
     log_path    = RAW_UNIONPOS_SALES / "log.parquet"
 
@@ -655,32 +680,58 @@ def write_log(**context) -> str:
 
 
 def verify_missing(**context) -> str:
-    """수집 후 raw 파일 존재 여부로 누락 날짜 확인 (로그만, 재수집 없음)."""
+    """수집 후 raw 파일과 수집 상태를 확인하고, 실패 의심 날짜만 1회 재수집."""
     sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates") or []
     if not sale_dates:
         return "검증 스킵 (sale_dates 없음)"
 
-    brand_dir = RAW_UNIONPOS_SALES / "brand=도리당"
-    missing = []
-    for date_str in sale_dates:
-        ym = date_str[:7]
-        found = False
-        if brand_dir.exists():
-            for store_dir in brand_dir.iterdir():
-                csv_path = store_dir / f"ym={ym}" / "unionpos_receipt_list.csv"
-                if not csv_path.exists():
-                    continue
-                try:
-                    df = pd.read_csv(csv_path, dtype=str, usecols=["sale_date"])
-                    if date_str in df["sale_date"].values:
-                        found = True
-                        break
-                except Exception:
-                    pass
-        if not found:
-            missing.append(date_str)
+    status_by_date = context["ti"].xcom_pull(
+        task_ids="collect_and_save",
+        key="collection_status_by_date",
+    ) or {}
 
-    if missing:
-        logger.warning("UnionPOS 수집 후 누락 날짜 감지: %s", missing)
-        return f"누락 {len(missing)}건: {missing}"
-    return f"누락 없음: {len(sale_dates)}일 정상 수집"
+    missing = _find_missing_dates(sale_dates, status_by_date)
+    if not missing:
+        return f"누락 없음: {len(sale_dates)}일 정상 수집"
+
+    logger.warning("UnionPOS 수집 후 누락 후보 감지, 1회 재수집: %s", missing)
+    recovered_files, recovered_status = _collect_and_save_dates(missing, context)
+    context["ti"].xcom_push(key="recovered_files", value=recovered_files)
+    context["ti"].xcom_push(key="recovered_status_by_date", value=recovered_status)
+
+    merged_status = {**status_by_date, **recovered_status}
+    unresolved = _find_missing_dates(missing, merged_status)
+    if unresolved:
+        raise RuntimeError(f"UnionPOS 재수집 후에도 누락 날짜 남음: {unresolved}")
+
+    return f"누락 {len(missing)}건 재수집 완료: {missing}"
+
+
+def _find_missing_dates(sale_dates: list[str], status_by_date: dict[str, str]) -> list[str]:
+    missing: list[str] = []
+    for date_str in sale_dates:
+        if _receipt_csv_has_sale_date(date_str):
+            continue
+        if status_by_date.get(date_str) == "no_data":
+            continue
+        missing.append(date_str)
+    return missing
+
+
+def _receipt_csv_has_sale_date(date_str: str) -> bool:
+    brand_dir = RAW_UNIONPOS_SALES / "brand=도리당"
+    ym = date_str[:7]
+    if not brand_dir.exists():
+        return False
+
+    for store_dir in brand_dir.iterdir():
+        csv_path = store_dir / f"ym={ym}" / "unionpos_receipt_list.csv"
+        if not csv_path.exists():
+            continue
+        try:
+            df = pd.read_csv(csv_path, dtype=str, usecols=["sale_date"])
+            if date_str in df["sale_date"].values:
+                return True
+        except Exception:
+            pass
+    return False

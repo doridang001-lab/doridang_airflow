@@ -51,6 +51,7 @@ from modules.transform.pipelines.sales.SMD_02_sales_orders_csv_review import (
     fin_save_to_csv
 
 )
+from modules.transform.utility.notifier import on_failure_callback
 
 # ==================================================
 # DAG 정의
@@ -69,6 +70,7 @@ with DAG(
         'depends_on_past': False,
         'email_on_failure': False,
         'email_on_retry': False,
+    "on_failure_callback": on_failure_callback,
     },
     tags=['02_sales', 'crawling', 'coupang'],
 ) as dag:

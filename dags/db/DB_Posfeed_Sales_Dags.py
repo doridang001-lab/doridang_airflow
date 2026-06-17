@@ -10,7 +10,7 @@ Posfeed 주문 수집 통합 DAG
 6. [Detail] 주문 상세 페이지 크롤링 → OneDrive 저장
 7. [Detail] 미수집 코드 재수집 (ALL_DONE)
 
-📅 스케줄: 매일 09:15 (DB_POSFEED_SALES_TIME)
+📅 스케줄: 매일 07:15 (DB_POSFEED_SALES_TIME)
 """
 
 import logging
@@ -23,7 +23,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.utils.trigger_rule import TriggerRule
 
-from modules.transform.utility.notifier import send_telegram
+from modules.transform.utility.notifier import enqueue_heal_task, send_telegram
 from modules.transform.utility.schedule import DB_POSFEED_SALES_TIME
 from modules.transform.pipelines.db.DB_Posfeed_Sales import (
     reset_posfeed_partitions,
@@ -106,6 +106,7 @@ def _on_failure_callback(context):
     except Exception as e:
         logger.error("실패 알림 발송 실패: %s", e)
     send_telegram(body + "\n해결해라")
+    enqueue_heal_task(context)
 
 
 default_args = {

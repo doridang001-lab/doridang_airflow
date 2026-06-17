@@ -5,7 +5,7 @@
 1. unified_sales parquet → 주간 집계 CSV (hall_sale_target.csv)
 2. CSV + 마케팅 CSV → 주간보고 Excel (hall_weekly_report.xlsx)
 
-실행: DB_UnifiedSales(10:30) 완료 후 10:55 실행 (매주 월요일)
+실행: DB_UnifiedSales 갱신 완료 후 11:00 실행 (매주 월요일)
 """
 
 from datetime import timedelta
@@ -24,6 +24,7 @@ from modules.transform.pipelines.db.DB_Hall_Sales_Excel import (
 from modules.transform.pipelines.db.DB_Hall_Daily_Excel import build_daily_tracking_excel
 # 목표치 계산은 airflow 비의존 헬퍼로 분리 (로컬 Windows 스크립트와 공유)
 from modules.transform.pipelines.db.DB_Hall_Sales_Target_config import build_targets
+from modules.transform.utility.notifier import on_failure_callback
 
 # 매출/마케팅 목표치 (매월 업데이트는 DB_Hall_Sales_Target_config.py 에서)
 MONTHLY_TARGETS, MARKETING_MONTHLY_TARGETS, DAILY_TRACKING_TARGET = build_targets()
@@ -37,10 +38,11 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     default_args={
-        "retries": 1,
-        "retry_delay": timedelta(minutes=5),
+        "retries": 3,
+        "retry_delay": timedelta(minutes=15),
         "email_on_failure": False,
         "email_on_retry": False,
+        "on_failure_callback": on_failure_callback,
     },
     tags=["db", "hall", "sales_target"],
 ) as dag:

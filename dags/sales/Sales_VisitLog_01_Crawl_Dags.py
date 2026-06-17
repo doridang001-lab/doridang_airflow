@@ -20,6 +20,7 @@ from modules.transform.utility.paths import LOCAL_DB
 # 크롤링 모듈 import
 from modules.transform.pipelines.sales.SMD_sales_visit_log_01_crawling import run_flow_visit_crawling
 from modules.transform.utility.io import SMD_VISIT_LOG
+from modules.transform.utility.notifier import on_failure_callback
 
 
 # ============================================================================
@@ -118,6 +119,7 @@ with DAG(
     default_args={
         'retries': 1,
         'retry_delay': timedelta(minutes=5),
+    "on_failure_callback": on_failure_callback,
     },
 ) as dag:
     

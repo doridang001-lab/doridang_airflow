@@ -24,6 +24,7 @@ from modules.transform.pipelines.db.DB_OKPOS_Product import (
     download_okpos_product,
     save_okpos_product,
 )
+from modules.transform.utility.notifier import on_failure_callback
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ default_args = {
     "depends_on_past": False,
     "email_on_failure": False,
     "email_on_retry": False,
+    "on_failure_callback": on_failure_callback,
 }
 
 

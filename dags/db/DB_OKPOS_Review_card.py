@@ -16,6 +16,7 @@ from modules.transform.pipelines.db.DB_OKPOS_Card_Test import (
     save_okpos_card_test_csv,
     validate_okpos_card_lookback,
 )
+from modules.transform.utility.notifier import on_failure_callback
 
 dag_id = Path(__file__).stem
 
@@ -25,6 +26,7 @@ default_args = {
     "depends_on_past": False,
     "email_on_failure": False,
     "email_on_retry": False,
+    "on_failure_callback": on_failure_callback,
 }
 
 with DAG(

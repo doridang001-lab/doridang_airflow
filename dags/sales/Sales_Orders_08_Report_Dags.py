@@ -32,6 +32,7 @@ from modules.transform.utility.paths import LOCAL_DB
 from modules.load.load_gsheet import save_to_gsheet
 from modules.extract.extract_gsheet import extract_gsheet
 from modules.transform.utility.io import SMD_ORDERS_TIME
+from modules.transform.utility.notifier import on_failure_callback
 
 filename = os.path.basename(__file__)
 
@@ -678,6 +679,7 @@ with DAG(
         'depends_on_past': False,
         'email_on_failure': False,
         'email_on_retry': False,
+    "on_failure_callback": on_failure_callback,
     },
     tags=['report', 'gsheet', '리포트'],
 ) as dag:

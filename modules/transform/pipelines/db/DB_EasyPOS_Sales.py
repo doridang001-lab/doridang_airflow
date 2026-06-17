@@ -26,6 +26,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from playwright.sync_api import sync_playwright, Frame, Page, TimeoutError as PlaywrightTimeoutError
@@ -36,6 +37,10 @@ from modules.load.load_onedrive import onedrive_csv_save
 from modules.transform.utility.playwright_launcher import launch_chromium
 
 logger = logging.getLogger(__name__)
+
+
+def _kst_now() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Seoul")).replace(tzinfo=None)
 
 # ============================================================
 # 상수
@@ -1068,7 +1073,7 @@ def _upsert_daily_total_csv(sale_date: str, total: int, source: str) -> None:
     """자동 다운로드 일별합계를 _manual_daily_totals.csv에 누적 저장(upsert).
     당일(오늘) 데이터는 매출이 진행 중이므로 저장하지 않는다.
     """
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = _kst_now().strftime("%Y-%m-%d")
     if sale_date >= today:
         logger.info("일별합계 CSV 저장 스킵 (당일 이후): %s", sale_date)
         return
@@ -1369,7 +1374,7 @@ def _download_and_save_daily_totals(page: Page, download_dir: Path) -> dict[str,
                        date_col, total_col, list(df.columns))
         return {}
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = _kst_now().strftime("%Y-%m-%d")
     result: dict[str, int] = {}
     for _, r in df.iterrows():
         sale_date = _normalize_sale_date(r.get(date_col))
@@ -1689,7 +1694,7 @@ def _collect_all_receipts(page: Page, mf: Frame, sale_date: str) -> list:
 def _get_missing_easypos_dates(lookback_days: int) -> list[str]:
     """최근 lookback_days일 중 raw CSV에 없는 날짜 반환."""
     missing = []
-    today = datetime.now()
+    today = _kst_now()
     for i in range(1, lookback_days + 1):
         d = today - timedelta(days=i)
         date_str = d.strftime("%Y-%m-%d")
@@ -1739,11 +1744,11 @@ def resolve_sale_dates(dag_date_from=None, dag_date_to=None, lookback_days=None,
         if sale_dates:
             logger.info(f"lookback {lookback_days}일: 누락 {len(sale_dates)}일 → {sale_dates}")
         else:
-            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            yesterday = (_kst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
             sale_dates = [yesterday]
             logger.info(f"lookback {lookback_days}일: 누락 없음 → 어제({yesterday}) 수집")
     else:
-        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        yesterday = (_kst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
         sale_dates = [yesterday]
         logger.info(f"어제 날짜 사용 → {yesterday}")
 
@@ -2163,7 +2168,7 @@ def verify_missing(**context) -> str:
         return f"스킵 (CSV 로드 실패: {e})"
 
     # manual totals 에 있는 전체 기간을 검증하되, 당일(오늘)은 매출 진행 중이므로 제외
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = _kst_now().strftime("%Y-%m-%d")
 
     ref_map: dict[str, int] = {}
     if "sale_date" in ref_df.columns and "total_sales" in ref_df.columns:

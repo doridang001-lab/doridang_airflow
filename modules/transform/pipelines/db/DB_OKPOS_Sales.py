@@ -18,6 +18,7 @@ import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
+from zoneinfo import ZoneInfo
 from zipfile import BadZipFile
 
 import pandas as pd
@@ -33,6 +34,10 @@ from modules.transform.utility.paths import ANALYTICS_DB, ONEDRIVE_DB, RAW_OKPOS
 from modules.transform.utility.selenium_uc import configure_uc_data_path
 
 logger = logging.getLogger(__name__)
+
+
+def _kst_now() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Seoul")).replace(tzinfo=None)
 
 # ============================================================
 # 상수
@@ -74,6 +79,9 @@ PAGE_TYPES = {
 DOWNLOAD_TIMEOUT = 120
 WAIT_TIMEOUT     = 30
 HEADLESS_MODE    = os.getenv("AIRFLOW_HOME") is not None
+
+# 어제/그제는 OKPOS 마감 지연으로 거짓 NO_DATA가 남기 쉬워 재확인한다.
+_NO_DATA_RETRY_RECENT_DAYS = 2
 
 
 # ============================================================
@@ -121,12 +129,18 @@ def _read_no_data_dates(marker_path: Path) -> set[str]:
 
 def _mark_no_data(store_short: str, ym: str, csv_stem: str, sale_date: str, reason: str) -> None:
     """sale_date를 'NO_DATA'로 마킹하여 이후 재다운로드/누락체크에서 제외되게 한다."""
+    try:
+        if datetime.strptime(sale_date, "%Y-%m-%d").date() >= _kst_now().date():
+            logger.info("당일/미래 데이터 NO_DATA 마킹 스킵: %s | %s", sale_date, reason)
+            return
+    except Exception:
+        pass
     marker_path = _no_data_marker_path(store_short, ym, csv_stem)
     marker_path.parent.mkdir(parents=True, exist_ok=True)
     existing = _read_no_data_dates(marker_path)
     if sale_date in existing:
         return
-    now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_ts = _kst_now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"{sale_date}\t{reason}\t{now_ts}\n"
     try:
         marker_path.write_text(
@@ -477,7 +491,11 @@ def _launch_browser(download_dir: Path) -> uc.Chrome:
         options.add_argument("--no-first-run")
         options.add_argument("--no-default-browser-check")
         options.add_argument("--disable-background-networking")
+        options.add_argument("--disable-background-timer-throttling")
         options.add_argument("--disable-extensions")
+        options.add_argument("--disable-ipc-flooding-protection")
+        options.add_argument("--disable-renderer-backgrounding")
+        options.add_argument("--disable-software-rasterizer")
         options.add_argument("--window-size=1920,1080")
         if platform.system() == "Windows":
             options.add_argument("--disable-crash-reporter")
@@ -564,6 +582,11 @@ def _is_transient_connection_error(exc: Exception) -> bool:
         return any(
             k in msg
             for k in (
+                "browser session died",
+                "browser session is not alive",
+                "chrome not reachable",
+                "target window",
+                "no such window",
                 "connection aborted",
                 "remotedisconnected",
                 "connection refused",
@@ -604,7 +627,13 @@ def _filter_missing_keys(sale_dates: list, csv_name: str) -> list:
             if marker_path not in marker_cache:
                 marker_cache[marker_path] = _read_no_data_dates(marker_path)
             if sale_date in marker_cache[marker_path]:
-                continue
+                try:
+                    sale_day = datetime.strptime(sale_date, "%Y-%m-%d").date()
+                    is_recent = (_kst_now().date() - sale_day).days <= _NO_DATA_RETRY_RECENT_DAYS
+                except Exception:
+                    is_recent = False
+                if not is_recent:
+                    continue
             if not csv_path.exists():
                 missing.append((sale_date, store))
                 continue
@@ -1265,6 +1294,9 @@ def _download_excel_for_store(
     for store_attempt in range(1, store_retry_max + 1):
         attempt_tag = f"{tag}[try {store_attempt}/{store_retry_max}]"
         try:
+            if not _is_driver_alive(driver):
+                raise WebDriverException("browser session is not alive before store retry")
+
             # ── 0. 매장마다 페이지 재로드 (IBSheet 중복 방지) ──────────────────
             logger.info(f"{attempt_tag} 페이지 재로드: {page_cfg['url']}")
             driver.get(page_cfg["url"])
@@ -1368,6 +1400,11 @@ def _download_excel_for_store(
                 raise
 
             if store_attempt < store_retry_max:
+                if not _is_driver_alive(driver):
+                    logger.warning(
+                        f"{attempt_tag} 실패 후 WebDriver 세션이 죽음 → 브라우저 재생성 경로로 위임: {exc}"
+                    )
+                    raise WebDriverException("browser session died after store attempt") from exc
                 logger.warning(f"{attempt_tag} 실패 → {store_retry_wait}s 후 재시도: {exc}")
                 time.sleep(store_retry_wait)
                 continue
@@ -1396,12 +1433,13 @@ def _download_excel_for_store(
 
             logger.exception(f"{attempt_tag} 다운로드 최종 실패 (상세 traceback)")
             _dismiss_alert(driver)
-            # TimeoutException 최종 실패 → 휴무/미등록/빈결과 등 "데이터 없음"으로 추정.
-            # 연결 오류(_is_transient_connection_error)는 위에서 raise로 브라우저 재시도에 위임되므로
-            # 여기까지 도달하면 "OKPOS 페이지 조작 자체는 됐으나 결과 없음" 케이스다.
+            # TimeoutException은 "데이터 없음"이 아니라 다운로드 실패로 본다.
+            # 여기서 __NO_DATA__로 바꾸면 Airflow task가 success 처리되고,
+            # .no_data__*.txt 마커가 생겨 이후 재수집까지 차단된다.
+            # 실제 NO_DATA는 OKPOS 화면/엑셀 파싱 단계에서 명확히 확인된 경우에만 마킹한다.
             if isinstance(exc, TimeoutException):
-                logger.warning(f"{attempt_tag} 타임아웃 최종 실패({exc}) → NO_DATA 표시 (재시도 불필요)")
-                return "__NO_DATA__"
+                logger.warning(f"{attempt_tag} 타임아웃 최종 실패({exc}) → 다운로드 실패로 처리")
+                return None
             return None
 
 
@@ -1409,7 +1447,7 @@ def _download_excel_for_store(
 # Task 함수
 # ============================================================
 
-def resolve_sale_dates(manual_date_range=None, **context) -> str:
+def resolve_sale_dates(manual_date_range=None, lookback_days=None, **context) -> str:
     """실행 날짜 범위 결정 (MANUAL_DATE_RANGE > dag_run.conf > yesterday 순)
 
     Args:
@@ -1446,9 +1484,17 @@ def resolve_sale_dates(manual_date_range=None, **context) -> str:
         while current <= dt_to:
             sale_dates.append(current.strftime("%Y-%m-%d"))
             current += timedelta(days=1)
+    elif lookback_days:
+        # 각 download task가 이미 수집된 (date, store)는 skip한다.
+        today = _kst_now()
+        sale_dates = [
+            (today - timedelta(days=i)).strftime("%Y-%m-%d")
+            for i in range(lookback_days, 0, -1)
+        ]
+        source = f"lookback {lookback_days}일"
     else:
         # 3순위: 어제 (기본값)
-        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        yesterday = (_kst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
         sale_dates = [yesterday]
         source = "yesterday(기본)"
 
@@ -1889,13 +1935,57 @@ def _transform_okpos_daily_df(df: pd.DataFrame, store_name: str, sale_date: str)
     출력 컬럼(최소):
     - sale_date, ym, 매장명, 총매출액, 총할인액, 실매출액, 영수건수, collected_at, _pk
     """
-    # _read_okpos_excel()이 이미 header_row를 추정해 컬럼을 세팅해준다.
-    # 따라서 컬럼에 '일자'/'실매출'이 이미 있으면 재헤더링하지 않는다.
+    def _clean_col(value) -> str:
+        return re.sub(r"\s+", "", str(value or "").strip())
+
+    def _normalize_store(value) -> str:
+        return re.sub(r"\s+", "", str(value or "").strip())
+
+    def _normalize_daily_columns(frame: pd.DataFrame) -> pd.DataFrame:
+        aliases = {
+            "일자": {"일자", "날짜", "영업일자"},
+            "영업매장": {"영업매장", "매장명", "매장", "점포명"},
+            "총매출액": {"총매출액", "총매출", "합매출", "매출액"},
+            "총할인액": {"총할인액", "총할인", "할인액", "할인금액"},
+            "실매출액": {"실매출액", "실매출", "순매출", "순매출액"},
+            "영수건수": {"영수건수", "영수증건수", "객수(수)", "객수", "건수"},
+        }
+        rename_map: dict[str, str] = {}
+        used: set[str] = set()
+        for col in frame.columns:
+            compact = _clean_col(col)
+            for canonical, names in aliases.items():
+                if canonical in used:
+                    continue
+                if compact in {_clean_col(name) for name in names}:
+                    rename_map[col] = canonical
+                    used.add(canonical)
+                    break
+        return frame.rename(columns=rename_map)
+
+    def _to_amount(value) -> int:
+        text = str(value if value is not None else "").strip()
+        if not text or text.lower() in {"nan", "none", "<na>"}:
+            return 0
+        text = text.replace(",", "")
+        if text.startswith("(") and text.endswith(")"):
+            text = "-" + text[1:-1]
+        text = re.sub(r"[^\d.-]", "", text)
+        result = pd.to_numeric(text, errors="coerce")
+        return int(result) if pd.notna(result) else 0
+
+    def _amount_from_row(row: pd.Series, *cols: str) -> int:
+        for col in cols:
+            if col in row.index:
+                return _to_amount(row.get(col))
+        return 0
+
     raw = df.copy()
     raw = raw.replace(r"^\s*$", pd.NA, regex=True)
 
     # 1) 정상 케이스: 컬럼이 이미 존재
-    _DAILY_AMT_COLS = {"실매출", "실매출액", "합매출", "총매출"}
+    raw = _normalize_daily_columns(raw)
+    _DAILY_AMT_COLS = {"실매출액", "총매출액", "총할인액"}
     if "일자" in raw.columns and bool(_DAILY_AMT_COLS & set(raw.columns)):
         data = raw.copy()
     else:
@@ -1903,8 +1993,9 @@ def _transform_okpos_daily_df(df: pd.DataFrame, store_name: str, sale_date: str)
         header_row = None
         for i in range(min(8, len(raw))):
             row = raw.iloc[i].astype(str).map(lambda s: (s or "").strip()).tolist()
-            row_set = set(row)
-            if "일자" in row_set and bool(_DAILY_AMT_COLS & row_set):
+            normalized_row = [_clean_col(v) for v in row]
+            row_set = set(normalized_row)
+            if "일자" in row_set and bool(row_set & {_clean_col(c) for c in _DAILY_AMT_COLS | {"실매출", "합매출", "총매출"}}):
                 header_row = i
                 break
         if header_row is None:
@@ -1913,6 +2004,7 @@ def _transform_okpos_daily_df(df: pd.DataFrame, store_name: str, sale_date: str)
         cols = raw.iloc[header_row].astype(str).map(lambda s: (s or "").strip()).tolist()
         data = raw.iloc[header_row + 1 :].copy()
         data.columns = cols
+        data = _normalize_daily_columns(data)
 
         for c in list(data.columns):
             if str(c).startswith("Unnamed"):
@@ -1920,20 +2012,44 @@ def _transform_okpos_daily_df(df: pd.DataFrame, store_name: str, sale_date: str)
 
     if "일자" not in data.columns:
         raise ValueError("daily 엑셀 파싱 실패: '일자' 컬럼 없음")
+    if not bool(_DAILY_AMT_COLS & set(data.columns)):
+        raise ValueError(f"daily 엑셀 파싱 실패: 금액 컬럼 없음 columns={list(data.columns)}")
 
     data["일자"] = data["일자"].astype(str).str.strip()
 
-    # 케이스 A) (구 포맷) 기간 리포트: '소계:' 행에 날짜별 합계가 있다.
-    sub = data[data["일자"].str.startswith("소계:")].copy()
-    if not sub.empty:
+    # 케이스 A) 현재 포맷: 날짜 x 영업매장 행에 매장별 금액이 있다.
+    row = pd.DataFrame()
+    if "영업매장" in data.columns:
+        dt = pd.to_datetime(data["일자"].astype(str).str.strip(), errors="coerce")
+        rows = data[dt.notna()].copy()
+        if not rows.empty:
+            rows["_sale_date"] = dt[dt.notna()].dt.strftime("%Y-%m-%d")
+            rows["_store_key"] = rows["영업매장"].map(_normalize_store)
+            wanted_store = _normalize_store(store_name)
+            row = rows[(rows["_sale_date"] == sale_date) & (rows["_store_key"] == wanted_store)].copy()
+            if row.empty:
+                store_short = store_name.replace("도리당 ", "", 1)
+                row = rows[
+                    (rows["_sale_date"] == sale_date)
+                    & rows["_store_key"].str.contains(re.escape(_normalize_store(store_short)), na=False)
+                ].copy()
+            if not row.empty:
+                row = row.iloc[:1].copy()
+
+    # 케이스 B) (구 포맷) 기간 리포트: '소계:' 행에 날짜별 합계가 있다.
+    if row.empty:
+        sub = data[data["일자"].str.startswith("소계:")].copy()
+    else:
+        sub = pd.DataFrame()
+    if row.empty and not sub.empty:
         sub["sale_date"] = sub["일자"].str.extract(r"(\d{4}-\d{2}-\d{2})")[0]
         row = sub[sub["sale_date"] == sale_date].copy()
         if row.empty:
             raise ValueError(f"daily 엑셀에 해당 날짜 소계 없음: {sale_date}")
         row = row.iloc[:1].copy()
 
-    # 케이스 B) (신 포맷) 단일 일자 리포트: '영업일수합:' 행 1개만 존재 (Airflow 로그 케이스)
-    else:
+    # 케이스 C) 단일 일자 리포트: '영업일수합:' 행 1개만 존재한다.
+    if row.empty:
         row = data[data["일자"].str.startswith("영업일수합:")].copy()
         if row.empty and ("영업매장" in data.columns):
             # 일부 포맷에서 '영업일수합:' 문자열이 누락될 수 있어, '합계' 행으로도 시도한다.
@@ -1945,25 +2061,37 @@ def _transform_okpos_daily_df(df: pd.DataFrame, store_name: str, sale_date: str)
             raise ValueError("daily 엑셀 파싱 실패: '소계:'/'영업일수합:'/합계 행 모두 없음")
         row = row.iloc[:1].copy()
 
-    def _num(*cols: str) -> int:
-        for col in cols:
-            if col in row.columns:
-                v = str(row.iloc[0][col]).replace(",", "").strip()
-                result = pd.to_numeric(v, errors="coerce")
-                if pd.notna(result):
-                    return int(result)
-        return 0
+    row_series = row.iloc[0]
 
     out = pd.DataFrame([{
         "sale_date": sale_date,
         "ym": sale_date[:7],
         "매장명": store_name,
-        "총매출액": _num("총매출", "합매출"),
-        "총할인액": _num("총할인", "할인액"),
-        "실매출액": _num("실매출", "실매출액"),
-        "영수건수": _num("영수건수", "객수(수)"),
+        "총매출액": _amount_from_row(row_series, "총매출액"),
+        "총할인액": _amount_from_row(row_series, "총할인액"),
+        "실매출액": _amount_from_row(row_series, "실매출액"),
+        "영수건수": _amount_from_row(row_series, "영수건수"),
         "collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }])
+
+    out_amount_sum = int(out[["총매출액", "총할인액", "실매출액", "영수건수"]].sum(axis=1).iloc[0])
+    if out_amount_sum == 0:
+        amount_cols = [c for c in ("총매출액", "총할인액", "실매출액", "영수건수") if c in data.columns]
+        nonzero_source_found = False
+        if amount_cols:
+            dt = pd.to_datetime(data["일자"].astype(str).str.strip(), errors="coerce")
+            same_date_rows = data[dt.dt.strftime("%Y-%m-%d") == sale_date].copy()
+            scan_rows = same_date_rows if not same_date_rows.empty else data
+            for _, src_row in scan_rows.iterrows():
+                if any(_to_amount(src_row.get(c)) != 0 for c in amount_cols):
+                    nonzero_source_found = True
+                    break
+        if nonzero_source_found:
+            raise ValueError(
+                "daily 엑셀 파싱 실패: 선택된 행은 0원이지만 같은 날짜 원본에 0이 아닌 금액이 있습니다 "
+                f"(sale_date={sale_date}, store={store_name}, selected={row_series.to_dict()})"
+            )
+
     out["_pk"] = out.apply(
         lambda r: hashlib.md5(f"{r['sale_date']}|{r['매장명']}|daily".encode()).hexdigest(),
         axis=1,
@@ -2356,6 +2484,7 @@ def save_to_raw(**context) -> str:
                     )
                 src.unlink(missing_ok=True)
                 saved.append(str(dest))
+                _unmark_no_data(store_short, ym, csv_name, sale_date)
                 logger.info(
                     f"저장 완료: {dest.relative_to(RAW_OKPOS_SALES)} | "
                     f"신규={result.get('inserted',0)} 중복={result.get('duplicated',0)}"

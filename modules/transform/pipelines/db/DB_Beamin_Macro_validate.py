@@ -12,20 +12,121 @@
 """
 
 import logging
+import re
 from collections import defaultdict
 from pathlib import Path
 
 import pandas as pd
 import pendulum
 
-from modules.transform.pipelines.db.DB_Beamin_04_orders import collect_orders_for_account
+from modules.transform.pipelines.db.DB_Beamin_04_orders import collect_orders_for_account, _COLUMNS
 from modules.transform.utility.paths import ANALYTICS_DB, BAEMIN_ORDERS_DB
+from modules.transform.pipelines.db.beamin_store_io import (
+    find_tables,
+    read_file,
+    read_table,
+    write_table,
+)
+from modules.transform.utility.store_normalize import normalize as normalize_store_names, strip_brand
 
 logger = logging.getLogger(__name__)
 
 KST = pendulum.timezone("Asia/Seoul")
 
 TOORDER_DAILY_DIR = ANALYTICS_DB / "toorder_daily_sales"
+
+
+def _manual_baemin_store_meta(raw_store_name: str, fallback_name: str = "") -> tuple[str, str]:
+    """Returns (store_key, brand) parsed from a manual Baemin CSV source name."""
+    text = str(raw_store_name or fallback_name or "").strip()
+    if not text:
+        return "", ""
+    text = re.sub(r"\[.*?\]\s*", "", text).strip()
+    brand = "나홀로" if "나홀로" in text else ("도리당" if "도리당" in text else "")
+    matches = re.findall(r"[가-힣A-Za-z0-9]+(?:점|지점|분점|직영점)", text)
+    branch = matches[-1] if matches else (text.split()[-1] if text.split() else text)
+    normalized = f"{brand} {branch}".strip() if brand else branch
+    normalized_series = normalize_store_names(pd.Series([normalized]))
+    branch_series = strip_brand(normalized_series)
+    return str(branch_series.iloc[0]).strip(), brand
+
+
+def _manual_baemin_filename_fallback(csv_path: Path) -> str:
+    stem = csv_path.stem
+    stem = re.sub(r"^baemin_orders_", "", stem)
+    stem = re.sub(r"_unknown_\d{8}$", "", stem)
+    return stem.replace("_", " ").strip()
+
+
+def import_manual_baemin_csvs(
+    target_date: str,
+    base_dir: Path,
+    file_pattern: str | None = None,
+) -> dict[str, int]:
+    """Import manual Baemin order CSVs into the monthly orders DB partition."""
+    ym = target_date[:7]
+    date_prefix = target_date.replace("-", ". ") + "."
+    now_str = pendulum.now(KST).isoformat()
+    imported: dict[str, int] = {}
+
+    pattern = str(file_pattern or "baemin_orders_*.csv")
+    for csv_path in sorted(base_dir.glob(pattern)):
+        try:
+            df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+        except Exception as exc:
+            logger.warning("manual import read failed: %s / %s", csv_path.name, exc)
+            continue
+        if df.empty:
+            continue
+
+        fallback_name = _manual_baemin_filename_fallback(csv_path)
+        raw_store = ""
+        if "store_name" in df.columns and not df["store_name"].dropna().empty:
+            raw_store = str(df["store_name"].dropna().astype(str).iloc[0])
+        store_key, brand = _manual_baemin_store_meta(raw_store, fallback_name)
+        if not store_key or not brand:
+            logger.warning("manual import store parse failed: %s / raw=%s", csv_path.name, raw_store)
+            continue
+
+        required = {"주문상태", "주문번호", "주문시각", "결제금액"}
+        if not required.issubset(df.columns):
+            logger.warning("manual import missing required columns: %s", csv_path.name)
+            continue
+
+        target_df = df[
+            (df["주문상태"].astype(str) == "배달완료")
+            & df["주문시각"].astype(str).str.startswith(date_prefix, na=False)
+            & df["결제금액"].astype(str).str.strip().ne("")
+        ].copy()
+        if target_df.empty:
+            continue
+
+        target_df["collected_at"] = now_str
+        target_df["store_name"] = store_key
+        target_df = target_df.reset_index(drop=True)
+
+        new_df = pd.DataFrame("", index=target_df.index, columns=_COLUMNS, dtype=str)
+        for col in _COLUMNS:
+            if col in target_df.columns:
+                new_df[col] = target_df[col].astype(str).values
+        new_df = new_df.fillna("").astype(str)
+
+        stem = BAEMIN_ORDERS_DB / f"brand={brand}" / f"store={store_key}" / f"ym={ym}" / f"orders_{ym}"
+
+        new_order_ids = set(new_df["주문번호"].unique())
+        existing = read_table(stem)
+        if existing is not None:
+            existing = existing[~existing["주문번호"].isin(new_order_ids)]
+            combined = pd.concat([existing, new_df], ignore_index=True)
+        else:
+            combined = new_df
+        out_path = write_table(combined, stem)
+
+        key = f"{brand}/{store_key}"
+        imported[key] = imported.get(key, 0) + len(new_df)
+        logger.info("manual import 완료: %s -> %d행 (%s)", key, len(new_df), out_path)
+
+    return imported
 
 
 # ============================================================
@@ -85,14 +186,14 @@ def _baemin_orders_by_store(target_date: str) -> dict:
     ym = target_date[:7]
     date_prefix = target_date.replace("-", ". ") + "."
 
-    csv_paths = list(BAEMIN_ORDERS_DB.glob(f"brand=*/store=*/ym={ym}/orders_{ym}.csv"))
-    logger.info("배민 orders CSV: %d개 (ym=%s)", len(csv_paths), ym)
+    csv_paths = find_tables(BAEMIN_ORDERS_DB, f"brand=*/store=*/ym={ym}/orders_{ym}")
+    logger.info("배민 orders 파일: %d개 (ym=%s)", len(csv_paths), ym)
 
     store_frames: dict = defaultdict(list)
     for csv_path in csv_paths:
         store_name = csv_path.parts[-3][len("store="):]
         try:
-            df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+            df = read_file(csv_path)
             if df.empty:
                 continue
             mask = (
@@ -152,11 +253,11 @@ def _inspect_brand_coverage(
         expected = set((expected_brands or {}).get(store_name) or [])
         existing: set[str] = set()
         active: set[str] = set()
-        for csv_path in BAEMIN_ORDERS_DB.glob(f"brand=*/store={store_name}/ym={ym}/orders_{ym}.csv"):
+        for csv_path in find_tables(BAEMIN_ORDERS_DB, f"brand=*/store={store_name}/ym={ym}/orders_{ym}"):
             brand = csv_path.parts[-4][len("brand="):]
             existing.add(brand)
             try:
-                df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+                df = read_file(csv_path)
             except Exception as exc:
                 logger.warning("brand coverage read failed: %s / %s", csv_path, exc)
                 continue
@@ -200,24 +301,24 @@ def _delete_orders_for_stores(target_date: str, store_names: list) -> int:
     deleted_total = 0
 
     for store_name in store_names:
-        csv_paths = list(
-            BAEMIN_ORDERS_DB.glob(f"brand=*/store={store_name}/ym={ym}/orders_{ym}.csv")
+        csv_paths = find_tables(
+            BAEMIN_ORDERS_DB, f"brand=*/store={store_name}/ym={ym}/orders_{ym}"
         )
         for csv_path in csv_paths:
             try:
-                df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+                df = read_file(csv_path)
                 before = len(df)
                 df = df[~df["주문시각"].str.startswith(date_prefix, na=False)]
                 deleted = before - len(df)
                 if deleted > 0:
-                    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+                    write_table(df, csv_path.with_suffix(""))
                     logger.info(
                         "행 삭제: %s / %s → %d행",
                         csv_path.parts[-4], store_name, deleted,
                     )
                     deleted_total += deleted
             except Exception as exc:
-                logger.warning("CSV 삭제 실패: %s / %s", csv_path, exc)
+                logger.warning("orders 행 삭제 실패: %s / %s", csv_path, exc)
 
     logger.info("총 삭제 행: %d (stores=%s)", deleted_total, store_names)
     return deleted_total
@@ -227,7 +328,7 @@ def _delete_orders_for_stores(target_date: str, store_names: list) -> int:
 def delete_baemin_orders_for_date(target_date: str) -> int:
     ym = target_date[:7]
     date_prefix = target_date.replace("-", ". ") + "."
-    csv_paths = list(BAEMIN_ORDERS_DB.glob(f"brand=*/store=*/ym={ym}/orders_{ym}.csv"))
+    csv_paths = find_tables(BAEMIN_ORDERS_DB, f"brand=*/store=*/ym={ym}/orders_{ym}")
     all_stores = list({p.parts[-3][len("store="):] for p in csv_paths})
     return _delete_orders_for_stores(target_date, all_stores)
 
@@ -337,11 +438,8 @@ def validate_toorder_orders(
         for s in item.get("stores", [])
         if s.get("store")
     }
-    if collected_stores:
-        compare_stores = set(toorder_by_store) & collected_stores
-    else:
-        # 폴백: 수집 메타가 없으면 배민 데이터가 있는 매장만 비교 (미수집 매장 제외)
-        compare_stores = set(toorder_by_store) & set(baemin_by_store)
+    baemin_has_data = {store for store, amount in baemin_by_store.items() if amount > 0}
+    compare_stores = set(toorder_by_store) & (collected_stores | baemin_has_data)
     expected_brands = _expected_brands_by_store(store_info_per_account)
     brand_coverage = _inspect_brand_coverage(target_date, compare_stores, expected_brands)
     result["compared_count"] = len(compare_stores)

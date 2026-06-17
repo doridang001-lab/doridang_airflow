@@ -1,5 +1,5 @@
 """
-로컬 Ollama LLM 클라이언트 래퍼 (gpt-oss 메인)
+로컬 Ollama LLM 클라이언트 래퍼 (qwen 메인)
 """
 import json
 import logging
@@ -20,12 +20,14 @@ OLLAMA_HOST_CANDIDATES = [
     "http://127.0.0.1:11434",            # localhost 대체
 ]
 LLM_MODEL_CANDIDATES = [
-    "gpt-oss:20b",
-    "gpt-oss:latest",
-    "gpt-oss",
     "qwen2.5:7b",
     "qwen2.5:latest",
     "qwen2.5",
+    "qwen:latest",
+    "qwen",
+    "gpt-oss:20b",
+    "gpt-oss:latest",
+    "gpt-oss",
     "gemma2:2b",
 ]
 LLM_CHAT_OPTIONS = {
@@ -110,9 +112,11 @@ def _should_mark_model_unhealthy(exc: Exception) -> bool:
     return any(hint in message for hint in MODEL_UNHEALTHY_HINTS)
 
 
-def _prioritize_primary_models(model_candidates: list[str]) -> list[str]:
+def _prioritize_primary_models(model_candidates: list[str], prefer_stable: bool = True) -> list[str]:
     gpt_oss = [m for m in model_candidates if "gpt-oss" in m]
     stable = [m for m in model_candidates if "gpt-oss" not in m]
+    if prefer_stable:
+        return stable + gpt_oss
     return gpt_oss + stable
 
 
@@ -120,10 +124,14 @@ def _chat_options_for_model(model_name: str, is_json: bool = False) -> dict:
     if "gpt-oss" in model_name:
         options = dict(GPT_OSS_OPTIONS)
         if is_json:
-            options["num_predict"] = min(options.get("num_predict", 128), 96)
+            options["num_predict"] = 256
             options["top_p"] = 0.5
         return options
-    return dict(LLM_CHAT_OPTIONS)
+    options = dict(LLM_CHAT_OPTIONS)
+    if is_json:
+        options["num_predict"] = max(options.get("num_predict", 220), 512)
+        options["temperature"] = 0
+    return options
 
 
 def get_ollama_client_with_candidates():
@@ -200,23 +208,7 @@ def _generate_content(response, model_name: str) -> str:
     return content
 
 
-def _extract_json_object(text: str) -> str:
-    """텍스트 안의 첫 JSON 객체를 중괄호 밸런싱으로 추출한다."""
-    text = (text or "").strip()
-    if not text:
-        raise ValueError("LLM 응답이 비어 있습니다")
-
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
-    if fenced:
-        return fenced.group(1).strip()
-
-    if text.startswith("{") and text.endswith("}"):
-        return text
-
-    start = text.find("{")
-    if start == -1:
-        raise ValueError("JSON 형식을 찾지 못했습니다")
-
+def _extract_from_pos(text: str, start: int) -> str | None:
     depth = 0
     in_str = False
     escape = False
@@ -239,6 +231,37 @@ def _extract_json_object(text: str) -> str:
             depth -= 1
             if depth == 0:
                 return text[start:idx + 1]
+
+    return None
+
+
+def _extract_json_object(text: str) -> str:
+    """텍스트 안의 JSON 객체를 추출한다. reasoning text가 앞에 있어도 처리한다."""
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("LLM 응답이 비어 있습니다")
+
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        return fenced.group(1).strip()
+
+    if text.startswith("{") and text.endswith("}"):
+        return text
+
+    last_brace = text.rfind("{")
+    if last_brace != -1:
+        candidate = _extract_from_pos(text, last_brace)
+        if candidate:
+            return candidate
+
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("JSON 형식을 찾지 못했습니다")
+    candidate = _extract_from_pos(text, start)
+    if candidate:
+        return candidate
 
     raise ValueError("JSON 객체 경계를 찾지 못했습니다")
 
@@ -292,6 +315,8 @@ def query_qwen_json(
     prompt: str,
     system_prompt: Optional[str] = None,
     preferred_models: Optional[list] = None,
+    client=None,
+    model_candidates: Optional[list] = None,
 ) -> dict:
     """
     qwen에 JSON 응답 요청
@@ -304,11 +329,12 @@ def query_qwen_json(
     Returns:
         dict: JSON 파싱된 응답
     """
-    try:
-        client, model_candidates = get_ollama_client_with_candidates()
-    except Exception as e:
-        logger.error(f"Ollama 초기화 실패: {e}")
-        raise
+    if client is None or model_candidates is None:
+        try:
+            client, model_candidates = get_ollama_client_with_candidates()
+        except Exception as e:
+            logger.error(f"Ollama 초기화 실패: {e}")
+            raise
 
     if preferred_models:
         available = {m for m in model_candidates}
@@ -327,10 +353,11 @@ def query_qwen_json(
             attempts = 2 if "gpt-oss" in model_name else 1
             for attempt in range(1, attempts + 1):
                 request_messages = messages
-                if attempt > 1 and "gpt-oss" in model_name:
+                if "gpt-oss" in model_name:
                     strict_system = (
                         "반드시 유효한 JSON 객체만 출력하세요. "
-                        "설명, 마크다운, 코드블록, 추가 문장은 금지합니다."
+                        "설명, 마크다운, 코드블록, 추가 문장은 금지합니다. "
+                        "문자열 값은 짧게 작성하고 모든 따옴표와 중괄호를 닫으세요."
                     )
                     request_messages = []
                     if system_prompt:
@@ -342,14 +369,19 @@ def query_qwen_json(
                         request_messages.append({"role": "system", "content": strict_system})
                     request_messages.append({"role": "user", "content": prompt})
 
-                response = client.chat(
-                    model=model_name,
-                    messages=request_messages,
-                    stream=False,
-                    think=False,
-                    options=_chat_options_for_model(model_name, is_json=True),
-                    format="json",
-                )
+                chat_kwargs = {
+                    "model": model_name,
+                    "messages": request_messages,
+                    "stream": False,
+                    "think": "gpt-oss" in model_name,
+                    "options": _chat_options_for_model(model_name, is_json=True),
+                }
+                # gpt-oss는 Ollama format=json에서 CUDA/stack buffer 오류가 나는 경우가 있어
+                # 일반 chat + 엄격 JSON 프롬프트로 JSON 텍스트를 받는다.
+                if "gpt-oss" not in model_name:
+                    chat_kwargs["format"] = "json"
+
+                response = client.chat(**chat_kwargs)
                 response_text = _response_content(response, model_name)
                 last_response_text = response_text
                 try:
@@ -362,7 +394,8 @@ def query_qwen_json(
                         return json.loads(json_flat)
                 except Exception as parse_exc:
                     last_error = parse_exc
-                    logger.warning(
+                    log_func = logger.info if attempt < attempts else logger.warning
+                    log_func(
                         "JSON 모델 %s 파싱 실패(%s/%s): %s",
                         model_name,
                         attempt,

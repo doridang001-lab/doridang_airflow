@@ -22,6 +22,7 @@ from modules.transform.pipelines.db.db_baemin_marketing import (
     save_partitioned_csv,
     write_baemin_log,
 )
+from modules.transform.utility.notifier import on_failure_callback
 
 # ==================================================
 # DAG 정의
@@ -37,6 +38,7 @@ with DAG(
     default_args={
         'retries': 1,
         'retry_delay': timedelta(minutes=5),
+    "on_failure_callback": on_failure_callback,
     },
     tags=['db', 'baemin', 'marketing'],
 ) as dag:

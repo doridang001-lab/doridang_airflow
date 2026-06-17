@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import csv
+import logging
 import os
 import time
+import zipfile
 from html import escape
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -13,6 +15,8 @@ import pendulum
 import pandas as pd
 
 from modules.transform.utility.paths import ANALYTICS_DB
+
+logger = logging.getLogger(__name__)
 
 
 AI_DAILY_COLLECTION_DIR = ANALYTICS_DB / "ai_daily_collection"
@@ -25,6 +29,32 @@ PARQUET_FILENAME = "toorder_daily_store_all.parquet"
 
 def _default_ai_daily_collection_dir() -> Path:
     return AI_DAILY_COLLECTION_DIR
+
+
+def _xlsx_validation_error(path: Path) -> str | None:
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = set(zf.namelist())
+    except (OSError, zipfile.BadZipFile) as exc:
+        return f"xlsx zip open failed: {type(exc).__name__}: {exc}"
+
+    missing = [name for name in ("[Content_Types].xml", "xl/workbook.xml") if name not in names]
+    if missing:
+        preview = ", ".join(sorted(names)[:5])
+        return f"xlsx required parts missing: {missing}; members={preview}"
+    return None
+
+
+def _quarantine_invalid_xlsx(path: Path, reason: str) -> Path:
+    quarantine_dir = path.parent / "_invalid_xlsx"
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    target = quarantine_dir / path.name
+    if target.exists():
+        target = quarantine_dir / f"{path.stem}_invalid_{pendulum.now('Asia/Seoul').format('YYYYMMDD_HHmmss')}{path.suffix}"
+    path.rename(target)
+    marker = target.with_suffix(target.suffix + ".reason.txt")
+    marker.write_text(reason, encoding="utf-8")
+    return target
 
 
 EXCLUDED_STORE_NAMES = {
@@ -157,6 +187,10 @@ def parse_toorder_daily_report(
     Returns:
         (report_date, [(date, store, order_count, sales), ...])
     """
+    invalid_reason = _xlsx_validation_error(xlsx_path)
+    if invalid_reason:
+        raise ValueError(f"Invalid xlsx report: {xlsx_path} | {invalid_reason}")
+
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
     ws = _find_daily_sheet_2(wb)
 
@@ -508,6 +542,19 @@ def ingest_ai_daily_collection_xlsx(
 ) -> Dict[str, object]:
     resolved_base_dir = Path(base_dir) if base_dir else _default_ai_daily_collection_dir()
     resolved_base_dir.mkdir(parents=True, exist_ok=True)
+    invalid_reason = _xlsx_validation_error(src_path)
+    if invalid_reason:
+        quarantined = _quarantine_invalid_xlsx(src_path, invalid_reason)
+        logger.warning("Invalid ToOrder daily xlsx quarantined: %s -> %s | %s", src_path, quarantined, invalid_reason)
+        return {
+            "source": src_path,
+            "raw_path": quarantined,
+            "report_date": None,
+            "upsert_rows": 0,
+            "skipped_invalid_xlsx": True,
+            "error": invalid_reason,
+        }
+
     report_date, rows = parse_toorder_daily_report(src_path)
     changed = _upsert_rows_to_daily_parquet(resolved_base_dir, _rows_to_dataframe(rows))
     raw_path = rename_ai_daily_collection_xlsx_to_raw(src_path) if (rename_to_raw or src_path.exists()) else src_path

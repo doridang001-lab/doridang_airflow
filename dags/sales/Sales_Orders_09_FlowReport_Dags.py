@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 logger = logging.getLogger(__name__)
 
 from modules.transform.utility.io import SMD_ORDERS_TIME
+from modules.transform.utility.notifier import on_failure_callback
 
 filename = os.path.basename(__file__)
 
@@ -818,6 +819,7 @@ with DAG(
         'depends_on_past': False,
         'email_on_failure': False,
         'email_on_retry': False,
+    "on_failure_callback": on_failure_callback,
     },
     tags=['flow', 'report', '영업관리', '리포트'],
 ) as dag:

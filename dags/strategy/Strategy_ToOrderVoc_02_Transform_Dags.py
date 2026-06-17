@@ -1,8 +1,8 @@
-"""
-투오더 VOC 전처리 DAG
+﻿"""
+?ъ삤??VOC ?꾩쿂由?DAG
 
-변경사항:
-- review_df_preprocess_df 태스크 내부에서 LLM secondary_category 분류 처리
+蹂寃쎌궗??
+- review_df_preprocess_df ?쒖뒪???대??먯꽌 LLM secondary_category 遺꾨쪟 泥섎━
 """
 
 import os
@@ -15,7 +15,7 @@ from airflow.operators.python import PythonOperator
 from airflow.sensors.external_task import ExternalTaskSensor
 
 from modules.common.config import ADMIN_EMAIL
-from modules.transform.utility.notifier import send_telegram
+from modules.transform.utility.notifier import enqueue_heal_task, send_telegram
 from modules.transform.pipelines.strategy.SMP_crawling_toorder_voc_02_trans import (
     load_toorder_voc_df,
     load_toorder_voc_upload_temp_df,
@@ -82,14 +82,15 @@ def _on_task_failure(context):
         logger.exception("Failure alert callback failed")
     try:
         _ti2 = context.get("task_instance") or context.get("ti")
-        _exc2 = context.get("exception", "알 수 없음")
+        _exc2 = context.get("exception", "?????놁쓬")
         _rd2 = getattr(_ti2, "execution_date", None)
         _ed2 = _rd2.strftime("%Y-%m-%d %H:%M") if _rd2 else ""
         _retry2 = getattr(_ti2, "try_number", 1) - 1
         send_telegram(
-            f"DAG: {_ti2.dag_id}\nTask: {_ti2.task_id}\n재시도: {_retry2}회차\n"
-            f"실행일시: {_ed2}\n에러: {_exc2}\n로그: {_ti2.log_url}\n해결해라"
+            f"DAG: {_ti2.dag_id}\nTask: {_ti2.task_id}\n?ъ떆?? {_retry2}?뚯감\n"
+            f"?ㅽ뻾?쇱떆: {_ed2}\n?먮윭: {_exc2}\n濡쒓렇: {_ti2.log_url}\n?닿껐?대씪"
         )
+        enqueue_heal_task(context)
     except Exception:
         pass
 
@@ -111,7 +112,7 @@ with DAG(
     },
 ) as dag:
 
-    # ── 01 DAG 완료 대기 ───────────────────────────────────────────
+    # ?? 01 DAG ?꾨즺 ?湲????????????????????????????????????????????
     wait_for_crawling = ExternalTaskSensor(
         task_id='wait_for_crawling',
         external_dag_id='Strategy_ToOrderVoc_01_Crawl_Dags',
@@ -123,7 +124,7 @@ with DAG(
         poke_interval=60,
     )
 
-    # ── 파일 로드 ──────────────────────────────────────────────────
+    # ?? ?뚯씪 濡쒕뱶 ??????????????????????????????????????????????????
     load_voc_df_task = PythonOperator(
         task_id='load_toorder_voc_df',
         python_callable=load_toorder_voc_df,
@@ -134,7 +135,7 @@ with DAG(
         python_callable=load_toorder_voc_upload_temp_df,
     )
 
-    # ── 집계 전처리 ────────────────────────────────────────────────
+    # ?? 吏묎퀎 ?꾩쿂由?????????????????????????????????????????????????
     store_summary_task = PythonOperator(
         task_id='voc_df_store_summary_preprocess_df',
         python_callable=voc_df_store_summary_preprocess_df,
@@ -153,7 +154,7 @@ with DAG(
         }
     )
 
-    # ── 리뷰 전처리 ────────────────────────────────────────────────
+    # ?? 由щ럭 ?꾩쿂由?????????????????????????????????????????????????
     review_summary_task = PythonOperator(
         task_id='review_df_preprocess_df',
         python_callable=review_df_preprocess_df,
@@ -161,11 +162,11 @@ with DAG(
             'input_xcom_key': 'toorder_voc_path',
             'output_xcom_key': 'toorder_voc_review_summary_path',
         },
-        # LLM 처리 시간 고려해 타임아웃 넉넉하게
+        # LLM 泥섎━ ?쒓컙 怨좊젮????꾩븘???됰꼮?섍쾶
         execution_timeout=pendulum.duration(hours=2),
     )
 
-    # ── GSheet 업로드 ──────────────────────────────────────────────
+    # ?? GSheet ?낅줈????????????????????????????????????????????????
     upload_store_task = PythonOperator(
         task_id='upload_store_summary_to_gsheet',
         python_callable=upload_store_summary_to_gsheet,
@@ -186,18 +187,18 @@ with DAG(
         python_callable=move_processed_voc_files,
     )
 
-    # ── 의존성 ────────────────────────────────────────────────────
-    # 01 완료 → 로드
+    # ?? ?섏〈??????????????????????????????????????????????????????
+    # 01 ?꾨즺 ??濡쒕뱶
     wait_for_crawling >> [load_voc_df_task, load_voc_upload_temp_df_task]
 
-    # 리뷰는 DOWN_DIR 기준, 집계는 업로드_temp 기준
+    # 由щ럭??DOWN_DIR 湲곗?, 吏묎퀎???낅줈??temp 湲곗?
     load_voc_df_task >> review_summary_task
     load_voc_upload_temp_df_task >> [store_summary_task, topic_summary_task]
 
-    # 각 전처리 → 각 업로드
-    store_summary_task >> upload_store_task
+    # 媛??꾩쿂由???媛??낅줈??    store_summary_task >> upload_store_task
     topic_summary_task >> upload_topic_task
     review_summary_task >> upload_review_task
 
-    # 모든 업로드 완료 후 원본 파일 이동
+    # 紐⑤뱺 ?낅줈???꾨즺 ???먮낯 ?뚯씪 ?대룞
     [upload_store_task, upload_topic_task, upload_review_task] >> move_processed_files_task
+

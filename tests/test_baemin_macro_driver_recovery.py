@@ -58,19 +58,12 @@ def test_collect_shop_change_retries_dead_store_and_continues():
         mock_time.sleep.return_value = None
         result = shop_change.collect_shop_change([account])
 
-    assert "store_fail=0" in result
+    assert "store_fail=0" in result["summary"]
 
 
 def test_collect_now_and_woori_bootstrap_recovery_failure_marks_account_failed():
     account = {"account_id": "acct1", "password": "pw"}
-    driver = MagicMock()
-    type(driver).current_url = property(
-        lambda _self: (_ for _ in ()).throw(Exception("Connection refused"))
-    )
-
-    with patch.object(combined, "launch_browser", return_value=driver), \
-         patch.object(combined, "login_baemin", return_value=True), \
-         patch.object(combined, "_recover_driver_for_stage", return_value=None):
+    with patch.object(combined, "_build_account_session", return_value=None):
         with pytest.raises(RuntimeError):
             combined.collect_now_and_woori([account])
 

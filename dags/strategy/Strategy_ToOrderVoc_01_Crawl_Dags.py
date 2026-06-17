@@ -20,6 +20,7 @@ from airflow.operators.python import PythonOperator
 from modules.transform.utility.paths import LOCAL_DB
 
 import sys
+from modules.transform.utility.notifier import on_failure_callback
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 filename = os.path.basename(__file__)
@@ -161,6 +162,7 @@ with DAG(
     default_args={
         "retries": 1,
         "retry_delay": pendulum.duration(minutes=5),
+    "on_failure_callback": on_failure_callback,
     },
 ) as dag:
 

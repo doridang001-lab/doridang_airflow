@@ -127,3 +127,23 @@ ollama_models/
 # Local scratch directories
 tmp/
 tmp_airflow/
+
+# Root temp/debug scratch artifacts
+output_temp.pptx
+*_unpacked*/
+qa_slides/
+tmp_*
+*_tmp.py
+*_debug.py
+*_debug.txt
+all_logs_summary.txt
+__read_excel_tmp.py
+tmp_debug_*.py
+tmp_debug_*.txt
+tmp_airflow_home/
+airflow_tmp/
+.airflow_tmp_test/
+.docker_tmp/
+.tmp/
+__pycache__/
+.pytest_cache/

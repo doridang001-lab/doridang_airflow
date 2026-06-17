@@ -22,6 +22,7 @@ from modules.transform.pipelines.db.DB_OKPOS_Sales import (
     WAIT_TIMEOUT,
     _click_search_btn,
     _dismiss_alert,
+    _kst_now,
     _launch_browser,
     _login,
     _select_store as _select_store_common,
@@ -56,13 +57,8 @@ def _resolve_sale_date(**context) -> str:
             raise ValueError(f"sale_date must be YYYY-MM-DD: {sale_date}") from exc
         source = "dag_run.conf.sale_date"
     else:
-        ds = context.get("ds")
-        if ds:
-            sale_date = str(ds)[:10]
-            source = "context.ds"
-        else:
-            sale_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-            source = "yesterday"
+        sale_date = (_kst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        source = "kst_yesterday"
 
     context["ti"].xcom_push(key="sale_date", value=sale_date)
     logger.info("OKPOS card test sale_date resolved: %s (%s)", sale_date, source)
@@ -818,8 +814,7 @@ def validate_okpos_card_lookback(lookback_days: int = 7, min_date: str = OKPOS_C
     if collected:
         today = datetime.strptime(collected, "%Y-%m-%d").date() + timedelta(days=1)
     else:
-        ds = context.get("ds")
-        today = datetime.strptime(str(ds)[:10], "%Y-%m-%d").date() + timedelta(days=1) if ds else datetime.now().date()
+        today = _kst_now().date()
     min_dt = datetime.strptime(min_date, "%Y-%m-%d").date()
     target_dates = [
         (today - timedelta(days=i)).strftime("%Y-%m-%d")

@@ -39,6 +39,7 @@ from modules.transform.pipelines.strategy.SMP_fdam_cs_mart import (
     save_mart,
     add_ai_columns,
 )
+from modules.transform.utility.notifier import on_failure_callback
 
 filename = os.path.basename(__file__)
 
@@ -173,6 +174,7 @@ with DAG(
         'depends_on_past': False,
         'email_on_failure': False,
         'email_on_retry': False,
+    "on_failure_callback": on_failure_callback,
     },
     tags=['03_mart', 'relay_cs', '매장cs', 'powerbi'],
 ) as dag:

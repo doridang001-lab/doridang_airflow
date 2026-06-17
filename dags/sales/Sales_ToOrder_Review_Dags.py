@@ -7,11 +7,12 @@ import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-from modules.transform.utility.notifier import send_telegram
+from modules.transform.utility.notifier import enqueue_heal_task, send_telegram
 from modules.transform.pipelines.sales.Sales_ToOrder_Review_collect import (
     t1_prepare,
     t2_collect,
     t3_save,
+    t4_validate,
 )
 
 # ── 수집 기간 설정 ─────────────────────────────────────────────────────
@@ -35,6 +36,7 @@ def _on_failure_callback(context):
         f"로그: {ti.log_url}"
     )
     send_telegram(body)
+    enqueue_heal_task(context)
 
 
 default_args = {
@@ -70,5 +72,10 @@ with DAG(
         python_callable=t3_save,
         retries=1,
     )
+    validate = PythonOperator(
+        task_id="t4_validate",
+        python_callable=t4_validate,
+        retries=1,
+    )
 
-    prepare >> collect >> save
+    prepare >> collect >> save >> validate

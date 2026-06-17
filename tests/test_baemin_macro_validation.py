@@ -3,6 +3,7 @@ from pathlib import Path
 
 from modules.transform.pipelines.db import DB_Beamin_Macro_validate as macro_validate
 from modules.transform.pipelines.db import DB_Beamin_combined as combined
+from modules.transform.utility.store_normalize import lookup_store_key
 
 
 DORIDANG = "\uB3C4\uB9AC\uB2F9"
@@ -23,6 +24,74 @@ def test_filter_store_list_for_request_keeps_sister_brand_options():
     assert [(item["brand"], item["store"]) for item in filtered] == [
         (DORIDANG, SAMSUNG),
         (NAHOLLO, SAMSUNG),
+    ]
+
+
+def test_filter_store_list_for_request_accepts_branch_suffix():
+    store_list = [
+        {"store_id": "1", "brand": DORIDANG, "store": "부산대신점"},
+        {"store_id": "2", "brand": NAHOLLO, "store": "부산대신점"},
+        {"store_id": "3", "brand": DORIDANG, "store": "\uc5ed\uc0bc\uc810"},
+    ]
+
+    filtered = combined._filter_store_list_for_request(store_list, f"{NAHOLLO} 1인 곱도리탕 대신점")
+
+    assert len(filtered) == 2
+    assert {(item["brand"], item["store"]) for item in filtered} == {
+        (DORIDANG, "부산대신점"),
+        (NAHOLLO, "부산대신점"),
+    }
+
+
+def test_parse_store_option_normalizes_store_name():
+    parsed = combined._parse_store_option(
+        {
+            "store_id": "x",
+            "text": "[음식배달] 나홀로 1인 곱도리탕 대신점",
+        }
+    )
+    assert parsed == {"store_id": "x", "brand": NAHOLLO, "store": "부산대신점"}
+
+
+def test_parse_store_option_normalizes_insangjang_point():
+    parsed = combined._parse_store_option(
+        {
+            "store_id": "y",
+            "text": "[음식배달] 나홀로 1인 곱도리탕 간석중앙점",
+        }
+    )
+    assert parsed == {"store_id": "y", "brand": NAHOLLO, "store": "인천간석중앙점"}
+
+
+def test_lookup_store_key_uses_store_name_map_when_available():
+    assert lookup_store_key(NAHOLLO, "대신점") == "부산대신점"
+    assert lookup_store_key(NAHOLLO, "간석중앙점") == "인천간석중앙점"
+    assert lookup_store_key("도리당", "부산대신점") == "부산대신점"
+    assert lookup_store_key("도리당", "역삼점") == "역삼점"
+
+
+def test_store_option_dedup_keeps_same_store_id_with_different_text(monkeypatch):
+    raw_options = [
+        {"store_id": "1", "text": "brand-a same-store"},
+        {"store_id": "1", "text": "brand-b same-store"},
+        {"store_id": "1", "text": "brand-a same-store"},
+    ]
+
+    monkeypatch.setattr(
+        combined,
+        "_parse_store_option",
+        lambda option: {
+            "store_id": str(option["store_id"]),
+            "brand": option["text"].split()[0],
+            "store": "same-store",
+        },
+    )
+
+    store_list = combined._build_store_list_from_options(raw_options)
+
+    assert [(item["store_id"], item["brand"]) for item in store_list] == [
+        ("1", "brand-a"),
+        ("1", "brand-b"),
     ]
 
 

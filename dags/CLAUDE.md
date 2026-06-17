@@ -1,43 +1,16 @@
-# DAG 규칙
+# DAG 참조
 
-> Codex 전용 운영 문서(`AGENTS.md`, `docs/codex/**`)는 Claude 작업 규칙으로 사용하지 않는다.
+핵심: DAG는 orchestration만 둡니다. 비즈니스 로직은 `modules/transform/pipelines/`로 보냅니다.
 
-```mermaid
-graph LR
-    01_Extract --> 02_Review --> 03_Transform --> 04_Join
-    04_Join --> 05_Marketing --> 06_Gsheet --> 07_Alert
-    07_Alert --> 08_Report --> 09_FlowReport
-```
+## 먼저 볼 곳
+- strategy DAG: @C:\airflow\dags\strategy\AGENTS.md
+- sales DAG: @C:\airflow\dags\sales\AGENTS.md
+- DB 수집 DAG: @C:\airflow\dags\db\AGENTS.md
+- DAG 변경 체크: @C:\airflow\docs\codex\dag-change-checklist.md
+- Airflow 실행/로그: @C:\airflow\docs\codex\airflow-workflow.md
 
-## 구조
-- `dag_id=Path(__file__).stem`, `catchup=False`, `max_active_runs=1`
-- schedule: `schedule.py` 상수 사용, 로직은 `modules/transform/pipelines/`
-
-## 네이밍
-- 영업: `Sales_{DOMAIN}_{##}_{STAGE}_Dags.py` → `dags/sales/`
-- 전략: `Strategy_{DOMAIN}_{##}_{STAGE}_Dags.py` → `dags/strategy/`
-- DB 수집: `DB_{Source}_Dags.py` → `dags/db/`
-- STAGE: Extract → Transform → Gsheet / Load / Alert / Report
-
-## conf 파라미터 패턴
-- `{"sale_date": "YYYY-MM-DD"}` → 정정 모드 (overwrite=True)
-- `{"backfill": true}` → 전체 백필 모드
-- conf 없음 → Lookback N일 누락 append 모드
-
-## 폴더
-- `sales/`, `strategy/`, `db/` — 도메인별 일반 DAG
-- `etl/` — 마이그레이션/ETL 유틸 | `private/` — 내부 전용
-
-## 크롤링 DAG (DB_*) 패턴
-- `combined.py` 패턴: 매장별 독립 Chrome (OOM 방지), 4단계 구조
-  - 1단계: 매장목록 조회 → 2단계: now+우가클+변경이력(per-store) → 3단계: orders(정상+취소) → 4단계: ad_funnel
-- 크롤링 DAG 신규 작성 전 `/crawl` skill로 대상 URL 사전 조사 필수
-
-## DB_UnifiedSales 현재 task 체인
-```
-t1 >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5a2 >> t5b >> t5c >> t6 >> t7 >> t8 >> t9
-t9 = build_daily_summary (daily_summary.parquet 생성, LLM 포함)
-```
-
-## 참조
-- `docs/architecture.md` - 아키텍처/모듈 구조도
+## 규칙
+- `dag_id=Path(__file__).stem`, `catchup=False`, `max_active_runs=1` 기본.
+- schedule은 `modules.transform.utility.schedule` 상수 우선.
+- conf 관례: `sale_date`, `backfill`, conf 없음은 lookback/append.
+- Selenium/crawler DAG면 @C:\airflow\docs\codex\crawling-gotchas.md 도 확인.

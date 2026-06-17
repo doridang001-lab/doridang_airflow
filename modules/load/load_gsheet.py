@@ -12,6 +12,7 @@ import time
 from datetime import date, datetime
 from http.client import RemoteDisconnected
 from typing import List, Optional, Tuple, Union
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from google.oauth2 import service_account
@@ -56,6 +57,7 @@ RETRY_INITIAL_DELAY_SECONDS = 2
 RETRY_MAX_DELAY_SECONDS = 30
 
 logger = logging.getLogger(__name__)
+KST = ZoneInfo("Asia/Seoul")
 
 
 def _parse_spreadsheet_id(url_or_id: str) -> str:
@@ -246,7 +248,7 @@ def _update_header_if_empty(service, spreadsheet_id: str, sheet_name: str, df_co
 
 def _add_timestamp_column(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    out[TIMESTAMP_COLUMN] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    out[TIMESTAMP_COLUMN] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
     return out
 
 

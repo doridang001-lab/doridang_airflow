@@ -1,14 +1,14 @@
-"""
-땡겨요 정책 수집 DAG
+﻿"""
+?↔꺼???뺤콉 ?섏쭛 DAG
 
-처리 흐름:
-1. Playwright 로그인 및 공지사항 목록 파싱
-2. 각 공지 본문 수집 (재로그인 후 상세 페이지 접근)
-3. 정책 행 생성 (정책유형 8종 분류, 실행 제안 생성)
-4. CSV 누적 저장 (중복제거, 정렬)
+泥섎━ ?먮쫫:
+1. Playwright 濡쒓렇??諛?怨듭??ы빆 紐⑸줉 ?뚯떛
+2. 媛?怨듭? 蹂몃Ц ?섏쭛 (?щ줈洹몄씤 ???곸꽭 ?섏씠吏 ?묎렐)
+3. ?뺤콉 ???앹꽦 (?뺤콉?좏삎 8醫?遺꾨쪟, ?ㅽ뻾 ?쒖븞 ?앹꽦)
+4. CSV ?꾩쟻 ???(以묐났?쒓굅, ?뺣젹)
 
-실행 시각: 매일 10:15 (KST, 정책 DAG 5분 간격 분산)
-데이터 스키마: policy_id, platform, collected_at, policy_date, title,
+?ㅽ뻾 ?쒓컖: 留ㅼ씪 10:15 (KST, ?뺤콉 DAG 5遺?媛꾧꺽 遺꾩궛)
+?곗씠???ㅽ궎留? policy_id, platform, collected_at, policy_date, title,
                category, content, content_summary, policy_type,
                recommended_action, source_url
 """
@@ -22,7 +22,7 @@ from airflow.operators.python import PythonOperator
 from airflow.exceptions import AirflowSkipException
 from modules.common.config import ADMIN_EMAIL
 from modules.transform.utility.mailer import send_email, text_to_html
-from modules.transform.utility.notifier import send_telegram
+from modules.transform.utility.notifier import enqueue_heal_task, send_telegram
 from modules.transform.utility.schedule import SMP_POLICY_DDANGYO_TIME
 from modules.transform.pipelines.strategy.SMP_ddangyo_policy_collect import (
     login_and_collect_notices,
@@ -38,9 +38,9 @@ logger = logging.getLogger(__name__)
 
 def _on_task_failure(context):
     """
-    실패 즉시 알림 발송.
-    - 1회차 실패: 즉시 알림 (재시도 예정 안내)
-    - 최종 실패: 재시도 소진 후 추가 알림
+    ?ㅽ뙣 利됱떆 ?뚮┝ 諛쒖넚.
+    - 1?뚯감 ?ㅽ뙣: 利됱떆 ?뚮┝ (?ъ떆???덉젙 ?덈궡)
+    - 理쒖쥌 ?ㅽ뙣: ?ъ떆???뚯쭊 ??異붽? ?뚮┝
     """
     try:
         ti = context.get("ti") or context.get("task_instance")
@@ -94,14 +94,15 @@ def _on_task_failure(context):
         logger.exception("Failure alert callback failed")
     try:
         _ti2 = context.get("task_instance") or context.get("ti")
-        _exc2 = context.get("exception", "알 수 없음")
+        _exc2 = context.get("exception", "?????놁쓬")
         _rd2 = getattr(_ti2, "execution_date", None)
         _ed2 = _rd2.strftime("%Y-%m-%d %H:%M") if _rd2 else ""
         _retry2 = getattr(_ti2, "try_number", 1) - 1
         send_telegram(
-            f"DAG: {_ti2.dag_id}\nTask: {_ti2.task_id}\n재시도: {_retry2}회차\n"
-            f"실행일시: {_ed2}\n에러: {_exc2}\n로그: {_ti2.log_url}\n해결해라"
+            f"DAG: {_ti2.dag_id}\nTask: {_ti2.task_id}\n?ъ떆?? {_retry2}?뚯감\n"
+            f"?ㅽ뻾?쇱떆: {_ed2}\n?먮윭: {_exc2}\n濡쒓렇: {_ti2.log_url}\n?닿껐?대씪"
         )
+        enqueue_heal_task(context)
     except Exception:
         pass
 
@@ -117,48 +118,48 @@ default_args = {
 
 
 # ============================================================
-# Task 래퍼 함수
+# Task ?섑띁 ?⑥닔
 # ============================================================
 
 def task_login_and_collect(**context):
-    """요기요 정책 수집 후 땡겨요 로그인 및 공지 목록 파싱"""
+    """?붽린???뺤콉 ?섏쭛 ???↔꺼??濡쒓렇??諛?怨듭? 紐⑸줉 ?뚯떛"""
     notice_list = login_and_collect_notices(**context)
     if not notice_list:
-        raise AirflowSkipException("수집된 공지가 없습니다.")
+        raise AirflowSkipException("?섏쭛??怨듭?媛 ?놁뒿?덈떎.")
     return notice_list
 
 
 def task_collect_notice_bodies(**context):
-    """각 공지 본문 수집"""
+    """媛?怨듭? 蹂몃Ц ?섏쭛"""
     notices_with_content = collect_notice_bodies(**context)
     if not notices_with_content:
-        raise AirflowSkipException("본문이 수집된 공지가 없습니다.")
+        raise AirflowSkipException("蹂몃Ц???섏쭛??怨듭?媛 ?놁뒿?덈떎.")
     return notices_with_content
 
 
 def task_build_policy_rows(**context):
-    """정책 행 생성 (정책유형 8종 분류)"""
+    """?뺤콉 ???앹꽦 (?뺤콉?좏삎 8醫?遺꾨쪟)"""
     policy_rows = build_policy_rows(**context)
     if not policy_rows:
-        raise AirflowSkipException("생성된 정책 행이 없습니다.")
+        raise AirflowSkipException("?앹꽦???뺤콉 ?됱씠 ?놁뒿?덈떎.")
     return policy_rows
 
 
 def task_save_policy_csv(**context):
-    """CSV 누적 저장 (중복제거, 정렬)"""
+    """CSV ?꾩쟻 ???(以묐났?쒓굅, ?뺣젹)"""
     saved_path = save_policy_csv(**context)
     policy_rows = context["ti"].xcom_pull(task_ids="task_build_policy_rows", key="policy_rows") or []
-    logger.info(f"땡겨요 정책 수집 완료 | 저장 경로: {saved_path} | 처리 건수: {len(policy_rows)}개")
+    logger.info("Ddangyo policy collection complete | path=%s | rows=%s", saved_path, len(policy_rows))
     return saved_path
 
 
 # ============================================================
-# DAG 정의
+# DAG ?뺤쓽
 # ============================================================
 
 with DAG(
     dag_id=dag_id,
-    description="땡겨요 정책 변경 수집 (Playwright 기반)",
+    description="?↔꺼???뺤콉 蹂寃??섏쭛 (Playwright 湲곕컲)",
     schedule=SMP_POLICY_DDANGYO_TIME,
     start_date=pendulum.datetime(2026, 4, 9, tz="Asia/Seoul"),
     catchup=False,
@@ -194,3 +195,4 @@ with DAG(
     )
 
     t1 >> t2 >> t3 >> t4 >> t5
+

@@ -76,5 +76,22 @@ def strip_brand(series: pd.Series) -> pd.Series:
     return series.map(lambda s: _BRAND_PREFIX_RE.sub("", str(s)).strip())
 
 
+def lookup_store_key(brand: str, store: str) -> str:
+    """입력 브랜드/지점명을 매장명 매핑 테이블 기반으로 정규화한다.
+
+    매핑 존재 시 브랜드 접두어를 제거한 지점 키를 반환하고,
+    매핑이 없으면 입력 지점명을 그대로 반환한다.
+    """
+    normalized_store = f"{brand} {store}".strip()
+    if not normalized_store:
+        return ""
+
+    normalized = _MAP.get(normalized_store, normalized_store)
+    prefix = f"{brand} ".strip()
+    if brand and normalized.startswith(prefix):
+        return normalized[len(prefix):].strip()
+    return store.strip()
+
+
 # 하위 호환 alias
 normalize_store_names = normalize

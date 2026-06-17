@@ -17,7 +17,7 @@
 
 import json
 import logging
-from datetime import date, datetime, timedelta
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import pendulum
@@ -77,32 +77,256 @@ def _collect_calendar_events() -> list[dict]:
         return []
 
 
+def _get_previous_day_window_kst() -> tuple[pendulum.DateTime, pendulum.DateTime, str]:
+    target_day = pendulum.now("Asia/Seoul").subtract(days=1)
+    start_kst = target_day.start_of("day")
+    end_kst = start_kst.add(days=1)
+    return start_kst, end_kst, target_day.strftime("%Y-%m-%d")
+
+
+def _normalize_run_dir_name(name: str) -> str:
+    return name.replace("", ":")
+
+
+def _find_run_log_dir(logs_base: Path, dag_id: str, run_id: str) -> Path | None:
+    dag_dir = logs_base / f"dag_id={dag_id}"
+    if not dag_dir.exists():
+        return None
+    expected = f"run_id={run_id}"
+    for run_dir in dag_dir.glob("run_id=*"):
+        if _normalize_run_dir_name(run_dir.name) == expected:
+            return run_dir
+    return None
+
+
+def _find_latest_attempt_log(run_log_dir: Path | None, task_id: str) -> Path | None:
+    if run_log_dir is None:
+        return None
+    task_dir = run_log_dir / f"task_id={task_id}"
+    if not task_dir.exists():
+        return None
+    attempts = sorted(task_dir.glob("attempt=*.log"))
+    return attempts[-1] if attempts else None
+
+
+def _extract_error_details(log_path: Path | None) -> tuple[str, str]:
+    if log_path is None or not log_path.exists():
+        return "", ""
+
+    lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    if not lines:
+        return "", ""
+
+    summary = ""
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if "traceback" in lowered:
+            continue
+        if "error" in lowered or "exception" in lowered or stripped.startswith("KeyError"):
+            summary = stripped[-220:]
+            break
+
+    traceback_start = None
+    for index in range(len(lines) - 1, -1, -1):
+        if "Traceback" in lines[index]:
+            traceback_start = index
+            break
+
+    excerpt_lines = lines[traceback_start:traceback_start + 40] if traceback_start is not None else lines[-40:]
+    excerpt = "\n".join(line.rstrip() for line in excerpt_lines if line.strip()).strip()
+    if not summary and excerpt:
+        summary = excerpt.splitlines()[-1][-220:]
+    return summary[:220], excerpt[:2000]
+
+
+def _collect_previous_day_dag_results() -> tuple[list[dict], list[dict]]:
+    from airflow.models import DagRun, TaskInstance
+    from airflow.utils.session import create_session
+    import os
+
+    start_kst, end_kst, _target_label = _get_previous_day_window_kst()
+    start_utc = start_kst.in_timezone("UTC")
+    end_utc = end_kst.in_timezone("UTC")
+    logs_base = Path(os.environ.get("AIRFLOW__LOGGING__BASE_LOG_FOLDER", "/opt/airflow/logs"))
+    excluded_dags = {"Private_MorningBriefing_Dags"}
+
+    with create_session() as session:
+        dag_runs = (
+            session.query(DagRun)
+            .filter(DagRun.execution_date >= start_utc)
+            .filter(DagRun.execution_date < end_utc)
+            .all()
+        )
+
+        latest_runs: dict[str, object] = {}
+        for dag_run in dag_runs:
+            if dag_run.dag_id in excluded_dags:
+                continue
+            sort_key = dag_run.end_date or dag_run.start_date or dag_run.execution_date
+            current = latest_runs.get(dag_run.dag_id)
+            if current is None:
+                latest_runs[dag_run.dag_id] = dag_run
+                continue
+            current_key = current.end_date or current.start_date or current.execution_date
+            if sort_key and current_key:
+                if sort_key >= current_key:
+                    latest_runs[dag_run.dag_id] = dag_run
+            elif sort_key and not current_key:
+                latest_runs[dag_run.dag_id] = dag_run
+
+        failures: list[dict] = []
+        log_errors: list[dict] = []
+
+        for dag_id, dag_run in sorted(latest_runs.items()):
+            if str(getattr(dag_run, "state", "")) != "failed":
+                continue
+
+            run_id = str(dag_run.run_id)
+            task_instances = (
+                session.query(TaskInstance)
+                .filter(TaskInstance.dag_id == dag_id)
+                .filter(TaskInstance.run_id == run_id)
+                .all()
+            )
+            failed_tasks = [ti for ti in task_instances if str(getattr(ti, "state", "")) in {"failed", "upstream_failed"}]
+            run_log_dir = _find_run_log_dir(logs_base, dag_id, run_id)
+
+            error_summary = ""
+            error_excerpt = ""
+            message_entries: list[dict] = []
+
+            for ti in failed_tasks:
+                log_path = _find_latest_attempt_log(run_log_dir, str(ti.task_id))
+                summary, excerpt = _extract_error_details(log_path)
+                if summary and not error_summary:
+                    error_summary = summary
+                if excerpt and not error_excerpt:
+                    error_excerpt = excerpt
+                if summary:
+                    entry = {"msg": summary[:200], "level": "ERROR"}
+                    if entry not in message_entries:
+                        message_entries.append(entry)
+
+            if not error_summary:
+                error_summary = f"?? ?? ?? run: failed task {len(failed_tasks)}?"
+
+            failures.append({
+                "dag_id": dag_id,
+                "status": "FAIL",
+                "fail_type": "dag_failed",
+                "error_summary": error_summary,
+                "error_excerpt": error_excerpt,
+            })
+
+            if message_entries:
+                log_errors.append({
+                    "dag_id": dag_id,
+                    "messages": message_entries[:3],
+                })
+
+    if not failures and not log_errors:
+        # DB 조회 결과가 없을 때는 기존 dags_monitoring CSV로 fallback
+        try:
+            import csv
+            from modules.transform.utility.paths import MART_DB
+
+            yesterday = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
+            csv_path = MART_DB / "dags_monitoring" / f"dags_monitoring_{yesterday}.csv"
+            if csv_path.exists():
+                with csv_path.open("r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        status = (row.get("status", "") or "").upper()
+                        if status not in {"FAIL", "WARN"}:
+                            continue
+                        excerpt = str(row.get("error_excerpt", ""))
+                        failures.append(
+                            {
+                                "dag_id": str(row.get("dag_id", "")),
+                                "status": status,
+                                "fail_type": str(row.get("fail_type", "")),
+                                "error_summary": str(row.get("error_summary", ""))[:500],
+                                "error_excerpt": excerpt[:2000] if excerpt not in ("nan", "None", "") else "",
+                            }
+                        )
+            else:
+                logger.warning(f"모니터링 CSV 없음: {csv_path}")
+        except Exception:
+            logger.warning("dags_monitoring CSV fallback 실패")
+
+    return failures, log_errors
+
+
+def _collect_previous_day_dag_results_v2() -> tuple[list[dict], list[dict]]:
+    failures, log_errors = _collect_previous_day_dag_results()
+    if failures or log_errors:
+        return failures, log_errors
+
+    # 실패/상위실패 재시도 없이 마지막 상태를 보는 경우가 있으면, 실패 상태만 따로 보정
+    from airflow.utils.session import create_session
+    import os
+
+    with create_session() as session:
+        from airflow.models import DagRun, TaskInstance
+
+        start_kst, end_kst, _ = _get_previous_day_window_kst()
+        start_utc = start_kst.in_timezone("UTC")
+        end_utc = end_kst.in_timezone("UTC")
+        logs_base = Path(os.environ.get("AIRFLOW__LOGGING__BASE_LOG_FOLDER", "/opt/airflow/logs"))
+
+        dag_runs = (
+            session.query(DagRun)
+            .filter(DagRun.execution_date >= start_utc)
+            .filter(DagRun.execution_date < end_utc)
+            .filter(DagRun.state.in_(["failed", "upstream_failed"]))
+            .order_by(DagRun.execution_date.desc())
+            .all()
+        )
+
+        seen: set[str] = set()
+        for dr in dag_runs:
+            if dr.dag_id in seen or dr.dag_id == "Private_MorningBriefing_Dags":
+                continue
+            seen.add(dr.dag_id)
+            task_instances = session.query(TaskInstance).filter(
+                TaskInstance.dag_id == dr.dag_id, TaskInstance.run_id == dr.run_id
+            ).all()
+            failed_tasks = [ti for ti in task_instances if str(getattr(ti, "state", "")) in {"failed", "upstream_failed"}]
+            run_log_dir = _find_run_log_dir(logs_base, dr.dag_id, str(dr.run_id))
+
+            msg_entries: list[dict] = []
+            error_summary = ""
+            error_excerpt = ""
+            for ti in failed_tasks:
+                log_path = _find_latest_attempt_log(run_log_dir, str(ti.task_id))
+                summary, excerpt = _extract_error_details(log_path)
+                if summary:
+                    if not error_summary:
+                        error_summary = summary
+                    msg_entries.append({"msg": summary[:200], "level": "ERROR"})
+                if excerpt and not error_excerpt:
+                    error_excerpt = excerpt
+
+            if not error_summary:
+                error_summary = f"실패 run: failed task {len(failed_tasks)}개"
+            if msg_entries:
+                log_errors.append({"dag_id": dr.dag_id, "messages": msg_entries[:3]})
+            failures.append({
+                "dag_id": dr.dag_id,
+                "status": "FAIL",
+                "fail_type": "dag_failed",
+                "error_summary": error_summary,
+                "error_excerpt": error_excerpt,
+            })
+
+    return failures, log_errors
+
+
 def _collect_dag_failures() -> list[dict]:
-    """어제 dags_monitoring CSV에서 FAIL/WARN DAG 목록 반환."""
-    from modules.transform.utility.paths import MART_DB
-
-    yesterday = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
-    csv_path = MART_DB / "dags_monitoring" / f"dags_monitoring_{yesterday}.csv"
-
-    if not csv_path.exists():
-        logger.warning(f"모니터링 CSV 없음: {csv_path}")
-        return []
-
-    import pandas as pd
-
-    df = pd.read_csv(csv_path)
-    df = df[df["status"].isin(["FAIL", "WARN"])]
-
-    failures = []
-    for _, row in df.iterrows():
-        excerpt = str(row.get("error_excerpt", ""))
-        failures.append({
-            "dag_id": str(row.get("dag_id", "")),
-            "status": str(row.get("status", "")),
-            "fail_type": str(row.get("fail_type", "")),
-            "error_summary": str(row.get("error_summary", ""))[:500],
-            "error_excerpt": excerpt[:2000] if excerpt not in ("nan", "None", "") else "",
-        })
+    failures, _ = _collect_previous_day_dag_results_v2()
     return failures
 
 
@@ -172,81 +396,8 @@ def _collect_data_freshness() -> str:
 
 
 def _collect_log_warnings() -> list[dict]:
-    """어제~오늘 태스크 로그에서 WARNING/ERROR 줄 추출, DAG별 대표 메시지 반환.
-
-    로그 구조: /opt/airflow/logs/dag_id=X/run_id=Y/task_id=Z/attempt=N.log
-    """
-    import os
-
-    logs_base = Path(os.environ.get("AIRFLOW__LOGGING__BASE_LOG_FOLDER", "/opt/airflow/logs"))
-    if not logs_base.exists():
-        logger.warning(f"로그 경로 없음: {logs_base}")
-        return []
-
-    cutoff = datetime.now() - timedelta(hours=26)  # 어제~오늘
-    # 라이브러리 수준 노이즈는 건너뜀
-    skip_keywords = [
-        "DeprecationWarning", "UserWarning", "FutureWarning",
-        "PendingDeprecationWarning", "ResourceWarning",
-        "is deprecated", "will be deprecated",
-        "InsecureRequestWarning",
-    ]
-    # 로거 이름 기준 무시 패턴 (Airflow 내부 잡음)
-    skip_loggers = [
-        "connectionpool", "urllib3", "paramiko", "botocore",
-        "google.auth", "httpx",
-    ]
-
-    dag_warnings: dict[str, list[str]] = {}
-
-    try:
-        for dag_dir in sorted(logs_base.glob("dag_id=*")):
-            dag_id = dag_dir.name.replace("dag_id=", "")
-            if dag_id == "Strategy_MorningBriefing_Dags":
-                continue
-
-            # run_id 폴더를 최신순 정렬, 최근 2개만
-            run_dirs = sorted(
-                dag_dir.glob("run_id=*"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )[:2]
-
-            for run_dir in run_dirs:
-                if datetime.fromtimestamp(run_dir.stat().st_mtime) < cutoff:
-                    continue
-                for task_dir in run_dir.glob("task_id=*"):
-                    for log_file in task_dir.glob("attempt=*.log"):
-                        try:
-                            text = log_file.read_text(encoding="utf-8", errors="ignore")
-                            for line in text.splitlines():
-                                is_warn = "} WARNING -" in line
-                                is_err = "} ERROR -" in line
-                                if not (is_warn or is_err):
-                                    continue
-                                if any(sk in line for sk in skip_keywords):
-                                    continue
-                                if any(sl in line for sl in skip_loggers):
-                                    continue
-                                # "{module} WARNING - 메시지" 에서 메시지만 추출
-                                marker = "} WARNING - " if is_warn else "} ERROR - "
-                                msg = line.split(marker, 1)[-1].strip()[:200]
-                                if not msg:
-                                    continue
-                                seen = dag_warnings.get(dag_id, [])
-                                if msg not in seen:
-                                    seen.append(msg)
-                                    dag_warnings[dag_id] = seen
-                        except Exception:
-                            continue
-    except Exception as e:
-        logger.warning(f"로그 스캔 실패: {e}")
-        return []
-
-    return [
-        {"dag_id": dag_id, "messages": msgs[:3]}   # DAG당 최대 3줄
-        for dag_id, msgs in dag_warnings.items()
-    ]
+    _, log_errors = _collect_previous_day_dag_results_v2()
+    return log_errors
 
 
 def _collect_scheduled_dags() -> list[str]:
@@ -265,7 +416,7 @@ def _collect_scheduled_dags() -> list[str]:
         return [
             f"{r.dag_id} ({r.schedule_interval})"
             for r in rows
-            if r.dag_id != "Strategy_MorningBriefing_Dags"
+            if r.dag_id != "Private_MorningBriefing_Dags"
         ]
     except Exception as e:
         logger.warning(f"DAG 목록 수집 실패: {e}")
@@ -279,11 +430,10 @@ def _collect_scheduled_dags() -> list[str]:
 def collect_briefing_data(**context):
     """브리핑에 필요한 모든 데이터 수집 후 XCom 저장."""
     calendar = _collect_calendar_events()
-    failures = _collect_dag_failures()
+    failures, log_warnings = _collect_previous_day_dag_results_v2()
     git = _collect_git_status()
     freshness = _collect_data_freshness()
     scheduled = _collect_scheduled_dags()
-    log_warnings = _collect_log_warnings()
 
     payload = {
         "calendar": calendar,
@@ -344,7 +494,7 @@ def generate_briefing(**context):
     # Step A — 각 FAIL DAG 원인 분석
     fail_lines = []
     for f in data["failures"]:
-        if f["status"] == "FAIL" and f["error_excerpt"]:
+        if f["error_excerpt"]:
             analysis = _analyze_fail_dag(f["dag_id"], f["error_excerpt"])
             fail_lines.append(f"• {f['dag_id']}: {analysis}")
         else:
@@ -358,33 +508,44 @@ def generate_briefing(**context):
 
     # 로그 오류: DAG명 + 첫 번째 메시지만 (LLM 컨텍스트용)
     log_ctx = "\n".join(
-        f"  {w['dag_id']}: {w['messages'][0][:120]}" for w in data.get("log_warnings", [])
+        f"  {w['dag_id']}: [{w['messages'][0].get('level', '?')}] {w['messages'][0].get('msg', '')[:120]}"
+        for w in data.get("log_warnings", [])
     ) or "  (없음)"
 
     b_prompt = (
         f"오늘 일정:\n{cal_text}\n\n"
-        f"실패/경고 DAG (어제):\n{fail_text}\n\n"
+        f"실패/경고 DAG(어제, KST 기준):\n{fail_text}\n\n"
         f"로그 오류 DAG:\n{log_ctx}\n\n"
         f"미커밋: {git['status'][:100]} | 최근커밋: {git['log']}\n"
         f"daily_summary 최신: {data['freshness']}"
     )
     b_system = (
         "너는 데이터 엔지니어의 아침 업무 비서야. "
-        "아래 정보를 보고 오늘 가장 먼저 처리해야 할 것을 번호 목록으로 정리해줘. "
-        "무조건 한국어로만 답변해. 영어 금지. 최대 5줄."
+        "아래 정보를 보고 오늘 가장 먼저 처리해야 할 작업을 번호 목록으로 정리해줘. "
+        "무조건 한국어로만 답변해. 영어 금지. "
+        "최대 5줄."
     )
     priority_text = _llm_call(b_prompt, b_system, num_predict=400)
 
     # 메시지 조합
     today = pendulum.now("Asia/Seoul").strftime("%Y-%m-%d (%a)")
-    fail_cnt = sum(1 for f in data["failures"] if f["status"] == "FAIL")
-    warn_cnt = sum(1 for f in data["failures"] if f["status"] == "WARN")
-    log_warn_cnt = len(data.get("log_warnings", []))
+    fail_cnt = len(data["failures"])
+    warn_cnt = sum(1 for f in data["failures"] if f.get("status") == "WARN")
+    log_warnings = data.get("log_warnings", [])
+    log_err_cnt = sum(
+        1 for w in log_warnings for m in w["messages"] if m.get("level") == "ERROR"
+    )
+    log_warn_msg_cnt = sum(
+        1 for w in log_warnings for m in w["messages"] if m.get("level") != "ERROR"
+    )
 
     sections = []
 
     # 헤더
-    sections.append(f"[AI 브리핑] {today}\nFAIL {fail_cnt} / WARN {warn_cnt} / 로그오류 {log_warn_cnt}")
+    sections.append(
+        f"[AI 브리핑] {today}\n"
+        f"FAIL {fail_cnt} / WARN {warn_cnt} / 로그오류 {log_err_cnt} / 로그경고 {log_warn_msg_cnt}"
+    )
 
     # 우선순위
     sections.append(f"🎯 오늘 우선순위\n{priority_text}")
@@ -399,12 +560,15 @@ def generate_briefing(**context):
         sections.append("❌ 실패/경고 DAG\n" + "\n".join(fail_lines))
 
     # 로그 오류 DAG — DAG명 + 핵심 메시지 한 줄, 최대 5개
-    log_warnings = data.get("log_warnings", [])
     if log_warnings:
         shown = log_warnings[:5]
-        lw_lines = [f"  • {w['dag_id']}: {w['messages'][0][:80]}" for w in shown]
-        extra = f"\n  ...외 {log_warn_cnt - 5}건" if log_warn_cnt > 5 else ""
-        sections.append(f"⚠️ 로그 오류 ({log_warn_cnt}건)\n" + "\n".join(lw_lines) + extra)
+        lw_lines = [
+            f"  • {w['dag_id']}: [{w['messages'][0].get('level', '?')}] {w['messages'][0].get('msg', '')[:80]}"
+            for w in shown
+        ]
+        total = len(log_warnings)
+        extra = f"\n  ...외 {total - 5}건" if total > 5 else ""
+        sections.append(f"⚠️ 로그 메시지 ({log_err_cnt}오류/{log_warn_msg_cnt}경고)\n" + "\n".join(lw_lines) + extra)
 
     # 미커밋 + 신선도
     uncommitted = [l for l in git["status"].split("\n") if l.strip()]
@@ -422,6 +586,7 @@ def generate_briefing(**context):
 def send_briefing(**context):
     """Telegram으로 브리핑 전송 (notifier.send_telegram 재사용)."""
     from modules.transform.utility.notifier import send_telegram
+    from modules.transform.utility.paths import MART_DB
 
     ti = context["ti"]
     message = ti.xcom_pull(task_ids="generate_briefing", key="briefing_message")
@@ -430,6 +595,17 @@ def send_briefing(**context):
         logger.warning("브리핑 메시지 없음 — 전송 건너뜀")
         return "전송 건너뜀"
 
-    send_telegram(message)
+    # 출처 추가
+    message_with_source = f"{message}\n\n출처: Private_MorningBriefing_Dags"
+
+    send_telegram(message_with_source)
     logger.info("Telegram 전송 완료")
+
+    today_str = pendulum.now("Asia/Seoul").strftime("%Y%m%d")
+    log_dir = MART_DB / "briefing_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"briefing_{today_str}.md"
+    log_file.write_text(message, encoding="utf-8")
+    logger.info(f"브리핑 로그 저장: {log_file}")
+
     return "Telegram 전송 완료"

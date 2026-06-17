@@ -11,7 +11,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from dags.db.DB_ToOrderMenu_Dags import _load_store_detail_excel
+from dags.db.DB_ToOrderMenu_Dags import _load_option_detail_excel, _load_store_detail_excel
 from modules.extract.crawling_toorder_menu import (
     OPTION_ANALYSIS_URL,
     download_first_menu_detail_for_debug,
@@ -56,15 +56,25 @@ def main() -> None:
     print("\n=== Raw Preview (top 12 x 10) ===")
     print(raw_preview.fillna("").to_string(index=False, header=False))
 
-    parsed = _load_store_detail_excel(file_path, menu_name, target_date)
+    if args.page == "option":
+        parsed = _load_option_detail_excel(file_path, menu_name, target_date)
+    else:
+        parsed = _load_store_detail_excel(file_path, menu_name, target_date)
     print("\n=== Parsed Preview ===")
     print(parsed.head(20).to_string(index=False))
 
-    print("\n=== Parsed Store Names ===")
-    stores = sorted(parsed["매장명"].dropna().astype(str).str.strip().unique().tolist())
-    for store in stores[:100]:
-        print(store)
-    print(f"\nrows={len(parsed)}, unique_stores={len(stores)}")
+    if args.page == "option":
+        print("\n=== Parsed Option Names ===")
+        options = sorted(parsed["옵션명"].dropna().astype(str).str.strip().unique().tolist())
+        for option_name in options[:100]:
+            print(option_name)
+        print(f"\nrows={len(parsed)}, unique_options={len(options)}")
+    else:
+        print("\n=== Parsed Store Names ===")
+        stores = sorted(parsed["매장명"].dropna().astype(str).str.strip().unique().tolist())
+        for store in stores[:100]:
+            print(store)
+        print(f"\nrows={len(parsed)}, unique_stores={len(stores)}")
 
 
 if __name__ == "__main__":
