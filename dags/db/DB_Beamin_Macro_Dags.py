@@ -499,7 +499,7 @@ def validate_toorder(**context) -> str:
 
     # 비교 매장이 0개면 검증 불가(예: ToOrder CSV 없음) → 허위 '불일치' 알림 보내지 않음
     if compared > 0 and (not matched or gap_stores or missing_brand_stores):
-        _send_alert(subject=f"[배민↔토더 불일치] {target_date}", body=summary)
+        send_telegram(summary)
 
     _save_validate_log(target_date, "ToOrder 교차검증", summary)
     return summary
@@ -1146,11 +1146,6 @@ def validate_toorder(**context) -> str:
     logger.info(summary)
     if compared > 0 and (not matched or gap_stores or missing_brand_stores):
         send_telegram(summary)
-    if mismatched or missing_brand_stores:
-        _send_alert(
-            subject=f"[검증 불일치 {target_date}] mismatch={len(mismatched)} missing_brand={len(sorted(set(missing_brand_stores)))}",
-            body=summary,
-        )
     return summary
 
 
@@ -1444,4 +1439,3 @@ with DAG(
     )
 
     t_dash >> t0 >> t1 >> t2 >> t3 >> [t4, t5, t6] >> t7
-
