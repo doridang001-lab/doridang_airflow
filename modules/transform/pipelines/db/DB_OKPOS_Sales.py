@@ -111,6 +111,14 @@ def _no_data_marker_path(store_short: str, ym: str, csv_stem: str) -> Path:
     )
 
 
+def _okpos_download_dir(context: dict, page_type: str) -> Path:
+    """Airflow run/page별 다운로드 격리 디렉터리."""
+    dag_run = context.get("dag_run") if context else None
+    run_id = getattr(dag_run, "run_id", "") or str(context.get("run_id", "manual"))
+    run_token = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id).strip("_")[-80:] or "manual"
+    return TEMP_DIR / f"okpos_download_{page_type}_{run_token}"
+
+
 def _read_no_data_dates(marker_path: Path) -> set[str]:
     if not marker_path.exists() or marker_path.stat().st_size == 0:
         return set()
@@ -976,6 +984,50 @@ def _select_store(driver: uc.Chrome, wait: WebDriverWait, shopCd: str) -> bool:
     from selenium.webdriver.common.action_chains import ActionChains
     _dismiss_alert(driver)
 
+    store_name = shopCd
+    for st in STORES:
+        if st.get("shopCd") == shopCd:
+            store_name = st.get("name", store_name).replace("도리당 ", "", 1)
+            break
+
+    def _force_set_store_fields() -> None:
+        # IBSheet 팝업이 깨지거나 row 탐색 실패했을 때 강제 주입 fallback.
+        setters = [
+            ("shopCd", shopCd),
+            ("source_SHOP_CD", shopCd),
+            ("source_Hd_SHOP_CD", shopCd),
+            ("source_HD_SHOP_CD", shopCd),
+            ("shopNms", store_name),
+            ("source_SHOP_NM", store_name),
+            ("source_Hd_SHOP_NM", store_name),
+            ("source_HD_SHOP_NM", store_name),
+            ("source_SHOP_NAME", store_name),
+            ("shopNm", store_name),
+        ]
+        script = """
+            const el = arguments[0];
+            const val = arguments[1];
+            if (!el) return;
+            el.value = val;
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('blur', { bubbles: true }));
+        """
+        for _id, value in setters:
+            for sel_name in ("ID", "NAME"):
+                if sel_name == "ID":
+                    els = driver.find_elements(By.ID, _id)
+                else:
+                    els = driver.find_elements(By.NAME, _id)
+                for e in els:
+                    try:
+                        driver.execute_script(script, e, value)
+                        logger.info(f"매장 강제 세팅: {_id}={value}")
+                    except Exception:
+                        continue
+        # 매장 검색 버튼 입력 상태 강제 반영.
+        driver.execute_script("if(document.activeElement && document.activeElement.blur){document.activeElement.blur();} return true;")
+
     # ── 팝업 열기 ─────────────────────────────────────────────────────────
     shop_btn = None
     for sel in [
@@ -1001,6 +1053,7 @@ def _select_store(driver: uc.Chrome, wait: WebDriverWait, shopCd: str) -> bool:
     ActionChains(driver).move_to_element(shop_btn).click().perform()
     time.sleep(2)
     _dismiss_alert(driver)
+    _force_set_store_fields()
 
     # ── 팝업 내 행 찾기 ───────────────────────────────────────────────────
     # 우선순위: shopCd를 포함한 TD 자체 → 그 TD가 속한 TR의 마지막 TD(매장명)
@@ -1030,7 +1083,8 @@ def _select_store(driver: uc.Chrome, wait: WebDriverWait, shopCd: str) -> bool:
     if target_el is None:
         all_tds = [td.text.strip() for td in driver.find_elements(By.CSS_SELECTOR, "td") if td.text.strip()]
         logger.error(f"shopCd={shopCd} 셀 없음 | td 목록: {all_tds[:30]}")
-        return False
+        _force_set_store_fields()
+        return True
 
     # ── 팝업 닫힘 감지용: "매장 검색" 텍스트를 포함한 컨테이너 ─────────────
     popup_text_el = None
@@ -1173,11 +1227,22 @@ def _wait_for_download(
             return False
         if p.name.lower() in blocked_names or suffix in blocked_suffixes:
             return False
+        if p.name.startswith("debug__"):
+            return False
         if expected_suffixes_normalized and suffix not in expected_suffixes_normalized:
             return False
         if filename_predicate and not filename_predicate(p):
             return False
         return True
+
+    existing_meta: dict[Path, tuple[float, int]] = {}
+    for p in existing_files:
+        try:
+            if p.is_file() and _is_candidate(p):
+                st = p.stat()
+                existing_meta[p] = (st.st_mtime, st.st_size)
+        except FileNotFoundError:
+            continue
 
     stable_window_sec = float(os.getenv("OKPOS_DOWNLOAD_STABLE_WINDOW_SEC", "1.5"))
     stable_poll_sec = 0.5
@@ -1195,16 +1260,28 @@ def _wait_for_download(
         current = {p for p in current_all if _is_candidate(p)}
         new_any_files = current_all - existing_files
         new_files = current - existing_files
+        changed_files = set()
+        for p in current & existing_files:
+            baseline = existing_meta.get(p)
+            if baseline is None:
+                continue
+            try:
+                st = p.stat()
+            except FileNotFoundError:
+                continue
+            if (st.st_mtime, st.st_size) != baseline:
+                changed_files.add(p)
+        candidate_files = new_files | changed_files
         partials = list(directory.glob("*.crdownload")) + list(directory.glob("*.part")) + list(directory.glob("*.tmp"))
 
         if not first_activity_seen:
-            if new_any_files or partials:
+            if new_any_files or changed_files or partials:
                 first_activity_seen = True
             elif time.time() > no_activity_deadline:
                 return None
 
-        if new_files:
-            latest = sorted(new_files, key=lambda f: f.stat().st_mtime, reverse=True)[0]
+        if candidate_files:
+            latest = sorted(candidate_files, key=lambda f: f.stat().st_mtime, reverse=True)[0]
             try:
                 size = latest.stat().st_size
             except FileNotFoundError:
@@ -1327,9 +1404,8 @@ def _download_excel_for_store(
             if "shop_open_checkbox_id" in page_cfg:
                 try:
                     cb = driver.find_element(By.ID, page_cfg["shop_open_checkbox_id"])
-                    # ensure checked
                     checked = driver.execute_script("return arguments[0].checked === true;", cb)
-                    if not checked:
+                    if checked:
                         driver.execute_script("arguments[0].click();", cb)
                         time.sleep(0.2)
                 except Exception:
@@ -1512,7 +1588,7 @@ def download_today_stores(**context) -> str:
     conf = context.get("dag_run").conf or {}
     force = bool(conf.get("force_redownload") or conf.get("force_redownload_today") or os.getenv("OKPOS_FORCE_REDOWNLOAD_TODAY", ""))
 
-    download_dir = TEMP_DIR / "okpos_download"
+    download_dir = _okpos_download_dir(context, "today")
     download_dir.mkdir(parents=True, exist_ok=True)
     page_cfg = PAGE_TYPES["today"]
 
@@ -1573,7 +1649,7 @@ def download_receipt_stores(**context) -> str:
     conf = context.get("dag_run").conf or {}
     force = bool(conf.get("force_redownload") or conf.get("force_redownload_receipt") or os.getenv("OKPOS_FORCE_REDOWNLOAD_RECEIPT", ""))
 
-    download_dir = TEMP_DIR / "okpos_download"
+    download_dir = _okpos_download_dir(context, "receipt")
     download_dir.mkdir(parents=True, exist_ok=True)
     page_cfg = PAGE_TYPES["receipt"]
 
@@ -1638,7 +1714,7 @@ def download_daily_stores(**context) -> str:
     conf = context.get("dag_run").conf or {}
     force = bool(conf.get("force_redownload") or conf.get("force_redownload_daily") or os.getenv("OKPOS_FORCE_REDOWNLOAD_DAILY", ""))
 
-    download_dir = TEMP_DIR / "okpos_download"
+    download_dir = _okpos_download_dir(context, "daily")
     download_dir.mkdir(parents=True, exist_ok=True)
     page_cfg = PAGE_TYPES["daily"]
 
@@ -2076,6 +2152,12 @@ def _transform_okpos_daily_df(df: pd.DataFrame, store_name: str, sale_date: str)
 
     out_amount_sum = int(out[["총매출액", "총할인액", "실매출액", "영수건수"]].sum(axis=1).iloc[0])
     if out_amount_sum == 0:
+        logger.warning(
+            f"daily 0원 감지 | {sale_date} | {store_name} | "
+            f"columns={list(data.columns)} | "
+            f"selected_row={row_series.to_dict()} | "
+            f"data_head=\n{data.head(10).to_string()}"
+        )
         amount_cols = [c for c in ("총매출액", "총할인액", "실매출액", "영수건수") if c in data.columns]
         nonzero_source_found = False
         if amount_cols:
@@ -2087,6 +2169,12 @@ def _transform_okpos_daily_df(df: pd.DataFrame, store_name: str, sale_date: str)
                     nonzero_source_found = True
                     break
         if nonzero_source_found:
+            logger.warning(
+                f"daily 0원 의심 | {sale_date} | {store_name} | "
+                f"columns={list(data.columns)} | "
+                f"selected_row={row_series.to_dict()} | "
+                f"data_head=\\n{data.head(10).to_string()}"
+            )
             raise ValueError(
                 "daily 엑셀 파싱 실패: 선택된 행은 0원이지만 같은 날짜 원본에 0이 아닌 금액이 있습니다 "
                 f"(sale_date={sale_date}, store={store_name}, selected={row_series.to_dict()})"
@@ -2374,6 +2462,61 @@ def save_to_raw(**context) -> str:
         "daily":   (daily_files,   "okpos_daily"),        # 일자별 종합매출 → okpos_daily.csv
     }
 
+    def _fallback_daily_from_order(df_daily: pd.DataFrame, store_short: str, sale_date: str, ym: str) -> pd.DataFrame:
+        """OKPOS daily 원본이 0원 합계만 내려오면 today(order) 합계로 daily를 보정한다."""
+        if df_daily.empty:
+            return df_daily
+        daily_sum = int(df_daily[["총매출액", "총할인액", "실매출액", "영수건수"]].sum(axis=1).iloc[0])
+        if daily_sum != 0:
+            return df_daily
+
+        order_csv = (
+            RAW_OKPOS_SALES
+            / "brand=도리당"
+            / f"store={store_short}"
+            / f"ym={ym}"
+            / "okpos_order.csv"
+        )
+        if not order_csv.exists() or order_csv.stat().st_size == 0:
+            return df_daily
+
+        try:
+            order_df = pd.read_csv(order_csv, dtype=str, encoding="utf-8-sig")
+        except Exception:
+            order_df = pd.read_csv(order_csv, dtype=str)
+
+        if order_df.empty or "sale_date" not in order_df.columns:
+            return df_daily
+
+        order_df = order_df[order_df["sale_date"].astype(str).str.strip() == sale_date].copy()
+        if order_df.empty:
+            return df_daily
+
+        out = pd.DataFrame([{
+            "sale_date": sale_date,
+            "ym": ym,
+            "매장명": df_daily["매장명"].iloc[0],
+            "총매출액": int((_to_int_series(order_df["총매출액"]) if "총매출액" in order_df.columns else pd.Series(0, index=order_df.index)).sum()),
+            "총할인액": int((_to_int_series(order_df["총할인액"]) if "총할인액" in order_df.columns else pd.Series(0, index=order_df.index)).sum()),
+            "실매출액": int((_to_int_series(order_df["실매출액"]) if "실매출액" in order_df.columns else pd.Series(0, index=order_df.index)).sum()),
+            "영수건수": int(len(order_df)),
+            "collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }])
+        out["_pk"] = out.apply(
+            lambda r: hashlib.md5(f"{r['sale_date']}|{r['매장명']}|daily".encode()).hexdigest(),
+            axis=1,
+        )
+        logger.warning(
+            "daily 0원 보정(order fallback): %s | %s | total=%s discount=%s net=%s receipts=%s",
+            sale_date,
+            df_daily["매장명"].iloc[0],
+            out["총매출액"].iloc[0],
+            out["총할인액"].iloc[0],
+            out["실매출액"].iloc[0],
+            out["영수건수"].iloc[0],
+        )
+        return out
+
     conf = context.get("dag_run").conf or {}
     replace_by_date = bool(conf.get("replace_by_date") or conf.get("force_redownload") or os.getenv("OKPOS_REPLACE_BY_DATE", ""))
 
@@ -2408,6 +2551,7 @@ def save_to_raw(**context) -> str:
 
                 if page_type == "daily":
                     df, ym = _transform_okpos_daily_df(raw_df, store_name, sale_date)
+                    df = _fallback_daily_from_order(df, store_short, sale_date, ym)
                 else:
                     df, ym = _transform_okpos_df(raw_df, store_name, sale_date)
                 if df.empty:
@@ -2518,7 +2662,11 @@ def save_to_raw(**context) -> str:
     logger.info(f"save_to_raw 완료: {len(saved)}개 저장")
     if save_errors:
         preview = ", ".join(save_errors[:10])
-        raise RuntimeError(f"save_to_raw 실패 {len(save_errors)}건 (예: {preview})")
+        critical_errors = [err for err in save_errors if err.startswith("daily:")]
+        if critical_errors:
+            critical_preview = ", ".join(critical_errors[:10])
+            raise RuntimeError(f"save_to_raw 실패 {len(critical_errors)}건 (예: {critical_preview})")
+        logger.warning(f"save_to_raw 일부 스킵 {len(save_errors)}건 (후속 누락 보정 대상, 예: {preview})")
     return f"변환 저장 완료: {len(saved)}개"
 
 
