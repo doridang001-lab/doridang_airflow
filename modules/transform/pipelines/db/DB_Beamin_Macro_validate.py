@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 KST = pendulum.timezone("Asia/Seoul")
 
-TOORDER_DAILY_DIR = ANALYTICS_DB / "toorder_daily_sales"
+TOORDER_PARQUET_PATH = ANALYTICS_DB / "toorder_daily_store_platform" / "toorder_store_platform_daily.parquet"
 
 
 def _manual_baemin_store_meta(raw_store_name: str, fallback_name: str = "") -> tuple[str, str]:
@@ -139,17 +139,16 @@ def _toorder_baemin_by_store(target_date: str) -> dict:
     Returns:
         {store_name: amount(int)}  파일 없으면 {}
     """
-    date_str = target_date.replace("-", "")
-    csv_path = TOORDER_DAILY_DIR / f"toorder_daily_sales_{date_str}.csv"
-    if not csv_path.exists():
-        logger.warning("ToOrder CSV 없음: %s", csv_path)
+    if not TOORDER_PARQUET_PATH.exists():
+        logger.warning("ToOrder parquet 없음: %s", TOORDER_PARQUET_PATH)
         return {}
     try:
-        df = pd.read_csv(csv_path, encoding="utf-8-sig")
-        mask = df["플랫폼명"].isin(["배달의민족", "배민1", "배민 포장"])
+        df = pd.read_parquet(TOORDER_PARQUET_PATH)
+        df = df[df["date"].astype(str) == target_date]
+        mask = df["platform"].isin(["배달의민족", "배민1", "배민 포장"])
         by_store = (
             df.loc[mask]
-            .groupby("매장명")["매출액"]
+            .groupby("store")["price"]
             .sum()
             .apply(int)
             .to_dict()
@@ -157,7 +156,7 @@ def _toorder_baemin_by_store(target_date: str) -> dict:
         logger.info("ToOrder 배민 매장 %d개 (target_date=%s)", len(by_store), target_date)
         return by_store
     except Exception as exc:
-        logger.error("ToOrder CSV 읽기 실패: %s / %s", csv_path, exc)
+        logger.error("ToOrder parquet 읽기 실패: %s / %s", TOORDER_PARQUET_PATH, exc)
         return {}
 
 
