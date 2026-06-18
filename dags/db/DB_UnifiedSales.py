@@ -55,20 +55,8 @@ logger = logging.getLogger(__name__)
 
 dag_id = Path(__file__).stem
 
-_ALERT_EMAILS = ["a17019@kakao.com"]
-
-
-def _send_alert(subject: str, body: str) -> None:
-    from modules.transform.utility.mailer import send_email, text_to_html
-    try:
-        send_email(subject=subject, html_content=text_to_html(body), to_emails=_ALERT_EMAILS)
-        logger.info("알림 발송 완료: %s", _ALERT_EMAILS)
-    except Exception as e:
-        logger.error("알림 발송 실패: %s", e)
-
-
 def _on_failure_callback(context):
-    """Task 최종 실패 시 이메일 + Telegram 알림"""
+    """Task 최종 실패 시 Telegram 알림"""
     ti             = context.get("task_instance")
     execution_date = ti.execution_date.strftime("%Y-%m-%d %H:%M")
     exception      = context.get("exception", "알 수 없음")
@@ -79,7 +67,6 @@ def _on_failure_callback(context):
         f"에러: {exception}\n"
         f"로그: {ti.log_url}"
     )
-    _send_alert(subject=f"[Airflow 실패] {ti.dag_id} / {ti.task_id}", body=body)
     send_telegram(body + "\n해결해라")
     enqueue_heal_task(context)
 
@@ -97,7 +84,11 @@ default_args = {
 # - int  : 최근 N일 누락분 보충
 # - None : 전체 소스 CSV 백필
 # LOOKBACK_DAYS: int | None = 7
-LOOKBACK_DAYS: int | None = 7  # 전체 백필 모드 (주의: 실행 시점 기준으로 소스 CSV 전체를 다시 처리하므로 오래 걸릴 수 있음)
+LOOKBACK_DAYS: int | None = 30  # 전체 백필 모드 (주의: 실행 시점 기준으로 소스 CSV 전체를 다시 처리하므로 오래 걸릴 수 있음)
+
+# 배민 직수집 교정 대상 테스트 매장 (검증 완료 후 확대)
+TEST_STORES: list[str] = ["해운대중동점", "법흥리점"]
+
 
 def resolve_date(**context) -> str:
     """conf['sale_date'] → XCom push (정정 모드). 없으면 None push."""
@@ -218,6 +209,22 @@ def build_posfeed(**context) -> str:
     return pipeline_lookback_posfeed(days=LOOKBACK_DAYS)
 
 
+def reconcile_baemin(**context) -> str:
+    """TEST_STORES의 배민 직수집 데이터로 UnifiedSales 배달의민족 행 교정."""
+    if not TEST_STORES:
+        return "TEST_STORES 없음 - 스킵"
+    from modules.transform.pipelines.db.DB_UnifiedSales_baemin import (
+        reconcile_baemin_for_test_stores,
+    )
+
+    sale_date = context["ti"].xcom_pull(task_ids="resolve_date", key="sale_date")
+    return reconcile_baemin_for_test_stores(
+        stores=TEST_STORES,
+        sale_date=sale_date,
+        lookback_days=LOOKBACK_DAYS or 7,
+    )
+
+
 def report_posfeed_exclusions(**context) -> str:
     """posfeed 블랙리스트 제외 내역을 ym별 상세·집계 CSV로 저장."""
     return pipeline_report_posfeed_exclusions(**context)
@@ -301,6 +308,11 @@ with DAG(
         python_callable=generate_posfeed_whitelist_draft,
     )
 
+    t_baemin = PythonOperator(
+        task_id="reconcile_baemin",
+        python_callable=reconcile_baemin,
+    )
+
     t6 = PythonOperator(
         task_id="reclassify_platform",
         python_callable=reclassify_platform,
@@ -322,4 +334,4 @@ with DAG(
     )
 
     # 순차 실행: 같은 날짜 parquet에 동시 write 방지
-    t1 >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5b >> t5c >> t6 >> t7 >> t8 >> t9
+    t1 >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5b >> t5c >> t_baemin >> t6 >> t7 >> t8 >> t9

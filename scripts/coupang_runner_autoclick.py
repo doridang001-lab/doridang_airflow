@@ -18,7 +18,7 @@ import urllib.error
 logger = logging.getLogger(__name__)
 
 RUNNER_URL = "chrome-extension://ocpdgnoaajajnlehamcalfcpholjhfbe/runner.html"
-BUTTON_ID = "topHalfBtn"
+BUTTON_ID = "startBtn"
 DEBUG_ENDPOINT = "http://127.0.0.1:9222"
 TIMEOUT_SECONDS = 60
 POLL_INTERVAL_SECONDS = 0.5

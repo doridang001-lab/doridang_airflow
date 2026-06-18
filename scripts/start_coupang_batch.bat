@@ -3,7 +3,7 @@ setlocal
 
 set "CHROME_64=C:\Program Files\Google\Chrome\Application\chrome.exe"
 set "CHROME_32=C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
-set "URL=chrome-extension://ocpdgnoaajajnlehamcalfcpholjhfbe/runner.html?auto=1"
+set "URL=chrome-extension://ocpdgnoaajajnlehamcalfcpholjhfbe/runner.html?auto=1&all=1"
 
 if exist "%CHROME_64%" (
     start "" "%CHROME_64%" "%URL%"

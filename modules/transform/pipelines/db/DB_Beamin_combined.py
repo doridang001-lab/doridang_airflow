@@ -694,6 +694,16 @@ def retry_once_failed(failed: dict, target_date: str | None = None) -> str:
             logger.info(
                 "orders 재시도 완료: %s (실패 %d건)", account["account_id"], len(still_failed)
             )
+            if still_failed:
+                logger.info("orders 2차 재시도 건수 %d건 (30초 대기)", len(still_failed))
+                time.sleep(30)
+                result2 = collect_orders_for_account(
+                    account["account_id"], account["password"], still_failed, target_date=target_date
+                )
+                still2 = result2.get("failed", []) if isinstance(result2, dict) else result2
+                logger.info(
+                    "orders 2차 재시도 완료 %s: 잔여 실패 %d건", account["account_id"], len(still2)
+                )
         except Exception as e:
             logger.error("orders 재시도 실패 [%s]: %s", account["account_id"], e)
 
@@ -708,7 +718,15 @@ def retry_once_failed(failed: dict, target_date: str | None = None) -> str:
             )
             logger.info("ads 재시도 성공: %s", account["account_id"])
         except Exception as e:
-            logger.error("ads 재시도 실패 [%s]: %s", account["account_id"], e)
+            logger.warning("ads 1차 실패, 30초 대기 후 2차 재시도 [%s]: %s", account["account_id"], e)
+            time.sleep(30)
+            try:
+                collect_ad_funnel_for_account(
+                    account["account_id"], account["password"], stores, target_date=target_date
+                )
+                logger.info("ads 2차 재시도 성공: %s", account["account_id"])
+            except Exception as e2:
+                logger.error("ads 2차 재시도 실패 [%s]: %s", account["account_id"], e2)
 
     return f"재시도 완료: accounts={n_accounts} stores={n_stores} orders={n_orders} ads={n_ads}"
 

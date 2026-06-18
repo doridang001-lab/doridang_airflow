@@ -393,6 +393,7 @@ def _save_unified_daily(df: pd.DataFrame, date_str: str, overwrite: bool = False
         if dropped:
             logger.warning("unified_sales %s: _pk 중복 %d행 제거(방어)", date_str, dropped)
 
+    merged["qty"] = pd.to_numeric(merged["qty"], errors="coerce").fillna(0).astype(int)
     merged["unit_price"] = pd.to_numeric(merged["unit_price"], errors="coerce").fillna(0).astype(int)
     if "total_price" in merged.columns:
         merged["total_price"] = pd.to_numeric(merged["total_price"], errors="coerce").fillna(0).astype(int)

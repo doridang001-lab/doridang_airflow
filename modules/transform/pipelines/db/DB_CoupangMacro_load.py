@@ -57,6 +57,7 @@ def _iter_source_files(prefix: str) -> list[dict[str, Path]]:
 def _resolve_brand_store(display_name: str) -> tuple[str, str]:
     """Resolve `(brand, store)` from display name and normalize store via store_normalize."""
     name = re.sub(r"\(\d+\)\s*$", "", str(display_name)).strip()
+    name = re.sub(r"\s*_\d+\s*$", "", name).strip()
     if not name:
         logger.warning("display_name missing when resolving brand/store: %s", display_name)
         return "", ""
