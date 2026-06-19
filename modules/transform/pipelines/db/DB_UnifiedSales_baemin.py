@@ -39,8 +39,9 @@ def reconcile_baemin_for_test_stores(
     """
     TEST_STORES의 배달의민족 행을 baemin_macro 직수집 기준으로 교정.
 
-    - 직수집 파일 없는 날짜: 기존 posfeed 보존
-    - 직수집 파일은 있지만 해당 날짜 행이 0건인 경우: 기존 posfeed 보존
+    - 직수집 파일 없는 날짜: 기존 배달의민족 행 제거
+    - 직수집 파일은 있지만 해당 날짜 행이 0건인 경우: 기존 배달의민족 행 제거
+    - 배민 원천은 주문상태=배달완료, 주문금액=결제금액 기준으로 교정
     """
     if sale_date:
         dates = [str(sale_date)]
@@ -60,12 +61,36 @@ def reconcile_baemin_for_test_stores(
         for ym in ym_list:
             baemin_files = _find_baemin_files(store, ym)
             if not baemin_files:
-                logger.info("배민 수집 파일 없음, posfeed 보존: store=%s ym=%s", store, ym)
+                for date in dates:
+                    if date[:7] != ym:
+                        continue
+                    removed, added = _upsert_daily(pd.DataFrame(columns=UNIFIED_COLUMNS), date, store)
+                    total_removed += removed
+                    total_added += added
+                    logger.info(
+                        "배민 수집 파일 없음, 기존 배달의민족 행 제거: store=%s date=%s | 제거=%d 추가=%d",
+                        store,
+                        date,
+                        removed,
+                        added,
+                    )
                 continue
 
             df_raw = _read_baemin_files(baemin_files)
             if df_raw.empty:
-                logger.info("배민 수집 데이터 없음, posfeed 보존: store=%s ym=%s", store, ym)
+                for date in dates:
+                    if date[:7] != ym:
+                        continue
+                    removed, added = _upsert_daily(pd.DataFrame(columns=UNIFIED_COLUMNS), date, store)
+                    total_removed += removed
+                    total_added += added
+                    logger.info(
+                        "배민 수집 데이터 없음, 기존 배달의민족 행 제거: store=%s date=%s | 제거=%d 추가=%d",
+                        store,
+                        date,
+                        removed,
+                        added,
+                    )
                 continue
 
             _assert_required_columns(df_raw, store, ym)
@@ -81,13 +106,31 @@ def reconcile_baemin_for_test_stores(
                     continue
                 df_day = df_raw[df_raw["sale_date"] == date].copy()
                 if df_day.empty:
-                    logger.info("배민 데이터 없음, posfeed 보존: store=%s date=%s", store, date)
+                    removed, added = _upsert_daily(pd.DataFrame(columns=UNIFIED_COLUMNS), date, store)
+                    total_removed += removed
+                    total_added += added
+                    logger.info(
+                        "배민 데이터 없음, 기존 배달의민족 행 제거: store=%s date=%s | 제거=%d 추가=%d",
+                        store,
+                        date,
+                        removed,
+                        added,
+                    )
                     continue
 
                 df_unified = _transform_to_unified(df_day, store, brand, store_map)
                 df_unified = _apply_posfeed_blacklist(df_unified)
                 if df_unified.empty:
-                    logger.warning("배민 교정 데이터가 블랙리스트 적용 후 비어 있음: store=%s date=%s", store, date)
+                    removed, added = _upsert_daily(df_unified, date, store)
+                    total_removed += removed
+                    total_added += added
+                    logger.info(
+                        "배민 교정 데이터 없음, 기존 배민 매출 제거: store=%s date=%s | 제거=%d 추가=%d",
+                        store,
+                        date,
+                        removed,
+                        added,
+                    )
                     continue
                 df_unified = _recalculate_order_fields(df_unified)
 
@@ -103,6 +146,68 @@ def reconcile_baemin_for_test_stores(
                 )
 
     return f"배민수동 교정 완료 | 제거={total_removed}행 추가={total_added}행"
+
+
+def enforce_baemin_manual_only_for_test_stores(
+    stores: list[str],
+    sale_date: str | None = None,
+    lookback_days: int = 7,
+) -> str:
+    """TEST_STORES의 배달의민족 최종 방어막.
+
+    모든 채널 적재/재분류가 끝난 뒤, 테스트 매장에 대해
+    platform=배달의민족 행은 source=배민수동만 남기고 나머지 source는 제거한다.
+    """
+    if not stores:
+        return "TEST_STORES 없음 - 배민수동 최종 정리 스킵"
+
+    if sale_date:
+        dates = [str(sale_date)]
+    else:
+        kst_now = pendulum.now("Asia/Seoul")
+        dates = [
+            (kst_now - timedelta(days=i)).strftime("%Y-%m-%d")
+            for i in range(lookback_days)
+        ]
+
+    store_set = {str(store).strip() for store in stores if str(store).strip()}
+    total_removed = 0
+    changed_files = 0
+
+    for date in dates:
+        daily_path = _unified_daily_path(date)
+        if not daily_path.exists():
+            logger.info("배민수동 최종 정리 스킵, 파일 없음: %s", daily_path)
+            continue
+
+        df = pd.read_parquet(daily_path).reindex(columns=UNIFIED_COLUMNS, fill_value="")
+        remove_mask = (
+            df["store"].fillna("").astype(str).str.strip().isin(store_set)
+            & df["platform"].fillna("").astype(str).str.strip().eq(BAEMIN_PLATFORM)
+            & ~df["source"].fillna("").astype(str).str.strip().eq(BAEMIN_SOURCE)
+        )
+        removed = int(remove_mask.sum())
+        if removed == 0:
+            logger.info("배민수동 최종 정리 변경 없음: %s", daily_path.name)
+            continue
+
+        df_out = df[~remove_mask].reset_index(drop=True)
+        for col in ("qty", "unit_price", "total_price", "discount_amount", "order_cnt"):
+            if col in df_out.columns:
+                df_out[col] = pd.to_numeric(df_out[col], errors="coerce").fillna(0).astype(int)
+        df_out = df_out.reindex(columns=UNIFIED_COLUMNS, fill_value="")
+        df_out.to_parquet(daily_path, index=False, engine="pyarrow")
+
+        total_removed += removed
+        changed_files += 1
+        logger.warning(
+            "배민수동 최종 정리: %s | 제거=%d | stores=%s",
+            daily_path.name,
+            removed,
+            sorted(df.loc[remove_mask, "store"].dropna().astype(str).unique().tolist()),
+        )
+
+    return f"배민수동 최종 정리 완료 | 파일={changed_files} 제거={total_removed}행"
 
 
 def _find_baemin_files(store: str, ym: str) -> list[str]:
@@ -141,7 +246,7 @@ def _assert_required_columns(df: pd.DataFrame, store: str, ym: str) -> None:
         "주문옵션상세",
         "주문수량",
         "주문옵션금액",
-        "상품금액",
+        "결제금액",
     }
     missing = sorted(required - set(df.columns))
     if missing:
@@ -188,7 +293,7 @@ def _transform_to_unified(
     store_map: dict,
 ) -> pd.DataFrame:
     """baemin_macro rows -> UNIFIED_COLUMNS DataFrame."""
-    df = df[~df["주문상태"].fillna("").astype(str).str.contains("취소", regex=False)].copy()
+    df = df[df["주문상태"].fillna("").astype(str).str.strip().eq("배달완료")].copy()
     if df.empty:
         return pd.DataFrame(columns=UNIFIED_COLUMNS)
 
@@ -220,7 +325,7 @@ def _transform_to_unified(
     out["item_total"] = out["unit_price"] * out["qty"]
 
     order_item_sum = out.groupby("order_id")["item_total"].transform("sum")
-    order_amount = _first_nonzero_by_order(out["order_id"], _to_int_series(df["상품금액"]))
+    order_amount = _first_nonzero_by_order(out["order_id"], _to_int_series(df["결제금액"]))
     out["total_price"] = (
         (out["item_total"] / order_item_sum.replace(0, 1)) * order_amount
     ).round().astype(int)
@@ -293,7 +398,6 @@ def _upsert_daily(df_new: pd.DataFrame, date: str, store: str) -> tuple[int, int
         remove_mask = (
             df_existing["store"].fillna("").astype(str).str.strip().eq(store)
             & df_existing["platform"].fillna("").astype(str).str.strip().eq(BAEMIN_PLATFORM)
-            & df_existing["source"].fillna("").astype(str).str.strip().isin(["posfeed", BAEMIN_SOURCE])
         )
         removed_count = int(remove_mask.sum())
         df_existing = df_existing[~remove_mask]

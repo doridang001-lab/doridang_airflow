@@ -16,7 +16,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pendulum
-from airflow import DAG
+from airflow import DAG, settings
 from airflow.operators.python import PythonOperator
 from airflow.sensors.external_task import ExternalTaskSensor
 
@@ -35,6 +35,55 @@ dag_id = Path(__file__).stem
 _ALERT_EMAILS = ["a17019@kakao.com"]
 
 LOOKBACK_DAYS = 30
+
+
+def _latest_toorder_review_execution_date(dt, **context):
+    """Sales_ToOrder_Review_Dags.t4_validate의 최신 성공 execution_date를 최신순으로 조회한다."""
+    from airflow.models.dagrun import DagRun
+    from airflow.models.taskinstance import TaskInstance as TI
+
+    session = settings.Session()
+    try:
+        row = (
+            session.query(DagRun.execution_date)
+            .join(
+                TI,
+                (TI.dag_id == DagRun.dag_id) & (TI.run_id == DagRun.run_id),
+            )
+            .filter(
+                TI.dag_id == "Sales_ToOrder_Review_Dags",
+                TI.task_id == "t4_validate",
+                TI.state == "success",
+            )
+            .order_by(DagRun.execution_date.desc())
+            .first()
+        )
+        if not row:
+            logger.info("[sensor] Sales_ToOrder_Review_Dags.t4_validate 성공 이력 없음. fallback=%s", dt)
+            return dt
+
+        latest_execution_date = row[0]
+        # DB 실행 기준으로 너무 오래된 완료 건은 무시한다.
+        now = pendulum.now("Asia/Seoul")
+        if latest_execution_date >= dt - timedelta(hours=12) and latest_execution_date <= now:
+            logger.info(
+                "[sensor] Sales_ToOrder_Review_Dags.t4_validate 최신 성공 시각: %s",
+                latest_execution_date,
+            )
+            return latest_execution_date
+
+        logger.info(
+            "[sensor] 최신 성공(%s)이 현재 기준(%s)에서 너무 과거/미래함. fallback=%s",
+            latest_execution_date,
+            dt,
+            dt,
+        )
+    except Exception as exc:
+        logger.warning("[sensor] Sales_ToOrder_Review_Dags.t4_validate 조회 실패: %s", exc)
+    finally:
+        session.close()
+
+    return dt
 
 
 def _resolve_sale_date(conf: dict) -> str | None:
@@ -141,9 +190,9 @@ with DAG(
     wait_for_toorder_review = ExternalTaskSensor(
         task_id="wait_for_toorder_review",
         external_dag_id="Sales_ToOrder_Review_Dags",
-        external_task_id=None,
+        external_task_id="t4_validate",
+        execution_date_fn=_latest_toorder_review_execution_date,
         allowed_states=["success"],
-        execution_delta=timedelta(0),
         timeout=60 * 60 * 6,
         poke_interval=60,
         mode="reschedule",

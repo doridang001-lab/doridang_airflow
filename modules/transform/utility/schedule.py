@@ -17,7 +17,7 @@ SMP_DELIVERY_ALERT_TIME  = "5 9 * * 1,2,3,4,5"  # 매주 월~금 09:00 실행
 SMP_CLOSING_RATE_TIME    = "0 7 * * 1"             # 매주 월요일 07:00 실행
 SMP_DAG_MONITORING_TIME = "0 15 * * *"  # 매일 15:00 실행 (KST)
 SMP_POLICY_TIME  = "0 8 * * *"   # 매일 08:00 실행 (KST)
-SMP_CHICKEN_PRICE_TIME  = "10 7 * * *"   # 매일 07:10 실행 (KST)
+SMP_CHICKEN_PRICE_TIME  = "0 9 * * *"   # 매일 09:00 실행 (KST)
 
 # 정책 수집 DAG 전용 스케줄 (5분 간격, 비중첩)
 SMP_POLICY_BAEMIN_TIME      = "0 8 * * *"   # 매일 08:00

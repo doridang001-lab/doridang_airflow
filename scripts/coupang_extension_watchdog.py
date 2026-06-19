@@ -26,6 +26,7 @@ DEBUG_ENDPOINT = "http://127.0.0.1:9222"
 MAX_RETRY = 5
 POLL_SEC = 30
 BATCH_TIMEOUT = 5400
+TARGET_SETTLE_SEC = 5
 
 
 def _http_json(url: str, method: str = "GET") -> Any:
@@ -114,17 +115,66 @@ def wait_for_batch_done(driver: webdriver.Chrome, poll_sec: int, batch_timeout: 
     logger.warning("배치 타임아웃 %ds 초과", batch_timeout)
 
 
-def find_failed_row_indices(driver: webdriver.Chrome) -> list[str]:
+def _row_index(row: Any) -> str | None:
+    row_id = row.get_attribute("id")
+    if not row_id or not row_id.startswith("row-"):
+        return None
+    return row_id.removeprefix("row-")
+
+
+def _has_skipped_badge(row: Any) -> bool:
+    for span in row.find_elements(By.CSS_SELECTOR, "span.badge"):
+        cls = span.get_attribute("class") or ""
+        text = span.text.strip()
+        if "b-wait" in cls and text == "건너뜀":
+            return True
+    return False
+
+
+def capture_initial_target_indices(driver: webdriver.Chrome, settle_sec: int) -> set[str]:
+    ensure_runner_tab(driver)
+    if settle_sec > 0:
+        time.sleep(settle_sec)
+
+    rows = driver.find_elements(By.CSS_SELECTOR, "tbody#rows tr")
+    target_indices: list[str] = []
+    skipped_indices: list[str] = []
+
+    for row in rows:
+        idx = _row_index(row)
+        if idx is None:
+            continue
+
+        if _has_skipped_badge(row):
+            skipped_indices.append(idx)
+            continue
+
+        target_indices.append(idx)
+
+    logger.info(
+        "최초 수집 대상 스냅샷: 대상 %d개, 초기 건너뜀 제외 %d개",
+        len(target_indices),
+        len(skipped_indices),
+    )
+    if skipped_indices:
+        logger.info("초기 건너뜀 제외 행: %s", skipped_indices)
+
+    return set(target_indices)
+
+
+def find_failed_row_indices(driver: webdriver.Chrome, target_indices: set[str] | None = None) -> list[str]:
     ensure_runner_tab(driver)
     rows = driver.find_elements(By.CSS_SELECTOR, "tbody#rows tr")
     failed: list[str] = []
 
     for row in rows:
-        row_id = row.get_attribute("id")
-        if not row_id or not row_id.startswith("row-"):
+        idx = _row_index(row)
+        if idx is None:
             continue
 
-        idx = row_id.removeprefix("row-")
+        if target_indices is not None and idx not in target_indices:
+            continue
+
         for span in row.find_elements(By.CSS_SELECTOR, "span.badge"):
             cls = span.get_attribute("class") or ""
             text = span.text.strip()
@@ -158,12 +208,13 @@ def run(args: argparse.Namespace) -> int:
     driver = connect_to_chrome()
     try:
         ensure_runner_tab(driver)
+        target_indices = capture_initial_target_indices(driver, args.target_settle_sec)
 
         for attempt in range(args.max_retry + 1):
             logger.info("[%d/%d] 배치 완료 대기 중", attempt, args.max_retry)
             wait_for_batch_done(driver, args.poll_sec, args.batch_timeout)
 
-            failed = find_failed_row_indices(driver)
+            failed = find_failed_row_indices(driver, target_indices)
             logger.info("실패/건너뜀 행: %s", failed)
 
             if not failed:
@@ -187,6 +238,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-retry", type=int, default=MAX_RETRY)
     parser.add_argument("--poll-sec", type=int, default=POLL_SEC)
     parser.add_argument("--batch-timeout", type=int, default=BATCH_TIMEOUT)
+    parser.add_argument("--target-settle-sec", type=int, default=TARGET_SETTLE_SEC)
     return parser.parse_args()
 
 

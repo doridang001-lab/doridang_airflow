@@ -9,7 +9,8 @@ unified_sales 일별 생성 DAG (okpos + unionpos + easypos + posfeed)
 5. easypos 적재
 6. posfeed 적재
 7. platform 재분류
-8. 최종 검증
+8. 테스트 매장 배달의민족 source 최종 정리
+9. 최종 검증
 """
 
 import logging
@@ -84,10 +85,120 @@ default_args = {
 # - int  : 최근 N일 누락분 보충
 # - None : 전체 소스 CSV 백필
 # LOOKBACK_DAYS: int | None = 7
-LOOKBACK_DAYS: int | None = 30  # 전체 백필 모드 (주의: 실행 시점 기준으로 소스 CSV 전체를 다시 처리하므로 오래 걸릴 수 있음)
+LOOKBACK_DAYS: int | None = 90  # 전체 백필 모드 (주의: 실행 시점 기준으로 소스 CSV 전체를 다시 처리하므로 오래 걸릴 수 있음)
 
 # 배민 직수집 교정 대상 테스트 매장 (검증 완료 후 확대)
-TEST_STORES: list[str] = ["해운대중동점", "법흥리점"]
+TEST_STORES: list[str] = ["해운대중동점", "법흥리점", "송파삼전점"]
+
+UPSTREAM_POS_TASKS = [
+    {
+        "dag_id": "DB_OKPOS_Sales_Dags",
+        "task_id": "write_log",
+        "execution_delta": timedelta(hours=1, minutes=5),
+    },
+    {
+        "dag_id": "DB_UnionPOS_Receipt_Dags",
+        "task_id": "write_log",
+        "execution_delta": timedelta(minutes=45),
+    },
+    {
+        "dag_id": "DB_EasyPOS_Sales_Dags",
+        "task_id": "save_easypos_product",
+        "execution_delta": timedelta(minutes=50),
+    },
+    {
+        "dag_id": "DB_Posfeed_Sales_Dags",
+        "task_id": "scrape_missing_order_details",
+        "execution_delta": timedelta(hours=1, minutes=25),
+    },
+]
+
+
+def _truthy(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+def wait_for_upstream_pos(**context) -> str:
+    """정기 실행에서 POS 원천 수집 DAG 완료를 확인한다.
+
+    수동 정정 실행은 기본적으로 대기하지 않는다. 수동 실행에서도 상류 완료를
+    강제하고 싶으면 dag_run.conf에 {"wait_upstreams": true}를 넣는다.
+    """
+    import time
+
+    from airflow import settings
+    from airflow.exceptions import AirflowException
+    from airflow.models.dagrun import DagRun
+    from airflow.models.taskinstance import TaskInstance
+
+    dag_run = context.get("dag_run")
+    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    run_type = str(getattr(dag_run, "run_type", "") or "").lower()
+    is_manual = "manual" in run_type or bool(getattr(dag_run, "external_trigger", False))
+
+    if is_manual and not _truthy(conf.get("wait_upstreams")):
+        logger.info("수동 실행: 상류 POS 대기 스킵 (wait_upstreams=true 아님)")
+        return "수동 실행: 상류 POS 대기 스킵"
+
+    logical_date = context.get("logical_date") or getattr(dag_run, "logical_date", None) or getattr(dag_run, "execution_date", None)
+    if logical_date is None:
+        raise AirflowException("logical_date를 확인할 수 없어 상류 POS 대기 불가")
+
+    timeout_seconds = int(conf.get("upstream_wait_timeout_seconds") or 60 * 60 * 6)
+    poke_interval = int(conf.get("upstream_wait_poke_interval") or 60)
+    deadline = time.monotonic() + timeout_seconds
+    logical_col = getattr(DagRun, "logical_date", DagRun.execution_date)
+
+    while True:
+        pending: list[str] = []
+        session = settings.Session()
+        try:
+            for spec in UPSTREAM_POS_TASKS:
+                target_logical_date = logical_date - spec["execution_delta"]
+                upstream_run = (
+                    session.query(DagRun)
+                    .filter(DagRun.dag_id == spec["dag_id"])
+                    .filter(logical_col == target_logical_date)
+                    .one_or_none()
+                )
+                label = f"{spec['dag_id']}.{spec['task_id']}@{target_logical_date}"
+                if upstream_run is None:
+                    pending.append(f"{label}: dag_run 없음")
+                    continue
+
+                ti = (
+                    session.query(TaskInstance)
+                    .filter(TaskInstance.dag_id == spec["dag_id"])
+                    .filter(TaskInstance.task_id == spec["task_id"])
+                    .filter(TaskInstance.run_id == upstream_run.run_id)
+                    .one_or_none()
+                )
+                if ti is None:
+                    pending.append(f"{label}: task_instance 없음")
+                    continue
+
+                state = str(ti.state or "").lower()
+                if state == "success":
+                    continue
+                if state in {"failed", "upstream_failed"}:
+                    raise AirflowException(f"상류 POS 실패: {label} state={ti.state}")
+                pending.append(f"{label}: state={ti.state}")
+        finally:
+            session.close()
+
+        if not pending:
+            logger.info("상류 POS 완료 확인")
+            return "상류 POS 완료 확인"
+
+        if time.monotonic() >= deadline:
+            raise AirflowException("상류 POS 대기 timeout: " + " | ".join(pending[:10]))
+
+        logger.info("상류 POS 대기 중: %s", " | ".join(pending[:10]))
+        time.sleep(poke_interval)
 
 
 def resolve_date(**context) -> str:
@@ -253,6 +364,22 @@ def reclassify_platform(**context) -> str:
     return pipeline_reclassify(sale_date, overwrite=True)
 
 
+def enforce_baemin_manual_only(**context) -> str:
+    """최종 방어: TEST_STORES의 배달의민족은 배민수동만 남긴다."""
+    if not TEST_STORES:
+        return "TEST_STORES 없음 - 스킵"
+    from modules.transform.pipelines.db.DB_UnifiedSales_baemin import (
+        enforce_baemin_manual_only_for_test_stores,
+    )
+
+    sale_date = context["ti"].xcom_pull(task_ids="resolve_date", key="sale_date")
+    return enforce_baemin_manual_only_for_test_stores(
+        stores=TEST_STORES,
+        sale_date=sale_date,
+        lookback_days=LOOKBACK_DAYS or 7,
+    )
+
+
 with DAG(
     dag_id=dag_id,
     schedule=DB_UNIFIED_SALES_TIME,
@@ -266,6 +393,11 @@ with DAG(
     t1 = PythonOperator(
         task_id="resolve_date",
         python_callable=resolve_date,
+    )
+
+    t_wait = PythonOperator(
+        task_id="wait_for_upstream_pos",
+        python_callable=wait_for_upstream_pos,
     )
 
     t3 = PythonOperator(
@@ -318,6 +450,11 @@ with DAG(
         python_callable=reclassify_platform,
     )
 
+    t6a = PythonOperator(
+        task_id="enforce_baemin_manual_only",
+        python_callable=enforce_baemin_manual_only,
+    )
+
     t7 = PythonOperator(
         task_id="validate_sales",
         python_callable=validate_sales,
@@ -334,4 +471,4 @@ with DAG(
     )
 
     # 순차 실행: 같은 날짜 parquet에 동시 write 방지
-    t1 >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5b >> t5c >> t_baemin >> t6 >> t7 >> t8 >> t9
+    t1 >> t_wait >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5b >> t5c >> t_baemin >> t6 >> t6a >> t7 >> t8 >> t9

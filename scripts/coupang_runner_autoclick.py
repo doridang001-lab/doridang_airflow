@@ -17,16 +17,18 @@ import urllib.error
 
 logger = logging.getLogger(__name__)
 
-RUNNER_URL = "chrome-extension://ocpdgnoaajajnlehamcalfcpholjhfbe/runner.html"
-BUTTON_ID = "startBtn"
+RUNNER_URL_SUFFIX = "/runner.html"
+RUNNER_URL_FALLBACK = "chrome-extension://ocpdgnoaajajnlehamcalfcpholjhfbe/runner.html"
+BUTTON_ID = "topHalfBtn"
 DEBUG_ENDPOINT = "http://127.0.0.1:9222"
 TIMEOUT_SECONDS = 60
 POLL_INTERVAL_SECONDS = 0.5
 
 
-def _http_json(url: str) -> Any:
+def _http_json(url: str, method: str = "GET") -> Any:
     try:
-        with urllib.request.urlopen(url, timeout=10) as resp:
+        req = urllib.request.Request(url, method=method, data=b"" if method != "GET" else None)
+        with urllib.request.urlopen(req, timeout=10) as resp:
             payload = resp.read()
     except urllib.error.URLError as exc:
         raise RuntimeError(f"DevTools endpoint unreachable: {url}") from exc
@@ -37,24 +39,33 @@ def _fetch_tabs() -> list[dict]:
     return _http_json(f"{DEBUG_ENDPOINT}/json")
 
 
+def _find_runner_url() -> str:
+    """extension ID를 동적으로 탐색해 runner.html URL을 반환."""
+    tabs = _fetch_tabs()
+    for tab in tabs:
+        url = str(tab.get("url", ""))
+        if url.startswith("chrome-extension://") and url.endswith(RUNNER_URL_SUFFIX):
+            return url
+    return RUNNER_URL_FALLBACK
+
+
 def _ensure_runner_tab() -> str:
+    runner_url = _find_runner_url()
     tabs = _fetch_tabs()
     for tab in tabs:
-        if str(tab.get("url", "")).startswith(RUNNER_URL):
+        url = str(tab.get("url", ""))
+        if url.startswith("chrome-extension://") and url.endswith(RUNNER_URL_SUFFIX):
             ws_url = tab.get("webSocketDebuggerUrl")
             if ws_url:
+                logger.info("existing runner tab found: %s", url)
                 return ws_url
 
-    logger.info("runner tab not found, create one")
-    encoded = urllib.parse.quote(RUNNER_URL, safe="")
-    _http_json(f"{DEBUG_ENDPOINT}/json/new?{encoded}")
-
-    tabs = _fetch_tabs()
-    for tab in tabs:
-        if str(tab.get("url", "")).startswith(RUNNER_URL):
-            ws_url = tab.get("webSocketDebuggerUrl")
-            if ws_url:
-                return ws_url
+    logger.info("runner tab not found, create one: %s", runner_url)
+    encoded = urllib.parse.quote(runner_url, safe="")
+    new_tab = _http_json(f"{DEBUG_ENDPOINT}/json/new?{encoded}", method="PUT")
+    ws_url = new_tab.get("webSocketDebuggerUrl") if isinstance(new_tab, dict) else None
+    if ws_url:
+        return ws_url
 
     raise RuntimeError("Unable to open runner.html tab with websocket endpoint")
 
