@@ -35,7 +35,7 @@ SMP_POLICY_CONSOLIDATE_TIME = "45 8 * * *"  # 매일 08:45 (수집 완료 후 �
 DB_COUPANG_MACRO_TIME = "0 9 * * *"  # 매일 09:00 실행 (쿠팡이츠 매크로 적재)
 DB_UNIFIED_SALES_TIME        = "40 8 * * *"  # 매일 09:00 실행 (POS 수집 완료 후)
 DB_ITEM_MASTER_TIME          = "30 9 * * *" # 매일 09:30 실행 (UnifiedSales 빌드 후)
-DB_COLLECTION_COMPARE_TIME   = "0 20 * * *"  # 매일 20:00 실행 (수집 비교 마트)
+DB_COLLECTION_COMPARE_TIME   = "37 7 * * *"  # 매일 07:37 실행 (수집 비교 마트)
 DB_FIN_PRODUCT_TIME          = "35 8 * * *" # 매일 08:35 실행 (OKPOS Product 완료 후)
 DB_POSFEED_SALES_TIME        = "15 7 * * *"  # 매일 07:15 실행
 DB_POSFEED_SALES_DETAIL_TIME = "45 7 * * *"  # 매일 07:45 실행
@@ -46,13 +46,13 @@ DB_UNIONPOS_RECEIPT_TIME     = "55 7 * * *"  # 매일 07:55 실행
 
 AI_DAILY_COLLECTION_TIME = "20 7 * * *"  # 매일 07:20 실행 (KST)
 
-SMD_TOORDER_SALES_REPORT_TIME = "0 7 * * *"  # 매일 07:00 실행
+SMD_TOORDER_SALES_REPORT_TIME = "5 6 * * *"  # 매일 6:05 실행
 
 DB_TOORDER_STORE_PLATFORM_TIME = "10 7 * * *"  # 매일 07:10 실행 (SMD_TOORDER_SALES_REPORT 이후)
 
 DB_UNIFIED_REVIEW_TIME         = "33 7 * * *"  # 매일 07:33 실행 (ToOrderVoc Transform 7:30 이후)
 
-SMD_BAEMIN_COLLECT_TIME = "15 7 * * *"  # 매일 KST 07:15 실행 (토더 매출 수집 완료 후)
+SMD_BAEMIN_COLLECT_TIME = "10 3 * * *"  # 매일 KST 07:15 실행 (토더 매출 수집 완료 후)
 
 SMP_MORNING_BRIEFING_TIME = "50 6 * * 1,2,3,4,5"  # 매주 월~금 06:47 실행 (KST)
 

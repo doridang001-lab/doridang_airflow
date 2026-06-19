@@ -5,7 +5,7 @@ unified_sales 일별/월별 검증 파이프라인.
 1. 대상일 1일을 결정한다.
 2. MART_DB/unified_sales_grp/unified_sales_*.parquet 에서 sale_date+store 기준 total_price를 집계한다.
 3. ToOrder 일별 store/platform parquet에서 같은 기준으로 집계한다.
-4. outer join 으로 비교하고 오차율 2% 이상 매장을 HTML 테이블로 메일 발송한다.
+4. outer join 으로 비교하고 오차율 2% 이상 매장을 Telegram으로 알림 발송한다.
 5. 일별 결과: MART_DB/unified_sales_grp_error_list/unified_sales_error_YYYY-MM-DD.csv
 6. 월별 결과: MART_DB/unified_sales_grp_error_list/unified_sales_monthly_YYYY-MM.csv
    (올해 데이터가 있는 모든 ym에 대해 생성, 알림은 어제 기준 달만)
@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from modules.transform.utility.mailer import send_email
+from modules.transform.utility.notifier import send_telegram
 from modules.transform.utility.paths import (
     ANALYTICS_DB,
     COLLECT_DB,
@@ -165,21 +165,29 @@ def _build_html_table(df: pd.DataFrame) -> str:
     )
 
 
-def _build_email_html(title: str, subtitle: str, table_html: str, csv_path: Path) -> str:
-    win_path, file_uri = _to_win_file_uri(csv_path)
-    return f"""<html>
-<head><meta charset="UTF-8"></head>
-<body style="font-family:'Malgun Gothic',Arial,sans-serif;margin:24px;line-height:1.6;background:#f4f6f8;">
-<div style="max-width:900px;margin:auto;background:#fff;border-radius:8px;padding:24px;
-            box-shadow:0 2px 8px rgba(0,0,0,0.08);">
-  <h2 style="margin-top:0;color:#2c3e50;border-bottom:2px solid #2c3e50;padding-bottom:8px;">{title}</h2>
-  <p style="color:#555;">{subtitle}</p>
-  {table_html}
-  <p style="color:#999;font-size:12px;margin-top:16px;">결과 파일: <a href="{file_uri}" style="color:#2980b9;">{win_path}</a></p>
-  <p style="color:#bbb;font-size:11px;">이 메일은 자동으로 발송되었습니다.</p>
-</div>
-</body>
-</html>"""
+def _format_telegram_rows(df: pd.DataFrame, *, date_col: str, limit: int = 20) -> str:
+    lines = []
+    for _, row in df.head(limit).iterrows():
+        lines.append(
+            f"- {row.get(date_col, '')} {row.get('store', '')}: "
+            f"오차율 {float(row.get('error_rate', 0)):.2f}% / "
+            f"차이 {int(row.get('difference', 0)):,}"
+        )
+    if len(df) > limit:
+        lines.append(f"... 외 {len(df) - limit}건")
+    return "\n".join(lines)
+
+
+def _build_telegram_message(title: str, target_label: str, error_rows: pd.DataFrame, csv_path: Path, *, date_col: str) -> str:
+    win_path, _ = _to_win_file_uri(csv_path)
+    rows_text = _format_telegram_rows(error_rows, date_col=date_col)
+    return (
+        f"{title}\n"
+        f"{target_label}\n"
+        f"오차율 2% 이상: {len(error_rows)}건\n"
+        f"CSV: {win_path}\n"
+        f"{rows_text}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -275,19 +283,14 @@ def _send_alert(target_date: str, error_rows: pd.DataFrame, csv_path: Path, **co
         error_rows[["sale_date", "store", "excel_total", "unified_total", "difference", "error_rate", "status"]]
         .sort_values(["error_rate", "store"], ascending=[False, True])
     )
-    table_html = _build_html_table(display)
-    html = _build_email_html(
-        title=f"[도리당] unified_sales 일별 검증 알림",
-        subtitle=f"대상일: <b>{target_date}</b> &nbsp;|&nbsp; 오차율 2% 이상 매장 수: <b>{len(error_rows)}</b>",
-        table_html=table_html,
+    message = _build_telegram_message(
+        title="[도리당] unified_sales 일별 검증 알림",
+        target_label=f"대상일: {target_date}",
+        error_rows=display,
         csv_path=csv_path,
+        date_col="sale_date",
     )
-    send_email(
-        subject=f"[도리당] unified_sales 검증 알림 ({target_date})",
-        html_content=html,
-        to_emails="a17019@kakao.com",
-        **context,
-    )
+    send_telegram(message)
 
 
 def validate_sales(**context) -> str:
@@ -419,19 +422,14 @@ def _send_monthly_alert(target_ym: str, error_rows: pd.DataFrame, csv_path: Path
         error_rows[["ym", "store", "excel_total", "unified_total", "difference", "error_rate", "status"]]
         .sort_values(["error_rate", "store"], ascending=[False, True])
     )
-    table_html = _build_html_table(display)
-    html = _build_email_html(
+    message = _build_telegram_message(
         title="[도리당] unified_sales 월별 검증 알림",
-        subtitle=f"대상월: <b>{target_ym}</b> &nbsp;|&nbsp; 오차율 2% 이상 매장 수: <b>{len(error_rows)}</b>",
-        table_html=table_html,
+        target_label=f"대상월: {target_ym}",
+        error_rows=display,
         csv_path=csv_path,
+        date_col="ym",
     )
-    send_email(
-        subject=f"[도리당] unified_sales 월별 검증 알림 ({target_ym})",
-        html_content=html,
-        to_emails="a17019@kakao.com",
-        **context,
-    )
+    send_telegram(message)
 
 
 def validate_monthly_sales(**context) -> str:
@@ -705,6 +703,7 @@ def build_daily_summary() -> str:
     # 전월 이전: expected_month_sales = total_price (일별 실매출) → SUM 집계 정합성 보장
     past_daily_mask = daily["ym"] < today_ym
     daily.loc[past_daily_mask, "expected_month_sales"] = daily.loc[past_daily_mask, "total_price"]
+    daily.loc[past_daily_mask, "expected_month_order_cnt"] = daily.loc[past_daily_mask, "order_cnt"]
 
     w_cols = ["week_start", "store", "brand", "order_type", "platform",
               "expected_week_sales", "expected_week_order_cnt",
@@ -716,27 +715,29 @@ def build_daily_summary() -> str:
     for col in ["llm_total_summary","llm_total_reason","llm_total_action",
                 "llm_brand_summary","llm_brand_reason","llm_brand_action"]:
         daily[col] = ""
+    daily["llm_summary"] = daily["llm_total_summary"]
+    daily["llm_reason"] = daily["llm_total_reason"]
+    daily["llm_action"] = daily["llm_total_action"]
 
     # ── 10. 최종 컬럼 순서 & 저장 ────────────────────────────────────────────
     daily = daily[[
-        "sale_date", "ym", "week_start", "store", "brand", "region", "담당자", "실오픈일",
+        # legacy daily_summary schema: keep these first for position-based consumers.
+        "sale_date", "ym", "store", "brand", "region", "담당자", "실오픈일",
         "order_type", "platform", "total_price", "order_cnt",
-        # 월별 채널 (SUM 가능)
         "expected_month_sales", "expected_month_order_cnt",
         "prev_expected_month_sales", "avg_3m_expected_sales",
         "prev_month_order_cnt", "avg_3m_order_cnt",
-        # 월별 매장 종합 (MAX 사용) + status는 store 기준
+        "status",
+        "llm_summary", "llm_reason", "llm_action",
+        # 추가 분석 컬럼은 legacy 컬럼 뒤에 배치
+        "week_start",
         "store_expected_month_sales", "store_expected_month_order_cnt",
         "store_prev_expected_month_sales", "store_prev_expected_month_order_cnt",
-        "status",
-        # 월별 LLM
         "llm_total_summary", "llm_total_reason", "llm_total_action",
         "llm_brand_summary", "llm_brand_reason", "llm_brand_action",
-        # 주별 채널 (SUM 가능)
         "expected_week_sales", "expected_week_order_cnt",
         "prev_expected_week_sales", "avg_3w_expected_sales",
         "prev_week_order_cnt", "avg_3w_order_cnt",
-        # 주별 매장 종합 (MAX 사용)
         "store_expected_week_sales", "store_expected_week_order_cnt",
     ]]
     DAILY_SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)

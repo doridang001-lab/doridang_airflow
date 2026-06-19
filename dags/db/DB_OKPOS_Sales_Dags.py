@@ -62,7 +62,7 @@ dag_id = Path(__file__).stem
 #   (기존 파일이 있으면 자동으로 skip, 강제 재다운로드는 conf의 force_redownload / force_redownload_daily 사용)
 # MANUAL_DATE_RANGE: tuple | None = None
 MANUAL_DATE_RANGE = None
-LOOKBACK_DAYS: int | None = 7
+LOOKBACK_DAYS: int | None = 120 # None or int형
 _ALERT_EMAILS = ["a17019@kakao.com"]
 
 

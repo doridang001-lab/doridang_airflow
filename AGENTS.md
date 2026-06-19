@@ -21,3 +21,12 @@
 ## 작업 산출물 규칙
 - 임시/디버그/일회성 스크립트·파일은 저장소 루트에 만들지 말 것.
 - 루트 임시 산출물은 `.tmp/`(gitignore됨) 또는 운영 스크립트가 지정한 경로에서만 생성하고, `git add` 하지 말 것.
+
+## 텍스트 인코딩 규칙
+- 문서/파이썬 소스(`*.md`, `*.py`, `*.txt`, `*.json`)는 UTF-8(가능하면 BOM 미포함)로 유지한다.
+- PowerShell에서 텍스트를 읽거나 쓸 때는 UTF-8을 명시한다.
+  - 읽기: `Get-Content -Path <path> -Encoding utf8`
+  - 쓰기: `Set-Content -Path <path> -Encoding utf8 -Value ...`
+  - 실행 후 확인: `python -c "from pathlib import Path; Path(r'<path>').read_text(encoding='utf-8'); print('utf8 ok')"`
+- 깔끔한 재확인:
+  - `python -c "import pathlib; f=pathlib.Path(r'<path>'); f.read_text(encoding='utf-8'); print('ok')"`

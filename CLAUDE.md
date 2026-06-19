@@ -1,5 +1,5 @@
 # Claude Reference
 
-This repository uses `AGENTS.md` as the single source of truth for operating rules.
+먼저 `C:\airflow\AGENTS.md`를 읽고 진행하세요.
 
-Read `C:\airflow\AGENTS.md` before making changes. Do not maintain separate rules in this file.
+이 파일에는 별도 규칙을 두지 않습니다.

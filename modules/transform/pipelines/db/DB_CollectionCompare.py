@@ -17,6 +17,7 @@ from modules.transform.utility.paths import (
     COUPANG_ORDERS_DB,
     MART_DB,
 )
+from modules.transform.utility.store_normalize import normalize_for_join
 
 logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
@@ -42,7 +43,8 @@ class SourceSpec:
 
 
 def _normalize_store_name(series: pd.Series) -> pd.Series:
-    return series.astype(str).str.strip().str.replace(r"\s+", "", regex=True)
+    stripped = series.astype(str).str.strip().str.replace(r"\s+", "", regex=True)
+    return normalize_for_join(stripped)
 
 
 def _normalize_grouped(

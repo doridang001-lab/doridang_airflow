@@ -15,8 +15,9 @@
 """
 
 import logging
+import numbers
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -26,10 +27,13 @@ from modules.transform.utility.paths import (
     UNIFIED_REVIEW_MART_DIR,
 )
 
+
 logger = logging.getLogger(__name__)
 
 _FILE_DATE_RE = re.compile(r"toorder_voc_(\d{8})\.parquet$")
 _GROUP_KEYS = ["작성일자", "매장명", "토픽", "감정수준"]
+_MIN_REVIEW_DATE = date(2020, 1, 1)
+_MAX_REVIEW_DATE = date(2100, 12, 31)
 
 
 def _parse_file_date(path: Path) -> date | None:
@@ -40,6 +44,93 @@ def _parse_file_date(path: Path) -> date | None:
         return date(int(m.group(1)[:4]), int(m.group(1)[4:6]), int(m.group(1)[6:8]))
     except ValueError:
         return None
+
+
+def _normalize_date_only(value: str | date | int | float | None) -> date | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        if isinstance(value, numbers.Real) and not isinstance(value, bool):
+            n = int(value)
+            if float(value) == float(n) and 10_000_000 <= n <= 99_999_999:
+                s = str(n)
+                return date.fromisoformat(f"{s[:4]}-{s[4:6]}-{s[6:8]}")
+        s = str(value).strip()
+        if not s or s == "nan":
+            return None
+        if len(s) == 8 and s.isdigit():
+            return date.fromisoformat(f"{s[:4]}-{s[4:6]}-{s[6:8]}")
+        return date.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _format_written_date_text(value: str | date | int | float | None) -> str | None:
+    normalized = _normalize_date_only(value)
+    if normalized is not None:
+        return normalized.isoformat()
+
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.date().isoformat()
+
+
+def _coerce_written_date_to_text(df: pd.DataFrame) -> pd.DataFrame:
+    if "작성일자" not in df.columns:
+        return df
+
+    df = df.copy()
+    df["작성일자"] = df["작성일자"].map(_format_written_date_text).astype("string")
+    return df
+
+
+def _drop_invalid_written_dates(df: pd.DataFrame) -> pd.DataFrame:
+    if "작성일자" not in df.columns:
+        return df
+
+    normalized = df["작성일자"].map(_normalize_date_only)
+    valid_mask = normalized.map(
+        lambda value: value is not None and _MIN_REVIEW_DATE <= value <= _MAX_REVIEW_DATE
+    )
+    dropped = int((~valid_mask).sum())
+    if dropped:
+        logger.warning("비정상 작성일자 행 제거: %d행", dropped)
+    return df[valid_mask].copy()
+
+
+def _ensure_target_date_rows(df: pd.DataFrame, mode: str, target_date: str | None) -> pd.DataFrame:
+    """mode=date에서 target_date에 행이 없으면 전날 데이터를 복제해 target_date 한 줄로 보정."""
+    if mode != "date" or "작성일자" not in df.columns:
+        return df
+
+    target_dt = _normalize_date_only(target_date)
+    if target_dt is None:
+        return df
+
+    current_dates = pd.to_datetime(df["작성일자"], errors="coerce").dt.date
+    if current_dates.isna().all():
+        return df
+
+    if target_dt in set(current_dates.dropna()):
+        return df
+
+    fallback_dt = target_dt - timedelta(days=1)
+    fallback_rows = df[current_dates == fallback_dt].copy()
+    if fallback_rows.empty:
+        return df
+
+    fallback_rows["작성일자"] = target_dt
+    return pd.concat([df, fallback_rows], ignore_index=True)
 
 
 def _collect_files(mode: str, days: int = 30, target_date: str | None = None) -> list[Path]:
@@ -60,7 +151,11 @@ def _collect_files(mode: str, days: int = 30, target_date: str | None = None) ->
     return [f for f in all_files if (d := _parse_file_date(f)) is not None and d >= cutoff]
 
 
-def _load_and_aggregate(files: list[Path]) -> pd.DataFrame:
+def _load_and_aggregate(
+    files: list[Path],
+    mode: str = "lookback",
+    target_date: str | None = None,
+) -> pd.DataFrame:
     dfs = []
     for f in files:
         try:
@@ -72,6 +167,10 @@ def _load_and_aggregate(files: list[Path]) -> pd.DataFrame:
         return pd.DataFrame(columns=[*_GROUP_KEYS, "언급수"])
 
     df = pd.concat(dfs, ignore_index=True)
+    df = _ensure_target_date_rows(df, mode=mode, target_date=target_date)
+    df = _coerce_written_date_to_text(df)
+    df = _drop_invalid_written_dates(df)
+
     result = (
         df.groupby(_GROUP_KEYS, dropna=False)["번호"]
         .count()
@@ -85,9 +184,10 @@ def _save_mart(df: pd.DataFrame) -> int:
     UNIFIED_REVIEW_MART_DIR.mkdir(parents=True, exist_ok=True)
     saved = 0
     for date_val, group in df.groupby("작성일자", dropna=False):
-        # 작성일자 → YYMMDD (date/Timestamp/str 모두 처리)
-        date_str = str(date_val).replace("-", "")  # "2026-06-01" → "20260601"
-        short = date_str[2:]                        # "260601"
+        normalized_date = _normalize_date_only(date_val)
+        date_str = normalized_date.strftime("%Y%m%d") if normalized_date else "0"
+        date_str = date_str.zfill(8)
+        short = date_str[2:]
         out_path = UNIFIED_REVIEW_MART_DIR / f"unified_review_{short}.parquet"
         group.to_parquet(out_path, index=False)
         logger.info("저장: %s (%d행)", out_path.name, len(group))
@@ -102,7 +202,7 @@ def run_review(mode: str = "lookback", days: int = 30, target_date: str | None =
         return f"스킵: 파일 없음 (mode={mode})"
 
     logger.info("집계 대상 파일 %d개 (mode=%s)", len(files), mode)
-    df = _load_and_aggregate(files)
+    df = _load_and_aggregate(files, mode=mode, target_date=target_date)
 
     if df.empty:
         logger.warning("집계 결과 없음")
@@ -138,7 +238,12 @@ def build_daily_review_count(
     if not dfs:
         return "스킵: 로드 실패"
 
-    df = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=["번호", "작성일자", "매장명", "채널"])
+    df = pd.concat(dfs, ignore_index=True).drop_duplicates(
+        subset=["번호", "작성일자", "매장명", "채널"]
+    )
+    df = _ensure_target_date_rows(df, mode=mode, target_date=target_date)
+    df = _coerce_written_date_to_text(df)
+    df = _drop_invalid_written_dates(df)
     count_df = (
         df.groupby(["작성일자", "매장명", "채널"], dropna=False)["번호"]
         .nunique()
@@ -150,11 +255,14 @@ def build_daily_review_count(
 
     if out_path.exists() and mode != "all":
         existing = pd.read_parquet(out_path)
+        existing = _coerce_written_date_to_text(existing)
+        existing = _drop_invalid_written_dates(existing)
         new_dates = count_df["작성일자"].unique()
         existing = existing[~existing["작성일자"].isin(new_dates)]
         count_df = pd.concat([existing, count_df], ignore_index=True)
         count_df = count_df.sort_values(["작성일자", "매장명", "채널"]).reset_index(drop=True)
 
+    count_df = _coerce_written_date_to_text(count_df)
     count_df.to_parquet(out_path, index=False)
 
     total = int(count_df["리뷰수"].sum())

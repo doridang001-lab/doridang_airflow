@@ -18,6 +18,7 @@ from pathlib import Path
 import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.sensors.external_task import ExternalTaskSensor
 
 from modules.transform.utility.notifier import enqueue_heal_task, send_telegram
 from modules.transform.utility.schedule import DB_UNIFIED_REVIEW_TIME
@@ -137,6 +138,16 @@ with DAG(
     default_args=default_args,
     tags=["db", "review", "toorder", "unified_review"],
 ) as dag:
+    wait_for_toorder_review = ExternalTaskSensor(
+        task_id="wait_for_toorder_review",
+        external_dag_id="Sales_ToOrder_Review_Dags",
+        external_task_id=None,
+        allowed_states=["success"],
+        execution_delta=timedelta(0),
+        timeout=60 * 60 * 6,
+        poke_interval=60,
+        mode="reschedule",
+    )
 
     t1 = PythonOperator(
         task_id="resolve_mode",
@@ -153,4 +164,4 @@ with DAG(
         python_callable=count_daily_reviews,
     )
 
-    t1 >> t2 >> t3
+    wait_for_toorder_review >> t1 >> t2 >> t3
