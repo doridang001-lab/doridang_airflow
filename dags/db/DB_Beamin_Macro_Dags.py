@@ -57,6 +57,11 @@ from modules.transform.pipelines.db.DB_Beamin_combined import (
     collect_now_and_woori as pipeline_collect_all,
     retry_once_failed as pipeline_retry_failed,
 )
+from modules.transform.pipelines.db.DB_Beamin_retry import (
+    build_retry_conf,
+    count_failed_items,
+    retry_needed,
+)
 from modules.transform.utility.schedule import SMD_BAEMIN_COLLECT_TIME
 from modules.transform.pipelines.db.DB_Beamin_Macro_validate import validate_toorder_orders
 from modules.transform.utility.paths import ANALYTICS_DB, COLLECT_DB
@@ -429,6 +434,7 @@ def validate_ad_funnel(**context) -> str:
         return "점검 없음"
 
     result = _validate_and_retry_ad_funnel(ad_stores, target_date)
+    context["ti"].xcom_push(key="ad_funnel_result", value=result)
     empty = result["empty_stores"]
     still = result["still_empty"]
 
@@ -1079,9 +1085,14 @@ def validate_ad_funnel(**context) -> str:
     ad_stores = context["ti"].xcom_pull(task_ids="collect_all", key="ad_stores") or []
     if not ad_stores:
         logger.info("ad_funnel 대상 없음")
+        context["ti"].xcom_push(
+            key="ad_funnel_result",
+            value={"empty_stores": [], "retried": [], "still_empty": []},
+        )
         return "대상 없음"
 
     result = _validate_and_retry_ad_funnel(ad_stores, target_date)
+    context["ti"].xcom_push(key="ad_funnel_result", value=result)
     empty = result["empty_stores"]
     still = result["still_empty"]
 
@@ -1107,6 +1118,7 @@ def validate_toorder(**context) -> str:
     manual_precheck = context["ti"].xcom_pull(task_ids="precheck_manual_baemin_orders", key="manual_precheck_summary") or {}
 
     result = validate_toorder_orders(account_list, store_info_per_account, target_date)
+    context["ti"].xcom_push(key="toorder_result", value=result)
 
     matched = result.get("matched", False)
     compared = result.get("compared_count", 0)
@@ -1147,6 +1159,67 @@ def validate_toorder(**context) -> str:
     if compared > 0 and (not matched or gap_stores or missing_brand_stores):
         send_telegram(summary)
     return summary
+
+
+def _safe_run_id_part(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.~-]+", "_", str(value or "manual")).strip("_")[:120]
+
+
+def trigger_retry_if_needed(**context) -> str:
+    ti = context["ti"]
+    dag_run = context.get("dag_run")
+    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
+
+    failed = ti.xcom_pull(task_ids="collect_all", key="failed") or {}
+    failed_count = count_failed_items(failed)
+    if failed_count == 0:
+        logger.info("Retry DAG 트리거 스킵: 원본 실패 없음")
+        return "Retry DAG 트리거 스킵: 원본 실패 없음"
+
+    toorder_result = ti.xcom_pull(task_ids="validate_toorder", key="toorder_result")
+    ad_funnel_result = ti.xcom_pull(task_ids="validate_ad_funnel", key="ad_funnel_result")
+    if not retry_needed(toorder_result, ad_funnel_result, failed):
+        logger.info("Retry DAG 트리거 스킵: 검증상 추가 재시도 불필요")
+        return "Retry DAG 트리거 스킵: 추가 재시도 불필요"
+
+    source_run_id = getattr(dag_run, "run_id", context.get("run_id", "manual"))
+    retry_conf = build_retry_conf(
+        failed=failed,
+        target_date=target_date,
+        source_dag_id=dag_id,
+        source_run_id=source_run_id,
+        attempt=1,
+        max_attempts=int(conf.get("max_attempts", 10)),
+    )
+    run_id = (
+        f"retry__{target_date.replace('-', '')}__attempt_1__"
+        f"{_safe_run_id_part(str(source_run_id))}"
+    )
+
+    from airflow.api.common.trigger_dag import trigger_dag
+    from airflow.exceptions import DagRunAlreadyExists
+
+    try:
+        trigger_dag(
+            dag_id="DB_Beamin_Macro_Dags_Retry",
+            run_id=run_id,
+            conf=retry_conf,
+        )
+    except DagRunAlreadyExists:
+        logger.info("Retry DAG run 이미 존재: %s", run_id)
+        return f"Retry DAG run 이미 존재: {run_id}"
+
+    logger.info(
+        "Retry DAG 트리거 완료: run_id=%s failed_count=%d accounts=%d stores=%d orders=%d ads=%d",
+        run_id,
+        failed_count,
+        len(retry_conf.get("failed_account_ids") or []),
+        len(retry_conf.get("failed_stores") or []),
+        len(retry_conf.get("failed_orders") or []),
+        len(retry_conf.get("failed_ads") or []),
+    )
+    return f"Retry DAG 트리거 완료: {run_id}"
 
 
 def _build_collection_notification_legacy_v4(context) -> tuple[str, str, str, bool]:
@@ -1438,4 +1511,10 @@ with DAG(
         trigger_rule=TriggerRule.ALL_DONE,
     )
 
-    t_dash >> t0 >> t1 >> t2 >> t3 >> [t4, t5, t6] >> t7
+    t8 = PythonOperator(
+        task_id="trigger_retry_if_needed",
+        python_callable=trigger_retry_if_needed,
+        trigger_rule=TriggerRule.ALL_DONE,
+    )
+
+    t_dash >> t0 >> t1 >> t2 >> t3 >> [t4, t5, t6] >> t7 >> t8

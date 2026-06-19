@@ -26,6 +26,8 @@ from modules.transform.pipelines.db.DB_UnifiedSales_common import (
 logger = logging.getLogger(__name__)
 
 OKPOS_BRAND_ROOT = RAW_OKPOS_SALES / "brand=도리당"
+BAEMIN_MANUAL_STORES = {"해운대중동점", "법흥리점", "송파삼전점"}
+BAEMIN_PLATFORM = "배달의민족"
 
 # 도리당 OKPOS "상품 미매칭" 알림은 운영상 불필요하여 기본 비활성화.
 # (필요 시 수신자 이메일을 지정하면 다시 활성화됨)
@@ -598,6 +600,17 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
     merged["source"] = "okpos"
     merged["ym"] = merged["sale_date"].str[:7]
     merged["platform"] = (merged[channel_col].fillna("").astype(str).str.strip() if channel_col else "")
+    baemin_manual_mask = (
+        merged["store"].fillna("").astype(str).str.strip().isin(BAEMIN_MANUAL_STORES)
+        & merged["platform"].fillna("").astype(str).str.strip().eq(BAEMIN_PLATFORM)
+    )
+    if baemin_manual_mask.any():
+        logger.info(
+            "OKPOS 배민수동 대상 매장 배달의민족 행 제외: %d행 | stores=%s",
+            int(baemin_manual_mask.sum()),
+            sorted(merged.loc[baemin_manual_mask, "store"].dropna().astype(str).unique().tolist()),
+        )
+        merged = merged[~baemin_manual_mask].copy()
 
     # order_time: OKPOS는 주문서의 "최초주문시각"을 우선 사용하고, 없으면 결제시각으로 fallback.
     # 병합 후 suffix가 붙은 주문서(_x) 컬럼을 먼저 봐야 item 미매칭 반품도 00:00:00으로 떨어지지 않는다.

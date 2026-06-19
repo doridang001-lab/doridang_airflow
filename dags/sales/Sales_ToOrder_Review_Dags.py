@@ -8,6 +8,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 
 from modules.transform.utility.notifier import enqueue_heal_task, send_telegram
+from modules.transform.utility.schedule import SMP_TOORDER_VOC_TIME
 from modules.transform.pipelines.sales.Sales_ToOrder_Review_collect import (
     t1_prepare,
     t2_collect,
@@ -16,7 +17,7 @@ from modules.transform.pipelines.sales.Sales_ToOrder_Review_collect import (
 )
 
 # ── 수집 기간 설정 ─────────────────────────────────────────────────────
-LOOKBACK_DAYS = None                        # None                      → 어제 하루만
+LOOKBACK_DAYS = 7                       # None                      → 어제 하루만
 #                  7                       → 7일 전 ~ 어제 (7일치)
 #                  "2026-01-01"            → 해당 날짜 ~ 어제
 #                  "2026-01-01~2026-01-15" → 해당 범위 고정
@@ -51,7 +52,7 @@ default_args = {
 with DAG(
     dag_id=Path(__file__).stem,
     description="ToOrder VOC analysis daily collection and parquet save",
-    schedule="30 7 * * *",
+    schedule=SMP_TOORDER_VOC_TIME,
     start_date=pendulum.datetime(2025, 1, 1, tz="Asia/Seoul"),
     catchup=False,
     tags=["sales", "toorder", "voc", "parquet"],

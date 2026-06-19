@@ -80,10 +80,7 @@ def _load_one_file(csv_path: Path) -> tuple[int, bool]:
         logger.warning("가게 파싱 실패: %s / raw=%s", csv_path.name, raw_store)
         return 0, False
 
-    target_df = df[
-        (df["주문상태"].astype(str) == _STATUS_DELIVERED)
-        & df["결제금액"].astype(str).str.strip().ne("")
-    ].copy()
+    target_df = df[df["주문상태"].astype(str).str.strip() == _STATUS_DELIVERED].copy()
     if target_df.empty:
         logger.info("처리할 배달완료 건 없음: %s", csv_path.name)
         return 0, True
@@ -104,13 +101,17 @@ def _load_one_file(csv_path: Path) -> tuple[int, bool]:
         new_df = new_df.fillna("").astype(str)
 
         stem = BAEMIN_ORDERS_DB / f"brand={brand}" / f"store={store_key}" / f"ym={ym}" / f"orders_{ym}"
-        new_order_ids = set(new_df["주문번호"].unique())
         existing = read_table(stem)
         if existing is not None and not existing.empty:
-            existing = existing[~existing["주문번호"].isin(new_order_ids)]
-            combined = pd.concat([existing, new_df], ignore_index=True)
-        else:
-            combined = new_df
+            logger.info(
+                "manual baemin partition replace: %s/%s ym=%s existing=%d new=%d",
+                brand,
+                store_key,
+                ym,
+                len(existing),
+                len(new_df),
+            )
+        combined = new_df
         out_path = write_table(combined, stem)
         total_rows += len(new_df)
         logger.info("ingest complete: %s/%s ym=%s rows=%d -> %s", brand, store_key, ym, len(new_df), out_path)

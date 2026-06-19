@@ -25,6 +25,7 @@ if (-not (Test-Path $chrome)) {
 
 $profileDir = "C:\coupang_chrome_profile"
 $port = 9222
+$extDir = "C:\airflow\coupang_extension_build"
 
 # 이미 같은 포트로 떠 있으면 중복 실행 방지
 $inUse = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
@@ -33,14 +34,20 @@ if ($inUse) {
     exit 0
 }
 
-Write-Host "전용 크롬 실행 (debug port $port, profile $profileDir)" -ForegroundColor Green
-Start-Process -FilePath $chrome -WindowStyle Minimized -ArgumentList @(
+$chromeArgs = @(
     "--remote-debugging-port=$port",
     "--remote-debugging-address=0.0.0.0",
     "--remote-allow-origins=*",
     "--user-data-dir=$profileDir",
     "--no-first-run",
-    "--no-default-browser-check",
-    "https://store.coupangeats.com/merchant/login"
+    "--no-default-browser-check"
 )
-Write-Host "완료. 뜬 크롬에서 쿠팡 로그인 1회 후 최소화해 두세요. (닫지 마세요)" -ForegroundColor Green
+if (Test-Path $extDir) {
+    $chromeArgs += "--load-extension=$extDir"
+    Write-Host "확장 로드: $extDir" -ForegroundColor Cyan
+}
+$chromeArgs += "chrome-extension://ocpdgnoaajajnlehamcalfcpholjhfbe/runner.html"
+
+Write-Host "전용 크롬 실행 (debug port $port, profile $profileDir)" -ForegroundColor Green
+Start-Process -FilePath $chrome -WindowStyle Normal -ArgumentList $chromeArgs
+Write-Host "완료. 크롬이 열리면 topHalfBtn 자동 클릭 후 수집이 시작됩니다." -ForegroundColor Green

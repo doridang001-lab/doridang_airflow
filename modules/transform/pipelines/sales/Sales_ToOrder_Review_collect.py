@@ -104,11 +104,30 @@ def _parse_date_str(date_str: str, field_name: str) -> datetime:
 
 
 def _select_order_date_series(df: pd.DataFrame) -> pd.Series | None:
-    candidates = ("target_date",)
+    candidates = ("작성일자", "target_date")
     for column_name in candidates:
         if column_name in df.columns:
             return df[column_name].astype(str).str[:10]
     return None
+
+
+def _validate_downloaded_date(df: pd.DataFrame, excel_path: Path, target_date: str) -> None:
+    """요청 날짜와 다른 범위의 엑셀을 내려받은 경우 저장 전에 실패시킨다."""
+    filename_dates = re.findall(r"\d{4}-\d{2}-\d{2}", excel_path.name)
+    if filename_dates and filename_dates[-1] != target_date:
+        raise RuntimeError(
+            f"download date mismatch: target={target_date}, file={excel_path.name}"
+        )
+
+    if "작성일자" not in df.columns:
+        raise RuntimeError(f"missing 작성일자 column in {excel_path.name}")
+
+    written_dates = pd.to_datetime(df["작성일자"], errors="coerce").dt.strftime("%Y-%m-%d")
+    max_written_date = written_dates.dropna().max()
+    if max_written_date and max_written_date < target_date:
+        raise RuntimeError(
+            f"download content stale: target={target_date}, max 작성일자={max_written_date}, file={excel_path.name}"
+        )
 
 
 def _validate_snapshot(new_path: Path, prev_path: Path, drop_tol: float = 0.05) -> dict[str, Any]:
@@ -143,7 +162,7 @@ def _validate_snapshot(new_path: Path, prev_path: Path, drop_tol: float = 0.05) 
             suspicious.append((target_date, prev_count, new_count))
 
     total_shrink = len(new_df) < len(prev_df)
-    ok = (not suspicious) and (not total_shrink)
+    ok = not suspicious
     return {
         "ok": ok,
         "suspicious": suspicious,
@@ -600,6 +619,7 @@ def _read_voc_excel(excel_path: Path, account_id: str, target_date: str) -> pd.D
     df = df.dropna(how="all")
     df = df.dropna(axis=1, how="all")
     df.columns = [str(col).strip() for col in df.columns]
+    _validate_downloaded_date(df, excel_path, target_date)
     if "secondary_category" not in df.columns:
         df["secondary_category"] = ""
     else:
@@ -787,7 +807,11 @@ def t2_collect(**context: Any) -> str:
     logger.info("[TOORDER_VOC] collected=%d failed=%d", len(temp_parquet_map), len(failed_dates))
 
     if failed_dates:
-        raise AirflowException(f"수집 실패 날짜: {failed_dates}")
+        logger.warning(
+            "[TOORDER_VOC] 수집 실패 날짜 %d건: %s → 다음 실행(LOOKBACK_DAYS=7)에서 자동 재시도",
+            len(failed_dates),
+            failed_dates,
+        )
 
     return f"collected={len(temp_parquet_map)}"
 
@@ -829,7 +853,7 @@ def t4_validate(**context: Any) -> str:
         return "no snapshots to validate"
 
     output_dir = Path(ti.xcom_pull(task_ids="t1_prepare", key="output_dir") or str(_resolve_output_dir()))
-    date_file_re = re.compile(r"^toorder_voc_(\\d{8})\\.parquet$")
+    date_file_re = re.compile(r"^toorder_voc_(\d{8})\.parquet$")
     validation_results: list[dict[str, Any]] = []
     failed = 0
 

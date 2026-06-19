@@ -107,6 +107,54 @@ default_args = {
     "on_failure_callback": _on_failure_callback,
 }
 
+
+def _truthy(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+def trigger_unified_sales_after_okpos(**context) -> str:
+    """수동 단일 날짜 OKPOS 재수집 후 UnifiedSales 정정 실행을 선택적으로 트리거."""
+    dag_run = context.get("dag_run")
+    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    if not _truthy(conf.get("trigger_unified_sales")):
+        return "trigger_unified_sales=false - 스킵"
+
+    sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates") or []
+    sale_dates = [str(d).strip() for d in sale_dates if str(d).strip()]
+    if len(sale_dates) != 1:
+        logger.warning("UnifiedSales 자동 트리거 스킵: 단일 날짜가 아님 (%s)", sale_dates)
+        return f"UnifiedSales 자동 트리거 스킵: 단일 날짜 아님 ({len(sale_dates)}일)"
+
+    sale_date = sale_dates[0]
+    import re
+    parent_run_id = str(context.get("run_id") or "manual")
+    safe_parent_run_id = re.sub(r"[^A-Za-z0-9_.~-]+", "_", parent_run_id).strip("_")[:120]
+    run_id = f"manual__okpos_after_unified_sales__{sale_date.replace('-', '')}__{safe_parent_run_id}"
+    from airflow.api.common.trigger_dag import trigger_dag
+    from airflow.exceptions import DagRunAlreadyExists
+
+    trigger_conf = {"sale_date": sale_date}
+    if _truthy(conf.get("wait_unified_upstreams")):
+        trigger_conf["wait_upstreams"] = True
+
+    try:
+        trigger_dag(
+            dag_id="DB_UnifiedSales",
+            run_id=run_id,
+            conf=trigger_conf,
+        )
+    except DagRunAlreadyExists:
+        logger.info("DB_UnifiedSales 이미 트리거됨: %s", run_id)
+        return f"DB_UnifiedSales 이미 트리거됨: {run_id}"
+
+    logger.info("DB_UnifiedSales 트리거 완료: %s | conf=%s", run_id, trigger_conf)
+    return f"DB_UnifiedSales 트리거 완료: {run_id}"
+
+
 with DAG(
     dag_id=dag_id,
     schedule=DB_OKPOS_SALES_TIME,
@@ -186,6 +234,11 @@ with DAG(
         python_callable=write_log,
     )
 
+    t7 = PythonOperator(
+        task_id="trigger_unified_sales_after_okpos",
+        python_callable=trigger_unified_sales_after_okpos,
+    )
+
     t6a = PythonOperator(
         task_id="reconcile_today_vs_receipt",
         python_callable=_reload_and_call,
@@ -207,5 +260,4 @@ with DAG(
         retries=0,
     )
 
-    t1 >> t1b >> t1c >> t1d >> t2 >> t3 >> t3b >> t4 >> t4b >> t5 >> t6c >> t6a >> t6b >> t6
-
+    t1 >> t1b >> t1c >> t1d >> t2 >> t3 >> t3b >> t4 >> t4b >> t5 >> t6c >> t6a >> t6b >> t6 >> t7
