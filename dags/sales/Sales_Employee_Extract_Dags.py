@@ -58,18 +58,42 @@ def send_email_alert(subject, body, to_email):
         smtp_port = 587
         sender_email = "airflow.alarm@gmail.com"
         sender_password = "bgtu jxdz grxj xvwu"  # Gmail App Password
+
+        try:
+            from airflow.hooks.base import BaseHook
+
+            connection = BaseHook.get_connection("doridang_conn_smtp_gmail")
+            if connection.host and connection.port and connection.login and connection.password:
+                smtp_server = connection.host
+                smtp_port = int(connection.port)
+                sender_email = connection.extra_dejson.get("from_email") or connection.login
+                sender_password = connection.password
+                smtp_login = connection.login
+            else:
+                smtp_login = sender_email
+        except Exception as conn_error:
+            print(f"[메일설정] Airflow SMTP 연결 사용 불가, 기본 설정 사용: {conn_error}")
+            smtp_login = sender_email
         
         msg = MIMEMultipart()
         msg['From'] = sender_email
         msg['To'] = to_email
         msg['Subject'] = subject
         
-        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+        body_subtype = 'html' if str(body).lstrip().lower().startswith('<html') else 'plain'
+        msg.attach(MIMEText(body, body_subtype, 'utf-8'))
         
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
-            server.starttls()
-            server.login(sender_email, sender_password)
-            server.send_message(msg)
+        if int(smtp_port) == 465:
+            with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
+                server.login(smtp_login, sender_password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_server, smtp_port) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(smtp_login, sender_password)
+                server.send_message(msg)
         
         print(f"[메일발송] {to_email} - {subject}")
         return True
@@ -129,7 +153,87 @@ def check_toder_null_values(df_original):
         """
         
         subject = f"[도리당 매장관리] 토더(TORDER) 계정정보 누락 - {len(null_stores)}건"
-        send_email_alert(subject, html_body, "a17019@kakao.com")
+        return send_email_alert(subject, html_body, "a17019@kakao.com")
+    return True
+
+
+def check_new_store_torder_alert(df):
+    """실오픈일 임박(7일 이내) 또는 경과 후 토더 계정 미등록 매장 알림"""
+    if '실오픈일' not in df.columns:
+        return
+
+    today = pd.Timestamp.now(tz='Asia/Seoul').normalize().tz_localize(None)
+    alert_rows = []
+
+    for _, row in df.iterrows():
+        store_name = str(row.get('매장명', '')).strip()
+        if not store_name or store_name in ('nan', 'None'):
+            continue
+
+        raw_date = str(row.get('실오픈일', '')).strip()
+        if not raw_date or raw_date in ('nan', 'None', ''):
+            continue
+
+        try:
+            open_date = pd.to_datetime(raw_date, errors='coerce')
+            if pd.isna(open_date):
+                continue
+            open_date = open_date.normalize()
+        except Exception:
+            continue
+
+        toder_id = str(row.get('토더ID', '')).strip()
+        toder_pw = str(row.get('토더PW', '')).strip()
+        toder_missing = toder_id in ('', 'nan', 'None') or toder_pw in ('', 'nan', 'None')
+
+        days_until = (open_date - today).days
+        is_upcoming = 0 <= days_until <= 7
+        is_overdue = days_until < 0 and toder_missing
+
+        if is_upcoming or is_overdue:
+            alert_rows.append(row)
+
+    if not alert_rows:
+        return
+
+    def _acct(id_val, pw_val):
+        """계정 문자열 포맷: ID // PW, 없으면 빈값"""
+        i = str(id_val).strip() if pd.notna(id_val) and str(id_val).strip() not in ('nan', 'None', '') else ''
+        p = str(pw_val).strip() if pd.notna(pw_val) and str(pw_val).strip() not in ('nan', 'None', '') else ''
+        if i and p:
+            return f"{i}   // {p}"
+        elif i:
+            return i
+        return ''
+
+    blocks = []
+    for row in alert_rows:
+        open_date_text = ''
+        open_date = pd.to_datetime(row.get('실오픈일', ''), errors='coerce')
+        if pd.notna(open_date):
+            open_date_text = open_date.strftime('%Y-%m-%d')
+
+        block = f"""[신규 매장]
+- 매장명 : {str(row.get('매장명', '')).strip()}
+- 사업자명의 : {str(row.get('점주명', '')).strip()}
+- 핸드폰번호 : {str(row.get('핸드폰번호', '')).strip()}
+- 매장주소 : {str(row.get('상세주소', '')).strip()}
+- 발주매장코드 : 
+- 배민 계정 : {_acct(row.get('배민ID'), row.get('배민PW'))}
+- 요기요 계정 : {_acct(row.get('요기요ID'), row.get('요기요PW'))}
+- 쿠팡 계정 : {_acct(row.get('쿠팡ID'), row.get('쿠팡PW'))}
+- 땡겨요 계정 : {_acct(row.get('땡겨요ID'), row.get('땡겨요PW'))}
+- 오픈일 : {open_date_text}"""
+        blocks.append(block)
+
+    body = "\n\n".join(blocks)
+    subject = f"[도리당] 토더계정을 만드세요 ({len(alert_rows)}건)"
+    sent = send_email_alert(subject, body, "a17019@kakao.com")
+    if sent:
+        print(f"[토더계정 알림] {len(alert_rows)}건 발송 완료")
+    else:
+        print(f"[토더계정 알림] {len(alert_rows)}건 발송 실패")
+    return sent
 
 
 
@@ -160,7 +264,7 @@ def load_employee_from_gsheet(**context):
             return "로드 실패: '호점' 컬럼이 포함된 헤더 행을 찾을 수 없습니다."
 
         # 헤더 정제 및 데이터 슬라이싱
-        raw_header = [str(col).strip().replace('\n', '') if pd.notna(col) else '' for col in df_raw.iloc[header_row_idx].tolist()]
+        raw_header = [str(col).strip().replace('\r', '').replace('\n', '') if pd.notna(col) else '' for col in df_raw.iloc[header_row_idx].tolist()]
         
         # 실제 데이터는 헤더 다음 줄부터
         df = df_raw.iloc[header_row_idx + 1:].copy()
@@ -180,6 +284,10 @@ def load_employee_from_gsheet(**context):
         '사업자 번호': '사업자번호', '사업자번호': '사업자번호',
         '점주명': '점주명',
         '담당 S.V': '담당자', '담당 SV': '담당자', '담당SV': '담당자',
+        '핸드폰번호': '핸드폰번호', '핸드폰': '핸드폰번호',
+        '전화번호': '핸드폰번호', '전화번호\n(mobile)': '핸드폰번호',
+        '전화번호(mobile)': '핸드폰번호',
+        '전화번호 (mobile)': '핸드폰번호', '연락처': '핸드폰번호',
         '주소': '상세주소',
         '배달의 민족ID': '배민ID', '배달의 민족PW': '배민PW',
         '요기요ID': '요기요ID', '요기요PW': '요기요PW',
@@ -236,6 +344,9 @@ def load_employee_from_gsheet(**context):
     if '상세주소' in df.columns:
         df[['광역', '시군구', '읍면동']] = df['상세주소'].apply(lambda x: pd.Series(parse_address(x)))
     
+    # 📧 신규매장 토더 계정 알림 (unpivot 전 전체 행 대상)
+    check_new_store_torder_alert(df)
+    
     # 7️⃣ 플랫폼별 행 분리 (Unpivot)
     print(f"\n[플랫폼 분리] 시작...")
     platform_mapping = {
@@ -279,10 +390,6 @@ def load_employee_from_gsheet(**context):
     # 매장명 정규화 (중앙 매핑: store_name_mapping.py)
     df_final['매장명'] = normalize_store_names(df_final['매장명'])
 
-    
-    # 📧 토더 ID/PW 체크 및 메일 알림 (저장 전)
-    check_toder_null_values(df)
-    
     # CSV 저장 (2개 경로)
     EMPLOYEE_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     
@@ -312,7 +419,7 @@ def load_employee_from_gsheet(**context):
 with DAG(
     dag_id=filename.replace('.py', ''),
     description='B3 시작점 대응 및 담당자 기반 플랫폼 분리 수집',
-    schedule="15 7 * * 2,4,6", # 매주 화 수 금 오전 7시 15분 실행
+    schedule="15 7 * * *", # 매일 오전 7:15에 실행
     start_date=pendulum.datetime(2023, 1, 1, tz="Asia/Seoul"),
     catchup=False,
     tags=['01_employee', 'gsheet', 'load'],

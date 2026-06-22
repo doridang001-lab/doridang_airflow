@@ -85,7 +85,7 @@ default_args = {
 # - int  : 최근 N일 누락분 보충
 # - None : 전체 소스 CSV 백필
 # LOOKBACK_DAYS: int | None = 7
-LOOKBACK_DAYS: int | None = 90  # 전체 백필 모드 (주의: 실행 시점 기준으로 소스 CSV 전체를 다시 처리하므로 오래 걸릴 수 있음)
+LOOKBACK_DAYS: int | None = None  # 전체 백필 모드는 None으로 변경
 
 # 배민 직수집 교정 대상 테스트 매장 (검증 완료 후 확대)
 TEST_STORES: list[str] = ["해운대중동점", "법흥리점", "송파삼전점"]
@@ -151,10 +151,10 @@ def wait_for_upstream_pos(**context) -> str:
     timeout_seconds = int(conf.get("upstream_wait_timeout_seconds") or 60 * 60 * 6)
     poke_interval = int(conf.get("upstream_wait_poke_interval") or 60)
     deadline = time.monotonic() + timeout_seconds
-    logical_col = getattr(DagRun, "logical_date", DagRun.execution_date)
 
     while True:
         pending: list[str] = []
+        completed: list[str] = []
         session = settings.Session()
         try:
             for spec in UPSTREAM_POS_TASKS:
@@ -162,13 +162,14 @@ def wait_for_upstream_pos(**context) -> str:
                 upstream_run = (
                     session.query(DagRun)
                     .filter(DagRun.dag_id == spec["dag_id"])
-                    .filter(logical_col == target_logical_date)
+                    .filter(DagRun.execution_date == target_logical_date)
                     .one_or_none()
                 )
                 label = f"{spec['dag_id']}.{spec['task_id']}@{target_logical_date}"
                 if upstream_run is None:
                     pending.append(f"{label}: dag_run 없음")
                     continue
+                run_label = f"{label} run_id={upstream_run.run_id}"
 
                 ti = (
                     session.query(TaskInstance)
@@ -178,20 +179,21 @@ def wait_for_upstream_pos(**context) -> str:
                     .one_or_none()
                 )
                 if ti is None:
-                    pending.append(f"{label}: task_instance 없음")
+                    pending.append(f"{run_label}: task_instance 없음")
                     continue
 
                 state = str(ti.state or "").lower()
                 if state == "success":
+                    completed.append(f"{run_label}: state=success")
                     continue
                 if state in {"failed", "upstream_failed"}:
-                    raise AirflowException(f"상류 POS 실패: {label} state={ti.state}")
-                pending.append(f"{label}: state={ti.state}")
+                    raise AirflowException(f"상류 POS 실패: {run_label} state={ti.state}")
+                pending.append(f"{run_label}: state={ti.state}")
         finally:
             session.close()
 
         if not pending:
-            logger.info("상류 POS 완료 확인")
+            logger.info("상류 POS 완료 확인: %s", " | ".join(completed[:10]))
             return "상류 POS 완료 확인"
 
         if time.monotonic() >= deadline:
@@ -336,6 +338,23 @@ def reconcile_baemin(**context) -> str:
     )
 
 
+def reconcile_coupang(**context) -> str:
+    """TEST_STORES의 쿠팡 직수집 데이터로 UnifiedSales 쿠팡이츠 행 교정."""
+    stores = [store for store in TEST_STORES if store != "법흥리점"]
+    if not stores:
+        return "쿠팡수동 대상 TEST_STORES 없음 - 스킵"
+    from modules.transform.pipelines.db.DB_UnifiedSales_coupang import (
+        reconcile_coupang_for_test_stores,
+    )
+
+    sale_date = context["ti"].xcom_pull(task_ids="resolve_date", key="sale_date")
+    return reconcile_coupang_for_test_stores(
+        stores=stores,
+        sale_date=sale_date,
+        lookback_days=LOOKBACK_DAYS or 7,
+    )
+
+
 def report_posfeed_exclusions(**context) -> str:
     """posfeed 블랙리스트 제외 내역을 ym별 상세·집계 CSV로 저장."""
     return pipeline_report_posfeed_exclusions(**context)
@@ -375,6 +394,23 @@ def enforce_baemin_manual_only(**context) -> str:
     sale_date = context["ti"].xcom_pull(task_ids="resolve_date", key="sale_date")
     return enforce_baemin_manual_only_for_test_stores(
         stores=TEST_STORES,
+        sale_date=sale_date,
+        lookback_days=LOOKBACK_DAYS or 7,
+    )
+
+
+def enforce_coupang_manual_only(**context) -> str:
+    """최종 방어: TEST_STORES의 쿠팡이츠는 쿠팡수동만 남긴다."""
+    stores = [store for store in TEST_STORES if store != "법흥리점"]
+    if not stores:
+        return "쿠팡수동 대상 TEST_STORES 없음 - 스킵"
+    from modules.transform.pipelines.db.DB_UnifiedSales_coupang import (
+        enforce_coupang_manual_only_for_test_stores,
+    )
+
+    sale_date = context["ti"].xcom_pull(task_ids="resolve_date", key="sale_date")
+    return enforce_coupang_manual_only_for_test_stores(
+        stores=stores,
         sale_date=sale_date,
         lookback_days=LOOKBACK_DAYS or 7,
     )
@@ -445,6 +481,11 @@ with DAG(
         python_callable=reconcile_baemin,
     )
 
+    t_coupang = PythonOperator(
+        task_id="reconcile_coupang",
+        python_callable=reconcile_coupang,
+    )
+
     t6 = PythonOperator(
         task_id="reclassify_platform",
         python_callable=reclassify_platform,
@@ -453,6 +494,11 @@ with DAG(
     t6a = PythonOperator(
         task_id="enforce_baemin_manual_only",
         python_callable=enforce_baemin_manual_only,
+    )
+
+    t6b = PythonOperator(
+        task_id="enforce_coupang_manual_only",
+        python_callable=enforce_coupang_manual_only,
     )
 
     t7 = PythonOperator(
@@ -471,4 +517,4 @@ with DAG(
     )
 
     # 순차 실행: 같은 날짜 parquet에 동시 write 방지
-    t1 >> t_wait >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5b >> t5c >> t_baemin >> t6 >> t6a >> t7 >> t8 >> t9
+    t1 >> t_wait >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5b >> t5c >> t_baemin >> t_coupang >> t6 >> t6a >> t6b >> t7 >> t8 >> t9

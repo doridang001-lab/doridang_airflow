@@ -1062,10 +1062,8 @@ def _upload_to_gsheet(config_key: str, **context):
 
     file_path_value = ti.xcom_pull(task_ids=cfg['xcom_task_id'], key=cfg['xcom_key'])
     if not file_path_value:
-        raise FileNotFoundError(
-            f"[{cfg['label']}] XCom 경로 없음 "
-            f"(task_id={cfg['xcom_task_id']}, key={cfg['xcom_key']})"
-        )
+        print(f"[{cfg['label']}] 업로드 스킵: 입력 데이터 없음 (XCom None)")
+        return f"[{cfg['label']}] 스킵: 데이터 없음"
 
     file_path = Path(file_path_value)
     if not file_path.exists():

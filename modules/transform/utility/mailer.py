@@ -29,12 +29,14 @@ def send_email(
     conn_id="doridang_conn_smtp_gmail",
     attachments=None,
     inline_images=None,
+    cc_emails=None,
     **context,
 ):
     """Airflow SMTP Connection을 사용해 메일을 발송한다."""
     del context
 
     import smtplib
+    import time
     from email.mime.application import MIMEApplication
     from email.mime.image import MIMEImage
     from email.mime.multipart import MIMEMultipart
@@ -47,12 +49,16 @@ def send_email(
         f"SMTP 연결 설정 불완전: {conn_id}"
     )
     smtp_host = connection.host
-    smtp_port = connection.port
+    smtp_port = int(connection.port)
     smtp_user = connection.login
     smtp_password = connection.password
-    from_email = connection.extra_dejson.get("from_email") or smtp_user
+    extra = connection.extra_dejson
+    from_email = extra.get("from_email") or smtp_user
+    timeout = int(extra.get("timeout") or 30)
+    retry_limit = max(1, int(extra.get("retry_limit") or 1))
 
     to_list = [to_emails] if isinstance(to_emails, str) else list(to_emails)
+    cc_list = [cc_emails] if isinstance(cc_emails, str) else list(cc_emails or [])
     attachments = list(attachments or [])
     inline_images = list(inline_images or [])
 
@@ -60,6 +66,8 @@ def send_email(
     msg["Subject"] = subject
     msg["From"] = from_email
     msg["To"] = ", ".join(to_list)
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
 
     alternative_part = MIMEMultipart("alternative")
     alternative_part.attach(MIMEText(html_content, "html", "utf-8"))
@@ -93,23 +101,32 @@ def send_email(
         attachment_part.add_header("Content-Disposition", "attachment", filename=filename)
         msg.attach(attachment_part)
 
-    try:
-        logger.info("메일 발송 시작: 수신=%s, 제목=%s", to_list, subject)
-        if int(smtp_port) == 465:
-            # SSL-only 포트: 처음부터 SSL 연결 (starttls 불필요)
-            with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
-                server.login(smtp_user, smtp_password)
-                server.send_message(msg)
-        else:
-            # STARTTLS 포트 (587 등)
-            with smtplib.SMTP(smtp_host, smtp_port) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(smtp_user, smtp_password)
-                server.send_message(msg)
-        logger.info("메일 발송 성공: %d명", len(to_list))
-        return f"메일 발송 완료: {len(to_list)}명"
-    except Exception as exc:
-        logger.error("메일 발송 실패: %s", exc)
-        raise
+    last_exc = None
+    for attempt in range(1, retry_limit + 1):
+        try:
+            logger.info("메일 발송 시작: 수신=%s, 제목=%s, 시도=%d/%d", to_list, subject, attempt, retry_limit)
+            if smtp_port == 465:
+                # SSL-only 포트: 처음부터 SSL 연결 (starttls 불필요)
+                with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=timeout) as server:
+                    server.login(smtp_user, smtp_password)
+                    server.send_message(msg)
+            else:
+                # STARTTLS 포트 (587 등)
+                with smtplib.SMTP(smtp_host, smtp_port, timeout=timeout) as server:
+                    server.ehlo()
+                    server.starttls()
+                    server.ehlo()
+                    server.login(smtp_user, smtp_password)
+                    server.send_message(msg)
+            logger.info("메일 발송 성공: %d명", len(to_list))
+            return f"메일 발송 완료: {len(to_list)}명"
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= retry_limit:
+                logger.error("메일 발송 실패: %s", exc)
+                raise
+            wait_sec = min(30, attempt * 5)
+            logger.warning("메일 발송 실패 후 재시도 대기: %s (wait=%ss)", exc, wait_sec)
+            time.sleep(wait_sec)
+
+    raise last_exc

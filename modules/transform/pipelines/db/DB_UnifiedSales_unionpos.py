@@ -17,6 +17,7 @@ import hashlib
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from functools import lru_cache
 
@@ -42,6 +43,46 @@ logger = logging.getLogger(__name__)
 UNIONPOS_BRAND_ROOT = RAW_UNIONPOS_SALES / "brand=도리당"
 UNIONPOS_SOURCE = "unionpos"
 UNIONPOS_BRAND = "도리당"
+
+
+def _replace_fin_product_csv_with_retry(tmp) -> None:
+    """OneDrive 잠금/권한 지연에 대비해 fin_product_grp.csv 교체를 짧게 재시도한다."""
+    attempts = 3
+    delay_seconds = 2
+    last_exc: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            os.replace(tmp, FIN_PRODUCT_CSV_PATH)
+            return
+        except (PermissionError, OSError) as exc:
+            last_exc = exc
+            logger.warning(
+                "fin_product_grp.csv 파일 교체 실패 (%d/%d): %s",
+                attempt,
+                attempts,
+                exc,
+            )
+            if attempt < attempts:
+                time.sleep(delay_seconds * attempt)
+
+    for attempt in range(1, attempts + 1):
+        try:
+            FIN_PRODUCT_CSV_PATH.write_bytes(tmp.read_bytes())
+            return
+        except (PermissionError, OSError) as exc:
+            last_exc = exc
+            logger.warning(
+                "fin_product_grp.csv 파일 덮어쓰기 실패 (%d/%d): %s",
+                attempt,
+                attempts,
+                exc,
+            )
+            if attempt < attempts:
+                time.sleep(delay_seconds * attempt)
+
+    if last_exc is not None:
+        raise last_exc
 
 # 월 단위 캐시 (DAG 실행 단위로 재사용)
 _UNIONPOS_MONTH_CACHE: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
@@ -573,10 +614,7 @@ def upsert_fin_product_grp_from_unionpos(
     tmp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
     try:
         out.to_csv(tmp, index=False, encoding="utf-8-sig")
-        try:
-            os.replace(tmp, FIN_PRODUCT_CSV_PATH)
-        except (PermissionError, OSError):
-            FIN_PRODUCT_CSV_PATH.write_bytes(tmp.read_bytes())
+        _replace_fin_product_csv_with_retry(tmp)
     finally:
         try:
             tmp.unlink(missing_ok=True)

@@ -13,6 +13,13 @@
 - script: @C:\airflow\scripts\CLAUDE.md
 - 환경/키배치: @C:\airflow\docs\team-clone-setup.md
 
+## 작업 원칙
+- 구현 전 가정, 불확실성, 선택지를 먼저 밝힌다.
+- 요청 범위 밖 개선, 리팩터링, 포맷 변경은 하지 않는다.
+- 기존 스타일과 구조를 따르고, 필요한 줄만 고친다.
+- 성공 기준과 검증 방법을 먼저 정하고 확인한다.
+- 불필요한 추상화, speculative 기능, 과한 예외처리는 피한다.
+
 ## Fast Start (권장 검증)
 - `docker compose ps` — Airflow 컨테이너 상태 확인
 - `python -c "from pathlib import Path; print(Path('dags').exists())"` — 저장소 경로 기본 가시성 점검

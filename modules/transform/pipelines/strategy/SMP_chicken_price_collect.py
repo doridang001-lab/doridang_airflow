@@ -786,10 +786,13 @@ def send_notification(**context) -> None:
     all_emails = ["a17019@kakao.com", "siw22222@kakao.com", "simjeong01@kakao.com", "simjeong00@kakao.com"]
     to_emails = all_emails if email_on_failure else pm_emails
 
-    send_email(
-        subject=subject,
-        html_content=html_content,
-        to_emails=to_emails,
-        **context,
-    )
-    logger.info(f"[send_notification] 알림 발송 완료: {subject}")
+    try:
+        send_email(
+            subject=subject,
+            html_content=html_content,
+            to_emails=to_emails,
+            **context,
+        )
+        logger.info(f"[send_notification] 알림 발송 완료: {subject}")
+    except Exception as exc:
+        logger.exception("[send_notification] 알림 발송 실패(수집 결과는 유지): %s", exc)

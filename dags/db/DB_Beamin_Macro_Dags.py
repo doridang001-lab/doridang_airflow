@@ -1391,61 +1391,6 @@ def notify_collection_result_legacy_v4(**context) -> str:
     return subject
 
 
-def start_dashboard(**context) -> str:
-    import subprocess
-    import time
-    import urllib.request
-
-    dashboard_url = "http://localhost:8787/db-beamin-macro"
-    health_url = "http://localhost:8787/health"
-
-    # 실행 여부 확인
-    running = False
-    try:
-        urllib.request.urlopen(health_url, timeout=3)
-        running = True
-        logger.info("대시보드 서버 이미 실행 중")
-    except Exception:
-        pass
-
-    if not running:
-        logger.info("대시보드 서버 시작 중...")
-        try:
-            subprocess.Popen(
-                ["python", "-m", "modules.transform.dashboard.server"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            time.sleep(3)
-        except Exception as e:
-            logger.warning("대시보드 서버 시작 실패(무시): %s", e)
-
-    # 브라우저 열기 (best-effort — WSL2/Docker 환경에서 cmd.exe 경유 시도)
-    opened = False
-    for cmd in (
-        ["cmd.exe", "/c", "start", dashboard_url],
-        ["/mnt/c/Windows/System32/cmd.exe", "/c", "start", dashboard_url],
-    ):
-        try:
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            logger.info("브라우저 열기 시도: %s", dashboard_url)
-            opened = True
-            break
-        except Exception:
-            continue
-    if not opened:
-        try:
-            import webbrowser
-            webbrowser.open(dashboard_url)
-            opened = True
-        except Exception:
-            pass
-    if not opened:
-        logger.info("브라우저 자동 열기 불가 — 수동 접속: %s", dashboard_url)
-
-    return dashboard_url
-
-
 with DAG(
     dag_id=dag_id,
     schedule=SMD_BAEMIN_COLLECT_TIME,
@@ -1455,12 +1400,6 @@ with DAG(
     default_args=default_args,
     tags=["db", "baemin", "crawl"],
 ) as dag:
-
-    t_dash = PythonOperator(
-        task_id="start_dashboard",
-        python_callable=start_dashboard,
-        execution_timeout=timedelta(minutes=2),
-    )
 
     t0 = PythonOperator(
         task_id="precheck_manual_baemin_orders",
@@ -1517,4 +1456,4 @@ with DAG(
         trigger_rule=TriggerRule.ALL_DONE,
     )
 
-    t_dash >> t0 >> t1 >> t2 >> t3 >> [t4, t5, t6] >> t7 >> t8
+    t0 >> t1 >> t2 >> t3 >> [t4, t5, t6] >> t7 >> t8

@@ -25,6 +25,7 @@ from modules.transform.utility.paths import (
     FIN_PRODUCT_REVIEW_CSV_PATH,
     FIN_PRODUCT_ALIAS_CSV_PATH,
     FIN_PRODUCT_MART_CSV_PATH,
+    MART_DB,
 )
 from modules.transform.utility.mailer import send_email
 
@@ -103,6 +104,14 @@ def _load_alias_map() -> dict[str, str]:
         return {}
     # last wins
     return dict(zip(df[col_alias].tolist(), df[col_canon].tolist()))
+
+
+def _normalize_updated_at(ts: str) -> str:
+    """'YYYY-MM-DD H:MM' 형식을 문자열 정렬 가능한 datetime 문자열로 정규화."""
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}) (\d):(\d{2})$", ts)
+    if m:
+        return f"{m.group(1)} 0{m.group(2)}:{m.group(3)}:00"
+    return ts
 
 
 _STRIP_TOKENS_RE = re.compile(
@@ -339,6 +348,9 @@ def _read_master() -> pd.DataFrame:
     if "llm_check" in df.columns:
         df["llm_check"] = df["llm_check"].fillna("").astype(str).str.strip().str.upper().replace({"": "N"})
 
+    if "updated_at" in df.columns:
+        df["updated_at"] = df["updated_at"].apply(_normalize_updated_at)
+
     return df
 
 
@@ -539,7 +551,11 @@ def detect_product_changes(**context) -> str:
             changes.append(d)
         else:
             matching = df_master[(master_src == src) & (master_code == code)]
-            prev = matching.iloc[-1]
+            if "is_latest" in matching.columns:
+                latest_rows = matching[matching["is_latest"].str.upper() == "Y"]
+                prev = latest_rows.iloc[-1] if not latest_rows.empty else matching.iloc[-1]
+            else:
+                prev = matching.iloc[-1]
             if any(str(row.get(k, "")).strip() != str(prev.get(k, "")).strip() for k in _CHANGE_KEYS):
                 d = row.to_dict()
                 d["_change_type"] = "변경"
@@ -925,7 +941,7 @@ def finalize_unionpos_pending(enable_llm: bool = True, **context) -> str:
 def build_fin_product_mart(**context) -> str:
     """fin_product_grp.csv → fin_product_mart.csv 생성.
 
-    - 컬럼: source, 상품코드, 수동분류 (중복 제거)
+    - 컬럼: source, 상품코드, 상품명, is_main_candidate, 수동분류, 중복_수동분류, launch_date
     - 동일 source+상품코드에 수동분류가 2가지 이상이면 이메일 알림 발송.
     """
     master = _read_master()
@@ -1024,9 +1040,42 @@ def build_fin_product_mart(**context) -> str:
     df["중복_수동분류"] = df.apply(
         lambda r: "Y" if (str(r["source"]), str(r["상품코드"])) in conflict_keys else "N", axis=1
     )
+    df["상품명"] = df["상품명"].astype(str).str.strip() if "상품명" in df.columns else ""
+    df["is_main_candidate"] = (
+        df["is_main_candidate"].astype(str).str.strip().str.upper()
+        if "is_main_candidate" in df.columns
+        else "N"
+    )
+
+    if "updated_at" in master.columns:
+        _master_for_launch = master.copy()
+        _master_for_launch["source"] = _master_for_launch["source"].astype(str).str.strip()
+        _master_for_launch["상품코드"] = _master_for_launch["상품코드"].astype(str).str.strip()
+        _master_for_launch["_ts"] = _master_for_launch["updated_at"].apply(_normalize_updated_at)
+        master_launch_dates = (
+            _master_for_launch[_master_for_launch["_ts"] != ""]
+            .groupby(["source", "상품코드"])["_ts"]
+            .min()
+            .reset_index(name="master_launch_date")
+        )
+    else:
+        master_launch_dates = pd.DataFrame(columns=["source", "상품코드", "master_launch_date"])
+
+    first_sale_dates = _build_first_sale_dates()
+    launch_dates = master_launch_dates.merge(
+        first_sale_dates,
+        on=["source", "상품코드"],
+        how="outer",
+    )
+    launch_dates["launch_date"] = launch_dates["first_sale_date"].fillna(
+        launch_dates["master_launch_date"]
+    )
+    launch_dates = launch_dates[["source", "상품코드", "launch_date"]]
+
     mart = (
-        df[["source", "상품코드", "수동분류", "중복_수동분류"]]
+        df[["source", "상품코드", "상품명", "is_main_candidate", "수동분류", "중복_수동분류"]]
         .drop_duplicates(subset=["source", "상품코드"], keep="first")
+        .merge(launch_dates, on=["source", "상품코드"], how="left")
         .sort_values(["source", "상품코드"])
         .reset_index(drop=True)
     )
@@ -1045,3 +1094,134 @@ def build_fin_product_mart(**context) -> str:
     conflict_msg = f", 충돌 {len(conflicts)}건 알림" if not conflicts.empty else ""
     logger.info("fin_product_mart.csv 저장: %d행%s", len(mart), conflict_msg)
     return f"마트 생성: {len(mart)}행{conflict_msg}"
+
+
+def _build_first_sale_dates() -> pd.DataFrame:
+    """unified_sales에서 source+상품코드별 최초 판매일을 계산."""
+    parquet_dir = MART_DB / "unified_sales_grp"
+    files = sorted(parquet_dir.glob("*.parquet")) if parquet_dir.exists() else []
+    if not files:
+        logger.warning("unified_sales parquet 없음: %s", parquet_dir)
+        return pd.DataFrame(columns=["source", "상품코드", "first_sale_date"])
+
+    frames = []
+    for file_path in files:
+        try:
+            frame = pd.read_parquet(file_path, columns=["source", "item_id", "sale_date"])
+        except Exception as exc:
+            logger.warning("최초판매일 산정 parquet 스킵: %s (%s)", file_path, exc)
+            continue
+        frames.append(frame)
+
+    if not frames:
+        return pd.DataFrame(columns=["source", "상품코드", "first_sale_date"])
+
+    sales = pd.concat(frames, ignore_index=True)
+    sales["source"] = sales["source"].astype(str).str.strip()
+    sales["상품코드"] = sales["item_id"].astype(str).str.strip()
+    sales["sale_date"] = pd.to_datetime(sales["sale_date"], errors="coerce")
+    sales = sales[(sales["source"] != "") & (sales["상품코드"] != "")].dropna(subset=["sale_date"])
+    if sales.empty:
+        return pd.DataFrame(columns=["source", "상품코드", "first_sale_date"])
+
+    first_sale_dates = (
+        sales.groupby(["source", "상품코드"])["sale_date"]
+        .min()
+        .dt.strftime("%Y-%m-%d")
+        .reset_index(name="first_sale_date")
+    )
+    return first_sale_dates
+
+
+def build_launch_tracking(**context) -> str:
+    """신규 메인 메뉴의 출시 후 30일 매출 성과 집계."""
+    if not FIN_PRODUCT_MART_CSV_PATH.exists():
+        logger.warning("fin_product_mart.csv 없음 - 스킵")
+        return "스킵: mart 없음"
+
+    mart = pd.read_csv(FIN_PRODUCT_MART_CSV_PATH, dtype=str).fillna("")
+    is_main = (
+        mart["is_main_candidate"].astype(str).str.strip().str.upper()
+        if "is_main_candidate" in mart.columns
+        else pd.Series(["N"] * len(mart), index=mart.index)
+    )
+    launch_date = (
+        mart["launch_date"].astype(str).str.strip()
+        if "launch_date" in mart.columns
+        else pd.Series([""] * len(mart), index=mart.index)
+    )
+    mart = mart[(is_main == "Y") & (launch_date != "")]
+    if mart.empty:
+        return "추적 대상 없음 (is_main_candidate=Y + launch_date 있는 메뉴 없음)"
+
+    mart["launch_date"] = pd.to_datetime(mart["launch_date"], errors="coerce")
+    mart = mart.dropna(subset=["launch_date"])
+    if mart.empty:
+        return "추적 대상 없음 (유효한 launch_date 없음)"
+
+    mart["source"] = mart["source"].astype(str).str.strip()
+    mart["상품코드"] = mart["상품코드"].astype(str).str.strip()
+
+    parquet_dir = MART_DB / "unified_sales_grp"
+    files = sorted(parquet_dir.glob("*.parquet")) if parquet_dir.exists() else []
+    if not files:
+        logger.warning("unified_sales parquet 없음: %s", parquet_dir)
+        return "스킵: unified_sales 없음"
+
+    sales = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+    if "item_id" not in sales.columns:
+        if "상품코드" in sales.columns:
+            sales["item_id"] = sales["상품코드"]
+            logger.warning("unified_sales item_id 없음 - 상품코드로 대체")
+        elif "menu_name" in sales.columns:
+            sales["item_id"] = sales["menu_name"]
+            logger.warning("unified_sales item_id/상품코드 없음 - menu_name으로 대체")
+        else:
+            logger.warning("unified_sales 조인 키 없음: item_id/상품코드/menu_name")
+            return "스킵: unified_sales 조인 키 없음"
+
+    if "sale_date" not in sales.columns or "source" not in sales.columns:
+        logger.warning("unified_sales 필수 컬럼 없음: source/sale_date")
+        return "스킵: unified_sales 필수 컬럼 없음"
+
+    sales["sale_date"] = pd.to_datetime(sales["sale_date"], errors="coerce")
+    sales["source"] = sales["source"].astype(str).str.strip()
+    sales["item_id"] = sales["item_id"].astype(str).str.strip()
+    sales["qty"] = pd.to_numeric(
+        sales["qty"] if "qty" in sales.columns else pd.Series([0] * len(sales), index=sales.index),
+        errors="coerce",
+    ).fillna(0)
+    sales["total_price"] = pd.to_numeric(
+        (
+            sales["total_price"]
+            if "total_price" in sales.columns
+            else pd.Series([0] * len(sales), index=sales.index)
+        ),
+        errors="coerce",
+    ).fillna(0)
+
+    merged = mart.merge(
+        sales[["source", "item_id", "sale_date", "qty", "total_price"]],
+        left_on=["source", "상품코드"],
+        right_on=["source", "item_id"],
+        how="left",
+    )
+
+    in_window = (merged["sale_date"] >= merged["launch_date"]) & (
+        merged["sale_date"] <= merged["launch_date"] + pd.Timedelta(days=30)
+    )
+    merged.loc[~in_window, ["qty", "total_price"]] = 0
+
+    result = (
+        merged.groupby(["source", "상품코드", "상품명", "수동분류", "launch_date"])
+        .agg(orders_30d=("qty", "sum"), revenue_30d=("total_price", "sum"))
+        .reset_index()
+    )
+    result["launch_date"] = result["launch_date"].dt.strftime("%Y-%m-%d")
+    result["orders_30d"] = result["orders_30d"].astype(int)
+    result["revenue_30d"] = result["revenue_30d"].astype(int)
+
+    out_path = FIN_PRODUCT_MART_CSV_PATH.parent / "fin_product_launch_tracking.csv"
+    result.to_csv(out_path, index=False, encoding="utf-8-sig")
+    logger.info("launch_tracking 저장: %d건", len(result))
+    return f"launch_tracking {len(result)}건 저장"
