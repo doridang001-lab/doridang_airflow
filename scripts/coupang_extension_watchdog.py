@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -27,6 +28,8 @@ MAX_RETRY = 5
 POLL_SEC = 30
 BATCH_TIMEOUT = 5400
 TARGET_SETTLE_SEC = 5
+LOAD_DAG_ID = "DB_CoupangMacro_Load_Dags"
+SCHEDULER_CONTAINER = "airflow-airflow-scheduler-1"
 
 
 def _http_json(url: str, method: str = "GET") -> Any:
@@ -204,8 +207,37 @@ def click_retry(driver: webdriver.Chrome, indices: list[str]) -> None:
     logger.info("재시도 시작: %s", indices)
 
 
+def trigger_load_dag(dag_id: str, scheduler_container: str) -> bool:
+    commands = [
+        ["docker", "exec", scheduler_container, "airflow", "dags", "trigger", dag_id],
+        ["airflow", "dags", "trigger", dag_id],
+    ]
+
+    for cmd in commands:
+        try:
+            result = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=60)
+        except FileNotFoundError:
+            logger.info("DAG 트리거 명령 없음: %s", cmd[0])
+            continue
+        except subprocess.TimeoutExpired:
+            logger.warning("DAG 트리거 타임아웃: %s", cmd)
+            continue
+
+        if result.returncode == 0:
+            logger.info("DAG 트리거 완료: %s", dag_id)
+            return True
+
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        logger.warning("DAG 트리거 실패: cmd=%s stdout=%s stderr=%s", cmd, stdout, stderr)
+
+    return False
+
+
 def run(args: argparse.Namespace) -> int:
     driver = connect_to_chrome()
+    exit_code = 1
+    should_trigger_load = False
     try:
         ensure_runner_tab(driver)
         target_indices = capture_initial_target_indices(driver, args.target_settle_sec)
@@ -216,21 +248,28 @@ def run(args: argparse.Namespace) -> int:
 
             failed = find_failed_row_indices(driver, target_indices)
             logger.info("실패/건너뜀 행: %s", failed)
+            should_trigger_load = True
 
             if not failed:
                 logger.info("모든 매장 완료")
-                return 0
+                exit_code = 0
+                break
 
             if attempt >= args.max_retry:
                 logger.warning("최대 재시도(%d) 도달, 미완료 행: %s", args.max_retry, failed)
-                return 1
+                exit_code = 1
+                break
 
             click_retry(driver, failed)
             time.sleep(3)
 
-        return 1
+        return exit_code
     finally:
         driver.quit()
+        if should_trigger_load and not args.skip_load_dag:
+            triggered = trigger_load_dag(args.load_dag_id, args.scheduler_container)
+            if not triggered:
+                logger.warning("적재 DAG 트리거 실패: %s", args.load_dag_id)
 
 
 def parse_args() -> argparse.Namespace:
@@ -239,6 +278,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--poll-sec", type=int, default=POLL_SEC)
     parser.add_argument("--batch-timeout", type=int, default=BATCH_TIMEOUT)
     parser.add_argument("--target-settle-sec", type=int, default=TARGET_SETTLE_SEC)
+    parser.add_argument("--load-dag-id", default=LOAD_DAG_ID)
+    parser.add_argument("--scheduler-container", default=SCHEDULER_CONTAINER)
+    parser.add_argument("--skip-load-dag", action="store_true")
     return parser.parse_args()
 
 

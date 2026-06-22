@@ -29,6 +29,7 @@ from modules.transform.pipelines.db.DB_FinProduct import (
     finalize_unionpos_pending,
     apply_review_approvals,
     build_fin_product_mart,
+    build_launch_tracking,
 )
 from modules.transform.utility.notifier import on_failure_callback
 
@@ -108,4 +109,10 @@ with DAG(
         trigger_rule="all_done",
     )
 
-    t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7 >> t8
+    t9 = PythonOperator(
+        task_id="build_launch_tracking",
+        python_callable=build_launch_tracking,
+        trigger_rule="all_done",
+    )
+
+    t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7 >> t8 >> t9

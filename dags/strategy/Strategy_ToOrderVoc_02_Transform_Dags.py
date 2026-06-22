@@ -195,7 +195,8 @@ with DAG(
     load_voc_df_task >> review_summary_task
     load_voc_upload_temp_df_task >> [store_summary_task, topic_summary_task]
 
-    # 媛??꾩쿂由???媛??낅줈??    store_summary_task >> upload_store_task
+    # 媛??꾩쿂由???媛??낅줈??
+    store_summary_task >> upload_store_task
     topic_summary_task >> upload_topic_task
     review_summary_task >> upload_review_task
 

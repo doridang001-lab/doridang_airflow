@@ -34,7 +34,7 @@ dag_id = Path(__file__).stem
 
 _ALERT_EMAILS = ["a17019@kakao.com"]
 
-LOOKBACK_DAYS = 30
+LOOKBACK_DAYS = 2
 
 
 def _latest_toorder_review_execution_date(dt, **context):

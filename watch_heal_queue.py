@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -125,6 +126,20 @@ def _request(url: str, accept: str = "application/json") -> bytes:
         return resp.read()
 
 
+def _request_json(url: str, method: str = "GET", data: dict | None = None) -> dict:
+    body = None
+    headers = {
+        "Authorization": _auth_header(),
+        "Accept": "application/json",
+    }
+    if data is not None:
+        body = json.dumps(data).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
 def _container_log_path(dag_id, run_id, task_id, try_number) -> str:
     return (
         f"/opt/airflow/logs/dag_id={dag_id}/"
@@ -164,6 +179,12 @@ def get_task_log(dag_id, run_id, task_id, try_number) -> str:
     except Exception as e:
         logger.warning("docker log fallback error: %s", e)
     return ""
+
+
+def trigger_dag(dag_id: str, conf: dict | None = None) -> str:
+    url = f"{AIRFLOW_API_URL}/dags/{_quote(dag_id)}/dagRuns"
+    payload = _request_json(url, method="POST", data={"conf": conf or {}})
+    return str(payload.get("dag_run_id") or "")
 
 
 def _load_queue_rows() -> list[tuple[str, object]]:
@@ -392,6 +413,83 @@ def _send_data_file_notification(entry: dict) -> None:
     )
 
 
+def _extract_toorder_snapshot_end_date(text: str) -> str | None:
+    matches = re.findall(r"리뷰VOC분석_(\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})", text or "")
+    if matches:
+        return matches[-1][1]
+
+    target_matches = re.findall(r"target=(\d{4}-\d{2}-\d{2})", text or "")
+    if target_matches:
+        return max(target_matches)
+
+    return None
+
+
+def _try_toorder_review_autorecover(
+    entry: dict,
+    log_text: str,
+    failure_class: str,
+    signature: str,
+) -> bool:
+    if entry.get("dag_id") != "Sales_ToOrder_Review_Dags":
+        return False
+    if entry.get("task_id") != "t2_collect":
+        return False
+
+    combined = "\n".join([str(entry.get("error") or ""), log_text or ""])
+    if "download date mismatch" not in combined:
+        return False
+
+    sale_date = _extract_toorder_snapshot_end_date(combined)
+    if not sale_date:
+        return False
+
+    conf = {"sale_date": sale_date, "force_recollect": True}
+    claimed_by = "autoheal-toorder-review"
+    try:
+        new_run_id = trigger_dag("Sales_ToOrder_Review_Dags", conf=conf)
+    except Exception as exc:
+        new_run_id = ""
+        trigger_error = str(exc)
+    else:
+        trigger_error = ""
+
+    updates = {
+        "failure_class": failure_class,
+        "signature": signature,
+        "autorecover": "toorder_review_recollect",
+        "autorecover_conf": conf,
+        "autorecover_run_id": new_run_id,
+        "autorecover_error": trigger_error,
+    }
+    if claim_heal_task(
+        entry["dag_id"],
+        entry["run_id"],
+        entry["task_id"],
+        claimed_by,
+        try_number=entry.get("try_number"),
+        updates=updates,
+    ):
+        if new_run_id:
+            send_telegram(
+                "[자동복구] ToOrder 리뷰 수집 재실행\n"
+                f"원본_run_id={entry.get('run_id')}\n"
+                f"재실행_run_id={new_run_id}\n"
+                f"sale_date={sale_date}\n"
+                "사유=download date mismatch"
+            )
+        else:
+            send_telegram(
+                "[자동복구] ToOrder 리뷰 수집 재실행 실패\n"
+                f"원본_run_id={entry.get('run_id')}\n"
+                f"sale_date={sale_date}\n"
+                f"오류={trigger_error or 'unknown'}"
+            )
+        return True
+
+    return False
+
+
 def _build_prompt(entry: dict, log_text: str) -> str:
     if entry.get("kind") == "import_error":
         return (
@@ -562,6 +660,9 @@ def process_once() -> bool:
             _send_skip_notification(entry, failure_class, "pending_retry")
             return True
         return False
+
+    if _try_toorder_review_autorecover(entry, log_text, failure_class, signature):
+        return True
 
     if failure_class == "data_file_error":
         if claim_heal_task(

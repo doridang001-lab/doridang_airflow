@@ -7,7 +7,7 @@ import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-from modules.transform.utility.notifier import enqueue_heal_task, send_telegram
+from modules.transform.utility.notifier import enqueue_heal_task, on_retry_callback, send_telegram
 from modules.transform.utility.schedule import SMP_TOORDER_VOC_TIME
 from modules.transform.pipelines.sales.Sales_ToOrder_Review_collect import (
     t1_prepare,
@@ -17,10 +17,11 @@ from modules.transform.pipelines.sales.Sales_ToOrder_Review_collect import (
 )
 
 # ── 수집 기간 설정 ─────────────────────────────────────────────────────
-LOOKBACK_DAYS = 7                       # None                      → 어제 하루만
-#                  7                       → 7일 전 ~ 어제 (7일치)
+LOOKBACK_DAYS = 1                       # None/1                    → 어제 누적 스냅샷
+#                  7                       → scheduled에서는 최신 하루만 사용
 #                  "2026-01-01"            → 해당 날짜 ~ 어제
 #                  "2026-01-01~2026-01-15" → 해당 범위 고정
+# scheduled 실행은 최신 D-1 누적 스냅샷을 기존 파일이 있어도 재수집
 # ───────────────────────────────────────────────────────────────────────
 
 KST = pendulum.timezone("Asia/Seoul")
@@ -47,6 +48,7 @@ default_args = {
     "email_on_failure": False,
     "email_on_retry": False,
     "on_failure_callback": _on_failure_callback,
+    "on_retry_callback": on_retry_callback,
 }
 
 with DAG(

@@ -712,15 +712,21 @@ def t1_prepare(lookback_days=None, **context: Any) -> str:
         force_recollect = True
 
     mode, date_list = _generate_date_list(lookback_days=lookback_days, conf=conf)
+    if mode == "scheduled" and date_list:
+        # ToOrder VOC export is a rolling snapshot ending on the selected date.
+        # Scheduled runs only need the latest D-1 snapshot; DB lookback compares snapshots.
+        date_list = [date_list[-1]]
     account_df = _resolve_account_df()
     account_records = account_df.to_dict("records")
 
     output_dir = _resolve_output_dir()
+    force_recollect_dates = set(date_list) if mode == "scheduled" else set()
     dates_to_collect = []
     skipped_dates = []
     for target_date in date_list:
         expected_path = output_dir / f"toorder_voc_{target_date.replace('-', '')}.parquet"
-        if expected_path.exists() and not force_recollect:
+        date_force_recollect = force_recollect or target_date in force_recollect_dates
+        if expected_path.exists() and not date_force_recollect:
             skipped_dates.append(target_date)
             logger.info("[TOORDER_VOC] %s 이미 저장되어 있어 skip", target_date)
         else:
@@ -733,8 +739,17 @@ def t1_prepare(lookback_days=None, **context: Any) -> str:
     ti.xcom_push(key="output_dir", value=str(output_dir))
     ti.xcom_push(key="mode", value=mode)
     ti.xcom_push(key="force_recollect", value=force_recollect)
+    ti.xcom_push(key="force_recollect_dates", value=sorted(force_recollect_dates))
 
-    logger.info("[TOORDER_VOC] mode=%s total=%d skip=%d collect=%d force_recollect=%s", mode, len(date_list), len(skipped_dates), len(dates_to_collect), force_recollect)
+    logger.info(
+        "[TOORDER_VOC] mode=%s total=%d skip=%d collect=%d force_recollect=%s force_recollect_dates=%s",
+        mode,
+        len(date_list),
+        len(skipped_dates),
+        len(dates_to_collect),
+        force_recollect,
+        sorted(force_recollect_dates),
+    )
     return f"mode={mode} total={len(date_list)} skip={len(skipped_dates)} collect={len(dates_to_collect)}"
 
 
@@ -743,6 +758,10 @@ def t2_collect(**context: Any) -> str:
     ti = context["ti"]
     dates_to_collect: list[str] = ti.xcom_pull(task_ids="t1_prepare", key="dates_to_collect") or []
     account_records: list[dict] = ti.xcom_pull(task_ids="t1_prepare", key="account_records") or []
+    mode = ti.xcom_pull(task_ids="t1_prepare", key="mode") or "scheduled"
+
+    if mode == "scheduled" and dates_to_collect:
+        dates_to_collect = [max(dates_to_collect)]
 
     if not dates_to_collect:
         logger.info("[TOORDER_VOC] 수집 대상이 없어 skip")
@@ -788,7 +807,7 @@ def t2_collect(**context: Any) -> str:
                     failure_details.append(detail)
                     still_failed.append(target_date)
                 else:
-                # DataFrame 임시 parquet 저장
+                    # DataFrame 임시 parquet 저장
                     tmp_path = session_temp_dir / f"tmp_{target_date.replace('-', '')}.parquet"
                     result.to_parquet(tmp_path, index=False)
                     temp_parquet_map[target_date] = str(tmp_path)
@@ -807,11 +826,12 @@ def t2_collect(**context: Any) -> str:
     logger.info("[TOORDER_VOC] collected=%d failed=%d", len(temp_parquet_map), len(failed_dates))
 
     if failed_dates:
-        logger.warning(
-            "[TOORDER_VOC] 수집 실패 날짜 %d건: %s → 다음 실행(LOOKBACK_DAYS=7)에서 자동 재시도",
-            len(failed_dates),
-            failed_dates,
+        message = (
+            f"[TOORDER_VOC] 수집 실패 날짜 {len(failed_dates)}건: {failed_dates}; "
+            f"details={failure_details}"
         )
+        logger.error(message)
+        raise AirflowException(message)
 
     return f"collected={len(temp_parquet_map)}"
 

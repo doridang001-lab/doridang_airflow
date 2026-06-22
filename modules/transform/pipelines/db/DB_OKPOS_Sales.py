@@ -81,7 +81,7 @@ WAIT_TIMEOUT     = 30
 HEADLESS_MODE    = os.getenv("AIRFLOW_HOME") is not None
 
 # 어제/그제는 OKPOS 마감 지연으로 거짓 NO_DATA가 남기 쉬워 재확인한다.
-_NO_DATA_RETRY_RECENT_DAYS = 2
+_NO_DATA_RETRY_RECENT_DAYS = 3
 
 
 # ============================================================
@@ -2187,6 +2187,82 @@ def _transform_okpos_daily_df(df: pd.DataFrame, store_name: str, sale_date: str)
     return out, sale_date[:7]
 
 
+def _read_okpos_csv(csv_path: Path) -> pd.DataFrame:
+    """OKPOS raw CSV를 UTF-8 BOM 유무와 무관하게 읽는다."""
+    try:
+        return pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+    except Exception:
+        return pd.read_csv(csv_path, dtype=str)
+
+
+def _daily_amount_sum(df_daily: pd.DataFrame) -> int:
+    cols = [c for c in ("총매출액", "총할인액", "실매출액", "영수건수") if c in df_daily.columns]
+    if not cols or df_daily.empty:
+        return 0
+    return int(df_daily[cols].apply(_to_int_series).sum(axis=1).iloc[0])
+
+
+def _fallback_daily_from_order_csv(df_daily: pd.DataFrame, store_short: str, sale_date: str, ym: str) -> pd.DataFrame:
+    """daily 0원 의심값을 같은 날짜 today(order) 합계로 보정한다.
+
+    OKPOS daily 페이지가 특정 날짜를 조회하지 못하면 정상 엑셀처럼 보이지만
+    '영업일수합: 0 일' 행만 내려오는 경우가 있다. 같은 날짜 order가 비0원이면
+    daily 0원은 수집 오류로 보고 order 합계로 교체한다.
+    """
+    if df_daily.empty or _daily_amount_sum(df_daily) != 0:
+        return df_daily
+
+    order_csv = (
+        RAW_OKPOS_SALES
+        / "brand=도리당"
+        / f"store={store_short}"
+        / f"ym={ym}"
+        / "okpos_order.csv"
+    )
+    if not order_csv.exists() or order_csv.stat().st_size == 0:
+        return df_daily
+
+    order_df = _read_okpos_csv(order_csv)
+    if order_df.empty or "sale_date" not in order_df.columns:
+        return df_daily
+
+    order_df = order_df[order_df["sale_date"].astype(str).str.strip() == sale_date].copy()
+    if order_df.empty:
+        return df_daily
+
+    total = int((_to_int_series(order_df["총매출액"]) if "총매출액" in order_df.columns else pd.Series(0, index=order_df.index)).sum())
+    discount = int((_to_int_series(order_df["총할인액"]) if "총할인액" in order_df.columns else pd.Series(0, index=order_df.index)).sum())
+    net = int((_to_int_series(order_df["실매출액"]) if "실매출액" in order_df.columns else pd.Series(0, index=order_df.index)).sum())
+    receipts = int(len(order_df))
+    if total == 0 and discount == 0 and net == 0 and receipts == 0:
+        return df_daily
+
+    out = pd.DataFrame([{
+        "sale_date": sale_date,
+        "ym": ym,
+        "매장명": df_daily["매장명"].iloc[0],
+        "총매출액": total,
+        "총할인액": discount,
+        "실매출액": net,
+        "영수건수": receipts,
+        "collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }])
+    out["_pk"] = out.apply(
+        lambda r: hashlib.md5(f"{r['sale_date']}|{r['매장명']}|daily".encode()).hexdigest(),
+        axis=1,
+    )
+    logger.warning(
+        "daily 0원 수집 오류 의심 → order fallback 보정: %s | %s | total=%s discount=%s net=%s receipts=%s",
+        sale_date,
+        df_daily["매장명"].iloc[0],
+        total,
+        discount,
+        net,
+        receipts,
+    )
+    return out
+
+
 def ingest_manual_daily_xlsx(
     manual_xlsx_path: str | None = None,
     store_name: str = "",
@@ -2462,61 +2538,6 @@ def save_to_raw(**context) -> str:
         "daily":   (daily_files,   "okpos_daily"),        # 일자별 종합매출 → okpos_daily.csv
     }
 
-    def _fallback_daily_from_order(df_daily: pd.DataFrame, store_short: str, sale_date: str, ym: str) -> pd.DataFrame:
-        """OKPOS daily 원본이 0원 합계만 내려오면 today(order) 합계로 daily를 보정한다."""
-        if df_daily.empty:
-            return df_daily
-        daily_sum = int(df_daily[["총매출액", "총할인액", "실매출액", "영수건수"]].sum(axis=1).iloc[0])
-        if daily_sum != 0:
-            return df_daily
-
-        order_csv = (
-            RAW_OKPOS_SALES
-            / "brand=도리당"
-            / f"store={store_short}"
-            / f"ym={ym}"
-            / "okpos_order.csv"
-        )
-        if not order_csv.exists() or order_csv.stat().st_size == 0:
-            return df_daily
-
-        try:
-            order_df = pd.read_csv(order_csv, dtype=str, encoding="utf-8-sig")
-        except Exception:
-            order_df = pd.read_csv(order_csv, dtype=str)
-
-        if order_df.empty or "sale_date" not in order_df.columns:
-            return df_daily
-
-        order_df = order_df[order_df["sale_date"].astype(str).str.strip() == sale_date].copy()
-        if order_df.empty:
-            return df_daily
-
-        out = pd.DataFrame([{
-            "sale_date": sale_date,
-            "ym": ym,
-            "매장명": df_daily["매장명"].iloc[0],
-            "총매출액": int((_to_int_series(order_df["총매출액"]) if "총매출액" in order_df.columns else pd.Series(0, index=order_df.index)).sum()),
-            "총할인액": int((_to_int_series(order_df["총할인액"]) if "총할인액" in order_df.columns else pd.Series(0, index=order_df.index)).sum()),
-            "실매출액": int((_to_int_series(order_df["실매출액"]) if "실매출액" in order_df.columns else pd.Series(0, index=order_df.index)).sum()),
-            "영수건수": int(len(order_df)),
-            "collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }])
-        out["_pk"] = out.apply(
-            lambda r: hashlib.md5(f"{r['sale_date']}|{r['매장명']}|daily".encode()).hexdigest(),
-            axis=1,
-        )
-        logger.warning(
-            "daily 0원 보정(order fallback): %s | %s | total=%s discount=%s net=%s receipts=%s",
-            sale_date,
-            df_daily["매장명"].iloc[0],
-            out["총매출액"].iloc[0],
-            out["총할인액"].iloc[0],
-            out["실매출액"].iloc[0],
-            out["영수건수"].iloc[0],
-        )
-        return out
-
     conf = context.get("dag_run").conf or {}
     replace_by_date = bool(conf.get("replace_by_date") or conf.get("force_redownload") or os.getenv("OKPOS_REPLACE_BY_DATE", ""))
 
@@ -2551,7 +2572,7 @@ def save_to_raw(**context) -> str:
 
                 if page_type == "daily":
                     df, ym = _transform_okpos_daily_df(raw_df, store_name, sale_date)
-                    df = _fallback_daily_from_order(df, store_short, sale_date, ym)
+                    df = _fallback_daily_from_order_csv(df, store_short, sale_date, ym)
                 else:
                     df, ym = _transform_okpos_df(raw_df, store_name, sale_date)
                 if df.empty:
@@ -2945,11 +2966,11 @@ def check_and_fill_missing_today(**context) -> str:
 
 
 def reconcile_against_daily_summary(**context) -> str:
-    """daily(일자별 종합매출) '실매출액'을 기준으로 today/receipt를 재수집·덮어쓰기하여 정합성을 맞춘다.
+    """daily(일자별 종합매출)와 today(order) 정합성을 맞춘다.
 
-    - 기준: okpos_daily.csv의 '실매출액'
-    - okpos_order.csv(실매출액 합), okpos_order_item.csv(실매출액 합) 각각 daily와 비교
-    - mismatch 건은 해당 페이지만 재다운로드 후 '해당 날짜 행만' 덮어쓰기
+    - daily가 0원인데 order가 비0원이면 daily 수집 오류로 보고 daily를 먼저 재수집한다.
+    - daily 재수집도 0원이면 order 합계 fallback으로 daily를 보정한다.
+    - 그 외 mismatch는 기존처럼 today를 재다운로드한다.
     """
     sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates") or []
     if not sale_dates:
@@ -3066,6 +3087,7 @@ def reconcile_against_daily_summary(**context) -> str:
                 likely_okpos = _is_likely_okpos_report(raw_df)
                 if page_type == "daily":
                     df_new, ym_new = _transform_okpos_daily_df(raw_df, store_name, sale_date)
+                    df_new = _fallback_daily_from_order_csv(df_new, store_short, sale_date, ym_new)
                 else:
                     df_new, ym_new = _transform_okpos_df(raw_df, store_name, sale_date)
                 if df_new.empty:
@@ -3083,6 +3105,7 @@ def reconcile_against_daily_summary(**context) -> str:
 
     remaining: list[tuple[str, dict]] = [(d, s) for d in sale_dates for s in STORES if _should_collect(s["name"], d)]
     for attempt in range(1, max_attempts + 1):
+        mism_daily: list[tuple[str, dict]] = []
         mism_today: list[tuple[str, dict]] = []
         mism_receipt: list[tuple[str, dict]] = []
         details: list[str] = []
@@ -3100,21 +3123,39 @@ def reconcile_against_daily_summary(**context) -> str:
 
             # order vs daily 비교 (order CSV는 반품 행이 음수로 저장되어 직접 합산 = 순매출)
             if order_sum is not None and abs(expected - order_sum) > tol:
-                mism_today.append((sale_date, store))
-                details.append(f"{sale_date}__{store['name']}:daily={expected}, order={order_sum}, diff={expected-order_sum}")
+                if expected == 0 and order_sum != 0:
+                    mism_daily.append((sale_date, store))
+                    details.append(f"{sale_date}__{store['name']}:daily_zero_order_nonzero daily={expected}, order={order_sum}, diff={expected-order_sum}")
+                else:
+                    mism_today.append((sale_date, store))
+                    details.append(f"{sale_date}__{store['name']}:daily={expected}, order={order_sum}, diff={expected-order_sum}")
             # NOTE: order_item(receipt) vs daily 비교는 제외 — receipt 페이지가 반품 영수증을
             # 미포함하므로 반품 있는 날은 구조적으로 daily와 불일치하며, 재다운로드로 해결 불가
 
-        if not mism_today and not mism_receipt:
+        if not mism_daily and not mism_today and not mism_receipt:
             msg = f"daily 기준 reconcile 완료: mismatch 없음 (tol={tol}) | attempts={attempt}"
             logger.info(msg)
             return msg
 
-        logger.warning("daily 기준 mismatch 발견(attempt=%d): today=%d, receipt=%d | 예: %s", attempt, len(mism_today), len(mism_receipt), details[:10])
+        logger.warning(
+            "daily/order mismatch 발견(attempt=%d): daily=%d, today=%d, receipt=%d | 예: %s",
+            attempt,
+            len(mism_daily),
+            len(mism_today),
+            len(mism_receipt),
+            details[:10],
+        )
 
+        saved_d = _redownload_page("daily", mism_daily, attempt_tag=str(attempt))
         saved_t = _redownload_page("today", mism_today, attempt_tag=str(attempt))
         saved_r = _redownload_page("receipt", mism_receipt, attempt_tag=str(attempt))
-        logger.info("daily 기준 reconcile attempt %d: today 재저장=%d, receipt 재저장=%d", attempt, saved_t, saved_r)
+        logger.info(
+            "daily/order reconcile attempt %d: daily 재저장=%d, today 재저장=%d, receipt 재저장=%d",
+            attempt,
+            saved_d,
+            saved_t,
+            saved_r,
+        )
 
     # 최대 재시도 후에도 mismatch 남으면 로그/XCom로 남김(실패시키지 않음)
     try:

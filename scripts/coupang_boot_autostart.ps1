@@ -1,4 +1,4 @@
-param(
+﻿param(
     [int]$StartupDelaySeconds = 60,
     [int]$CollectionWaitSeconds = 1200,
     [int]$CollectionStableSeconds = 60,
@@ -13,36 +13,41 @@ $repoRoot = "C:\airflow"
 $venvPython = "C:\airflow\.venv\Scripts\python.exe"
 $hostScript = Join-Path $repoRoot "scripts\coupang_host_chrome.ps1"
 $autoClickScript = Join-Path $repoRoot "scripts\coupang_runner_autoclick.py"
+$logFile = Join-Path $repoRoot ".tmp\coupang_boot_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+$null = New-Item -ItemType Directory -Force -Path (Split-Path $logFile)
+function Log([string]$msg) {
+    $line = "$(Get-Date -Format 'HH:mm:ss') $msg"
+    Write-Host $line
+    Add-Content -Path $logFile -Value $line -Encoding utf8
+}
+
+Log "=== coupang_boot_autostart START ==="
 
 if (-not (Test-Path $venvPython)) {
-    Write-Error "Python 경로가 존재하지 않습니다: $venvPython"
+    Log "[ERROR] Python not found: $venvPython"
     exit 1
 }
 
 function Get-CollectDirs {
-    $dirs = @()
+    $dirs = [System.Collections.Generic.List[string]]::new()
     $down = "E:\down"
-    if (Test-Path $down) { $dirs += $down }
+    if (Test-Path $down) { $dirs.Add($down) }
 
     if ($env:COLLECT_DB -and (Test-Path $env:COLLECT_DB)) {
-        $dirs += Join-Path $env:COLLECT_DB "영업관리부_수집"
-        return ($dirs | Select-Object -Unique)
+        $dirs.Add((Join-Path $env:COLLECT_DB "collect"))
+        return $dirs.ToArray()
     }
 
-    $home = [Environment]::GetFolderPath("UserProfile")
-    $onedriveCandidates = @(
-        (Join-Path $home "OneDrive - 주식회사 도리당"),
-        (Join-Path $home "OneDrive - 도리당")
-    )
-    foreach ($base in $onedriveCandidates) {
+    $userHome = [Environment]::GetFolderPath("UserProfile")
+    foreach ($suffix in @("OneDrive - ã¹¹ã¹¹", "OneDrive")) {
+        $base = Join-Path $userHome $suffix
         if (Test-Path $base) {
-            $collect = Join-Path $base "Collect_Data\영업관리부_수집"
-            if (Test-Path $collect) {
-                $dirs += $collect
-            }
+            $collect = Join-Path $base "Collect_Data\collect"
+            if (Test-Path $collect) { $dirs.Add($collect) }
         }
     }
-    return ($dirs | Select-Object -Unique)
+    return $dirs.ToArray()
 }
 
 function Get-RawCounts {
@@ -51,7 +56,7 @@ function Get-RawCounts {
     $total = 0
     foreach ($dir in $Paths) {
         foreach ($pattern in $patterns) {
-            $total += (Get-ChildItem -Path $dir -Filter $pattern -File -ErrorAction SilentlyContinue).Count
+            $total += @(Get-ChildItem -Path $dir -Filter $pattern -File -ErrorAction SilentlyContinue).Count
         }
     }
     return $total
@@ -59,51 +64,58 @@ function Get-RawCounts {
 
 function Trigger-CoupangMacroDag {
     param([string]$DagId, [string]$SchedulerContainer)
-
-    # 1) docker scheduler if available
     $hasDocker = Get-Command docker -ErrorAction SilentlyContinue
     if ($hasDocker) {
         $running = docker ps --filter "name=$SchedulerContainer" --filter "status=running" --format "{{.Names}}"
         if ($running -and $running.Trim()) {
-            Write-Host "Trigger DAG in Docker scheduler: $DagId ($SchedulerContainer)"
+            Log "Triggering DAG via Docker: $DagId"
             docker exec $SchedulerContainer airflow dags trigger $DagId
             return
         }
     }
-
-    # 2) fallback local airflow cli
-    $hasLocalAirflow = Get-Command airflow -ErrorAction SilentlyContinue
-    if (-not $hasLocalAirflow -and (Test-Path $venvPython)) {
-        & $venvPython -m airflow dags trigger $DagId
-        return
+    $hasAirflow = Get-Command airflow -ErrorAction SilentlyContinue
+    if (-not $hasAirflow -and (Test-Path $venvPython)) {
+        & $venvPython -m airflow dags trigger $DagId; return
     }
-
-    if ($hasLocalAirflow) {
-        airflow dags trigger $DagId
-        return
-    }
-
-    Write-Warning "Airflow CLI를 찾지 못해 DAG 트리거를 건너뜁니다."
+    if ($hasAirflow) { airflow dags trigger $DagId; return }
+    Log "[WARNING] Airflow CLI not found, skipping DAG trigger"
 }
 
 Set-Location $repoRoot
-if ($StartupDelaySeconds -gt 0) { Start-Sleep -Seconds $StartupDelaySeconds }
+if ($StartupDelaySeconds -gt 0) {
+    Log "Waiting ${StartupDelaySeconds}s for boot..."
+    Start-Sleep -Seconds $StartupDelaySeconds
+}
 
-& powershell -ExecutionPolicy Bypass -File $hostScript
+Log "Starting Chrome..."
+$chromeOut = & powershell -ExecutionPolicy Bypass -File $hostScript 2>&1
+foreach ($line in $chromeOut) { Log "$line" }
 if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne $null) {
-    Write-Error "coupang_host_chrome.ps1 실행 실패: $LASTEXITCODE"
+    Log "[ERROR] coupang_host_chrome.ps1 failed: $LASTEXITCODE"
     exit 1
 }
 
-$collectDirs = Get-CollectDirs
-$before = Get-RawCounts -Paths $collectDirs
-Write-Host "시작 시 수집 파일 수: $before개"
-& $venvPython $autoClickScript
-$clickExit = $LASTEXITCODE
-if ($clickExit -ne 0) {
-    Write-Error "coupang_runner_autoclick.py 실행 실패: $clickExit"
-    exit $clickExit
+Log "Waiting for Chrome port 9222..."
+$portReady = $false
+for ($i = 0; $i -lt 30; $i++) {
+    Start-Sleep -Seconds 2
+    $conn = Get-NetTCPConnection -LocalPort 9222 -State Listen -ErrorAction SilentlyContinue
+    if ($conn) { $portReady = $true; Log "Port 9222 ready (attempt $i)"; break }
 }
+if (-not $portReady) { Log "[ERROR] Port 9222 not open after 60s"; exit 1 }
+
+$collectDirs = @(Get-CollectDirs)
+$before = Get-RawCounts -Paths $collectDirs
+Log "Files before collection: $before"
+
+Log "Running autoclick..."
+$ErrorActionPreference = "Continue"
+$acOut = & $venvPython $autoClickScript 2>&1
+$clickExit = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
+foreach ($line in $acOut) { Log "$line" }
+if ($clickExit -ne 0) { Log "[ERROR] autoclick failed: $clickExit"; exit $clickExit }
+Log "topHalfBtn clicked OK"
 
 if ($CollectionWaitSeconds -gt 0) {
     $deadline = (Get-Date).AddSeconds($CollectionWaitSeconds)
@@ -111,13 +123,13 @@ if ($CollectionWaitSeconds -gt 0) {
     while ((Get-Date) -lt $deadline) {
         $nowCount = Get-RawCounts -Paths $collectDirs
         if ($nowCount -gt $before) {
-            Write-Host "수집 파일 증가 감지: $before -> $nowCount"
+            Log "Files increased: $before -> $nowCount"
             $before = $nowCount
             $lastChanged = Get-Date
         } else {
             $stableSeconds = ((Get-Date) - $lastChanged).TotalSeconds
             if ($stableSeconds -ge $CollectionStableSeconds) {
-                Write-Host "수집 원본 파일이 $CollectionStableSeconds초 동안 안정 상태입니다."
+                Log "Collection stable for ${CollectionStableSeconds}s, done waiting"
                 break
             }
         }
@@ -127,9 +139,9 @@ if ($CollectionWaitSeconds -gt 0) {
 
 try {
     Trigger-CoupangMacroDag -DagId $AirflowDag -SchedulerContainer $AirflowSchedulerContainer
-    Write-Host "DAG 트리거 완료: $AirflowDag"
+    Log "DAG triggered: $AirflowDag"
 } catch {
-    Write-Warning "DAG 트리거 실패: $($_.Exception.Message)"
+    Log "[WARNING] DAG trigger failed: $($_.Exception.Message)"
 }
-
+Log "=== DONE ==="
 exit 0
