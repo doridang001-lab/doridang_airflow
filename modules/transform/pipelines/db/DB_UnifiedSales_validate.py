@@ -5,9 +5,10 @@ unified_sales 일별/월별 검증 파이프라인.
 1. 대상일 1일을 결정한다.
 2. MART_DB/unified_sales_grp/unified_sales_*.parquet 에서 sale_date+store 기준 total_price를 집계한다.
 3. ToOrder 일별 store/platform parquet에서 같은 기준으로 집계한다.
-4. outer join 으로 비교하고 오차율 2% 이상 매장을 Telegram으로 알림 발송한다.
-5. 일별 결과: MART_DB/unified_sales_grp_error_list/unified_sales_error_YYYY-MM-DD.csv
-6. 월별 결과: MART_DB/unified_sales_grp_error_list/unified_sales_monthly_YYYY-MM.csv
+4. 수동 교정 기준을 쓰는 TEST_STORES는 토더 기준 검증에서 제외한다.
+5. outer join 으로 비교하고 오차율 2% 이상 매장을 Telegram으로 알림 발송한다.
+6. 일별 결과: MART_DB/unified_sales_grp_error_list/unified_sales_error_YYYY-MM-DD.csv
+7. 월별 결과: MART_DB/unified_sales_grp_error_list/unified_sales_monthly_YYYY-MM.csv
    (올해 데이터가 있는 모든 ym에 대해 생성, 알림은 어제 기준 달만)
 """
 
@@ -77,6 +78,21 @@ _COL_LABELS = {
     "error_rate": "오차율(%)",
     "status": "상태",
 }
+
+BAEMIN_MANUAL_TEST_STORES = {"해운대중동점", "법흥리점", "송파삼전점"}
+COUPANG_MANUAL_TEST_STORES = {"해운대중동점", "송파삼전점"}
+VALIDATION_EXCLUDED_TEST_STORES = BAEMIN_MANUAL_TEST_STORES | COUPANG_MANUAL_TEST_STORES
+VALIDATION_SCOPE_NOTE = "기준: TEST_STORES 제외, 나머지 매장 토더↔unified 비교"
+
+
+def _apply_validation_scope(df: pd.DataFrame) -> pd.DataFrame:
+    """TEST_STORES는 수동 교정 기준이 달라 토더 기준 검증에서 제외한다."""
+    if df.empty or "store" not in df.columns:
+        return df
+
+    scoped = df.copy()
+    scoped["store"] = scoped["store"].astype(str).str.strip()
+    return scoped[~scoped["store"].isin(VALIDATION_EXCLUDED_TEST_STORES)].copy()
 
 
 def _resolve_target_date(**context) -> str:
@@ -184,6 +200,7 @@ def _build_telegram_message(title: str, target_label: str, error_rows: pd.DataFr
     return (
         f"{title}\n"
         f"{target_label}\n"
+        f"{VALIDATION_SCOPE_NOTE}\n"
         f"오차율 2% 이상: {len(error_rows)}건\n"
         f"CSV: {win_path}\n"
         f"{rows_text}"
@@ -217,6 +234,10 @@ def _load_parquet_totals(target_date: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["sale_date", "store", "unified_total"])
 
+    df = _apply_validation_scope(df)
+    if df.empty:
+        return pd.DataFrame(columns=["sale_date", "store", "unified_total"])
+
     df["store"] = df["store"].astype(str).str.strip()
     df["total_price"] = pd.to_numeric(df["total_price"], errors="coerce").fillna(0)
     grouped = (
@@ -239,6 +260,10 @@ def _load_excel_totals(target_date: str) -> pd.DataFrame:
     df = df[df["sale_date"] == target_date].copy()
     if df.empty:
         logger.warning("토더 parquet 데이터 없음: %s", target_date)
+        return pd.DataFrame(columns=["sale_date", "store", "excel_total"])
+
+    df = _apply_validation_scope(df)
+    if df.empty:
         return pd.DataFrame(columns=["sale_date", "store", "excel_total"])
 
     grouped = (
@@ -355,6 +380,10 @@ def _load_parquet_monthly_totals(target_ym: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["ym", "store", "unified_total"])
 
+    df = _apply_validation_scope(df)
+    if df.empty:
+        return pd.DataFrame(columns=["ym", "store", "unified_total"])
+
     df["store"] = df["store"].astype(str).str.strip()
     df["total_price"] = pd.to_numeric(df["total_price"], errors="coerce").fillna(0)
     grouped = (
@@ -378,6 +407,10 @@ def _load_excel_monthly_totals(target_ym: str) -> pd.DataFrame:
     df = df[df["ym"] == target_ym].copy()
     if df.empty:
         logger.warning("토더 parquet 데이터 없음 (월별): %s", target_ym)
+        return pd.DataFrame(columns=["ym", "store", "excel_total"])
+
+    df = _apply_validation_scope(df)
+    if df.empty:
         return pd.DataFrame(columns=["ym", "store", "excel_total"])
 
     df["store"] = df["store"].astype(str).str.strip()

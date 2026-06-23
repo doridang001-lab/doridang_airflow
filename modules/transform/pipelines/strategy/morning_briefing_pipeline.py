@@ -15,8 +15,13 @@
     - Telegram (modules.transform.utility.telegram)
 """
 
+import csv
+import io
 import json
 import logging
+import os
+import re
+import subprocess
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
@@ -27,6 +32,29 @@ logger = logging.getLogger(__name__)
 # morning_briefing_pipeline.py는 modules/transform/pipelines/strategy/ 에 위치
 # → parent×5 = airflow 프로젝트 루트
 _GIT_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
+
+_WINDOWS_SCHEDULED_TASKS = [
+    {
+        "label": "쿠팡 자동 수집",
+        "task_name": "CoupangAutoCollect",
+        "duplicate": False,
+    },
+    {
+        "label": "WSL 에러 감지",
+        "task_name": "telegram_claude_loop",
+        "duplicate": False,
+    },
+    {
+        "label": "WSL 에러 감지 중복 후보",
+        "task_name": "TelegramClaudeLoop",
+        "duplicate": True,
+    },
+    {
+        "label": "AGENTS.md 업그레이드",
+        "task_name": "Airflow_Codex_MD_Improver_Weekly",
+        "duplicate": False,
+    },
+]
 
 
 # ============================================================
@@ -423,6 +451,146 @@ def _collect_scheduled_dags() -> list[str]:
         return []
 
 
+def _task_result_label(value: str) -> tuple[str, str]:
+    raw = (value or "").strip()
+    if raw == "0":
+        return "ok", "최근 성공"
+    if raw == "267011":
+        return "not_run", "아직 실행 전"
+    if raw == "267009":
+        return "running", "실행 중"
+    if raw in {"", "N/A"}:
+        return "unknown", "결과 없음"
+    return "failed", f"Last Result {raw}"
+
+
+def _clean_schtasks_time(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw or raw == "N/A":
+        return raw
+    date_match = re.search(r"\d{4}-\d{2}-\d{2}", raw)
+    time_match = re.search(r"\d{1,2}:\d{2}:\d{2}", raw)
+    if date_match and time_match:
+        return f"{date_match.group(0)} {time_match.group(0)}"
+    return raw.replace("\ufffd", "").strip()
+
+
+def _collect_windows_scheduled_tasks() -> list[dict]:
+    """Windows 작업 스케줄러 상태 수집. Windows 호스트 접근이 안 되면 확인 불가로 반환."""
+    base_rows = []
+    for spec in _WINDOWS_SCHEDULED_TASKS:
+        task_name = spec["task_name"]
+        base_rows.append({
+            "label": spec["label"],
+            "task_name": task_name,
+            "duplicate": spec["duplicate"],
+            "status": "unavailable",
+            "status_label": "확인 불가",
+            "last_run": "",
+            "last_result": "",
+            "next_run": "",
+            "task_to_run": "",
+            "error": "",
+        })
+
+    try:
+        encoding = "mbcs" if os.name == "nt" else None
+        result = subprocess.run(
+            ["schtasks", "/query", "/fo", "CSV", "/v"],
+            capture_output=True,
+            text=True,
+            encoding=encoding,
+            errors="replace",
+            timeout=20,
+        )
+    except FileNotFoundError:
+        for row in base_rows:
+            row["error"] = "schtasks 없음"
+        return base_rows
+    except Exception as e:
+        for row in base_rows:
+            row["error"] = str(e)[:120]
+        return base_rows
+
+    if result.returncode != 0:
+        error = (result.stderr or result.stdout or "").strip()[:120]
+        for row in base_rows:
+            row["error"] = error
+        return base_rows
+
+    try:
+        task_rows = list(csv.DictReader(io.StringIO(result.stdout)))
+    except Exception as e:
+        for row in base_rows:
+            row["error"] = f"CSV 파싱 실패: {str(e)[:100]}"
+        return base_rows
+
+    by_name = {}
+    for task_row in task_rows:
+        raw_name = (task_row.get("TaskName") or "").strip()
+        normalized = raw_name.lstrip("\\")
+        if normalized:
+            by_name[normalized.lower()] = task_row
+
+    rows = []
+    for base in base_rows:
+        task_row = by_name.get(base["task_name"].lower())
+        if not task_row:
+            base.update({
+                "status": "missing",
+                "status_label": "등록 없음",
+            })
+            rows.append(base)
+            continue
+
+        status, status_label = _task_result_label(task_row.get("Last Result", ""))
+        base.update({
+            "status": status,
+            "status_label": status_label,
+            "last_run": _clean_schtasks_time(task_row.get("Last Run Time", "")),
+            "last_result": task_row.get("Last Result", ""),
+            "next_run": _clean_schtasks_time(task_row.get("Next Run Time", "")),
+            "task_to_run": task_row.get("Task To Run", "")[:160],
+        })
+        rows.append(base)
+
+    return rows
+
+
+def _format_scheduled_task_line(task: dict) -> str:
+    if task.get("duplicate"):
+        prefix = "⚠️"
+    else:
+        prefix = {
+            "ok": "✅",
+            "running": "🟡",
+            "not_run": "⚪",
+            "missing": "❌",
+            "failed": "❌",
+            "unavailable": "⚪",
+            "unknown": "⚪",
+        }.get(task.get("status"), "⚪")
+
+    parts = [f"{prefix} {task['label']}"]
+    if task.get("duplicate"):
+        parts.append(f"중복 후보({task['task_name']})")
+    else:
+        parts.append(task.get("status_label") or "상태 없음")
+
+    if task.get("last_run"):
+        parts.append(f"최근 {task['last_run']}")
+    if task.get("next_run") and task["next_run"] != "N/A":
+        parts.append(f"다음 {task['next_run']}")
+    if task.get("error") and task.get("status") in {"missing", "unavailable"}:
+        parts.append(task["error"])
+
+    return " - ".join(parts)
+
+
+def _should_include_scheduled_task_summary() -> bool:
+    return pendulum.now("Asia/Seoul").day_of_week == 0
+
+
 # ============================================================
 # Task 함수
 # ============================================================
@@ -434,6 +602,7 @@ def collect_briefing_data(**context):
     git = _collect_git_status()
     freshness = _collect_data_freshness()
     scheduled = _collect_scheduled_dags()
+    scheduled_tasks = _collect_windows_scheduled_tasks()
 
     payload = {
         "calendar": calendar,
@@ -442,6 +611,7 @@ def collect_briefing_data(**context):
         "freshness": freshness,
         "scheduled": scheduled[:10],
         "log_warnings": log_warnings,
+        "scheduled_tasks": scheduled_tasks,
     }
     context["ti"].xcom_push(key="briefing_data", value=json.dumps(payload, ensure_ascii=False))
     msg = f"수집 완료 — 일정 {len(calendar)}건 / 실패 {len(failures)}건 / 로그오류 DAG {len(log_warnings)}건"
@@ -569,6 +739,12 @@ def generate_briefing(**context):
         total = len(log_warnings)
         extra = f"\n  ...외 {total - 5}건" if total > 5 else ""
         sections.append(f"⚠️ 로그 메시지 ({log_err_cnt}오류/{log_warn_msg_cnt}경고)\n" + "\n".join(lw_lines) + extra)
+
+    # Windows 작업 스케줄러 요약 — 주 1회 월요일만 표시
+    scheduled_tasks = data.get("scheduled_tasks") or []
+    if scheduled_tasks and _should_include_scheduled_task_summary():
+        task_lines = [_format_scheduled_task_line(task) for task in scheduled_tasks]
+        sections.append("🗓 작업 스케줄러\n" + "\n".join(task_lines))
 
     # 미커밋 + 신선도
     uncommitted = [l for l in git["status"].split("\n") if l.strip()]

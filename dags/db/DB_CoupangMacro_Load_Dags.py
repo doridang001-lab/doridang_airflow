@@ -90,7 +90,7 @@ with DAG(
     schedule=DB_COUPANG_MACRO_TIME,
     start_date=pendulum.datetime(2026, 1, 1, tz="Asia/Seoul"),
     catchup=False,
-    max_active_runs=3,
+    max_active_runs=1,
     default_args=default_args,
     tags=["db", "coupang_macro", "partition"],
 ) as dag:

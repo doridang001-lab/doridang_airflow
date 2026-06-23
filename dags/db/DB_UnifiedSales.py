@@ -183,8 +183,8 @@ def wait_for_upstream_pos(**context) -> str:
                     continue
 
                 state = str(ti.state or "").lower()
-                if state == "success":
-                    completed.append(f"{run_label}: state=success")
+                if state in {"success", "skipped"}:
+                    completed.append(f"{run_label}: state={state}")
                     continue
                 if state in {"failed", "upstream_failed"}:
                     raise AirflowException(f"상류 POS 실패: {run_label} state={ti.state}")
