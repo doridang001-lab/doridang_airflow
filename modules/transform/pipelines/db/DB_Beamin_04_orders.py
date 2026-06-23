@@ -254,7 +254,7 @@ def _collect_with_retry_on_mismatch(
 
         try:
             driver.get(ORDERS_URL)
-            if not wait_for_page(driver, _TABLE_ROW_CSS, timeout=30):
+            if not wait_for_page(driver, _TABLE_ROW_CSS, timeout=45):
                 logger.warning("재수집 페이지 로드 실패, 중단: %s", store)
                 break
             if not filter_fn(driver):
@@ -429,7 +429,7 @@ def collect_orders_for_account(
                 driver.set_page_load_timeout(45)
                 driver.get(ORDERS_URL)
 
-                if not wait_for_page(driver, _TABLE_ROW_CSS, timeout=30):
+                if not wait_for_page(driver, _TABLE_ROW_CSS, timeout=45):
                     logger.warning("테이블 로드 실패, 건너뜀: %s", store)
                     if attempt < _ORDER_COLLECTION_ATTEMPTS - 1:
                         continue
@@ -706,22 +706,18 @@ def _set_date_specific(driver, target_date: str) -> bool:
         target_day = dt.day
         day_label = f"{target_day}일"
 
-        # 1. DefaultDateFilter 트리거 클릭
-        clicked = driver.execute_script(
-            """
-            // data-atelier-component="DatePicker.Trigger" 또는 DefaultDateFilter 내 버튼
-            let btn = document.querySelector('[data-atelier-component="DatePicker.Trigger"]');
-            if (!btn) {
-                const wrap = document.querySelector('[class*="DefaultDateFilter"]');
-                btn = wrap && wrap.querySelector('button');
-            }
-            if (btn) { btn.click(); return true; }
-            return false;
-            """
-        )
-        if not clicked:
-            logger.warning("DefaultDateFilter 트리거 버튼 미발견")
+        # 1. DefaultDateFilter 트리거 클릭 — 클릭 가능 상태까지 대기
+        try:
+            trigger = WebDriverWait(driver, 30).until(
+                EC.element_to_be_clickable((
+                    By.CSS_SELECTOR,
+                    '[data-atelier-component="DatePicker.Trigger"], [class*="DefaultDateFilter"] button',
+                ))
+            )
+        except TimeoutException:
+            logger.warning("DefaultDateFilter 트리거 버튼 미발견 (30s 대기 초과)")
             return False
+        human_click(driver, trigger)
 
         # 2. 달력 헤더 확인 후 목표 월로 이동
         def _get_calendar_ym(d):

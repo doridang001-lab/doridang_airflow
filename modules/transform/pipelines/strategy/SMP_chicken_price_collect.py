@@ -572,31 +572,8 @@ def save_results(**context) -> None:
     else:
         df_all = df_new.copy()
 
-    # 중복 제거: source_site + base_date + collected_at 날짜 기준
-    # collected_at 포맷이 섞여 있어도(초 포함/미포함 등) 예외 없이 처리
-    collected_raw = df_all["collected_at"].astype(str)
-    collected_dt = pd.to_datetime(collected_raw, errors="coerce", cache=False)
-    collected_date = collected_dt.dt.strftime("%Y-%m-%d")
-    if collected_date.isna().any():
-        fallback_date = collected_raw.str.extract(r"(\d{4}-\d{2}-\d{2})", expand=False)
-        collected_date = collected_date.fillna(fallback_date)
-    invalid_count = int(collected_date.isna().sum())
-    if invalid_count:
-        logger.warning(f"[save_results] collected_at 파싱 실패 {invalid_count}건: 'unknown'로 처리합니다.")
-        collected_date = collected_date.fillna("unknown")
-
-    df_all["_dedup_key"] = (
-        df_all["source_site"].astype(str)
-        + "_"
-        + df_all["base_date"].astype(str)
-        + "_"
-        + collected_date.astype(str)
-    )
-    df_all = (
-        df_all
-        .drop_duplicates(subset=["_dedup_key"], keep="last")
-        .drop(columns=["_dedup_key"])
-    )
+    # 같은 사이트/기준일은 재실행 시 마지막 수집값만 유지한다.
+    df_all = df_all.drop_duplicates(subset=["source_site", "base_date"], keep="last")
 
     df_all.to_csv(CHICKEN_PRICE_CSV_PATH, index=False, encoding="utf-8-sig")
     logger.info(f"저장 완료: {len(df_new)}행 추가, 총 {len(df_all)}행 → {CHICKEN_PRICE_CSV_PATH}")
@@ -690,20 +667,21 @@ def _build_email_html(results: list, ma_info: dict, base_date: str, any_failure:
 
     # 이동평균 섹션
     ma_section = ""
-    primary_site = "poultry.or.kr"
-    if primary_site in ma_info:
-        ma = ma_info[primary_site]
-        ma_rows = ""
+    ma_rows = ""
+    for site in ("poultry.or.kr", "chicken.or.kr"):
+        if site not in ma_info:
+            continue
+        ma = ma_info[site]
         if ma.get("ma20") is not None:
-            ma_rows += f'<tr><td style="color:#555;padding:4px 0;font-size:13px;">20일 평균</td><td style="text-align:right;font-size:13px;color:#2c3e50;">{ma["ma20"]:,.0f}원</td></tr>'
+            ma_rows += f'<tr><td style="color:#555;padding:4px 0;font-size:13px;">{site} 20일 평균</td><td style="text-align:right;font-size:13px;color:#2c3e50;">{ma["ma20"]:,.0f}원</td></tr>'
         if ma.get("ma60") is not None:
-            ma_rows += f'<tr><td style="color:#555;padding:4px 0;font-size:13px;">60일 평균</td><td style="text-align:right;font-size:13px;color:#2c3e50;">{ma["ma60"]:,.0f}원</td></tr>'
+            ma_rows += f'<tr><td style="color:#555;padding:4px 0;font-size:13px;">{site} 60일 평균</td><td style="text-align:right;font-size:13px;color:#2c3e50;">{ma["ma60"]:,.0f}원</td></tr>'
         if ma.get("ma120") is not None:
-            ma_rows += f'<tr><td style="color:#555;padding:4px 0;font-size:13px;">120일 평균</td><td style="text-align:right;font-size:13px;color:#2c3e50;">{ma["ma120"]:,.0f}원</td></tr>'
-        if ma_rows:
-            ma_section = f"""
+            ma_rows += f'<tr><td style="color:#555;padding:4px 0;font-size:13px;">{site} 120일 평균</td><td style="text-align:right;font-size:13px;color:#2c3e50;">{ma["ma120"]:,.0f}원</td></tr>'
+    if ma_rows:
+        ma_section = f"""
             <div style="background:#f8f9fa;border-radius:6px;padding:14px 18px;margin-bottom:16px;">
-              <div style="font-weight:bold;color:#555;margin-bottom:10px;font-size:14px;">📊 이동평균 ({primary_site} 기준)</div>
+              <div style="font-weight:bold;color:#555;margin-bottom:10px;font-size:14px;">📊 이동평균</div>
               <table style="width:100%;border-collapse:collapse;">{ma_rows}</table>
             </div>"""
 
@@ -765,11 +743,44 @@ def send_notification(**context) -> None:
         df_csv["base_date"] = pd.to_datetime(df_csv["base_date"], errors="coerce")
 
         for site in df_csv["source_site"].unique():
-            site_df = df_csv[df_csv["source_site"] == site].sort_values("base_date")
+            site_df = (
+                df_csv[df_csv["source_site"] == site]
+                .dropna(subset=["price_today"])
+                .drop_duplicates(subset=["base_date"], keep="last")
+                .sort_values("base_date")
+            )
             ma20 = site_df["price_today"].rolling(20).mean().iloc[-1] if len(site_df) >= 20 else None
             ma60 = site_df["price_today"].rolling(60).mean().iloc[-1] if len(site_df) >= 60 else None
             ma120 = site_df["price_today"].rolling(120).mean().iloc[-1] if len(site_df) >= 120 else None
             ma_info[site] = {"ma20": ma20, "ma60": ma60, "ma120": ma120}
+
+        # chicken.or.kr는 사이트가 비교값을 제공하지 않아 누적 CSV에서 보정한다.
+        ch_csv = (
+            df_csv[df_csv["source_site"] == "chicken.or.kr"]
+            .dropna(subset=["price_today"])
+            .drop_duplicates(subset=["base_date"], keep="last")
+            .copy()
+        )
+        ch_csv["base_date"] = pd.to_datetime(ch_csv["base_date"], errors="coerce")
+        ch_csv = ch_csv.dropna(subset=["base_date"])
+
+        def _nearest_price(target_date, days_tol):
+            if ch_csv.empty:
+                return None
+            diff = (ch_csv["base_date"] - target_date).abs()
+            mask = diff <= pd.Timedelta(days=days_tol)
+            if not mask.any():
+                return None
+            idx = diff[mask].idxmin()
+            return int(ch_csv.loc[idx, "price_today"])
+
+        for r in results:
+            if r.get("source_site") == "chicken.or.kr" and r.get("success"):
+                base = pd.to_datetime(r.get("base_date"), errors="coerce")
+                if pd.isna(base):
+                    continue
+                r["price_prev_month"] = _nearest_price(base - pd.DateOffset(months=1), 7)
+                r["price_prev_year"] = _nearest_price(base - pd.DateOffset(years=1), 14)
 
     # 기준일자 (첫 번째 성공 결과 기준)
     base_date = next(
@@ -784,7 +795,7 @@ def send_notification(**context) -> None:
 
     pm_emails = ["a17019@kakao.com"]
     all_emails = ["a17019@kakao.com", "siw22222@kakao.com", "simjeong01@kakao.com", "simjeong00@kakao.com"]
-    to_emails = all_emails if email_on_failure else pm_emails
+    to_emails = all_emails
 
     try:
         send_email(
