@@ -86,10 +86,7 @@ def reconcile_coupang_for_test_stores(
                     continue
                 df_day = df_raw[df_raw["sale_date"] == date].copy()
                 if df_day.empty:
-                    removed, added = _upsert_daily(pd.DataFrame(columns=UNIFIED_COLUMNS), date, store)
-                    total_removed += removed
-                    total_added += added
-                    logger.info("쿠팡 데이터 없음, 기존 쿠팡이츠 행 제거: store=%s date=%s | 제거=%d", store, date, removed)
+                    logger.info("쿠팡 데이터 없음, 기존 쿠팡이츠 행 유지: store=%s date=%s", store, date)
                     continue
 
                 df_unified = _transform_to_unified(df_day, store, brand, store_map, opt_map)
@@ -128,8 +125,20 @@ def enforce_coupang_manual_only_for_test_stores(
             continue
 
         df = pd.read_parquet(daily_path).reindex(columns=UNIFIED_COLUMNS, fill_value="")
+        manual_store_set = set(
+            df.loc[
+                df["store"].fillna("").astype(str).str.strip().isin(store_set)
+                & df["platform"].fillna("").astype(str).str.strip().eq(COUPANG_PLATFORM)
+                & df["source"].fillna("").astype(str).str.strip().eq(COUPANG_SOURCE),
+                "store",
+            ].fillna("").astype(str).str.strip()
+        )
+        if not manual_store_set:
+            logger.info("쿠팡수동 최종 정리 스킵, 수동 행 없음: %s", daily_path.name)
+            continue
+
         remove_mask = (
-            df["store"].fillna("").astype(str).str.strip().isin(store_set)
+            df["store"].fillna("").astype(str).str.strip().isin(manual_store_set)
             & df["platform"].fillna("").astype(str).str.strip().eq(COUPANG_PLATFORM)
             & ~df["source"].fillna("").astype(str).str.strip().eq(COUPANG_SOURCE)
         )

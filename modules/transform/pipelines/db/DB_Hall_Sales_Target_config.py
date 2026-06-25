@@ -1,60 +1,29 @@
 """
-홀 매장 주간보고 목표치 설정 (airflow 비의존)
+홀 매장 주간/일간 보고 목표치 설정 (airflow 비의존).
 
 DAG(DB_Hall_Sales_Target_Dags.py)와 Windows 로컬 실행 스크립트
 (scripts/run_hall_weekly_report_local.py)가 공유한다.
 
-매월 업데이트 대상: DAILY_TARGET / MARKETING_DAILY_TARGET 만 수정하면
-월수(calendar 자동)에 맞춰 MONTHLY_TARGETS 가 자동 계산된다.
+목표 입력은 같은 폴더의 hall_sale_target_input.json에서 관리한다.
+- 월별목표에 입력된 월은 해당 월부터 적용된다.
+- 특정 월 입력이 없으면 가장 가까운 이전 월 목표를 그대로 승계한다.
+- 예: 2026-06 입력이 없으면 2026-05 목표를 기준으로 6월 월목표를 계산한다.
+- 영업일수는 선택값이다. 입력하지 않으면 해당 달의 달력 일수를 사용한다.
 """
 
 import calendar
+import json
+from copy import deepcopy
+from pathlib import Path
 
 import pendulum
 
-# ──────────────────────────────────────────────────────────────
-# 매출 월간 목표치 (매월 업데이트)
-# 세팅 기준: 일목표 × 해당월 일수
-#   점심: 일 29건 / 일 812,000원 / 테이블단가 28,000원
-#   저녁: 일 33건 / 일 1,544,000원 / 테이블단가 47,000원
-#   테이블 총 9개
-# ──────────────────────────────────────────────────────────────
-DAILY_TARGET = {
-    "sale": 2_356_000,          # 일 매출 목표
-    "aov": 38_000,              # 전체 테이블단가
-    "orders": 62,               # 일 영수건수
-
-    "lunch_sale": 812_000,      # 점심 일 매출 목표
-    "lunch_orders": 29,         # 점심 일 영수건수
-    "lunch_aov": 28_000,        # 점심 테이블단가
-
-    "dinner_sale": 1_544_000,   # 저녁 일 매출 목표
-    "dinner_orders": 33,        # 저녁 일 영수건수
-    "dinner_aov": 47_000,       # 저녁 테이블단가
-}
-
-# ──────────────────────────────────────────────────────────────
-# 마케팅 월간 목표치 (매월 업데이트)
-# 세팅 기준: 일목표 × 해당월 일수
-#   플레이스 유입: 800명/일 (월 24,000명)
-#   홍보물 배포:  100건/일 (월  3,000건)
-#   쿠폰 회수:     7건/일 (3,000건 × 7%)
-#   인스타 노출: 3,334회/일 (월 100,000회)
-#   당근 노출:   3,334회/일 (월 100,000회)
-#   네이버 오더:   15건/일 (월    450건)
-# ──────────────────────────────────────────────────────────────
-MARKETING_DAILY_TARGET = {
-    "플레이스_유입":   800,      # 명/일
-    "홍보물_배포":    300,       # 건/일
-    "쿠폰_회수":        7,       # 건/일
-    "인스타_노출":  3_334,       # 회/일
-    "당근_노출":    3_334,       # 회/일
-    "네이버_오더":     15,       # 건/일
-}
+TARGET_INPUT_PATH = Path(__file__).with_name("hall_sale_target_input.json")
+START_YM = "2026-04"
 
 
 def _make_month_days(start_ym: str, end_ym: str) -> dict:
-    """start_ym ~ end_ym(포함) 범위의 {ym: days} 자동 생성"""
+    """start_ym ~ end_ym(포함) 범위의 {ym: days} 자동 생성."""
     result = {}
     y, m = int(start_ym[:4]), int(start_ym[5:7])
     ey, em = int(end_ym[:4]), int(end_ym[5:7])
@@ -68,56 +37,124 @@ def _make_month_days(start_ym: str, end_ym: str) -> dict:
     return result
 
 
+def _load_target_input() -> dict:
+    """JSON 목표 입력 파일을 읽는다. 파일이 없거나 형식이 깨지면 즉시 실패시킨다."""
+    try:
+        with TARGET_INPUT_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"홀 목표 입력 JSON 없음: {TARGET_INPUT_PATH}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"홀 목표 입력 JSON 파싱 실패: {TARGET_INPUT_PATH}: {exc}") from exc
+
+    monthly_input = data.get("월별목표")
+    if not isinstance(monthly_input, dict) or not monthly_input:
+        raise ValueError("hall_sale_target_input.json의 '월별목표'는 비어 있지 않은 객체여야 합니다.")
+    return monthly_input
+
+
+def _resolve_monthly_inputs(month_days: dict, monthly_input: dict) -> dict:
+    """
+    월별 입력을 실행 대상 월 범위에 맞춰 확정한다.
+
+    입력되지 않은 월은 직전 입력 월의 목표를 승계한다. 이렇게 해야 7월 목표를 바꿔도
+    5월/6월을 다시 백필할 때 당시 입력 기준이 유지된다.
+    """
+    configured = sorted(ym for ym in monthly_input if isinstance(monthly_input[ym], dict))
+    resolved = {}
+    latest = None
+
+    for ym in month_days:
+        is_configured_month = ym in monthly_input
+        if ym in monthly_input:
+            latest = deepcopy(monthly_input[ym])
+        elif latest is None:
+            previous = [key for key in configured if key <= ym]
+            if previous:
+                latest = deepcopy(monthly_input[previous[-1]])
+
+        if latest is None:
+            raise ValueError(f"{ym}에 적용할 홀 목표 입력이 없습니다. {START_YM} 또는 이전 월 목표를 입력하세요.")
+        month_target = deepcopy(latest)
+        if not is_configured_month:
+            # 영업일수는 특정 월 보정값이다. 목표값은 승계하되 영업일수 보정은 다음 달로 넘기지 않는다.
+            month_target.pop("영업일수", None)
+        resolved[ym] = month_target
+
+    return resolved
+
+
+def _require_section(month_target: dict, ym: str, section: str) -> dict:
+    value = month_target.get(section)
+    if not isinstance(value, dict):
+        raise ValueError(f"{ym} 목표 입력에 '{section}' 객체가 필요합니다.")
+    return value
+
+
+def _daily_tracking_target(daily_target: dict, marketing_daily_target: dict) -> dict:
+    """일간 추적 CSV의 예측/일평균 목표에 쓰는 일목표 dict를 만든다."""
+    return {
+        "sale":          daily_target["sale"],
+        "lunch_sale":    daily_target["lunch_sale"],
+        "lunch_orders":  daily_target["lunch_orders"],
+        "lunch_aov":     daily_target["lunch_aov"],
+        "dinner_sale":   daily_target["dinner_sale"],
+        "dinner_orders": daily_target["dinner_orders"],
+        "dinner_aov":    daily_target["dinner_aov"],
+        "place":         marketing_daily_target["플레이스_유입"],
+        "홍보물_배포":   marketing_daily_target["홍보물_배포"],
+        "coupon":        marketing_daily_target["쿠폰_회수"],
+        "insta":         marketing_daily_target["인스타_노출"],
+        "karrot":        marketing_daily_target["당근_노출"],
+        "naver":         marketing_daily_target["네이버_오더"],
+    }
+
+
 def build_targets() -> tuple[dict, dict, dict]:
     """
     (MONTHLY_TARGETS, MARKETING_MONTHLY_TARGETS, DAILY_TRACKING_TARGET) 반환.
 
-    DAG 태스크(op_kwargs)와 로컬 스크립트가 동일하게 사용한다.
+    DAILY_TRACKING_TARGET에는 월별 일목표 원장(_by_ym)도 같이 담는다. 기존 호출부는
+    일반 일목표 dict처럼 사용할 수 있고, 월 지정 백필 함수는 _by_ym에서 해당 월을 고른다.
     """
-    # 2026-04 시작 ~ 당월+12개월 범위 자동 생성 (매월 수동 추가 불필요)
     today = pendulum.now("Asia/Seoul")
     end_ym = f"{today.year + (today.month + 11) // 12:04d}-{(today.month + 11) % 12 + 1:02d}"
-    month_days = _make_month_days("2026-04", end_ym)
-    # 2026-04 실제 영업일수는 14일 (오픈 기준 보정)
-    month_days["2026-04"] = 14
+    month_days = _make_month_days(START_YM, end_ym)
+    monthly_input = _load_target_input()
+    resolved_inputs = _resolve_monthly_inputs(month_days, monthly_input)
 
-    monthly_targets = {
-        ym: {
-            "sale":   DAILY_TARGET["sale"]   * days,
-            "aov":    DAILY_TARGET["aov"],
-            "orders": DAILY_TARGET["orders"] * days,
+    monthly_targets = {}
+    marketing_monthly_targets = {}
+    daily_tracking_by_ym = {}
 
-            "lunch_sale":   DAILY_TARGET["lunch_sale"]   * days,
-            "lunch_orders": DAILY_TARGET["lunch_orders"] * days,
-            "lunch_aov":    DAILY_TARGET["lunch_aov"],
+    for ym, days in month_days.items():
+        month_target = resolved_inputs[ym]
+        target_days = int(month_target.get("영업일수") or days)
+        daily_target = _require_section(month_target, ym, "일매출목표")
+        marketing_daily_target = _require_section(month_target, ym, "일마케팅목표")
 
-            "dinner_sale":   DAILY_TARGET["dinner_sale"]   * days,
-            "dinner_orders": DAILY_TARGET["dinner_orders"] * days,
-            "dinner_aov":    DAILY_TARGET["dinner_aov"],
+        monthly_targets[ym] = {
+            "sale":   daily_target["sale"]   * target_days,
+            "aov":    daily_target["aov"],
+            "orders": daily_target["orders"] * target_days,
+
+            "lunch_sale":   daily_target["lunch_sale"]   * target_days,
+            "lunch_orders": daily_target["lunch_orders"] * target_days,
+            "lunch_aov":    daily_target["lunch_aov"],
+
+            "dinner_sale":   daily_target["dinner_sale"]   * target_days,
+            "dinner_orders": daily_target["dinner_orders"] * target_days,
+            "dinner_aov":    daily_target["dinner_aov"],
         }
-        for ym, days in month_days.items()
-    }
 
-    marketing_monthly_targets = {
-        ym: {k: v * days for k, v in MARKETING_DAILY_TARGET.items()}
-        for ym, days in month_days.items()
-    }
+        marketing_monthly_targets[ym] = {
+            key: value * target_days
+            for key, value in marketing_daily_target.items()
+        }
+        daily_tracking_by_ym[ym] = _daily_tracking_target(daily_target, marketing_daily_target)
 
-    # 일단위 트래킹용 일목표 (DB_Hall_Daily_Excel 전달)
-    daily_tracking_target = {
-        "sale":          DAILY_TARGET["sale"],           # 일 매출
-        "lunch_sale":    DAILY_TARGET["lunch_sale"],     # 점심 일 매출
-        "lunch_orders":  DAILY_TARGET["lunch_orders"],   # 점심 영수건수
-        "lunch_aov":     DAILY_TARGET["lunch_aov"],      # 점심 테이블단가
-        "dinner_sale":   DAILY_TARGET["dinner_sale"],    # 저녁 일 매출
-        "dinner_orders": DAILY_TARGET["dinner_orders"],  # 저녁 영수건수
-        "dinner_aov":    DAILY_TARGET["dinner_aov"],     # 저녁 테이블단가
-        "place":         MARKETING_DAILY_TARGET["플레이스_유입"],
-        "홍보물_배포":   300,                              # 홍보물 배포(누적) 기간 목표
-        "coupon":        MARKETING_DAILY_TARGET["쿠폰_회수"],
-        "insta":         MARKETING_DAILY_TARGET["인스타_노출"],
-        "karrot":        MARKETING_DAILY_TARGET["당근_노출"],
-        "naver":         MARKETING_DAILY_TARGET["네이버_오더"],
-    }
+    current_ym = today.strftime("%Y-%m")
+    daily_tracking_target = deepcopy(daily_tracking_by_ym.get(current_ym) or daily_tracking_by_ym[START_YM])
+    daily_tracking_target["_by_ym"] = daily_tracking_by_ym
 
     return monthly_targets, marketing_monthly_targets, daily_tracking_target

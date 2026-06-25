@@ -8,7 +8,7 @@ OKPOS 매출 원본파일 자동 수집 DAG
 4. 합계 제거 + 매장명 추가 후 brand=도리당/store={매장}/ym={YYYY-MM}/{page_type}.csv 저장
 5. log.parquet 실행 이력 기록
 
-매일 07:35 실행 (DB_OKPOS_SALES_TIME)
+매일 06:00 KST 실행 (DB_OKPOS_SALES_TIME)
 인증: OKPOS ID/PW (파이프라인 상수)
 """
 
@@ -63,13 +63,10 @@ dag_id = Path(__file__).stem
 # MANUAL_DATE_RANGE: tuple | None = None
 MANUAL_DATE_RANGE = None
 LOOKBACK_DAYS: int | None = 120 # None or int형
-_ALERT_EMAILS = ["a17019@kakao.com"]
 
 
 def _on_failure_callback(context):
-    """Task 실패 시 이메일/텔레그램 알림 발송."""
-    from modules.transform.utility.mailer import send_email, text_to_html
-
+    """Task 실패 시 Telegram 알림 발송."""
     ti = context.get("task_instance")
     dag_id_ = ti.dag_id
     task_id = ti.task_id
@@ -77,7 +74,6 @@ def _on_failure_callback(context):
     exception = context.get("exception", "예외 없음")
     log_url = ti.log_url
 
-    subject = f"[Airflow 실패] {dag_id_} / {task_id}"
     body = (
         f"DAG: {dag_id_}\n"
         f"Task: {task_id}\n"
@@ -85,15 +81,6 @@ def _on_failure_callback(context):
         f"에러: {exception}\n"
         f"로그: {log_url}"
     )
-    try:
-        send_email(
-            subject=subject,
-            html_content=text_to_html(body),
-            to_emails=_ALERT_EMAILS,
-        )
-        logger.info(f"실패 알림 발송 완료: {_ALERT_EMAILS}")
-    except Exception as e:
-        logger.error(f"실패 알림 발송 실패: {e}")
     send_telegram(body + "\n해결해라")
     enqueue_heal_task(context)
 

@@ -333,10 +333,16 @@ def _make_unified_pk(df: pd.DataFrame) -> pd.Series:
     return key.map(lambda s: hashlib.md5(s.encode()).hexdigest())
 
 
-def _save_unified_daily(df: pd.DataFrame, date_str: str, overwrite: bool = False) -> int:
+def _save_unified_daily(
+    df: pd.DataFrame,
+    date_str: str,
+    overwrite: bool = False,
+    replace_stores: list[str] | None = None,
+) -> int:
     """일별 unified_sales 저장.
 
     overwrite=False(기본): 동일 source 행을 교체(source-aware replace). 다른 source 행은 유지.
+    replace_stores: 지정 시 동일 source 중 해당 store 행만 교체한다.
     overwrite=True: 기존 파일 전체 교체 (정정용).
     """
     UNIFIED_ROOT.mkdir(parents=True, exist_ok=True)
@@ -366,8 +372,15 @@ def _save_unified_daily(df: pd.DataFrame, date_str: str, overwrite: bool = False
             existing = existing.copy()
             existing["source"] = existing["source"].fillna("").astype(str).str.strip().str.lower()
         sources = df["source"].dropna().unique().tolist()
-        existing_same_src = existing[existing["source"].isin(sources)] if sources else existing.iloc[:0]
-        existing_other_src = existing[~existing["source"].isin(sources)] if sources else existing
+        if replace_stores:
+            store_keys = {str(store).strip().split()[-1] for store in replace_stores if str(store).strip()}
+            existing_store = existing["store"].fillna("").astype(str).str.strip().str.split().str[-1]
+            replace_mask = existing["source"].isin(sources) & existing_store.isin(store_keys) if sources else pd.Series(False, index=existing.index)
+            existing_same_src = existing[replace_mask]
+            existing_other_src = existing[~replace_mask]
+        else:
+            existing_same_src = existing[existing["source"].isin(sources)] if sources else existing.iloc[:0]
+            existing_other_src = existing[~existing["source"].isin(sources)] if sources else existing
         # no-op 체크: overwrite=False일 때만 적용 (overwrite=True면 강제 재기록)
         if not overwrite and (
             set(existing_same_src["_pk"]) == set(df["_pk"])

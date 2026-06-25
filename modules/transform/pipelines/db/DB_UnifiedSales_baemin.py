@@ -34,23 +34,18 @@ BAEMIN_PLATFORM = "배달의민족"
 def reconcile_baemin_for_test_stores(
     stores: list[str],
     sale_date: str | None = None,
-    lookback_days: int = 7,
+    lookback_days: int | None = 7,
 ) -> str:
     """
     TEST_STORES의 배달의민족 행을 baemin_macro 직수집 기준으로 교정.
 
-    - 직수집 파일 없는 날짜: 기존 배달의민족 행 제거
-    - 직수집 파일은 있지만 해당 날짜 행이 0건인 경우: 기존 배달의민족 행 제거
+    - 직수집 파일 없는 날짜: 기존 배달의민족 행 유지
+    - 직수집 파일은 있지만 해당 날짜 행이 0건인 경우: 기존 배달의민족 행 유지
     - 배민 원천은 주문상태=배달완료, 주문금액=결제금액 기준으로 교정
     """
-    if sale_date:
-        dates = [str(sale_date)]
-    else:
-        kst_now = pendulum.now("Asia/Seoul")
-        dates = [
-            (kst_now - timedelta(days=i)).strftime("%Y-%m-%d")
-            for i in range(lookback_days)
-        ]
+    dates = _resolve_baemin_target_dates(stores, sale_date, lookback_days)
+    if not dates:
+        return "배민수동 교정 스킵 | 대상 날짜 없음"
     ym_list = sorted({d[:7] for d in dates})
 
     total_added = 0
@@ -61,36 +56,12 @@ def reconcile_baemin_for_test_stores(
         for ym in ym_list:
             baemin_files = _find_baemin_files(store, ym)
             if not baemin_files:
-                for date in dates:
-                    if date[:7] != ym:
-                        continue
-                    removed, added = _upsert_daily(pd.DataFrame(columns=UNIFIED_COLUMNS), date, store)
-                    total_removed += removed
-                    total_added += added
-                    logger.info(
-                        "배민 수집 파일 없음, 기존 배달의민족 행 제거: store=%s date=%s | 제거=%d 추가=%d",
-                        store,
-                        date,
-                        removed,
-                        added,
-                    )
+                logger.warning("배민 수집 파일 없음, 기존 배달의민족 행 유지: store=%s ym=%s", store, ym)
                 continue
 
             df_raw = _read_baemin_files(baemin_files)
             if df_raw.empty:
-                for date in dates:
-                    if date[:7] != ym:
-                        continue
-                    removed, added = _upsert_daily(pd.DataFrame(columns=UNIFIED_COLUMNS), date, store)
-                    total_removed += removed
-                    total_added += added
-                    logger.info(
-                        "배민 수집 데이터 없음, 기존 배달의민족 행 제거: store=%s date=%s | 제거=%d 추가=%d",
-                        store,
-                        date,
-                        removed,
-                        added,
-                    )
+                logger.warning("배민 수집 데이터 없음, 기존 배달의민족 행 유지: store=%s ym=%s", store, ym)
                 continue
 
             _assert_required_columns(df_raw, store, ym)
@@ -106,16 +77,7 @@ def reconcile_baemin_for_test_stores(
                     continue
                 df_day = df_raw[df_raw["sale_date"] == date].copy()
                 if df_day.empty:
-                    removed, added = _upsert_daily(pd.DataFrame(columns=UNIFIED_COLUMNS), date, store)
-                    total_removed += removed
-                    total_added += added
-                    logger.info(
-                        "배민 데이터 없음, 기존 배달의민족 행 제거: store=%s date=%s | 제거=%d 추가=%d",
-                        store,
-                        date,
-                        removed,
-                        added,
-                    )
+                    logger.info("배민 데이터 없음, 기존 배달의민족 행 유지: store=%s date=%s", store, date)
                     continue
 
                 df_unified = _transform_to_unified(df_day, store, brand, store_map)
@@ -151,7 +113,7 @@ def reconcile_baemin_for_test_stores(
 def enforce_baemin_manual_only_for_test_stores(
     stores: list[str],
     sale_date: str | None = None,
-    lookback_days: int = 7,
+    lookback_days: int | None = 7,
 ) -> str:
     """TEST_STORES의 배달의민족 최종 방어막.
 
@@ -161,14 +123,9 @@ def enforce_baemin_manual_only_for_test_stores(
     if not stores:
         return "TEST_STORES 없음 - 배민수동 최종 정리 스킵"
 
-    if sale_date:
-        dates = [str(sale_date)]
-    else:
-        kst_now = pendulum.now("Asia/Seoul")
-        dates = [
-            (kst_now - timedelta(days=i)).strftime("%Y-%m-%d")
-            for i in range(lookback_days)
-        ]
+    dates = _resolve_baemin_target_dates(stores, sale_date, lookback_days)
+    if not dates:
+        return "배민수동 최종 정리 스킵 | 대상 날짜 없음"
 
     store_set = {str(store).strip() for store in stores if str(store).strip()}
     total_removed = 0
@@ -181,8 +138,20 @@ def enforce_baemin_manual_only_for_test_stores(
             continue
 
         df = pd.read_parquet(daily_path).reindex(columns=UNIFIED_COLUMNS, fill_value="")
+        manual_store_set = set(
+            df.loc[
+                df["store"].fillna("").astype(str).str.strip().isin(store_set)
+                & df["platform"].fillna("").astype(str).str.strip().eq(BAEMIN_PLATFORM)
+                & df["source"].fillna("").astype(str).str.strip().eq(BAEMIN_SOURCE),
+                "store",
+            ].fillna("").astype(str).str.strip()
+        )
+        if not manual_store_set:
+            logger.info("배민수동 최종 정리 스킵, 수동 행 없음: %s", daily_path.name)
+            continue
+
         remove_mask = (
-            df["store"].fillna("").astype(str).str.strip().isin(store_set)
+            df["store"].fillna("").astype(str).str.strip().isin(manual_store_set)
             & df["platform"].fillna("").astype(str).str.strip().eq(BAEMIN_PLATFORM)
             & ~df["source"].fillna("").astype(str).str.strip().eq(BAEMIN_SOURCE)
         )
@@ -208,6 +177,83 @@ def enforce_baemin_manual_only_for_test_stores(
         )
 
     return f"배민수동 최종 정리 완료 | 파일={changed_files} 제거={total_removed}행"
+
+
+def _resolve_baemin_target_dates(
+    stores: list[str],
+    sale_date: str | None,
+    lookback_days: int | None,
+) -> list[str]:
+    """교정 대상 날짜 결정.
+
+    - sale_date 지정: 단일 날짜
+    - lookback_days 정수: 최근 N일
+    - lookback_days None: 배민수동 원천과 기존 unified 배민 행의 전체 보유 날짜
+    """
+    if sale_date:
+        return [str(sale_date)]
+
+    if lookback_days is not None:
+        kst_now = pendulum.now("Asia/Seoul")
+        return [
+            (kst_now - timedelta(days=i)).strftime("%Y-%m-%d")
+            for i in range(lookback_days)
+        ]
+
+    dates = set()
+    for store in stores:
+        dates.update(_collect_baemin_source_dates(store))
+    dates.update(_collect_existing_unified_baemin_dates(stores))
+    return sorted(d for d in dates if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d))
+
+
+def _find_all_baemin_files(store: str) -> list[str]:
+    """store 기준 baemin_macro orders 전체 파일 탐색 (.parquet 우선, .csv 포함)."""
+    base = ANALYTICS_DB / "baemin_macro" / "orders"
+    files: list[str] = []
+    for ext in ("parquet", "csv"):
+        pattern = str(base / "brand=*" / f"store={store}" / "ym=*" / f"orders_*.{ext}")
+        files.extend(sorted(glob(pattern)))
+    return files
+
+
+def _collect_baemin_source_dates(store: str) -> set[str]:
+    dates: set[str] = set()
+    for file_path in _find_all_baemin_files(store):
+        try:
+            if file_path.endswith(".parquet"):
+                df = pd.read_parquet(file_path, columns=["주문시각"])
+            else:
+                df = pd.read_csv(file_path, dtype=str, encoding="utf-8-sig", usecols=["주문시각"])
+        except Exception as exc:
+            logger.warning("배민 날짜 수집 실패: %s | %s", file_path, exc)
+            continue
+
+        parsed = df["주문시각"].map(_parse_baemin_datetime)
+        dates.update(date for date, _ in parsed if date)
+    return dates
+
+
+def _collect_existing_unified_baemin_dates(stores: list[str]) -> set[str]:
+    store_set = {str(store).strip() for store in stores if str(store).strip()}
+    if not store_set or not UNIFIED_ROOT.exists():
+        return set()
+
+    dates: set[str] = set()
+    for path in sorted(UNIFIED_ROOT.glob("unified_sales_*.parquet")):
+        try:
+            df = pd.read_parquet(path, columns=["sale_date", "store", "platform"])
+        except Exception as exc:
+            logger.warning("unified 배민 날짜 수집 실패: %s | %s", path, exc)
+            continue
+
+        mask = (
+            df["store"].fillna("").astype(str).str.strip().isin(store_set)
+            & df["platform"].fillna("").astype(str).str.strip().eq(BAEMIN_PLATFORM)
+        )
+        if mask.any():
+            dates.update(df.loc[mask, "sale_date"].fillna("").astype(str).str.strip().tolist())
+    return dates
 
 
 def _find_baemin_files(store: str, ym: str) -> list[str]:

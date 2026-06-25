@@ -30,6 +30,7 @@ stats_df = run_baemin_crawling(account_df, mode="stats")
 
 import socket
 import subprocess
+import tempfile
 import time
 import random
 import re
@@ -42,7 +43,6 @@ from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
-import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
@@ -237,6 +237,33 @@ def _detect_chrome_major_version() -> int | None:
         return None
 
 
+def _kill_chrome_by_profile(profile_path: str, account_id: str = "") -> None:
+    """주어진 user-data-dir을 점유한 Chrome 프로세스를 강제 종료한다.
+
+    이전 실패 런치가 Chrome을 살려둔 채 ChromeDriver만 포기한 경우,
+    같은 프로필로 재시도하면 Chrome이 프로필 잠금 경합으로 'chrome not reachable'이 된다.
+    런치 직전에 해당 프로필을 쥔 모든 Chrome을 제거해 이를 방지한다.
+    """
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", f"--user-data-dir={profile_path}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pids = [p for p in result.stdout.strip().split() if p.isdigit()]
+        if pids:
+            log(f"프로필 점유 Chrome {len(pids)}개 제거: {pids}", account_id)
+        for pid_str in pids:
+            try:
+                subprocess.run(["pkill", "-9", "-P", pid_str], capture_output=True, timeout=3)
+                os.kill(int(pid_str), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, ValueError):
+                pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def clean_chrome_cache(account_id: str):
     """Chrome 캐시만 삭제 (쿠키는 유지 → 세션 재사용 가능).
 
@@ -244,6 +271,9 @@ def clean_chrome_cache(account_id: str):
     SingletonLock 등 잠금 파일도 제거 (비정상 종료 후 재실행 크래시 방지).
     """
     profile_root = CHROME_PROFILE_DIR / account_id
+    # 이 프로필을 점유한 Chrome 프로세스 제거 (좀비가 아닌 살아있는 고아 Chrome 차단)
+    _kill_chrome_by_profile(str(profile_root.absolute()), account_id)
+
     # 잠금 파일 제거 (이전 비정상 종료 후 남은 파일 → Chrome 즉시 종료 원인)
     for lock_name in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
         lock_file = profile_root / lock_name
@@ -255,6 +285,15 @@ def clean_chrome_cache(account_id: str):
                 pass
 
     profile_default = profile_root / "Default"
+    # LevelDB 잠금 해제 (비정상 종료 후 남은 Default/LOCK → 프로필 열기 실패 원인)
+    db_lock = profile_default / "LOCK"
+    if db_lock.exists():
+        try:
+            db_lock.unlink()
+            log("DB 잠금 해제: Default/LOCK", account_id)
+        except Exception:
+            pass
+
     for cache_dir in ["Cache", "GPUCache", "Code Cache"]:
         target = profile_default / cache_dir
         if target.exists():
@@ -287,6 +326,7 @@ def _ensure_xvfb_display() -> str:
 
 
 def launch_browser(account_id: str):
+    import undetected_chromedriver as uc
     """브라우저 실행 (Xvfb 가상 디스플레이 사용, 비-헤드리스).
 
     배민 봇 탐지가 headless 모드를 감지해 metrics API를 차단하므로
@@ -294,6 +334,11 @@ def launch_browser(account_id: str):
     """
     _reap_zombie_children()          # 이전 launch가 남긴 좀비 회수 (cannot-connect 누적 방지)
     clean_chrome_cache(account_id)   # 세션 유지 + 캐시만 정리 (OOM 방지)
+    primary_temp_profile: Path | None = None
+    profile_root = CHROME_PROFILE_DIR / account_id
+    if any((profile_root / name).exists() for name in ("SingletonLock", "SingletonCookie", "SingletonSocket")):
+        primary_temp_profile = Path(tempfile.mkdtemp(prefix=f"chrome_{account_id}_"))
+        log(f"프로필 잠금 잔존 감지, 임시 프로필 사용: {primary_temp_profile}", account_id)
 
     # Xvfb 가상 디스플레이 설정
     display = _ensure_xvfb_display()
@@ -302,50 +347,70 @@ def launch_browser(account_id: str):
         log(f"브라우저 실행 시도 (Xvfb {display})", account_id)
     else:
         log(f"브라우저 실행 시도 (headless fallback)", account_id)
+        if primary_temp_profile is None:
+            primary_temp_profile = Path(tempfile.mkdtemp(prefix=f"chrome_{account_id}_"))
+            log(f"headless fallback 임시 프로필 사용: {primary_temp_profile}", account_id)
 
-    options = uc.ChromeOptions()
+    def _build_options(profile_path_override: Path | None = None):
+        options = uc.ChromeOptions()
 
-    chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/google-chrome")
-    if Path(chrome_bin).exists():
-        options.binary_location = chrome_bin
-        log(f"Chrome 바이너리: {chrome_bin}", account_id)
-    else:
-        log(f"경고: Chrome 바이너리를 찾을 수 없음 ({chrome_bin})", account_id)
+        chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/google-chrome")
+        if Path(chrome_bin).exists():
+            options.binary_location = chrome_bin
+            log(f"Chrome 바이너리: {chrome_bin}", account_id)
+        else:
+            log(f"경고: Chrome 바이너리를 찾을 수 없음 ({chrome_bin})", account_id)
 
-    if not display:
-        options.add_argument('--headless=new')   # Xvfb 없을 때만 헤드리스
-    options.add_argument('--no-sandbox')
-    options.add_argument('--no-zygote')           # Chrome 148+ Docker 크래시 방지
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--disable-blink-features=AutomationControlled')
-    options.add_argument('--disk-cache-size=1')           # 캐시 최소화 (OOM 방지)
-    options.add_argument('--disable-extensions')
-    options.add_argument('--disable-default-apps')
-    options.add_argument('--no-first-run')
-    options.add_argument('--disable-background-networking')
-    options.add_argument('--disable-sync')
-    options.add_argument('--mute-audio')
-    options.add_argument('--js-flags=--max-old-space-size=512')  # JS 힙 512MB (256 → 512: 크래시 방지)
-    w, h = random.choice(WINDOW_SIZES)
-    options.add_argument(f'--window-size={w},{h}')
-    options.add_argument('--lang=ko-KR')
-    options.add_argument(f'--user-agent={DEFAULT_WIN_CHROME_UA}')
-    
-    profile_path = CHROME_PROFILE_DIR / account_id
-    profile_path.mkdir(parents=True, exist_ok=True)
-    options.add_argument(f'--user-data-dir={profile_path.absolute()}')
+        if not display:
+            options.add_argument('--headless=new')   # Xvfb 없을 때만 헤드리스
+        options.add_argument('--no-sandbox')
+        options.add_argument('--no-zygote')           # Chrome 148+ Docker 크래시 방지
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--disable-software-rasterizer')
+        options.add_argument('--disable-blink-features=AutomationControlled')
+        options.add_argument('--disk-cache-size=1')           # 캐시 최소화 (OOM 방지)
+        options.add_argument('--disable-extensions')
+        options.add_argument('--disable-default-apps')
+        options.add_argument('--no-first-run')
+        options.add_argument('--disable-background-networking')
+        options.add_argument('--disable-sync')
+        options.add_argument('--mute-audio')
+        options.add_argument('--js-flags=--max-old-space-size=512')  # JS 힙 512MB (256 → 512: 크래시 방지)
+        w, h = random.choice(WINDOW_SIZES)
+        options.add_argument(f'--window-size={w},{h}')
+        options.add_argument('--lang=ko-KR')
+        options.add_argument(f'--user-agent={DEFAULT_WIN_CHROME_UA}')
+
+        profile_path = profile_path_override or (CHROME_PROFILE_DIR / account_id)
+        profile_path.mkdir(parents=True, exist_ok=True)
+        options.add_argument(f'--user-data-dir={profile_path.absolute()}')
+        return options
     
     try:
         driver = launch_uc_chrome(
-            options,
+            _build_options(primary_temp_profile),
             account_id=account_id,
             chrome_bin=os.getenv("CHROME_BIN", "/usr/bin/google-chrome"),
             log_fn=lambda msg: log(msg, account_id),
         )
+        if primary_temp_profile:
+            driver._doridang_temp_profile = str(primary_temp_profile)
         log(f"브라우저 실행 성공", account_id)
         return driver
     except Exception as e:
+        if is_driver_crash_error(e) or "undetected_chromedriver" in str(e):
+            temp_profile = Path(tempfile.mkdtemp(prefix=f"chrome_{account_id}_"))
+            log(f"브라우저 실행 실패 후 임시 프로필 재시도: {temp_profile}", account_id)
+            driver = launch_uc_chrome(
+                _build_options(temp_profile),
+                account_id=account_id,
+                chrome_bin=os.getenv("CHROME_BIN", "/usr/bin/google-chrome"),
+                log_fn=lambda msg: log(msg, account_id),
+            )
+            driver._doridang_temp_profile = str(temp_profile)
+            log(f"브라우저 실행 성공 (프로필 초기화 후)", account_id)
+            return driver
         log(f"브라우저 실행 실패: {e}", account_id)
         raise
 
@@ -1153,6 +1218,7 @@ def quit_driver_safely(driver, account_id: str = "SYSTEM") -> None:
     browser_pid = getattr(driver, "browser_pid", None)
     service = getattr(driver, "service", None)
     service_pid = getattr(getattr(service, "process", None), "pid", None)
+    temp_profile = getattr(driver, "_doridang_temp_profile", None)
 
     try:
         driver.quit()
@@ -1161,6 +1227,8 @@ def quit_driver_safely(driver, account_id: str = "SYSTEM") -> None:
 
     _kill_pid_tree(browser_pid)
     _kill_pid_tree(service_pid)
+    if temp_profile:
+        shutil.rmtree(temp_profile, ignore_errors=True)
 
     n = _reap_zombie_children()
     if n:

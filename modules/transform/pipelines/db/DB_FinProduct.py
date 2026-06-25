@@ -1099,36 +1099,40 @@ def build_fin_product_mart(**context) -> str:
 def _build_first_sale_dates() -> pd.DataFrame:
     """unified_sales에서 source+상품코드별 최초 판매일을 계산."""
     parquet_dir = MART_DB / "unified_sales_grp"
-    files = sorted(parquet_dir.glob("*.parquet")) if parquet_dir.exists() else []
+    files = sorted(parquet_dir.glob("unified_sales_*.parquet")) if parquet_dir.exists() else []
     if not files:
         logger.warning("unified_sales parquet 없음: %s", parquet_dir)
         return pd.DataFrame(columns=["source", "상품코드", "first_sale_date"])
 
-    frames = []
+    first_by_key: dict[tuple[str, str], pd.Timestamp] = {}
     for file_path in files:
         try:
             frame = pd.read_parquet(file_path, columns=["source", "item_id", "sale_date"])
         except Exception as exc:
             logger.warning("최초판매일 산정 parquet 스킵: %s (%s)", file_path, exc)
             continue
-        frames.append(frame)
 
-    if not frames:
+        frame["source"] = frame["source"].astype(str).str.strip()
+        frame["상품코드"] = frame["item_id"].astype(str).str.strip()
+        frame["sale_date"] = pd.to_datetime(frame["sale_date"], errors="coerce")
+        frame = frame[(frame["source"] != "") & (frame["상품코드"] != "")].dropna(subset=["sale_date"])
+        if frame.empty:
+            continue
+
+        daily_first = frame.groupby(["source", "상품코드"])["sale_date"].min()
+        for key, sale_date in daily_first.items():
+            current = first_by_key.get(key)
+            if current is None or sale_date < current:
+                first_by_key[key] = sale_date
+
+    if not first_by_key:
         return pd.DataFrame(columns=["source", "상품코드", "first_sale_date"])
 
-    sales = pd.concat(frames, ignore_index=True)
-    sales["source"] = sales["source"].astype(str).str.strip()
-    sales["상품코드"] = sales["item_id"].astype(str).str.strip()
-    sales["sale_date"] = pd.to_datetime(sales["sale_date"], errors="coerce")
-    sales = sales[(sales["source"] != "") & (sales["상품코드"] != "")].dropna(subset=["sale_date"])
-    if sales.empty:
-        return pd.DataFrame(columns=["source", "상품코드", "first_sale_date"])
-
-    first_sale_dates = (
-        sales.groupby(["source", "상품코드"])["sale_date"]
-        .min()
-        .dt.strftime("%Y-%m-%d")
-        .reset_index(name="first_sale_date")
+    first_sale_dates = pd.DataFrame(
+        [
+            {"source": source, "상품코드": item_id, "first_sale_date": sale_date.strftime("%Y-%m-%d")}
+            for (source, item_id), sale_date in first_by_key.items()
+        ]
     )
     return first_sale_dates
 
@@ -1161,62 +1165,65 @@ def build_launch_tracking(**context) -> str:
 
     mart["source"] = mart["source"].astype(str).str.strip()
     mart["상품코드"] = mart["상품코드"].astype(str).str.strip()
+    mart["상품명"] = mart["상품명"].astype(str).str.strip() if "상품명" in mart.columns else ""
+    mart["수동분류"] = mart["수동분류"].astype(str).str.strip() if "수동분류" in mart.columns else ""
+    mart = mart.drop_duplicates(subset=["source", "상품코드", "상품명", "수동분류", "launch_date"])
+    mart["_launch_end"] = mart["launch_date"] + pd.Timedelta(days=30)
+    target_keys = set(zip(mart["source"], mart["상품코드"]))
 
     parquet_dir = MART_DB / "unified_sales_grp"
-    files = sorted(parquet_dir.glob("*.parquet")) if parquet_dir.exists() else []
+    files = sorted(parquet_dir.glob("unified_sales_*.parquet")) if parquet_dir.exists() else []
     if not files:
         logger.warning("unified_sales parquet 없음: %s", parquet_dir)
         return "스킵: unified_sales 없음"
 
-    sales = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
-    if "item_id" not in sales.columns:
-        if "상품코드" in sales.columns:
-            sales["item_id"] = sales["상품코드"]
-            logger.warning("unified_sales item_id 없음 - 상품코드로 대체")
-        elif "menu_name" in sales.columns:
-            sales["item_id"] = sales["menu_name"]
-            logger.warning("unified_sales item_id/상품코드 없음 - menu_name으로 대체")
-        else:
-            logger.warning("unified_sales 조인 키 없음: item_id/상품코드/menu_name")
-            return "스킵: unified_sales 조인 키 없음"
+    result = mart[["source", "상품코드", "상품명", "수동분류", "launch_date"]].copy()
+    result["orders_30d"] = 0
+    result["revenue_30d"] = 0
+    result = result.set_index(["source", "상품코드", "상품명", "수동분류", "launch_date"])
 
-    if "sale_date" not in sales.columns or "source" not in sales.columns:
-        logger.warning("unified_sales 필수 컬럼 없음: source/sale_date")
-        return "스킵: unified_sales 필수 컬럼 없음"
+    read_columns = ["source", "item_id", "sale_date", "qty", "total_price"]
+    for file_path in files:
+        try:
+            sales = pd.read_parquet(file_path, columns=read_columns)
+        except Exception as exc:
+            logger.warning("launch_tracking parquet 스킵: %s (%s)", file_path, exc)
+            continue
 
-    sales["sale_date"] = pd.to_datetime(sales["sale_date"], errors="coerce")
-    sales["source"] = sales["source"].astype(str).str.strip()
-    sales["item_id"] = sales["item_id"].astype(str).str.strip()
-    sales["qty"] = pd.to_numeric(
-        sales["qty"] if "qty" in sales.columns else pd.Series([0] * len(sales), index=sales.index),
-        errors="coerce",
-    ).fillna(0)
-    sales["total_price"] = pd.to_numeric(
-        (
-            sales["total_price"]
-            if "total_price" in sales.columns
-            else pd.Series([0] * len(sales), index=sales.index)
-        ),
-        errors="coerce",
-    ).fillna(0)
+        sales["source"] = sales["source"].astype(str).str.strip()
+        sales["item_id"] = sales["item_id"].astype(str).str.strip()
+        sales_keys = pd.MultiIndex.from_arrays([sales["source"], sales["item_id"]])
+        sales = sales[sales_keys.isin(target_keys)]
+        if sales.empty:
+            continue
 
-    merged = mart.merge(
-        sales[["source", "item_id", "sale_date", "qty", "total_price"]],
-        left_on=["source", "상품코드"],
-        right_on=["source", "item_id"],
-        how="left",
-    )
+        sales["sale_date"] = pd.to_datetime(sales["sale_date"], errors="coerce")
+        sales = sales.dropna(subset=["sale_date"])
+        if sales.empty:
+            continue
 
-    in_window = (merged["sale_date"] >= merged["launch_date"]) & (
-        merged["sale_date"] <= merged["launch_date"] + pd.Timedelta(days=30)
-    )
-    merged.loc[~in_window, ["qty", "total_price"]] = 0
+        sales["qty"] = pd.to_numeric(sales["qty"], errors="coerce").fillna(0)
+        sales["total_price"] = pd.to_numeric(sales["total_price"], errors="coerce").fillna(0)
+        merged = mart.merge(
+            sales,
+            left_on=["source", "상품코드"],
+            right_on=["source", "item_id"],
+            how="inner",
+        )
+        merged = merged[
+            (merged["sale_date"] >= merged["launch_date"])
+            & (merged["sale_date"] <= merged["_launch_end"])
+        ]
+        if merged.empty:
+            continue
 
-    result = (
-        merged.groupby(["source", "상품코드", "상품명", "수동분류", "launch_date"])
-        .agg(orders_30d=("qty", "sum"), revenue_30d=("total_price", "sum"))
-        .reset_index()
-    )
+        grouped = (
+            merged.groupby(["source", "상품코드", "상품명", "수동분류", "launch_date"])
+            .agg(orders_30d=("qty", "sum"), revenue_30d=("total_price", "sum"))
+        )
+        result.loc[grouped.index, ["orders_30d", "revenue_30d"]] += grouped[["orders_30d", "revenue_30d"]]
+
+    result = result.reset_index()
     result["launch_date"] = result["launch_date"].dt.strftime("%Y-%m-%d")
     result["orders_30d"] = result["orders_30d"].astype(int)
     result["revenue_30d"] = result["revenue_30d"].astype(int)

@@ -15,7 +15,6 @@ unified_sales 일별 생성 DAG (okpos + unionpos + easypos + posfeed)
 
 import logging
 from datetime import timedelta
-from pathlib import Path
 
 import pendulum
 from airflow import DAG
@@ -54,7 +53,7 @@ from modules.transform.pipelines.db.DB_UnifiedSales_validate import (
 
 logger = logging.getLogger(__name__)
 
-dag_id = Path(__file__).stem
+dag_id = "DB_UnifiedSales"
 
 def _on_failure_callback(context):
     """Task 최종 실패 시 Telegram 알림"""
@@ -74,7 +73,7 @@ def _on_failure_callback(context):
 
 default_args = {
     "retries": 1,
-    "retry_delay": timedelta(minutes=5),
+    "retry_delay": timedelta(minutes=3),
     "depends_on_past": False,
     "email_on_failure": False,
     "email_on_retry": False,
@@ -84,17 +83,16 @@ default_args = {
 # LOOKBACK_DAYS:
 # - int  : 최근 N일 누락분 보충
 # - None : 전체 소스 CSV 백필
-# LOOKBACK_DAYS: int | None = 7
-LOOKBACK_DAYS: int | None = None  # 전체 백필 모드는 None으로 변경
+LOOKBACK_DAYS: int | None = 7
 
 # 배민 직수집 교정 대상 테스트 매장 (검증 완료 후 확대)
-TEST_STORES: list[str] = ["해운대중동점", "법흥리점", "송파삼전점"]
+TEST_STORES: list[str] = ["해운대중동점", "법흥리점", "송파삼전점", "동탄영천점", "중랑면목점", "시흥배곧점", "동두천지행점", "평택비전점"]
 
 UPSTREAM_POS_TASKS = [
     {
         "dag_id": "DB_OKPOS_Sales_Dags",
         "task_id": "write_log",
-        "execution_delta": timedelta(hours=1, minutes=5),
+        "execution_delta": timedelta(hours=2, minutes=40),
     },
     {
         "dag_id": "DB_UnionPOS_Receipt_Dags",
@@ -334,7 +332,7 @@ def reconcile_baemin(**context) -> str:
     return reconcile_baemin_for_test_stores(
         stores=TEST_STORES,
         sale_date=sale_date,
-        lookback_days=LOOKBACK_DAYS or 7,
+        lookback_days=LOOKBACK_DAYS,
     )
 
 
@@ -395,7 +393,7 @@ def enforce_baemin_manual_only(**context) -> str:
     return enforce_baemin_manual_only_for_test_stores(
         stores=TEST_STORES,
         sale_date=sale_date,
-        lookback_days=LOOKBACK_DAYS or 7,
+        lookback_days=LOOKBACK_DAYS,
     )
 
 

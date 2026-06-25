@@ -43,7 +43,7 @@ with DAG(
         "retries": 0,
         "email_on_failure": False,
         "email_on_retry": False,
-    "on_failure_callback": on_failure_callback,
+        "on_failure_callback": on_failure_callback,
     },
 ) as dag:
 

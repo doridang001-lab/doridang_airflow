@@ -231,7 +231,7 @@ airflow logs Strategy_CoupangEats_CMG_Partition_Dags load_coupangeats_cmg_partit
 
 ## 관련 문서
 - `AGENTS.md` - 프로젝트 운영 규칙 원본
-- `modules/AGENTS.md` 또는 루트 `AGENTS.md` - 모듈 개발 규칙 참조
-- `dags/AGENTS.md` 또는 루트 `AGENTS.md` - DAG 네이밍 규칙 참조
+- `modules/CLAUDE.md` - 모듈 개발 규칙 참조
+- `dags/CLAUDE.md` - DAG 네이밍 규칙 참조
 - `modules/transform/utility/paths.py` - 경로 상수
 - `modules/transform/utility/onedrive.py` - OneDrive 백업 유틸

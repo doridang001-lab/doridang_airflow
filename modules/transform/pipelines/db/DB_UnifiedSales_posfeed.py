@@ -51,6 +51,18 @@ _ENABLE_POSFEED_DORI_EXCLUSION_ALERT = True
 # 주문상태 → 정상 처리할 완료 상태 (포장주문도 '배달완료'로 기록됨)
 _COMPLETE_STATUSES = {"배달완료"}
 
+
+def _filter_target_stores(df: pd.DataFrame, target_stores: list[str] | None = None) -> pd.DataFrame:
+    if not target_stores or df.empty or "store" not in df.columns:
+        return df
+    store_keys = {str(store).strip().split()[-1] for store in target_stores if str(store).strip()}
+    if not store_keys:
+        return df
+    mask = df["store"].fillna("").astype(str).str.strip().str.split().str[-1].isin(store_keys)
+    filtered = df[mask].copy()
+    logger.info("Posfeed unified target_stores 필터: %s -> %d/%d행", sorted(store_keys), len(filtered), len(df))
+    return filtered
+
 # 주문경로 → platform 정규화 (배민1 → 배달의민족 통일)
 _PLATFORM_MAP = {
     "배민1": "배달의민족",
@@ -572,26 +584,27 @@ def report_posfeed_exclusions(**context) -> str:
     return " | ".join(results) if results else "exclusion report: 제외 데이터 없음"
 
 
-def run_posfeed(date_str: str, overwrite: bool = False) -> str:
+def run_posfeed(date_str: str, overwrite: bool = False, target_stores: list[str] | None = None) -> str:
     ym = date_str[:7]
     orders = _load_orders_for_ym(ym)
     items = _load_items_for_ym(ym)
     if orders.empty:
         raise FileNotFoundError(f"posfeed orders 없음: {date_str}")
     df = _transform_df(orders, items, date_str)
+    df = _filter_target_stores(df, target_stores)
     if df.empty:
         return f"SKIP: posfeed {date_str} 해당일 데이터 없음"
-    saved = _save_unified_daily(df, date_str, overwrite=overwrite)
+    saved = _save_unified_daily(df, date_str, overwrite=overwrite, replace_stores=target_stores)
     return f"posfeed {date_str}: {saved}행 저장"
 
 
-def run_lookback_posfeed(days: int = 7) -> str:
+def run_lookback_posfeed(days: int = 7, target_stores: list[str] | None = None) -> str:
     total = 0
     today = datetime.now()
     for i in range(days):
         d = (today - timedelta(days=i)).strftime("%Y-%m-%d")
         try:
-            result = run_posfeed(d)
+            result = run_posfeed(d, target_stores=target_stores)
             logger.info(result)
             # 저장 행수 추출
             try:

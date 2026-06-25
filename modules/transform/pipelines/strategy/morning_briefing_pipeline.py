@@ -2,7 +2,7 @@
 출근길 AI 브리핑 파이프라인
 
 수집:
-    - Google Calendar 오늘 일정
+    - 오늘 일정 (기본 Notion Calendar, MORNING_BRIEFING_INCLUDE_CALENDAR=0이면 제외)
     - 어제 FAIL/WARN DAG (모니터링 CSV)
     - git status / branch / log
     - daily_summary.parquet 신선도
@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -32,6 +33,13 @@ logger = logging.getLogger(__name__)
 # morning_briefing_pipeline.py는 modules/transform/pipelines/strategy/ 에 위치
 # → parent×5 = airflow 프로젝트 루트
 _GIT_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
+_INCLUDE_CALENDAR = os.getenv("MORNING_BRIEFING_INCLUDE_CALENDAR", "1").strip() not in {"0", "false", "False", "no", "NO"}
+_CALENDAR_SOURCE = os.getenv("MORNING_BRIEFING_CALENDAR_SOURCE", "cache").strip().lower()
+_CALENDAR_CACHE_PATH = Path(
+    os.getenv("MORNING_BRIEFING_CALENDAR_CACHE", "/opt/airflow/config/notion_calendar_cache.json")
+    if os.getenv("AIRFLOW_HOME")
+    else os.getenv("MORNING_BRIEFING_CALENDAR_CACHE", str(_GIT_ROOT / "config" / "notion_calendar_cache.json"))
+)
 
 _WINDOWS_SCHEDULED_TASKS = [
     {
@@ -62,7 +70,85 @@ _WINDOWS_SCHEDULED_TASKS = [
 # ============================================================
 
 def _collect_calendar_events() -> list[dict]:
+    """오늘 일정 수집. 기본은 Notion Calendar, 필요 시 Google Calendar로 전환."""
+    if not _INCLUDE_CALENDAR:
+        logger.info("Calendar 수집 비활성화(MORNING_BRIEFING_INCLUDE_CALENDAR=0)")
+        return []
+    if _CALENDAR_SOURCE in {"cache", "cached", "notion_cache"}:
+        events = _collect_cached_calendar_events()
+        if events:
+            return events
+        logger.info("Calendar cache 비어 있음 — Notion Calendar 직접 수집 시도")
+        return _collect_notion_calendar_events()
+    if _CALENDAR_SOURCE in {"notion", "notion_calendar"}:
+        return _collect_notion_calendar_events()
+    if _CALENDAR_SOURCE not in {"google", "google_calendar"}:
+        logger.warning("알 수 없는 Calendar source=%s — 일정 수집 건너뜀", _CALENDAR_SOURCE)
+        return []
+
+    return _collect_google_calendar_events()
+
+
+def _collect_cached_calendar_events() -> list[dict]:
+    """호스트 수집 스크립트가 저장한 Notion Calendar 캐시를 읽는다."""
+    if not _CALENDAR_CACHE_PATH.exists():
+        logger.warning("Calendar cache 없음: %s", _CALENDAR_CACHE_PATH)
+        return []
+    try:
+        payload = json.loads(_CALENDAR_CACHE_PATH.read_text(encoding="utf-8"))
+        today = pendulum.now("Asia/Seoul").to_date_string()
+        if payload.get("date") != today:
+            logger.warning("Calendar cache 날짜 불일치: cache=%s today=%s", payload.get("date"), today)
+            return []
+        events = payload.get("events") or []
+        return [
+            {
+                "time": str(ev.get("time") or "종일"),
+                "summary": str(ev.get("summary") or ev.get("title") or "").strip(),
+                "status": str(ev.get("status") or "").strip(),
+            }
+            for ev in events
+            if str(ev.get("summary") or ev.get("title") or "").strip()
+        ]
+    except Exception as e:
+        logger.warning("Calendar cache 읽기 실패: %s", e)
+        return []
+
+
+def _collect_notion_calendar_events() -> list[dict]:
+    """Notion Calendar 오늘 일정 수집. 실패 시 빈 목록 반환."""
+    driver = None
+    notion_briefing = None
+    try:
+        from modules.transform.pipelines.private import private_morning_briefing as notion_briefing
+
+        target_date = pendulum.now("Asia/Seoul").to_date_string()
+        driver = notion_briefing._launch_browser()
+        events_by_day = notion_briefing._collect_calendar(driver, target_date=target_date)
+        events = events_by_day.get("today", []) if isinstance(events_by_day, dict) else []
+        return [
+            {
+                "time": (ev.get("time") or "종일"),
+                "summary": (ev.get("title") or "").strip(),
+                "status": (ev.get("status") or "").strip(),
+            }
+            for ev in events
+            if (ev.get("title") or "").strip()
+        ]
+    except Exception as e:
+        logger.warning("Notion Calendar 수집 실패: %s", e)
+        return []
+    finally:
+        if driver is not None and notion_briefing is not None:
+            try:
+                notion_briefing._quit_browser(driver)
+            except Exception:
+                pass
+
+
+def _collect_google_calendar_events() -> list[dict]:
     """Google Calendar 오늘 일정 수집. token.json 없으면 빈 목록 반환."""
+
     token_path = _GIT_ROOT / "config" / "calendar_token.json"
     if not token_path.exists():
         logger.warning("calendar_token.json 없음 — Calendar 수집 건너뜀 (scripts/generate_calendar_token.py 실행 필요)")
@@ -170,6 +256,48 @@ def _extract_error_details(log_path: Path | None) -> tuple[str, str]:
     return summary[:220], excerpt[:2000]
 
 
+def _dag_run_sort_key(dag_run) -> pendulum.DateTime:
+    return dag_run.end_date or dag_run.start_date or dag_run.execution_date
+
+
+def _to_pendulum_utc(value) -> pendulum.DateTime | None:
+    if value is None:
+        return None
+    try:
+        return pendulum.instance(value).in_timezone("UTC")
+    except Exception:
+        try:
+            return pendulum.parse(str(value)).in_timezone("UTC")
+        except Exception:
+            return None
+
+
+def _dag_run_completed_at(dag_run) -> pendulum.DateTime | None:
+    return _to_pendulum_utc(getattr(dag_run, "end_date", None) or getattr(dag_run, "start_date", None))
+
+
+def _dag_run_logical_at(dag_run) -> pendulum.DateTime | None:
+    return _to_pendulum_utc(getattr(dag_run, "execution_date", None))
+
+
+def _is_excluded_briefing_dag(dag_id: str) -> bool:
+    lowered = (dag_id or "").lower()
+    if dag_id == "Private_MorningBriefing_Dags":
+        return True
+    return lowered.startswith("tmp_") or lowered.endswith("_test") or "_test_" in lowered
+
+
+def _is_noise_log_message(message: str) -> bool:
+    text = (message or "").lower()
+    noise_patterns = [
+        "received sigterm",
+        "::endgroup:",
+        "local_task_job_runner.py",
+        "taskinstance.py:3093",
+    ]
+    return any(pattern in text for pattern in noise_patterns)
+
+
 def _collect_previous_day_dag_results() -> tuple[list[dict], list[dict]]:
     from airflow.models import DagRun, TaskInstance
     from airflow.utils.session import create_session
@@ -193,12 +321,12 @@ def _collect_previous_day_dag_results() -> tuple[list[dict], list[dict]]:
         for dag_run in dag_runs:
             if dag_run.dag_id in excluded_dags:
                 continue
-            sort_key = dag_run.end_date or dag_run.start_date or dag_run.execution_date
+            sort_key = _dag_run_sort_key(dag_run)
             current = latest_runs.get(dag_run.dag_id)
             if current is None:
                 latest_runs[dag_run.dag_id] = dag_run
                 continue
-            current_key = current.end_date or current.start_date or current.execution_date
+            current_key = _dag_run_sort_key(current)
             if sort_key and current_key:
                 if sort_key >= current_key:
                     latest_runs[dag_run.dag_id] = dag_run
@@ -233,7 +361,7 @@ def _collect_previous_day_dag_results() -> tuple[list[dict], list[dict]]:
                     error_summary = summary
                 if excerpt and not error_excerpt:
                     error_excerpt = excerpt
-                if summary:
+                if summary and not _is_noise_log_message(summary):
                     entry = {"msg": summary[:200], "level": "ERROR"}
                     if entry not in message_entries:
                         message_entries.append(entry)
@@ -289,11 +417,12 @@ def _collect_previous_day_dag_results() -> tuple[list[dict], list[dict]]:
 
 
 def _collect_previous_day_dag_results_v2() -> tuple[list[dict], list[dict]]:
-    failures, log_errors = _collect_previous_day_dag_results()
-    if failures or log_errors:
-        return failures, log_errors
+    """전일 KST 기준 최종 미해결 run만 실패로 판단한다.
 
-    # 실패/상위실패 재시도 없이 마지막 상태를 보는 경우가 있으면, 실패 상태만 따로 보정
+    실패 후 더 최신 성공 run이 있거나 retry 최종 상태가 성공이면 운영 적재가
+    회복된 것으로 보고 브리핑의 FAIL/로그오류에서 제외한다. 오래된 manual run이
+    뒤늦게 종료되어 end_date만 전일에 찍힌 경우도 제외한다.
+    """
     from airflow.utils.session import create_session
     import os
 
@@ -302,23 +431,46 @@ def _collect_previous_day_dag_results_v2() -> tuple[list[dict], list[dict]]:
 
         start_kst, end_kst, _ = _get_previous_day_window_kst()
         start_utc = start_kst.in_timezone("UTC")
-        end_utc = end_kst.in_timezone("UTC")
+        # 새벽/아침 브리핑 시 전일 logical date의 스케줄 run이 KST 자정 이후 끝나는 경우가 있어
+        # 완료 시각 확인 범위는 다음날 오전까지 허용한다.
+        end_utc = end_kst.add(hours=12).in_timezone("UTC")
         logs_base = Path(os.environ.get("AIRFLOW__LOGGING__BASE_LOG_FOLDER", "/opt/airflow/logs"))
 
         dag_runs = (
             session.query(DagRun)
             .filter(DagRun.execution_date >= start_utc)
             .filter(DagRun.execution_date < end_utc)
-            .filter(DagRun.state.in_(["failed", "upstream_failed"]))
-            .order_by(DagRun.execution_date.desc())
+            .filter(DagRun.state.in_(["success", "failed", "upstream_failed"]))
             .all()
         )
 
-        seen: set[str] = set()
+        latest_runs: dict[str, object] = {}
         for dr in dag_runs:
-            if dr.dag_id in seen or dr.dag_id == "Private_MorningBriefing_Dags":
+            if _is_excluded_briefing_dag(dr.dag_id):
                 continue
-            seen.add(dr.dag_id)
+
+            logical_at = _dag_run_logical_at(dr)
+            completed_at = _dag_run_completed_at(dr)
+            if not logical_at or logical_at < start_utc or logical_at >= end_utc:
+                continue
+
+            # 브리핑 시점까지 완료된 run만 최종 판정에 사용한다. 아직 running인 run은
+            # 실패로 단정하지 않는다.
+            if not completed_at or completed_at < start_utc or completed_at >= end_utc:
+                continue
+
+            sort_key = completed_at or logical_at
+            current = latest_runs.get(dr.dag_id)
+            current_key = _dag_run_completed_at(current) if current is not None else None
+            if current is None or (current_key is not None and sort_key >= current_key) or current_key is None:
+                latest_runs[dr.dag_id] = dr
+
+        failures: list[dict] = []
+        log_errors: list[dict] = []
+        for dr in sorted(latest_runs.values(), key=lambda item: item.dag_id):
+            if str(getattr(dr, "state", "")) not in {"failed", "upstream_failed"}:
+                continue
+
             task_instances = session.query(TaskInstance).filter(
                 TaskInstance.dag_id == dr.dag_id, TaskInstance.run_id == dr.run_id
             ).all()
@@ -334,7 +486,8 @@ def _collect_previous_day_dag_results_v2() -> tuple[list[dict], list[dict]]:
                 if summary:
                     if not error_summary:
                         error_summary = summary
-                    msg_entries.append({"msg": summary[:200], "level": "ERROR"})
+                    if not _is_noise_log_message(summary):
+                        msg_entries.append({"msg": summary[:200], "level": "ERROR"})
                 if excerpt and not error_excerpt:
                     error_excerpt = excerpt
 
@@ -359,58 +512,52 @@ def _collect_dag_failures() -> list[dict]:
 
 
 def _collect_git_status() -> dict:
-    """.git 폴더 직접 파싱 — git 바이너리/gitpython 없이 브랜치·커밋 수집.
-    loose refs(refs/heads/) + packed-refs 모두 처리."""
+    """git status --short 기준으로 실제 미커밋 변경사항을 수집한다."""
     git_dir = _GIT_ROOT / ".git"
     if not git_dir.exists():
-        return {"status": "(git 없음)", "log": "(git 없음)", "unmerged_branches": "(git 없음)"}
+        return {"status": "(git 없음)", "log": "(git 없음)", "unmerged_branches": "(git 없음)", "dirty_count": 0}
+    if not shutil.which("git"):
+        return {"status": "(git 명령 없음)", "log": "(git 명령 없음)", "unmerged_branches": "(git 명령 없음)", "dirty_count": 0}
     try:
-        # 현재 브랜치
-        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
-        current_branch = head.replace("ref: refs/heads/", "") if head.startswith("ref:") else head[:7]
+        def _run_git(args: list[str]) -> str:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=str(_GIT_ROOT),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+            if result.returncode != 0:
+                raise RuntimeError((result.stderr or result.stdout or "").strip()[:200])
+            return result.stdout.strip()
 
-        # 브랜치 해시 수집: loose refs + packed-refs 합산
-        branch_hashes: dict[str, str] = {}
+        branch = _run_git(["branch", "--show-current"]) or _run_git(["rev-parse", "--short", "HEAD"])
+        status_text = _run_git(["status", "--short"])
+        dirty_lines = [line for line in status_text.splitlines() if line.strip()]
+        log_line = _run_git(["log", "-1", "--pretty=format:%h %s"])
 
-        # 1) loose refs
-        refs_dir = git_dir / "refs" / "heads"
-        if refs_dir.exists():
-            for p in refs_dir.rglob("*"):
-                if p.is_file():
-                    branch_name = str(p.relative_to(refs_dir)).replace("\\", "/")
-                    branch_hashes[branch_name] = p.read_text(encoding="utf-8").strip()
+        try:
+            unmerged_text = _run_git(["branch", "--no-merged", "main", "--format=%(refname:short)"])
+            unmerged = [
+                line.strip()
+                for line in unmerged_text.splitlines()
+                if line.strip() and line.strip() != branch
+            ]
+        except Exception:
+            unmerged = []
 
-        # 2) packed-refs (git pack-refs 이후 loose 파일이 없어지는 경우)
-        packed_refs_path = git_dir / "packed-refs"
-        if packed_refs_path.exists():
-            for line in packed_refs_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line.startswith("#") or not line:
-                    continue
-                parts = line.split()
-                if len(parts) == 2 and parts[1].startswith("refs/heads/"):
-                    bname = parts[1][len("refs/heads/"):]
-                    if bname not in branch_hashes:  # loose ref 우선
-                        branch_hashes[bname] = parts[0]
-
-        main_hash = branch_hashes.get("main", "")
-        unmerged = [b for b, h in branch_hashes.items() if b != "main" and h != main_hash]
-        unmerged_str = "\n".join(unmerged) if unmerged else "(없음)"
-
-        # 최근 커밋 메시지 (COMMIT_EDITMSG = 마지막 커밋)
-        commit_msg_path = git_dir / "COMMIT_EDITMSG"
-        last_msg = commit_msg_path.read_text(encoding="utf-8", errors="ignore").strip() if commit_msg_path.exists() else ""
-        log = f"최근: {last_msg[:80]}" if last_msg else "(커밋 없음)"
-
-        # 진행 중인 git 작업 확인
-        dirty_indicators = ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REBASE_HEAD"]
-        in_progress = [f for f in dirty_indicators if (git_dir / f).exists()]
-        status = f"브랜치: {current_branch}" + (f" ({', '.join(in_progress)} 진행 중)" if in_progress else "")
-
-        return {"status": status, "log": log, "unmerged_branches": unmerged_str}
+        return {
+            "status": status_text if dirty_lines else "(변경사항 없음)",
+            "log": f"최근: {log_line[:80]}" if log_line else "(커밋 없음)",
+            "branch": branch,
+            "unmerged_branches": "\n".join(unmerged) if unmerged else "(없음)",
+            "dirty_count": len(dirty_lines),
+        }
     except Exception as e:
         logger.warning(f"git 파싱 실패: {e}")
-        return {"status": "(git 파싱 오류)", "log": "(git 파싱 오류)", "unmerged_branches": "(git 파싱 오류)"}
+        return {"status": "(git 파싱 오류)", "log": "(git 파싱 오류)", "unmerged_branches": "(git 파싱 오류)", "dirty_count": 0}
 
 
 def _collect_data_freshness() -> str:
@@ -644,9 +791,13 @@ def _llm_call(prompt: str, system: str, num_predict: int = 300) -> str:
 
 def _analyze_fail_dag(dag_id: str, error_excerpt: str) -> str:
     """gpt-oss로 FAIL DAG 원인 한 줄 분석."""
+    if not error_excerpt:
+        return "문제: 최종 실패 run 존재 / 원인: 로그 excerpt 없음 / 조치: Airflow task log 직접 확인"
     system = (
-        "You are an Airflow expert. Analyze the error and reply ONLY in Korean, "
-        "one line: '문제: X / 원인: Y / 조치: Z'."
+        "You are an Airflow expert. Analyze ONLY unresolved final failed DAG runs. "
+        "Reply ONLY in Korean, one line: '문제: X / 원인: Y / 조치: Z'. "
+        "Do not recommend Airflow/Python version upgrades unless the log proves that is the direct fix. "
+        "Do not treat retry history or already successful reruns as current incidents."
     )
     prompt = f"DAG: {dag_id}\n에러:\n{error_excerpt[:1500]}"
     try:
@@ -672,7 +823,10 @@ def generate_briefing(**context):
             fail_lines.append(f"• {f['dag_id']} [{f['status']}]: {label}")
 
     # Step B — 전체 우선순위 브리핑 (로그 오류 요약을 LLM에 넘겨 우선순위에 반영)
-    cal_text = "\n".join(f"  {e['time']} {e['summary']}" for e in data["calendar"]) or "  (없음)"
+    cal_text = "\n".join(
+        f"  {e['time']} {e['summary']}" + (f" ({e.get('status')})" if e.get("status") else "")
+        for e in data["calendar"]
+    ) or "  (없음)"
     fail_text = "\n".join(fail_lines) or "  (없음)"
     git = data["git"]
 
@@ -683,23 +837,33 @@ def generate_briefing(**context):
     ) or "  (없음)"
 
     b_prompt = (
-        f"오늘 일정:\n{cal_text}\n\n"
-        f"실패/경고 DAG(어제, KST 기준):\n{fail_text}\n\n"
-        f"로그 오류 DAG:\n{log_ctx}\n\n"
-        f"미커밋: {git['status'][:100]} | 최근커밋: {git['log']}\n"
+        "[오늘 일정]\n"
+        f"{cal_text}\n\n"
+        "[미해결 실패 DAG]\n"
+        f"{fail_text}\n\n"
+        "[미해결 DAG와 연결된 로그 오류]\n"
+        f"{log_ctx}\n\n"
+        "[Git]\n"
+        f"미커밋: {git.get('dirty_count', 0)}건 | 상태: {git['status'][:100]} | 최근커밋: {git['log']}\n\n"
+        "[데이터 신선도]\n"
         f"daily_summary 최신: {data['freshness']}"
     )
     b_system = (
         "너는 데이터 엔지니어의 아침 업무 비서야. "
-        "아래 정보를 보고 오늘 가장 먼저 처리해야 할 작업을 번호 목록으로 정리해줘. "
+        "아래 구조화된 정보를 보고 오늘 가장 먼저 처리해야 할 작업을 번호 목록으로 정리해줘. "
         "무조건 한국어로만 답변해. 영어 금지. "
+        "미해결 실패 DAG가 '(없음)'이면 DAG 장애 해결 작업을 우선순위에 넣지 마. "
+        "재실행 성공, retry 성공, 오래된 manual 실패, test/tmp DAG, 참고용 로그는 오늘 조치로 쓰지 마. "
+        "로그 오류는 미해결 실패 DAG와 직접 연결될 때만 장애 조치로 표현해. "
+        "근거 없이 Airflow 또는 Python 버전 업데이트를 권고하지 마. "
+        "각 항목은 실제 실행 가능한 동사형 작업으로 작성해. "
         "최대 5줄."
     )
     priority_text = _llm_call(b_prompt, b_system, num_predict=400)
 
     # 메시지 조합
     today = pendulum.now("Asia/Seoul").strftime("%Y-%m-%d (%a)")
-    fail_cnt = len(data["failures"])
+    fail_cnt = sum(1 for f in data["failures"] if f.get("status") == "FAIL")
     warn_cnt = sum(1 for f in data["failures"] if f.get("status") == "WARN")
     log_warnings = data.get("log_warnings", [])
     log_err_cnt = sum(
@@ -722,7 +886,10 @@ def generate_briefing(**context):
 
     # 일정
     if data["calendar"]:
-        cal_lines = "\n".join(f"  {e['time']}  {e['summary']}" for e in data["calendar"])
+        cal_lines = "\n".join(
+            f"  {e['time']}  {e['summary']}" + (f" ({e.get('status')})" if e.get("status") else "")
+            for e in data["calendar"]
+        )
         sections.append(f"📅 오늘 일정\n{cal_lines}")
 
     # 실패/경고 DAG (어제)
@@ -747,9 +914,9 @@ def generate_briefing(**context):
         sections.append("🗓 작업 스케줄러\n" + "\n".join(task_lines))
 
     # 미커밋 + 신선도
-    uncommitted = [l for l in git["status"].split("\n") if l.strip()]
-    if uncommitted and git["status"] not in ("(변경사항 없음)", "(git 미지원)", "(git 오류)"):
-        sections.append(f"📋 미커밋 {len(uncommitted)}건\n  daily_summary 최신: {data['freshness']}")
+    dirty_count = int(git.get("dirty_count") or 0)
+    if dirty_count > 0:
+        sections.append(f"📋 미커밋 {dirty_count}건\n  daily_summary 최신: {data['freshness']}")
     else:
         sections.append(f"✅ 미커밋 없음\n  daily_summary 최신: {data['freshness']}")
 

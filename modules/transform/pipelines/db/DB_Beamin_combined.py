@@ -46,6 +46,7 @@ from modules.transform.pipelines.db.DB_Beamin_03_shop_change import (
     collect_shop_change_for_driver,
 )
 from modules.transform.pipelines.db.beamin_stability import resolve_stability_profile
+from modules.transform.utility.store_normalize import lookup_store_key
 
 logger = logging.getLogger(__name__)
 
@@ -744,6 +745,7 @@ def _parse_store_option(opt: dict) -> dict | None:
 
     matches = re.findall(r"[가-힣]+(?:점|지점|분점|직영점)", text)
     store = matches[-1] if matches else text[:20]
+    store = lookup_store_key(brand, store)
 
     return {"store_id": str(opt["store_id"]), "brand": brand, "store": store}
 
@@ -760,14 +762,20 @@ def _split_requested_store_name(requested_store_name: str) -> tuple[str | None, 
 
 def _filter_store_list_for_request(store_list: list[dict], requested_store_name: str) -> list[dict]:
     """대표 매장명이 주어지면 같은 지점의 sister brand 옵션까지 함께 남긴다."""
-    _, requested_store = _split_requested_store_name(requested_store_name)
+    requested_brand, requested_store = _split_requested_store_name(requested_store_name)
     if not requested_store:
         return list(store_list)
+
+    requested_keys = {requested_store}
+    brands = [requested_brand] if requested_brand else KNOWN_BRANDS
+    for brand in brands:
+        if brand:
+            requested_keys.add(lookup_store_key(brand, requested_store))
 
     return [
         store_info
         for store_info in store_list
-        if requested_store == str(store_info.get("store") or "").strip()
+        if str(store_info.get("store") or "").strip() in requested_keys
     ]
 
 

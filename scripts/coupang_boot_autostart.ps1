@@ -62,6 +62,91 @@ function Get-RawCounts {
     return $total
 }
 
+function Get-PatternCounts {
+    param([string[]]$Paths)
+    $patterns = @("coupangeats_orders_*.csv","coupangeats_cmg_*.csv","coupangeats_options_*.csv")
+    $parts = [System.Collections.Generic.List[string]]::new()
+    foreach ($dir in $Paths) {
+        if (-not (Test-Path $dir)) {
+            $parts.Add("${dir}:missing")
+            continue
+        }
+        foreach ($pattern in $patterns) {
+            $count = @(Get-ChildItem -Path $dir -Filter $pattern -File -ErrorAction SilentlyContinue).Count
+            $parts.Add("${dir}\${pattern}=${count}")
+        }
+    }
+    return ($parts -join "; ")
+}
+
+function Log-ChromeDownloadDiagnostics {
+    param([string]$PythonPath)
+
+    $script = @"
+from pathlib import Path
+import json
+import shutil
+import sqlite3
+import tempfile
+
+profile = Path(r"C:\coupang_chrome_profile")
+prefs = profile / "Default" / "Preferences"
+if prefs.exists():
+    try:
+        data = json.loads(prefs.read_text(encoding="utf-8"))
+        download = data.get("download", {})
+        print("[DIAG] chrome download prefs: default_directory=%s directory_upgrade=%s" % (
+            download.get("default_directory", ""),
+            download.get("directory_upgrade", ""),
+        ))
+    except Exception as exc:
+        print("[DIAG] chrome download prefs read failed: %s" % exc)
+else:
+    print("[DIAG] chrome download prefs missing: %s" % prefs)
+
+history = profile / "Default" / "History"
+if not history.exists():
+    print("[DIAG] chrome history missing: %s" % history)
+    raise SystemExit(0)
+
+tmp = Path(tempfile.gettempdir()) / "coupang_chrome_history_diag_copy"
+try:
+    shutil.copy2(history, tmp)
+    con = sqlite3.connect(str(tmp))
+    cur = con.cursor()
+    rows = list(cur.execute(
+        "select guid, target_path, mime_type, received_bytes from downloads "
+        "order by start_time desc limit 10"
+    ))
+    con.close()
+finally:
+    try:
+        tmp.unlink()
+    except Exception:
+        pass
+
+bad = [row for row in rows if "playwright-artifacts" in str(row[1])]
+if bad:
+    print("[DIAG][WARNING] latest downloads include playwright-artifacts paths: %d/10" % len(bad))
+for guid, target_path, mime_type, received_bytes in rows[:5]:
+    print("[DIAG] recent download: guid=%s path=%s mime=%s bytes=%s" % (
+        guid,
+        target_path,
+        mime_type,
+        received_bytes,
+    ))
+"@
+
+    $ErrorActionPreference = "Continue"
+    $diagOut = & $PythonPath -X utf8 -c $script 2>&1
+    $diagExit = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    foreach ($line in $diagOut) { Log "$line" }
+    if ($diagExit -ne 0) {
+        Log "[WARNING] Chrome download diagnostics failed: $diagExit"
+    }
+}
+
 function Trigger-CoupangMacroDag {
     param([string]$DagId, [string]$SchedulerContainer)
     $hasDocker = Get-Command docker -ErrorAction SilentlyContinue
@@ -107,6 +192,8 @@ if (-not $portReady) { Log "[ERROR] Port 9222 not open after 60s"; exit 1 }
 $collectDirs = @(Get-CollectDirs)
 $before = Get-RawCounts -Paths $collectDirs
 Log "Files before collection: $before"
+Log "Pattern counts before: $(Get-PatternCounts -Paths $collectDirs)"
+Log-ChromeDownloadDiagnostics -PythonPath $venvPython
 
 Log "Running autoclick..."
 $ErrorActionPreference = "Continue"
@@ -124,6 +211,7 @@ if ($CollectionWaitSeconds -gt 0) {
         $nowCount = Get-RawCounts -Paths $collectDirs
         if ($nowCount -gt $before) {
             Log "Files increased: $before -> $nowCount"
+            Log "Pattern counts current: $(Get-PatternCounts -Paths $collectDirs)"
             $before = $nowCount
             $lastChanged = Get-Date
         } else {
@@ -136,6 +224,9 @@ if ($CollectionWaitSeconds -gt 0) {
         Start-Sleep -Seconds 5
     }
 }
+
+Log "Pattern counts after: $(Get-PatternCounts -Paths $collectDirs)"
+Log-ChromeDownloadDiagnostics -PythonPath $venvPython
 
 try {
     Trigger-CoupangMacroDag -DagId $AirflowDag -SchedulerContainer $AirflowSchedulerContainer

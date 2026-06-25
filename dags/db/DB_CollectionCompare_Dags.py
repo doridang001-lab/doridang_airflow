@@ -6,7 +6,7 @@ from datetime import timedelta
 import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.sensors.external_task import ExternalTaskSensor
 
 from modules.transform.pipelines.db.DB_CollectionCompare import build_collection_compare
 from modules.transform.pipelines.db.DB_BaeminManual_load import (
@@ -24,6 +24,23 @@ default_args = {
     "email_on_failure": False,
     "email_on_retry": False,
 }
+
+
+def _latest_macro_execution_date(dt, **kwargs):
+    """가장 최근 성공한 CoupangMacro run의 execution_date 반환."""
+    from airflow.models import DagRun
+    from airflow.utils.state import DagRunState
+
+    runs = DagRun.find(
+        dag_id="DB_CoupangMacro_Load_Dags",
+        state=DagRunState.SUCCESS,
+    )
+    eligible = sorted(
+        [run for run in runs if run.execution_date <= dt],
+        key=lambda run: run.execution_date,
+        reverse=True,
+    )
+    return eligible[0].execution_date if eligible else dt
 
 
 with DAG(
@@ -45,13 +62,16 @@ with DAG(
         python_callable=cleanup_manual_baemin_orders,
     )
 
-    ensure_coupang_macro_loaded = TriggerDagRunOperator(
+    ensure_coupang_macro_loaded = ExternalTaskSensor(
         task_id="ensure_coupang_macro_loaded",
-        trigger_dag_id="DB_CoupangMacro_Load_Dags",
-        wait_for_completion=True,
-        poke_interval=60,
+        external_dag_id="DB_CoupangMacro_Load_Dags",
+        external_task_id=None,
+        execution_date_fn=_latest_macro_execution_date,
         allowed_states=["success"],
         failed_states=["failed"],
+        poke_interval=60,
+        timeout=3600,
+        mode="poke",
     )
 
     build_compare = PythonOperator(
