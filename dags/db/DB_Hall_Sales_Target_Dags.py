@@ -22,15 +22,37 @@ from modules.transform.pipelines.db.DB_Hall_Sales_Excel import (
     build_weekly_report_excel,
     check_marketing_input,
 )
-from modules.transform.pipelines.db.DB_Hall_Daily_Excel import build_daily_tracking_excel
+from modules.transform.pipelines.db.DB_Hall_Daily_CSV import build_daily_tracking_csv
 # 목표치 계산은 airflow 비의존 헬퍼로 분리 (로컬 Windows 스크립트와 공유)
 from modules.transform.pipelines.db.DB_Hall_Sales_Target_config import build_targets
 from modules.transform.utility.notifier import on_failure_callback
 
-# 매출/마케팅 목표치 (매월 업데이트는 DB_Hall_Sales_Target_config.py 에서)
-MONTHLY_TARGETS, MARKETING_MONTHLY_TARGETS, DAILY_TRACKING_TARGET = build_targets()
 
 dag_id = Path(__file__).stem
+
+
+def _build_hall_sales_target() -> str:
+    # 목표 JSON은 사용자가 수시로 바꿀 수 있으므로 태스크 실행 시점에 읽는다.
+    monthly_targets, _, _ = build_targets()
+    return build_hall_sales_target(monthly_targets)
+
+
+def _build_weekly_report_excel() -> str:
+    # DAG 파싱 시점 값이 아니라 실행 시점의 hall_sale_target_input.json을 기준으로 한다.
+    monthly_targets, marketing_monthly_targets, _ = build_targets()
+    return build_weekly_report_excel(monthly_targets, marketing_monthly_targets)
+
+
+def _build_daily_tracking_csv(ym: str = "") -> str:
+    # ym이 비어 있으면 build_daily_tracking_csv 내부에서 당월로 처리된다.
+    monthly_targets, marketing_monthly_targets, daily_tracking_target = build_targets()
+    return build_daily_tracking_csv(
+        monthly_targets,
+        marketing_monthly_targets,
+        daily_tracking_target,
+        ym=ym,
+    )
+
 
 with DAG(
     dag_id=dag_id,
@@ -50,26 +72,19 @@ with DAG(
 
     t_csv = PythonOperator(
         task_id="build_hall_sales_target",
-        python_callable=build_hall_sales_target,
-        op_kwargs={"monthly_targets": MONTHLY_TARGETS},
+        python_callable=_build_hall_sales_target,
     )
 
     t_excel = PythonOperator(
         task_id="build_weekly_report_excel",
-        python_callable=build_weekly_report_excel,
-        op_kwargs={
-            "monthly_targets":           MONTHLY_TARGETS,
-            "marketing_monthly_targets": MARKETING_MONTHLY_TARGETS,
-        },
+        python_callable=_build_weekly_report_excel,
     )
 
-    t_daily_excel = PythonOperator(
-        task_id="build_daily_tracking_excel",
-        python_callable=build_daily_tracking_excel,
+    t_daily_csv = PythonOperator(
+        task_id="build_daily_tracking_csv",
+        python_callable=_build_daily_tracking_csv,
         op_kwargs={
-            "monthly_targets":           MONTHLY_TARGETS,
-            "marketing_monthly_targets": MARKETING_MONTHLY_TARGETS,
-            "daily_target":              DAILY_TRACKING_TARGET,
+            "ym":                        "{{ dag_run.conf.get('ym') or '' }}",
         },
     )
 
@@ -83,5 +98,5 @@ with DAG(
         python_callable=append_weekly_ai_log,
     )
 
-    t_csv >> [t_excel, t_daily_excel, t_check_mkt]
+    t_csv >> [t_excel, t_daily_csv, t_check_mkt]
     t_excel >> t_llm_log

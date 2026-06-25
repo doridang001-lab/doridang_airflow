@@ -619,13 +619,28 @@ def _is_driver_alive(driver: uc.Chrome) -> bool:
         return False
 
 
-def _filter_missing_keys(sale_dates: list, csv_name: str) -> list:
+def _resolve_target_stores(target_stores: list | None = None) -> list[dict]:
+    if not target_stores:
+        return STORES
+    targets = [str(target).strip() for target in target_stores if str(target).strip()]
+    stores = [
+        store
+        for store in STORES
+        if any(target in store["name"] for target in targets)
+    ]
+    if not stores:
+        raise ValueError(f"OKPOS target_stores 매칭 없음: {target_stores!r}")
+    return stores
+
+
+def _filter_missing_keys(sale_dates: list, csv_name: str, stores: list[dict] | None = None) -> list:
     """sale_dates × STORES 중 csv_name.csv에 해당 날짜 데이터가 없는 (date, store) 조합만 반환."""
     missing = []
     marker_cache: dict[Path, set[str]] = {}
+    stores_to_check = stores or STORES
     for sale_date in sale_dates:
         ym = sale_date[:7]
-        for store in STORES:
+        for store in stores_to_check:
             if not _should_collect(store["name"], sale_date):
                 continue
             store_short = store["name"].replace("도리당 ", "", 1)
@@ -1579,11 +1594,12 @@ def resolve_sale_dates(manual_date_range=None, lookback_days=None, **context) ->
     return f"날짜 범위 결정 완료 [{source}]: {sale_dates[0]} ~ {sale_dates[-1]} ({len(sale_dates)}일)"
 
 
-def download_today_stores(**context) -> str:
+def download_today_stores(target_stores: list | None = None, **context) -> str:
     """today 페이지 매장별 엑셀 다운로드"""
     sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates")
     if not sale_dates:
         raise ValueError("sale_dates XCom 값이 없습니다.")
+    stores = _resolve_target_stores(target_stores)
 
     conf = context.get("dag_run").conf or {}
     force = bool(conf.get("force_redownload") or conf.get("force_redownload_today") or os.getenv("OKPOS_FORCE_REDOWNLOAD_TODAY", ""))
@@ -1613,10 +1629,10 @@ def download_today_stores(**context) -> str:
 
     # 이미 수집된 (날짜, 매장) 조합 제외 → 누락분만 다운로드
     if force:
-        pending_keys = [(sd, st) for sd in sale_dates for st in STORES if _should_collect(st["name"], sd)]
+        pending_keys = [(sd, st) for sd in sale_dates for st in stores if _should_collect(st["name"], sd)]
         logger.warning(f"today 강제 재다운로드 모드: {len(pending_keys)}건")
     else:
-        pending_keys = _filter_missing_keys(sale_dates, "okpos_order")
+        pending_keys = _filter_missing_keys(sale_dates, "okpos_order", stores=stores)
     if not pending_keys:
         logger.info("today: 모든 날짜/매장 데이터 이미 수집됨, 스킵")
         context["ti"].xcom_push(key="today_files", value={})
@@ -1640,11 +1656,12 @@ def download_today_stores(**context) -> str:
     return f"today 다운로드: {success}/{len(results)}건 성공"
 
 
-def download_receipt_stores(**context) -> str:
+def download_receipt_stores(target_stores: list | None = None, **context) -> str:
     """receipt/details 페이지 매장별 엑셀 다운로드 (영수증별매출상세현황)"""
     sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates")
     if not sale_dates:
         raise ValueError("sale_dates XCom 값이 없습니다.")
+    stores = _resolve_target_stores(target_stores)
 
     conf = context.get("dag_run").conf or {}
     force = bool(conf.get("force_redownload") or conf.get("force_redownload_receipt") or os.getenv("OKPOS_FORCE_REDOWNLOAD_RECEIPT", ""))
@@ -1674,10 +1691,10 @@ def download_receipt_stores(**context) -> str:
 
     # 이미 수집된 (날짜, 매장) 조합 제외 → 누락분만 다운로드
     if force:
-        pending_keys = [(sd, st) for sd in sale_dates for st in STORES if _should_collect(st["name"], sd)]
+        pending_keys = [(sd, st) for sd in sale_dates for st in stores if _should_collect(st["name"], sd)]
         logger.warning(f"receipt 강제 재다운로드 모드: {len(pending_keys)}건")
     else:
-        pending_keys = _filter_missing_keys(sale_dates, "okpos_order_item")
+        pending_keys = _filter_missing_keys(sale_dates, "okpos_order_item", stores=stores)
     if not pending_keys:
         logger.info("receipt: 모든 날짜/매장 데이터 이미 수집됨, 스킵")
         context["ti"].xcom_push(key="receipt_files", value={})
@@ -1701,7 +1718,7 @@ def download_receipt_stores(**context) -> str:
     return f"receipt 다운로드: {success}/{len(results)}건 성공"
 
 
-def download_daily_stores(**context) -> str:
+def download_daily_stores(target_stores: list | None = None, **context) -> str:
     """daily(일자별 종합매출) 페이지 매장별 엑셀 다운로드.
 
     - startDate/endDate를 동일 sale_date로 설정해 '1일치'로 다운로드한다.
@@ -1710,6 +1727,7 @@ def download_daily_stores(**context) -> str:
     sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates")
     if not sale_dates:
         raise ValueError("sale_dates XCom 값이 없습니다.")
+    stores = _resolve_target_stores(target_stores)
 
     conf = context.get("dag_run").conf or {}
     force = bool(conf.get("force_redownload") or conf.get("force_redownload_daily") or os.getenv("OKPOS_FORCE_REDOWNLOAD_DAILY", ""))
@@ -1738,10 +1756,10 @@ def download_daily_stores(**context) -> str:
                 results[key] = str(downloaded)
 
     if force:
-        pending_keys = [(sd, st) for sd in sale_dates for st in STORES if _should_collect(st["name"], sd)]
+        pending_keys = [(sd, st) for sd in sale_dates for st in stores if _should_collect(st["name"], sd)]
         logger.warning(f"daily 강제 재다운로드 모드: {len(pending_keys)}건")
     else:
-        pending_keys = _filter_missing_keys(sale_dates, "okpos_daily")
+        pending_keys = _filter_missing_keys(sale_dates, "okpos_daily", stores=stores)
     if not pending_keys:
         logger.info("daily: 모든 날짜/매장 데이터 이미 수집됨, 스킵")
         context["ti"].xcom_push(key="daily_files", value={})
@@ -2056,6 +2074,10 @@ def _transform_okpos_daily_df(df: pd.DataFrame, store_name: str, sale_date: str)
                 return _to_amount(row.get(col))
         return 0
 
+    def _is_zero_business_days_marker(value) -> bool:
+        match = re.search(r"영업일수합\s*:\s*([0-9]+)\s*일", str(value or ""))
+        return bool(match and int(match.group(1)) == 0)
+
     raw = df.copy()
     raw = raw.replace(r"^\s*$", pd.NA, regex=True)
 
@@ -2138,6 +2160,17 @@ def _transform_okpos_daily_df(df: pd.DataFrame, store_name: str, sale_date: str)
         row = row.iloc[:1].copy()
 
     row_series = row.iloc[0]
+    row_amount_sum = sum(
+        _amount_from_row(row_series, col)
+        for col in ("총매출액", "총할인액", "실매출액", "영수건수")
+    )
+    if row_amount_sum == 0 and data["일자"].map(_is_zero_business_days_marker).any():
+        logger.info(
+            "daily '영업일수합: 0 일' 감지 → OKPOS 미마감/매출없음으로 판단, empty 반환: %s | %s",
+            sale_date,
+            store_name,
+        )
+        return pd.DataFrame(), sale_date[:7]
 
     out = pd.DataFrame([{
         "sale_date": sale_date,
@@ -2195,23 +2228,8 @@ def _read_okpos_csv(csv_path: Path) -> pd.DataFrame:
         return pd.read_csv(csv_path, dtype=str)
 
 
-def _daily_amount_sum(df_daily: pd.DataFrame) -> int:
-    cols = [c for c in ("총매출액", "총할인액", "실매출액", "영수건수") if c in df_daily.columns]
-    if not cols or df_daily.empty:
-        return 0
-    return int(df_daily[cols].apply(_to_int_series).sum(axis=1).iloc[0])
-
-
-def _fallback_daily_from_order_csv(df_daily: pd.DataFrame, store_short: str, sale_date: str, ym: str) -> pd.DataFrame:
-    """daily 0원 의심값을 같은 날짜 today(order) 합계로 보정한다.
-
-    OKPOS daily 페이지가 특정 날짜를 조회하지 못하면 정상 엑셀처럼 보이지만
-    '영업일수합: 0 일' 행만 내려오는 경우가 있다. 같은 날짜 order가 비0원이면
-    daily 0원은 수집 오류로 보고 order 합계로 교체한다.
-    """
-    if df_daily.empty or _daily_amount_sum(df_daily) != 0:
-        return df_daily
-
+def _derive_daily_from_order_csv(store_short: str, store_name: str, sale_date: str, ym: str) -> pd.DataFrame:
+    """OKPOS daily 페이지가 0 셸을 내려줄 때 order 원천으로 daily 집계 1행을 만든다."""
     order_csv = (
         RAW_OKPOS_SALES
         / "brand=도리당"
@@ -2220,27 +2238,32 @@ def _fallback_daily_from_order_csv(df_daily: pd.DataFrame, store_short: str, sal
         / "okpos_order.csv"
     )
     if not order_csv.exists() or order_csv.stat().st_size == 0:
-        return df_daily
+        return pd.DataFrame()
 
     order_df = _read_okpos_csv(order_csv)
-    if order_df.empty or "sale_date" not in order_df.columns:
-        return df_daily
+    if order_df.empty:
+        return pd.DataFrame()
+    if "sale_date" not in order_df.columns:
+        if "결제시각" not in order_df.columns:
+            return pd.DataFrame()
+        order_df = order_df.copy()
+        order_df["sale_date"] = pd.to_datetime(order_df["결제시각"], errors="coerce").dt.strftime("%Y-%m-%d")
 
     order_df = order_df[order_df["sale_date"].astype(str).str.strip() == sale_date].copy()
     if order_df.empty:
-        return df_daily
+        return pd.DataFrame()
 
     total = int((_to_int_series(order_df["총매출액"]) if "총매출액" in order_df.columns else pd.Series(0, index=order_df.index)).sum())
     discount = int((_to_int_series(order_df["총할인액"]) if "총할인액" in order_df.columns else pd.Series(0, index=order_df.index)).sum())
     net = int((_to_int_series(order_df["실매출액"]) if "실매출액" in order_df.columns else pd.Series(0, index=order_df.index)).sum())
     receipts = int(len(order_df))
     if total == 0 and discount == 0 and net == 0 and receipts == 0:
-        return df_daily
+        return pd.DataFrame()
 
     out = pd.DataFrame([{
         "sale_date": sale_date,
         "ym": ym,
-        "매장명": df_daily["매장명"].iloc[0],
+        "매장명": store_name,
         "총매출액": total,
         "총할인액": discount,
         "실매출액": net,
@@ -2252,9 +2275,9 @@ def _fallback_daily_from_order_csv(df_daily: pd.DataFrame, store_short: str, sal
         axis=1,
     )
     logger.warning(
-        "daily 0원 수집 오류 의심 → order fallback 보정: %s | %s | total=%s discount=%s net=%s receipts=%s",
+        "daily 0원 셸 리포트 → okpos_order 기준 daily 집계 생성: %s | %s | total=%s discount=%s net=%s receipts=%s",
         sale_date,
-        df_daily["매장명"].iloc[0],
+        store_name,
         total,
         discount,
         net,
@@ -2572,7 +2595,13 @@ def save_to_raw(**context) -> str:
 
                 if page_type == "daily":
                     df, ym = _transform_okpos_daily_df(raw_df, store_name, sale_date)
-                    df = _fallback_daily_from_order_csv(df, store_short, sale_date, ym)
+                    if df.empty or (
+                        {"총매출액", "총할인액", "실매출액", "영수건수"}.issubset(df.columns)
+                        and int(df[["총매출액", "총할인액", "실매출액", "영수건수"]].apply(_to_int_series).sum(axis=1).iloc[0]) == 0
+                    ):
+                        derived = _derive_daily_from_order_csv(store_short, store_name, sale_date, ym)
+                        if not derived.empty:
+                            df = derived
                 else:
                     df, ym = _transform_okpos_df(raw_df, store_name, sale_date)
                 if df.empty:
@@ -2691,7 +2720,7 @@ def save_to_raw(**context) -> str:
     return f"변환 저장 완료: {len(saved)}개"
 
 
-def check_and_fill_missing_today(**context) -> str:
+def check_and_fill_missing_today(target_stores: list | None = None, **context) -> str:
     """today/receipt 저장 결과를 대조해서 누락분만 재다운로드해 채운다.
 
     save_to_raw 이후 실행:
@@ -2703,6 +2732,7 @@ def check_and_fill_missing_today(**context) -> str:
     sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates") or []
     if not sale_dates:
         return "sale_dates 없음, 스킵"
+    stores = _resolve_target_stores(target_stores)
 
     # NOTE: 기존 구현은 (sale_date, store) 조합마다 CSV를 매번 읽어서,
     # 날짜 범위가 길면 I/O 과다로 느려지거나 시간초과가 날 수 있다.
@@ -2810,7 +2840,7 @@ def check_and_fill_missing_today(**context) -> str:
     missing_receipt_keys: list[tuple[str, dict]] = []
     for sale_date in sale_dates:
         ym = sale_date[:7]
-        for store in STORES:
+        for store in stores:
             if not _should_collect(store["name"], sale_date):
                 continue
             store_short = store["name"].replace("도리당 ", "", 1)
@@ -2847,7 +2877,7 @@ def check_and_fill_missing_today(**context) -> str:
     logger.info(
         "today/receipt 대조 완료: sale_dates=%d, stores=%d, csv_cache=%d",
         len(sale_dates),
-        len(STORES),
+        len(stores),
         len(sale_date_cache),
     )
 
@@ -2965,16 +2995,17 @@ def check_and_fill_missing_today(**context) -> str:
     return msg
 
 
-def reconcile_against_daily_summary(**context) -> str:
+def reconcile_against_daily_summary(target_stores: list | None = None, **context) -> str:
     """daily(일자별 종합매출)와 today(order) 정합성을 맞춘다.
 
     - daily가 0원인데 order가 비0원이면 daily 수집 오류로 보고 daily를 먼저 재수집한다.
-    - daily 재수집도 0원이면 order 합계 fallback으로 daily를 보정한다.
+    - daily 재수집도 0원이면 저장하지 않고 로그/XCom에 남겨 OKPOS 원천 확인 대상으로 둔다.
     - 그 외 mismatch는 기존처럼 today를 재다운로드한다.
     """
     sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates") or []
     if not sale_dates:
         return "sale_dates 없음, 스킵"
+    stores = _resolve_target_stores(target_stores)
 
     tol = int(os.getenv("OKPOS_DAILY_VALIDATE_TOLERANCE", "0"))
     max_attempts = int(os.getenv("OKPOS_DAILY_RECONCILE_MAX_ATTEMPTS", "2"))
@@ -3087,7 +3118,13 @@ def reconcile_against_daily_summary(**context) -> str:
                 likely_okpos = _is_likely_okpos_report(raw_df)
                 if page_type == "daily":
                     df_new, ym_new = _transform_okpos_daily_df(raw_df, store_name, sale_date)
-                    df_new = _fallback_daily_from_order_csv(df_new, store_short, sale_date, ym_new)
+                    if df_new.empty or (
+                        {"총매출액", "총할인액", "실매출액", "영수건수"}.issubset(df_new.columns)
+                        and int(df_new[["총매출액", "총할인액", "실매출액", "영수건수"]].apply(_to_int_series).sum(axis=1).iloc[0]) == 0
+                    ):
+                        derived = _derive_daily_from_order_csv(store_short, store_name, sale_date, ym_new)
+                        if not derived.empty:
+                            df_new = derived
                 else:
                     df_new, ym_new = _transform_okpos_df(raw_df, store_name, sale_date)
                 if df_new.empty:
@@ -3103,7 +3140,7 @@ def reconcile_against_daily_summary(**context) -> str:
                 src.unlink(missing_ok=True)
         return saved
 
-    remaining: list[tuple[str, dict]] = [(d, s) for d in sale_dates for s in STORES if _should_collect(s["name"], d)]
+    remaining: list[tuple[str, dict]] = [(d, s) for d in sale_dates for s in stores if _should_collect(s["name"], d)]
     for attempt in range(1, max_attempts + 1):
         mism_daily: list[tuple[str, dict]] = []
         mism_today: list[tuple[str, dict]] = []
@@ -3165,7 +3202,7 @@ def reconcile_against_daily_summary(**context) -> str:
     return f"daily 기준 reconcile 종료: mismatch 남음 (tol={tol}) | 예: {details[:20]}"
 
 
-def validate_today_vs_receipt(**context) -> str:
+def validate_today_vs_receipt(target_stores: list | None = None, **context) -> str:
     """today(okpos_order) vs receipt(okpos_order_item) 합계 정합성 검증.
 
     - (sale_date, store) 기준으로 okpos_order 합계와 okpos_order_item 합계가 일치하는지 확인
@@ -3184,6 +3221,7 @@ def validate_today_vs_receipt(**context) -> str:
     sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates") or []
     if not sale_dates:
         return "sale_dates 없음, 스킵"
+    stores = _resolve_target_stores(target_stores)
 
     tol = int(os.getenv("OKPOS_VALIDATE_TOLERANCE", "0"))
     failures: list[str] = []
@@ -3198,7 +3236,7 @@ def validate_today_vs_receipt(**context) -> str:
 
     for sale_date in sale_dates:
         ym = sale_date[:7]
-        for store in STORES:
+        for store in stores:
             if not _should_collect(store["name"], sale_date):
                 continue
             store_short = store["name"].replace("도리당 ", "", 1)
@@ -3281,7 +3319,7 @@ def validate_today_vs_receipt(**context) -> str:
     return msg
 
 
-def reconcile_today_vs_receipt(**context) -> str:
+def reconcile_today_vs_receipt(target_stores: list | None = None, **context) -> str:
     """okpos_order 합계 기준으로 today/receipt를 재수집/재저장하여 정합성을 최대한 맞춘다.
 
     - mismatch 탐지 → receipt 재수집/덮어쓰기
@@ -3296,6 +3334,7 @@ def reconcile_today_vs_receipt(**context) -> str:
     sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates") or []
     if not sale_dates:
         return "sale_dates 없음, 스킵"
+    stores = _resolve_target_stores(target_stores)
 
     tol = int(os.getenv("OKPOS_VALIDATE_TOLERANCE", "0"))
     max_attempts = int(os.getenv("OKPOS_RECONCILE_MAX_ATTEMPTS", "2"))
@@ -3360,7 +3399,7 @@ def reconcile_today_vs_receipt(**context) -> str:
         skipped: list[str] = []
         details: list[str] = []
         for sale_date in sale_dates:
-            for store in STORES:
+            for store in stores:
                 if not _should_collect(store["name"], sale_date):
                     continue
                 o_sum, i_sum_a, i_sum_t, reason = _sums_for_one(sale_date, store)

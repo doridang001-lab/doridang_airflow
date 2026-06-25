@@ -617,7 +617,16 @@ def _parse_collect_mode(collect_mode: str) -> tuple[str, list[str]]:
     return "date_range", dates
 
 
-def _load_source_df(collect_mode: str) -> pd.DataFrame:
+def _filter_target_store(df: pd.DataFrame, target_store: str | None = None) -> pd.DataFrame:
+    if not target_store or df.empty or "store" not in df.columns:
+        return df
+    before = len(df)
+    filtered = df[df["store"].fillna("").astype(str).str.strip() == target_store].copy()
+    logger.info("target_store detail 필터: %s -> %d/%d건", target_store, len(filtered), before)
+    return filtered
+
+
+def _load_source_df(collect_mode: str, target_store: str | None = None) -> pd.DataFrame:
     """collect_mode에 따라 posfeed_sales 파티션 로드(파일명: posfeed_orders.csv)"""
     sales_root = ANALYTICS_DB / "posfeed_sales"
     mode_type, date_list = _parse_collect_mode(collect_mode)
@@ -658,6 +667,9 @@ def _load_source_df(collect_mode: str) -> pd.DataFrame:
         if df.empty:
             raise AirflowSkipException(f"해당 날짜 데이터 없음 | {collect_mode}")
 
+    df = _filter_target_store(df, target_store)
+    if df.empty:
+        raise AirflowSkipException(f"target_store 데이터 없음 | {target_store} | {collect_mode}")
     return df
 
 
@@ -679,14 +691,19 @@ def _load_collected_set(ym_filter: str | None) -> set[str]:
     return collected
 
 
-def extract_order_codes(collect_mode: str = "yesterday", force_rescrape: bool = False, **context) -> str:
+def extract_order_codes(
+    collect_mode: str = "yesterday",
+    force_rescrape: bool = False,
+    target_store: str | None = None,
+    **context,
+) -> str:
     """collect_mode에 따라 수집 대상 주문 코드를 매장별로 그룹화하여 XCom에 저장"""
     # dag_run.conf로도 강제 재수집 가능
     dag_run = context.get("dag_run")
     if dag_run and dag_run.conf and dag_run.conf.get("force_rescrape"):
         force_rescrape = True
 
-    df = _load_source_df(collect_mode)
+    df = _load_source_df(collect_mode, target_store=target_store)
 
     df["주문 코드"] = df["주문 코드"].dropna().astype(str)
 
@@ -1150,7 +1167,7 @@ def scrape_order_details(**context) -> str:
     return result
 
 
-def scrape_missing_order_details(collect_mode: str = "yesterday", **context) -> str:
+def scrape_missing_order_details(collect_mode: str = "yesterday", target_store: str | None = None, **context) -> str:
     """scrape_order_details 이후 결과를 기준으로, extract_order_codes에서 추출된 코드 중
     미수집된 코드만 다시 수집해서 추가 저장한다."""
     payload = context["ti"].xcom_pull(task_ids="check_undetailed_orders", key="order_codes")
@@ -1166,7 +1183,7 @@ def scrape_missing_order_details(collect_mode: str = "yesterday", **context) -> 
     logger.info("미수집 재수집 체크 시작 | 추출 코드: %d건", extracted_total)
 
     # extract_order_codes와 동일한 ym_filter 계산 로직 유지
-    df = _load_source_df(collect_mode)
+    df = _load_source_df(collect_mode, target_store=target_store)
     mode_type, date_list = _parse_collect_mode(collect_mode)
     if mode_type == "yesterday":
         latest_date = df["등록날짜"].dropna().max()

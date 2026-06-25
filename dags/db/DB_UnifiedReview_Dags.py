@@ -65,7 +65,9 @@ def _latest_toorder_review_execution_date(dt, **context):
         latest_execution_date = row[0]
         # DB 실행 기준으로 너무 오래된 완료 건은 무시한다.
         now = pendulum.now("Asia/Seoul")
-        if latest_execution_date >= dt - timedelta(hours=12) and latest_execution_date <= now:
+        # DB_UnifiedReview는 07:50 이전 구간 실행되므로 당일 ToOrderReview는 아직 완료되지 않는다.
+        # 직전 1일 이내의 성공 실행을 추적해 수집 누락 없이 이어받는다.
+        if latest_execution_date >= dt - timedelta(days=1) and latest_execution_date <= now:
             logger.info(
                 "[sensor] Sales_ToOrder_Review_Dags.t4_validate 최신 성공 시각: %s",
                 latest_execution_date,

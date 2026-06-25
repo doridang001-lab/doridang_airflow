@@ -95,6 +95,19 @@ def _apply_validation_scope(df: pd.DataFrame) -> pd.DataFrame:
     return scoped[~scoped["store"].isin(VALIDATION_EXCLUDED_TEST_STORES)].copy()
 
 
+def _filter_target_stores(df: pd.DataFrame, target_stores: list[str] | None = None) -> pd.DataFrame:
+    if df.empty or not target_stores or "store" not in df.columns:
+        return df
+
+    targets = {str(store).strip() for store in target_stores if str(store).strip()}
+    if not targets:
+        return df
+
+    scoped = df.copy()
+    scoped["store"] = scoped["store"].astype(str).str.strip()
+    return scoped[scoped["store"].isin(targets)].copy()
+
+
 def _resolve_target_date(**context) -> str:
     """conf.sale_date 또는 resolve_date XCom 을 우선 사용하고, 없으면 KST 기준 전일을 사용한다."""
     dag_run = context.get("dag_run")
@@ -318,13 +331,13 @@ def _send_alert(target_date: str, error_rows: pd.DataFrame, csv_path: Path, **co
     send_telegram(message)
 
 
-def validate_sales(**context) -> str:
+def validate_sales(target_stores: list[str] | None = None, **context) -> str:
     """대상일 1일 기준 unified_sales 와 일별매출보고서를 비교한다."""
     target_date = _resolve_target_date(**context)
     logger.info("unified_sales 검증 대상일: %s", target_date)
 
-    parquet = _load_parquet_totals(target_date=target_date)
-    excel = _load_excel_totals(target_date=target_date)
+    parquet = _filter_target_stores(_load_parquet_totals(target_date=target_date), target_stores)
+    excel = _filter_target_stores(_load_excel_totals(target_date=target_date), target_stores)
     diff = _compute_diff(excel=excel, parquet=parquet)
     csv_path = _save_validation_csv(diff=diff, target_date=target_date)
     logger.info("검증 결과 저장: %s | rows=%d", csv_path, len(diff))
@@ -465,7 +478,7 @@ def _send_monthly_alert(target_ym: str, error_rows: pd.DataFrame, csv_path: Path
     send_telegram(message)
 
 
-def validate_monthly_sales(**context) -> str:
+def validate_monthly_sales(target_stores: list[str] | None = None, **context) -> str:
     """올해 데이터가 있는 모든 ym에 대해 월별 CSV를 생성하고, 어제 기준 달만 알림을 발송한다."""
     target_date = _resolve_target_date(**context)
     current_year = target_date[:4]
@@ -479,8 +492,8 @@ def validate_monthly_sales(**context) -> str:
     saved = []
     alert_sent = False
     for ym in all_ym:
-        parquet = _load_parquet_monthly_totals(ym)
-        excel = _load_excel_monthly_totals(ym)
+        parquet = _filter_target_stores(_load_parquet_monthly_totals(ym), target_stores)
+        excel = _filter_target_stores(_load_excel_monthly_totals(ym), target_stores)
         diff = _compute_monthly_diff(excel=excel, parquet=parquet)
         csv_path = _save_monthly_comparison_csv(diff=diff, target_ym=ym)
         saved.append(ym)

@@ -40,6 +40,18 @@ _OKPOS_MONTH_CACHE: dict[str, tuple[pd.DataFrame, pd.DataFrame, float]] = {}
 _PENDING_UNMATCHED: set[str] = set()
 
 
+def _filter_target_stores(df: pd.DataFrame, target_stores: list[str] | None = None) -> pd.DataFrame:
+    if not target_stores or df.empty or "store" not in df.columns:
+        return df
+    store_keys = {str(store).strip().split()[-1] for store in target_stores if str(store).strip()}
+    if not store_keys:
+        return df
+    mask = df["store"].fillna("").astype(str).str.strip().str.split().str[-1].isin(store_keys)
+    filtered = df[mask].copy()
+    logger.info("OKPOS unified target_stores 필터: %s -> %d/%d행", sorted(store_keys), len(filtered), len(df))
+    return filtered
+
+
 def _dedup_okpos_df_by_stable_key(df: pd.DataFrame, kind: str) -> pd.DataFrame:
     """OKPOS 원천 CSV의 중복 방어.
 
@@ -835,7 +847,7 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
     return merged[UNIFIED_COLUMNS]
 
 
-def run_okpos(date_str: str, overwrite: bool = False) -> str:
+def run_okpos(date_str: str, overwrite: bool = False, target_stores: list[str] | None = None) -> str:
     """특정 날짜 OKPOS order+order_item → unified_sales 저장.
 
     overwrite=True: 기존 데이터 교체 (정정용).
@@ -846,16 +858,17 @@ def run_okpos(date_str: str, overwrite: bool = False) -> str:
         logger.warning("스킵: %s", e)
         return f"스킵 (okpos CSV 없음 | {date_str})"
     df = _transform_okpos_df(order_df, item_df)
+    df = _filter_target_stores(df, target_stores)
     if df.empty:
         return f"스킵 (데이터 없음 | {date_str})"
-    saved = _save_unified_daily(df, date_str, overwrite=overwrite)
+    saved = _save_unified_daily(df, date_str, overwrite=overwrite, replace_stores=target_stores)
     _flush_unmatched_alert()
     result = f"unified_sales(okpos) 저장 | {date_str} | {saved}행"
     logger.info(result)
     return result
 
 
-def run_lookback_okpos(days: int = 7) -> str:
+def run_lookback_okpos(days: int = 7, target_stores: list[str] | None = None) -> str:
     """최근 N일 okpos 누락분 보충 (append-only, 월별 캐시).
 
     같은 달 날짜를 반복 처리해도 월간 CSV는 1회만 로드.
@@ -879,9 +892,10 @@ def run_lookback_okpos(days: int = 7) -> str:
             logger.warning("okpos CSV 없음, 스킵: %s", date_str)
             continue
         df = _transform_okpos_df(order_df, item_df)
+        df = _filter_target_stores(df, target_stores)
         if df.empty:
             continue
-        saved = _save_unified_daily(df, date_str)
+        saved = _save_unified_daily(df, date_str, replace_stores=target_stores)
         total_saved += saved
         if saved:
             logger.info("lookback okpos %s | 신규 %d행", date_str, saved)

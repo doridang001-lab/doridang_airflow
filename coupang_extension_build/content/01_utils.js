@@ -391,11 +391,12 @@ Utils = {
       purpose = 'data',
       storeName = '',
       storeId = '',
-      dateStr = ''
+      dateStr = '',
+      suffix = ''
     } = options;
-    
+
     const cleanStr = (str) => String(str || '').replace(/[\\/:*?"<>|\s]/g, '_').substring(0, 30);
-    
+
     const timestamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
     const parts = [
       channel,
@@ -404,8 +405,8 @@ Utils = {
       storeId || 'unknown',
       dateStr || timestamp
     ];
-    
-    const filename = parts.join('_') + '.csv';
+
+    const filename = parts.join('_') + (suffix ? '_' + suffix : '') + '.csv';
     
     return new Promise((resolve, reject) => {
       let isResolved = false; // ✅ 중복 실행 방지 플래그

@@ -1,5 +1,7 @@
 # DB pipeline
 
+Root `C:\airflow\AGENTS.md` is the source of truth.
+
 먼저 @C:\airflow\modules\transform\CLAUDE.md
 DB DAG는 @C:\airflow\dags\db\AGENTS.md
 

@@ -586,13 +586,14 @@ def _wait_for_downloaded_file(
 # ============================================================
 # Task 함수
 # ============================================================
-def download_posfeed_excel(collect_mode: str = None, **context) -> str:
+def download_posfeed_excel(collect_mode: str = None, target_date: str | None = None, **context) -> str:
     """Posfeed 관리자 사이트에서 주문 엑셀 다운로드"""
     _mode = str(collect_mode or "").strip()
     if _mode and _mode not in ("yesterday", "backfill_missing"):
         raise AirflowSkipException(
             f"date mode ({collect_mode}): main download skipped — collect_missing_dates handles this"
         )
+    target_dt = datetime.strptime(target_date, "%Y-%m-%d") if target_date else None
     download_dir = DOWN_DIR
     download_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"다운로드 경로: {download_dir}")
@@ -605,13 +606,14 @@ def download_posfeed_excel(collect_mode: str = None, **context) -> str:
         try:
             _login(driver, wait)
             download_start = time.time()
-            _click_download(driver, wait)
+            _click_download(driver, wait, target_date=target_dt)
             downloaded_file = _wait_for_downloaded_file(download_dir, min_mtime=download_start)
             file_path = str(downloaded_file)
             from datetime import timedelta
-            data_date = (_kst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            data_date = target_dt.strftime("%Y-%m-%d") if target_dt else (_kst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
             logger.info("✅ 다운로드 완료 | 파일: %s | 데이터 날짜: %s", downloaded_file.name, data_date)
             context['ti'].xcom_push(key='downloaded_file_path', value=file_path)
+            context['ti'].xcom_push(key='data_date', value=data_date)
             return file_path
         except (TimeoutException, WebDriverException, Exception) as e:
             last_exc = e
@@ -644,7 +646,8 @@ def move_to_storage(**context) -> str:
     dest_dir = DOWN_DIR  # E:\down — OneDrive 업로드 후 업로드_temp로 이동됨
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    yesterday = (_kst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    data_date = context['ti'].xcom_pull(task_ids='download_excel', key='data_date')
+    yesterday = data_date or (_kst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
     today = _kst_now().strftime("%Y%m%d")
 
     # 엑셀 읽기 → 등록날짜 컬럼 추가 → UTF-8 CSV 저장
@@ -723,7 +726,7 @@ def _normalize_store(store_name: str, brand: str) -> str:
     return _normalize_store_series(pd.Series([normalized])).iloc[0]
 
 
-def partition_to_onedrive(**context) -> str:
+def partition_to_onedrive(target_store: str | None = None, **context) -> str:
     """포스피드 주문 CSV → 브랜드/지점/월 파티션 CSV로 누적 저장
 
     - 도리당 / 나홀로 대상만 필터링
@@ -768,6 +771,14 @@ def partition_to_onedrive(**context) -> str:
     # 파생 컬럼 추가
     collected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     df["지점명"] = df.apply(lambda r: _normalize_store(r["가맹점명"], r["브랜드"]), axis=1)
+    if target_store:
+        before = len(df)
+        df = df[df["지점명"] == target_store].copy()
+        logger.info("target_store 필터 적용: %s -> %d -> %d건", target_store, before, len(df))
+        if df.empty:
+            logger.warning("target_store 적재 대상 없음: %s", target_store)
+            return f"적재 대상 없음: target_store={target_store}"
+        target = len(df)
     # downstream(상세 수집) 호환: 기존 파티션 컬럼명(brand/store)도 함께 유지
     df["brand"] = df["브랜드"]
     df["store"] = df["지점명"]

@@ -37,3 +37,6 @@
   - 실행 후 확인: `python -c "from pathlib import Path; Path(r'<path>').read_text(encoding='utf-8'); print('utf8 ok')"`
 - 깔끔한 재확인:
   - `python -c "import pathlib; f=pathlib.Path(r'<path>'); f.read_text(encoding='utf-8'); print('ok')"`
+- 한글 매장명/파일명/컬럼명/검색어를 PowerShell 파이프나 쉘 인자로 직접 넘겨 검증하지 않는다. 가능하면 `python -X utf8`로 실행하고 Python 내부에서 원본 파일을 읽어 필터값을 추출한다.
+- 물음표 2개 연속, 유니코드 replacement 문자, CP949/UTF-8 왕복 실패처럼 보이는 모지바케가 보이면 자동 수정하지 말고 작업을 멈춘 뒤 원본 데이터를 다시 확인한다.
+- 한글 필터 결과가 비어 있으면 “데이터 없음”으로 결론내기 전에 인코딩/필터 깨짐 가능성을 먼저 검증한다.

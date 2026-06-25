@@ -34,6 +34,11 @@ filename = os.path.basename(__file__)
 logger = logging.getLogger(__name__)
 
 
+def _toorder_voc_01_execution_date(dt, **context):
+    target = pendulum.instance(dt).in_timezone("Asia/Seoul")
+    return target.replace(hour=7, minute=30, second=0, microsecond=0).in_timezone("UTC")
+
+
 def _on_task_failure(context):
     try:
         ti = context.get("ti") or context.get("task_instance")
@@ -119,8 +124,9 @@ with DAG(
         external_task_id='move_voc_files',
         allowed_states=['success'],
         failed_states=['failed', 'skipped'],
-        mode='poke',
-        timeout=3600,
+        execution_date_fn=_toorder_voc_01_execution_date,
+        mode='reschedule',
+        timeout=7200,
         poke_interval=60,
     )
 
