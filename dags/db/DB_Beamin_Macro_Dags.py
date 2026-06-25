@@ -31,10 +31,13 @@ Baemin macro DAG — 배달의민족 계정별 자동 수집
 
 import html
 import logging
+import os
 import random
 import re
+import shutil
 import time
 import warnings
+import importlib
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -64,11 +67,12 @@ from modules.transform.pipelines.db.DB_Beamin_retry import (
 )
 from modules.transform.utility.schedule import SMD_BAEMIN_COLLECT_TIME
 from modules.transform.pipelines.db.DB_Beamin_Macro_validate import validate_toorder_orders
-from modules.transform.utility.paths import ANALYTICS_DB, COLLECT_DB
+from modules.transform.utility.paths import ANALYTICS_DB, COLLECT_DB, LOCAL_DB
 from modules.transform.utility.store_normalize import normalize as normalize_store_names, strip_brand
 
 logger = logging.getLogger(__name__)
 dag_id = Path(__file__).stem
+BAEMIN_SCHEDULE = os.getenv("BAEMIN_COLLECT_SCHEDULE", SMD_BAEMIN_COLLECT_TIME)
 
 warnings.filterwarnings(
     "ignore",
@@ -144,6 +148,128 @@ default_args = {
 }
 
 
+_MISSING = object()
+_BAEMIN_STAGE_ATTRS = (
+    (
+        "modules.transform.pipelines.db.DB_Beamin_01_now",
+        "BAEMIN_METRICS_DB",
+        ("metrics_now",),
+    ),
+    (
+        "modules.transform.pipelines.db.DB_Beamin_02_woori_shop_click",
+        "BAEMIN_OUR_STORE_CLICKS_DB",
+        ("metrics_our_store_clicks",),
+    ),
+    (
+        "modules.transform.pipelines.db.DB_Beamin_03_shop_change",
+        "BAEMIN_SHOP_CHANGE_DB",
+        ("shop_change",),
+    ),
+    (
+        "modules.transform.pipelines.db.DB_Beamin_03_shop_change",
+        "BAEMIN_SHOP_OPERATION_DB",
+        ("shop_operation",),
+    ),
+    (
+        "modules.transform.pipelines.db.DB_Beamin_04_orders",
+        "BAEMIN_ORDERS_DB",
+        ("orders",),
+    ),
+    (
+        "modules.transform.pipelines.db.DB_Beamin_05_ad_funnel",
+        "BAEMIN_AD_FUNNEL_DB",
+        ("ad_funnel",),
+    ),
+    (
+        "modules.transform.pipelines.db.DB_Beamin_Macro_validate",
+        "BAEMIN_ORDERS_DB",
+        ("orders",),
+    ),
+    (
+        "modules.transform.pipelines.db.DB_Beamin_monthly_operation",
+        "BAEMIN_MONTHLY_OPERATION_DB",
+        ("monthly_operation",),
+    ),
+    (
+        "modules.transform.pipelines.db.DB_Beamin_monthly_operation",
+        "BAEMIN_SHOP_CHANGE_DB",
+        ("shop_change",),
+    ),
+    (
+        "modules.transform.pipelines.db.DB_Beamin_monthly_operation",
+        "BAEMIN_SHOP_OPERATION_DB",
+        ("shop_operation",),
+    ),
+)
+
+
+def _reset_baemin_staging(onedrive_baemin: Path, local_baemin: Path) -> None:
+    local_root = LOCAL_DB.resolve()
+    target = local_baemin.resolve()
+    if local_baemin.exists():
+        if not target.is_relative_to(local_root):
+            raise RuntimeError(f"staging 삭제 범위 오류: {local_baemin}")
+        shutil.rmtree(local_baemin)
+
+    if onedrive_baemin.exists():
+        shutil.copytree(str(onedrive_baemin), str(local_baemin), dirs_exist_ok=True)
+        logger.info("OneDrive 원본 staging 복사 완료: %s -> %s", onedrive_baemin, local_baemin)
+    else:
+        local_baemin.mkdir(parents=True, exist_ok=True)
+        logger.info("OneDrive 원본 없음, 빈 staging 생성: %s", local_baemin)
+
+
+def _patch_baemin_staging_paths(local_analytics: Path) -> tuple[str | None, list[tuple[Any, str, Any]]]:
+    import modules.transform.utility.paths as _paths
+
+    analytics_original = os.environ.get("ANALYTICS_DB")
+    os.environ["ANALYTICS_DB"] = str(local_analytics)
+    _paths._cache.clear()
+
+    local_baemin = local_analytics / "baemin_macro"
+    originals: list[tuple[Any, str, Any]] = []
+    for module_name, attr_name, relative_parts in _BAEMIN_STAGE_ATTRS:
+        module = importlib.import_module(module_name)
+        originals.append((module, attr_name, getattr(module, attr_name, _MISSING)))
+        setattr(module, attr_name, local_baemin.joinpath(*relative_parts))
+
+    logger.info("staging 모드 전환: %s", local_analytics)
+    return analytics_original, originals
+
+
+def _restore_baemin_staging_paths(
+    analytics_original: str | None,
+    originals: list[tuple[Any, str, Any]],
+) -> None:
+    import modules.transform.utility.paths as _paths
+
+    for module, attr_name, original_value in reversed(originals):
+        if original_value is _MISSING:
+            try:
+                delattr(module, attr_name)
+            except AttributeError:
+                pass
+        else:
+            setattr(module, attr_name, original_value)
+
+    if analytics_original is None:
+        os.environ.pop("ANALYTICS_DB", None)
+    else:
+        os.environ["ANALYTICS_DB"] = analytics_original
+    _paths._cache.clear()
+    logger.info("staging 모드 해제")
+
+
+def _upload_baemin_staging(local_baemin: Path, onedrive_baemin: Path) -> None:
+    if not local_baemin.exists():
+        logger.warning("staging 경로 없음, OneDrive 업로드 생략: %s", local_baemin)
+        return
+
+    onedrive_baemin.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(str(local_baemin), str(onedrive_baemin), dirs_exist_ok=True)
+    logger.info("OneDrive 업로드 완료: %s -> %s", local_baemin, onedrive_baemin)
+
+
 def _split_accounts_by_range(accounts: list[dict], collect_range: str | None) -> list[dict]:
     if not collect_range or not accounts:
         return accounts
@@ -183,8 +309,8 @@ def load_accounts(**context) -> str:
 
     context["ti"].xcom_push(key="account_list", value=accounts)
     stores = [a["store_name"] for a in accounts]
-    logger.info("怨꾩젙 濡쒕뱶 ?꾨즺: %d媛?-> %s", len(accounts), stores)
-    return f"怨꾩젙 {len(accounts)}媛? {stores}"
+    logger.info("계정 로드 완료: %d개 -> %s", len(accounts), stores)
+    return f"계정 {len(accounts)}개, {stores}"
 
 
 def _manual_baemin_store_key(raw_store_name: str, fallback_name: str = "") -> str:
@@ -969,68 +1095,79 @@ def collect_all(**context) -> str:
         logger.warning("수집 대상 계정 없음")
         return "수집 대상 없음"
 
-    # 백필 날짜 목록 계산 (ORDERS_BACKFILL_DAYS 설정 & conf 미지정 시)
-    backfill_dates: list[str] = []
-    if target_date is None and ORDERS_BACKFILL_DAYS is not None:
-        yesterday = pendulum.yesterday(KST)
-        backfill_dates = [
-            yesterday.subtract(days=i).format("YYYY-MM-DD")
-            for i in range(ORDERS_BACKFILL_DAYS)
-        ]
-        logger.info(
-            "주문 백필 모드: %d일치 (%s ~ %s)",
-            len(backfill_dates),
-            backfill_dates[-1],
-            backfill_dates[0],
+    onedrive_baemin = ANALYTICS_DB / "baemin_macro"
+    local_analytics = LOCAL_DB / "analytics_stage"
+    local_baemin = local_analytics / "baemin_macro"
+    _reset_baemin_staging(onedrive_baemin, local_baemin)
+    analytics_original, patched_paths = _patch_baemin_staging_paths(local_analytics)
+
+    try:
+        # 백필 날짜 목록 계산 (ORDERS_BACKFILL_DAYS 설정 & conf 미지정 시)
+        backfill_dates: list[str] = []
+        if target_date is None and ORDERS_BACKFILL_DAYS is not None:
+            yesterday = pendulum.yesterday(KST)
+            backfill_dates = [
+                yesterday.subtract(days=i).format("YYYY-MM-DD")
+                for i in range(ORDERS_BACKFILL_DAYS)
+            ]
+            logger.info(
+                "주문 백필 모드: %d일치 (%s ~ %s)",
+                len(backfill_dates),
+                backfill_dates[-1],
+                backfill_dates[0],
+            )
+
+        result = pipeline_collect_all(
+            account_list,
+            target_date=target_date,
+            stability_profile=profile["name"],
         )
+        context["ti"].xcom_push(key="failed", value=result.get("failed", {}))
+        context["ti"].xcom_push(key="validation", value=result.get("validation", []))
+        context["ti"].xcom_push(key="ad_stores", value=result.get("ad_stores", []))
+        store_info_per_account = result.get("store_info_per_account", [])
+        context["ti"].xcom_push(key="store_info_per_account", value=store_info_per_account)
+        metrics = result.get("metrics")
+        if metrics and dag_run:
+            write_runtime_metrics(run_id=dag_run.run_id, stage="collect_all", payload=metrics)
 
-    result = pipeline_collect_all(
-        account_list,
-        target_date=target_date,
-        stability_profile=profile["name"],
-    )
-    context["ti"].xcom_push(key="failed", value=result.get("failed", {}))
-    context["ti"].xcom_push(key="validation", value=result.get("validation", []))
-    context["ti"].xcom_push(key="ad_stores", value=result.get("ad_stores", []))
-    store_info_per_account = result.get("store_info_per_account", [])
-    context["ti"].xcom_push(key="store_info_per_account", value=store_info_per_account)
-    metrics = result.get("metrics")
-    if metrics and dag_run:
-        write_runtime_metrics(run_id=dag_run.run_id, stage="collect_all", payload=metrics)
+        # 백필: 추가 날짜들에 대해 orders만 재수집
+        backfill_summary = ""
+        if backfill_dates and store_info_per_account:
+            from modules.transform.pipelines.db.DB_Beamin_04_orders import (
+                collect_orders_for_account as _orders_fn,
+            )
+            pw_map = {a["account_id"]: a["password"] for a in account_list}
+            lines = []
+            for bdate in backfill_dates:
+                ok, fail = 0, 0
+                for item in store_info_per_account:
+                    acc_id = item["account_id"]
+                    stores = item.get("stores", [])
+                    pw = pw_map.get(acc_id, "")
+                    if not pw or not stores:
+                        continue
+                    try:
+                        res = _orders_fn(acc_id, pw, stores, target_date=bdate)
+                        if res.get("failed"):
+                            fail += len(res["failed"])
+                        else:
+                            ok += 1
+                    except Exception as exc:
+                        logger.warning("백필 orders 실패 [%s / %s]: %s", acc_id, bdate, exc)
+                        fail += 1
+                lines.append(f"{bdate}: 성공 {ok} / 실패 {fail}")
+            backfill_summary = " | ".join(lines)
+            logger.info("백필 완료: %s", backfill_summary)
 
-    # 백필: 추가 날짜들에 대해 orders만 재수집
-    backfill_summary = ""
-    if backfill_dates and store_info_per_account:
-        from modules.transform.pipelines.db.DB_Beamin_04_orders import (
-            collect_orders_for_account as _orders_fn,
-        )
-        pw_map = {a["account_id"]: a["password"] for a in account_list}
-        lines = []
-        for bdate in backfill_dates:
-            ok, fail = 0, 0
-            for item in store_info_per_account:
-                acc_id = item["account_id"]
-                stores = item.get("stores", [])
-                pw = pw_map.get(acc_id, "")
-                if not pw or not stores:
-                    continue
-                try:
-                    res = _orders_fn(acc_id, pw, stores, target_date=bdate)
-                    if res.get("failed"):
-                        fail += len(res["failed"])
-                    else:
-                        ok += 1
-                except Exception as exc:
-                    logger.warning("백필 orders 실패 [%s / %s]: %s", acc_id, bdate, exc)
-                    fail += 1
-            lines.append(f"{bdate}: 성공 {ok} / 실패 {fail}")
-        backfill_summary = " | ".join(lines)
-        logger.info("백필 완료: %s", backfill_summary)
+        summary = result["summary"]
+        if backfill_summary:
+            summary += f"\n[백필] {backfill_summary}"
 
-    summary = result["summary"]
-    if backfill_summary:
-        summary += f"\n[백필] {backfill_summary}"
-    return summary
+        _upload_baemin_staging(local_baemin, onedrive_baemin)
+        return summary
+    finally:
+        _restore_baemin_staging_paths(analytics_original, patched_paths)
 
 
 def _send_alert(subject: str, body: str, html_content: str | None = None) -> None:
@@ -1393,7 +1530,7 @@ def notify_collection_result_legacy_v4(**context) -> str:
 
 with DAG(
     dag_id=dag_id,
-    schedule=SMD_BAEMIN_COLLECT_TIME,
+    schedule=BAEMIN_SCHEDULE,
     start_date=pendulum.datetime(2024, 1, 1, tz="Asia/Seoul"),
     catchup=False,
     max_active_runs=1,
