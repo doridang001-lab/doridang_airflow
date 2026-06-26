@@ -18,8 +18,9 @@ from airflow.operators.python import PythonOperator
 from modules.transform.pipelines.db.DB_FinProduct_Map import (
     llm_product_map,
     migrate_product_map,
+    build_fin_product_map_train_json,
 )
-from modules.transform.utility.notifier import on_failure_callback
+from modules.transform.utility.notifier import on_failure_callback, send_telegram
 from modules.transform.utility.schedule import DB_FIN_PRODUCT_MAP_TIME
 
 logger = logging.getLogger(__name__)
@@ -68,13 +69,29 @@ def run_migrate(**context) -> dict:
     return migrate_product_map(dry_run=dry_run)
 
 
+def run_build_train_json(**context) -> dict:
+    conf = _dag_conf(context)
+    dry_run = _conf_bool(conf, "dry_run", DRY_RUN_BY_DEFAULT)
+    logger.info("fin_product_map_train_json 빌드 시작: dry_run=%s", dry_run)
+    return build_fin_product_map_train_json(dry_run=dry_run)
+
+
 def run_llm(**context) -> dict:
     conf = _dag_conf(context)
     dry_run = _conf_bool(conf, "dry_run", DRY_RUN_BY_DEFAULT)
     default_limit = DRY_RUN_LLM_LIMIT if dry_run else None
     limit = _conf_int(conf, "limit", default_limit)
     logger.info("fin_product_map llm 시작: dry_run=%s limit=%s", dry_run, limit)
-    return llm_product_map(dry_run=dry_run, limit=limit)
+    result = llm_product_map(dry_run=dry_run, limit=limit)
+    new_count = int(result.get("new_classified") or 0)
+    if not dry_run and new_count > 0:
+        send_telegram(
+            "[상품 매핑] 신규 상품 분류 완료\n"
+            f"신규 상품: {new_count}건\n"
+            f"검수 대상: {result.get('review_rows', 0)}건\n"
+            "fin_product_map_review.csv를 확인해주세요."
+        )
+    return result
 
 
 with DAG(
@@ -97,4 +114,9 @@ with DAG(
         python_callable=run_llm,
     )
 
-    t1 >> t2
+    t1_5 = PythonOperator(
+        task_id="build_fin_product_map_train_json",
+        python_callable=run_build_train_json,
+    )
+
+    t1 >> t1_5 >> t2

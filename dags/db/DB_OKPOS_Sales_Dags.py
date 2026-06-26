@@ -8,7 +8,7 @@ OKPOS 매출 원본파일 자동 수집 DAG
 4. 합계 제거 + 매장명 추가 후 brand=도리당/store={매장}/ym={YYYY-MM}/{page_type}.csv 저장
 5. log.parquet 실행 이력 기록
 
-매일 06:00 KST 실행 (DB_OKPOS_SALES_TIME)
+매일 07:45 KST 실행 (DB_OKPOS_SALES_TIME)
 인증: OKPOS ID/PW (파이프라인 상수)
 """
 

@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 BAEMIN_SOURCE = "배민수동"
 BAEMIN_PLATFORM = "배달의민족"
+BAEMIN_REPLACED_PLATFORMS = {BAEMIN_PLATFORM, "배민1", "배민 포장"}
 
 
 def reconcile_baemin_for_test_stores(
@@ -118,7 +119,7 @@ def enforce_baemin_manual_only_for_test_stores(
     """TEST_STORES의 배달의민족 최종 방어막.
 
     모든 채널 적재/재분류가 끝난 뒤, 테스트 매장에 대해
-    platform=배달의민족 행은 source=배민수동만 남기고 나머지 source는 제거한다.
+    배민 계열 플랫폼 행은 source=배민수동만 남기고 나머지 source는 제거한다.
     """
     if not stores:
         return "TEST_STORES 없음 - 배민수동 최종 정리 스킵"
@@ -138,21 +139,9 @@ def enforce_baemin_manual_only_for_test_stores(
             continue
 
         df = pd.read_parquet(daily_path).reindex(columns=UNIFIED_COLUMNS, fill_value="")
-        manual_store_set = set(
-            df.loc[
-                df["store"].fillna("").astype(str).str.strip().isin(store_set)
-                & df["platform"].fillna("").astype(str).str.strip().eq(BAEMIN_PLATFORM)
-                & df["source"].fillna("").astype(str).str.strip().eq(BAEMIN_SOURCE),
-                "store",
-            ].fillna("").astype(str).str.strip()
-        )
-        if not manual_store_set:
-            logger.info("배민수동 최종 정리 스킵, 수동 행 없음: %s", daily_path.name)
-            continue
-
         remove_mask = (
-            df["store"].fillna("").astype(str).str.strip().isin(manual_store_set)
-            & df["platform"].fillna("").astype(str).str.strip().eq(BAEMIN_PLATFORM)
+            df["store"].fillna("").astype(str).str.strip().isin(store_set)
+            & df["platform"].fillna("").astype(str).str.strip().isin(BAEMIN_REPLACED_PLATFORMS)
             & ~df["source"].fillna("").astype(str).str.strip().eq(BAEMIN_SOURCE)
         )
         removed = int(remove_mask.sum())
@@ -249,7 +238,7 @@ def _collect_existing_unified_baemin_dates(stores: list[str]) -> set[str]:
 
         mask = (
             df["store"].fillna("").astype(str).str.strip().isin(store_set)
-            & df["platform"].fillna("").astype(str).str.strip().eq(BAEMIN_PLATFORM)
+            & df["platform"].fillna("").astype(str).str.strip().isin(BAEMIN_REPLACED_PLATFORMS)
         )
         if mask.any():
             dates.update(df.loc[mask, "sale_date"].fillna("").astype(str).str.strip().tolist())
@@ -443,7 +432,7 @@ def _upsert_daily(df_new: pd.DataFrame, date: str, store: str) -> tuple[int, int
         df_existing = pd.read_parquet(daily_path).reindex(columns=UNIFIED_COLUMNS, fill_value="")
         remove_mask = (
             df_existing["store"].fillna("").astype(str).str.strip().eq(store)
-            & df_existing["platform"].fillna("").astype(str).str.strip().eq(BAEMIN_PLATFORM)
+            & df_existing["platform"].fillna("").astype(str).str.strip().isin(BAEMIN_REPLACED_PLATFORMS)
         )
         removed_count = int(remove_mask.sum())
         df_existing = df_existing[~remove_mask]

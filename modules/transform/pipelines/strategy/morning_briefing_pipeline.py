@@ -62,6 +62,11 @@ _WINDOWS_SCHEDULED_TASKS = [
         "task_name": "Airflow_Codex_MD_Improver_Weekly",
         "duplicate": False,
     },
+    {
+        "label": "노션 캘린더 캐시",
+        "task_name": "NotionCalendarCache",
+        "duplicate": False,
+    },
 ]
 
 
@@ -95,10 +100,18 @@ def _collect_cached_calendar_events() -> list[dict]:
         logger.warning("Calendar cache 없음: %s", _CALENDAR_CACHE_PATH)
         return []
     try:
-        payload = json.loads(_CALENDAR_CACHE_PATH.read_text(encoding="utf-8"))
+        raw = _CALENDAR_CACHE_PATH.read_bytes()
+        try:
+            payload_text = raw.decode("utf-8-sig")
+        except Exception:
+            payload_text = raw.decode("utf-8")
+        payload = json.loads(payload_text)
         today = pendulum.now("Asia/Seoul").to_date_string()
         if payload.get("date") != today:
             logger.warning("Calendar cache 날짜 불일치: cache=%s today=%s", payload.get("date"), today)
+            return []
+        if payload.get("source") != "notion_calendar":
+            logger.warning("Calendar cache source 불일치: %s", payload.get("source"))
             return []
         events = payload.get("events") or []
         return [
@@ -890,7 +903,9 @@ def generate_briefing(**context):
             f"  {e['time']}  {e['summary']}" + (f" ({e.get('status')})" if e.get("status") else "")
             for e in data["calendar"]
         )
-        sections.append(f"📅 오늘 일정\n{cal_lines}")
+    else:
+        cal_lines = "  (없음)"
+    sections.append(f"📅 오늘 일정\n{cal_lines}")
 
     # 실패/경고 DAG (어제)
     if fail_lines:

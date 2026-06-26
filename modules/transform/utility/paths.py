@@ -294,13 +294,12 @@ _RESOLVERS = {
     # Derived — MART_DB 계열
     "COLLECTION_COMPARE_PATH":      lambda: _get("MART_DB") / "collection_compare" / "collection_compare.parquet",
     "FIN_PRODUCT_CSV_PATH":         lambda: _get("MART_DB") / "fin_product" / "fin_product_grp.csv",
+    "FIN_PRODUCT_GRP_TRAIN_JSON_PATH": lambda: _get("MART_DB") / "fin_product" / "fin_product_grp_train.json",
     "FIN_PRODUCT_REVIEW_CSV_PATH":  lambda: _get("MART_DB") / "fin_product" / "fin_product_review.csv",
     "FIN_PRODUCT_ALIAS_CSV_PATH":   lambda: _get("MART_DB") / "fin_product" / "fin_product_alias.csv",
-    "FIN_PRODUCT_MART_CSV_PATH":    lambda: _get("MART_DB") / "fin_product" / "fin_product_mart.csv",
-    "POSFEED_WHITELIST_CSV_PATH":   lambda: _get("MART_DB") / "fin_product" / "fin_product_posfeed_whitelist.csv",
-    "FIN_PRODUCT_MAP_CSV_PATH":     lambda: _get("MART_DB") / "fin_product" / "fin_product_map.csv",
-    "FIN_PRODUCT_MAP_REVIEW_CSV_PATH": lambda: _get("MART_DB") / "fin_product" / "fin_product_map_review.csv",
-    "FIN_PRODUCT_MAP_JSON_PATH":    lambda: _get("MART_DB") / "fin_product" / "fin_product_map.json",
+    "FIN_PRODUCT_MAP_CSV_PATH":         lambda: _get("MART_DB") / "fin_product" / "fin_product_map.csv",
+    "FIN_PRODUCT_MAP_REVIEW_CSV_PATH":  lambda: _get("MART_DB") / "fin_product" / "fin_product_map_review.csv",
+    "FIN_PRODUCT_MAP_TRAIN_JSON_PATH": lambda: _get("MART_DB") / "fin_product" / "fin_product_map_train.json",
     "UNIFIED_REVIEW_MART_DIR":      lambda: _get("MART_DB") / "unified_review",
     # Derived — STORE_SALES 계열
     "STORE_SALES_TARGET_DIR":        lambda: _get("ANALYTICS_DB") / "store_sales_target",

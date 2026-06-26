@@ -26,6 +26,7 @@ ARCHIVE_DIR = COLLECT_SRC / "_archived"
 
 _REQUIRED = {"주문상태", "주문번호", "주문시각", "결제금액"}
 _STATUS_DELIVERED = "배달완료"
+_UPSERT_KEY_CANDIDATES = ["주문번호", "주문옵션상세", "주문옵션금액", "주문내역", "주문수량"]
 
 
 def _ym_from_order_time(value: str) -> str:
@@ -50,6 +51,25 @@ def _archive_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
     raise RuntimeError(f"cannot create archive path for {path}")
+
+
+def _upsert_manual_rows(existing: pd.DataFrame | None, new_df: pd.DataFrame) -> tuple[pd.DataFrame, int, int]:
+    """월 파티션 기존 행을 보존하고, 같은 주문/옵션 행은 신규 CSV로 덮어쓴다."""
+    new_df = new_df.reindex(columns=_COLUMNS, fill_value="").fillna("").astype(str)
+    if existing is None or existing.empty:
+        return new_df, 0, len(new_df)
+
+    existing = existing.reindex(columns=_COLUMNS, fill_value="").fillna("").astype(str)
+    combined = pd.concat([existing, new_df], ignore_index=True)
+    key_cols = [col for col in _UPSERT_KEY_CANDIDATES if col in combined.columns]
+    if "주문번호" not in key_cols:
+        logger.warning("manual baemin upsert key missing 주문번호, append only")
+        return combined, 0, len(combined)
+
+    before = len(combined)
+    combined = combined.drop_duplicates(subset=key_cols, keep="last").reset_index(drop=True)
+    dropped = before - len(combined)
+    return combined.reindex(columns=_COLUMNS, fill_value=""), dropped, len(combined)
 
 
 def _load_one_file(csv_path: Path) -> tuple[int, bool]:
@@ -104,17 +124,26 @@ def _load_one_file(csv_path: Path) -> tuple[int, bool]:
         existing = read_table(stem)
         if existing is not None and not existing.empty:
             logger.info(
-                "manual baemin partition replace: %s/%s ym=%s existing=%d new=%d",
+                "manual baemin partition upsert: %s/%s ym=%s existing=%d new=%d",
                 brand,
                 store_key,
                 ym,
                 len(existing),
                 len(new_df),
             )
-        combined = new_df
+        combined, dropped, final_rows = _upsert_manual_rows(existing, new_df)
         out_path = write_table(combined, stem)
         total_rows += len(new_df)
-        logger.info("ingest complete: %s/%s ym=%s rows=%d -> %s", brand, store_key, ym, len(new_df), out_path)
+        logger.info(
+            "ingest complete: %s/%s ym=%s new=%d dedup=%d final=%d -> %s",
+            brand,
+            store_key,
+            ym,
+            len(new_df),
+            dropped,
+            final_rows,
+            out_path,
+        )
 
     return total_rows, True
 

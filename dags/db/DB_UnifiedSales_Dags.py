@@ -50,6 +50,7 @@ from modules.transform.pipelines.db.DB_UnifiedSales_validate import (
     validate_monthly_sales,
     build_daily_summary as pipeline_build_daily_summary,
 )
+from modules.transform.pipelines.db.DB_Beamin_pc2_distribute import ingest_baemin_pc2_inbox
 
 logger = logging.getLogger(__name__)
 
@@ -83,10 +84,11 @@ default_args = {
 # LOOKBACK_DAYS:
 # - int  : 최근 N일 누락분 보충
 # - None : 전체 소스 CSV 백필
-LOOKBACK_DAYS: int | None = 7
+LOOKBACK_DAYS: int | None = None
 
-# 배민 직수집 교정 대상 테스트 매장 (검증 완료 후 확대)
-TEST_STORES: list[str] = ["해운대중동점", "법흥리점", "송파삼전점", "동탄영천점", "중랑면목점", "시흥배곧점", "동두천지행점", "평택비전점"]
+# 배민·쿠팡 직수집 교정 대상 테스트 매장 (검증 완료 후 확대)
+#  ["해운대중동점", "법흥리점", "송파삼전점", "동탄영천점", "중랑면목점", "시흥배곧점", "동두천지행점", "평택비전점"]
+TEST_STORES: list[str] = ["해운대중동점", "법흥리점", "송파삼전점"]
 
 UPSTREAM_POS_TASKS = [
     {
@@ -221,6 +223,10 @@ def resolve_date(**context) -> str:
     return f"Lookback {LOOKBACK_DAYS}일 모드"
 
 
+def ingest_pc2(**context) -> str:
+    return ingest_baemin_pc2_inbox(**context)
+
+
 def build_okpos(**context) -> str:
     """okpos → unified_sales 저장.
 
@@ -338,8 +344,7 @@ def reconcile_baemin(**context) -> str:
 
 def reconcile_coupang(**context) -> str:
     """TEST_STORES의 쿠팡 직수집 데이터로 UnifiedSales 쿠팡이츠 행 교정."""
-    stores = [store for store in TEST_STORES if store != "법흥리점"]
-    if not stores:
+    if not TEST_STORES:
         return "쿠팡수동 대상 TEST_STORES 없음 - 스킵"
     from modules.transform.pipelines.db.DB_UnifiedSales_coupang import (
         reconcile_coupang_for_test_stores,
@@ -347,7 +352,7 @@ def reconcile_coupang(**context) -> str:
 
     sale_date = context["ti"].xcom_pull(task_ids="resolve_date", key="sale_date")
     return reconcile_coupang_for_test_stores(
-        stores=stores,
+        stores=TEST_STORES,
         sale_date=sale_date,
         lookback_days=LOOKBACK_DAYS or 7,
     )
@@ -359,7 +364,7 @@ def report_posfeed_exclusions(**context) -> str:
 
 
 def sync_posfeed_blacklist(**context) -> str:
-    """fin_product_posfeed_whitelist.csv의 N 항목을 기존 parquet에 소급 적용 (매 실행마다)."""
+    """fin_product_grp.csv의 posfeed N 항목을 기존 parquet에 소급 적용 (매 실행마다)."""
     return pipeline_sync_posfeed_blacklist()
 
 
@@ -399,8 +404,7 @@ def enforce_baemin_manual_only(**context) -> str:
 
 def enforce_coupang_manual_only(**context) -> str:
     """최종 방어: TEST_STORES의 쿠팡이츠는 쿠팡수동만 남긴다."""
-    stores = [store for store in TEST_STORES if store != "법흥리점"]
-    if not stores:
+    if not TEST_STORES:
         return "쿠팡수동 대상 TEST_STORES 없음 - 스킵"
     from modules.transform.pipelines.db.DB_UnifiedSales_coupang import (
         enforce_coupang_manual_only_for_test_stores,
@@ -408,7 +412,7 @@ def enforce_coupang_manual_only(**context) -> str:
 
     sale_date = context["ti"].xcom_pull(task_ids="resolve_date", key="sale_date")
     return enforce_coupang_manual_only_for_test_stores(
-        stores=stores,
+        stores=TEST_STORES,
         sale_date=sale_date,
         lookback_days=LOOKBACK_DAYS or 7,
     )
@@ -432,6 +436,11 @@ with DAG(
     t_wait = PythonOperator(
         task_id="wait_for_upstream_pos",
         python_callable=wait_for_upstream_pos,
+    )
+
+    t_ingest_pc2 = PythonOperator(
+        task_id="ingest_baemin_pc2_inbox",
+        python_callable=ingest_pc2,
     )
 
     t3 = PythonOperator(
@@ -515,4 +524,4 @@ with DAG(
     )
 
     # 순차 실행: 같은 날짜 parquet에 동시 write 방지
-    t1 >> t_wait >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5b >> t5c >> t_baemin >> t_coupang >> t6 >> t6a >> t6b >> t7 >> t8 >> t9
+    t1 >> t_ingest_pc2 >> t_wait >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5b >> t5c >> t_baemin >> t_coupang >> t6 >> t6a >> t6b >> t7 >> t8 >> t9

@@ -13,6 +13,7 @@ from modules.transform.pipelines.db.DB_BaeminManual_load import (
     load_manual_baemin_orders,
     cleanup_manual_baemin_orders,
 )
+from modules.transform.pipelines.db.DB_Beamin_pc2_distribute import ingest_baemin_pc2_inbox
 from modules.transform.utility.schedule import DB_COLLECTION_COMPARE_TIME
 
 dag_id = Path(__file__).stem
@@ -43,6 +44,10 @@ def _latest_macro_execution_date(dt, **kwargs):
     return eligible[0].execution_date if eligible else dt
 
 
+def ingest_pc2(**context) -> str:
+    return ingest_baemin_pc2_inbox(**context)
+
+
 with DAG(
     dag_id=dag_id,
     schedule=DB_COLLECTION_COMPARE_TIME,
@@ -52,6 +57,11 @@ with DAG(
     default_args=default_args,
     tags=["db", "dashboard", "collection_compare", "powerbi"],
 ) as dag:
+    ingest_pc2_inbox = PythonOperator(
+        task_id="ingest_baemin_pc2_inbox",
+        python_callable=ingest_pc2,
+    )
+
     ingest_baemin = PythonOperator(
         task_id="ingest_manual_baemin_orders",
         python_callable=load_manual_baemin_orders,
@@ -79,5 +89,5 @@ with DAG(
         python_callable=build_collection_compare,
     )
 
-    ingest_baemin >> cleanup_baemin
+    ingest_pc2_inbox >> ingest_baemin >> cleanup_baemin
     [cleanup_baemin, ensure_coupang_macro_loaded] >> build_compare
