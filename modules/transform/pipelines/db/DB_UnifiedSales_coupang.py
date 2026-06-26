@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 COUPANG_SOURCE = "쿠팡수동"
 COUPANG_PLATFORM = "쿠팡이츠"
+COUPANG_REPLACED_PLATFORMS = {COUPANG_PLATFORM, "쿠팡 포장"}
 
 _DEDUP_COLUMNS = [
     "store_id",
@@ -125,21 +126,9 @@ def enforce_coupang_manual_only_for_test_stores(
             continue
 
         df = pd.read_parquet(daily_path).reindex(columns=UNIFIED_COLUMNS, fill_value="")
-        manual_store_set = set(
-            df.loc[
-                df["store"].fillna("").astype(str).str.strip().isin(store_set)
-                & df["platform"].fillna("").astype(str).str.strip().eq(COUPANG_PLATFORM)
-                & df["source"].fillna("").astype(str).str.strip().eq(COUPANG_SOURCE),
-                "store",
-            ].fillna("").astype(str).str.strip()
-        )
-        if not manual_store_set:
-            logger.info("쿠팡수동 최종 정리 스킵, 수동 행 없음: %s", daily_path.name)
-            continue
-
         remove_mask = (
-            df["store"].fillna("").astype(str).str.strip().isin(manual_store_set)
-            & df["platform"].fillna("").astype(str).str.strip().eq(COUPANG_PLATFORM)
+            df["store"].fillna("").astype(str).str.strip().isin(store_set)
+            & df["platform"].fillna("").astype(str).str.strip().isin(COUPANG_REPLACED_PLATFORMS)
             & ~df["source"].fillna("").astype(str).str.strip().eq(COUPANG_SOURCE)
         )
         removed = int(remove_mask.sum())
@@ -441,7 +430,7 @@ def _upsert_daily(df_new: pd.DataFrame, date: str, store: str) -> tuple[int, int
         df_existing = pd.read_parquet(daily_path).reindex(columns=UNIFIED_COLUMNS, fill_value="")
         remove_mask = (
             df_existing["store"].fillna("").astype(str).str.strip().eq(store)
-            & df_existing["platform"].fillna("").astype(str).str.strip().eq(COUPANG_PLATFORM)
+            & df_existing["platform"].fillna("").astype(str).str.strip().isin(COUPANG_REPLACED_PLATFORMS)
         )
         removed_count = int(remove_mask.sum())
         df_existing = df_existing[~remove_mask]

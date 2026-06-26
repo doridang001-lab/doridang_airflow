@@ -91,98 +91,6 @@ LOOKBACK_DAYS: int | None = 1
 TEST_STORES: list[str] = ["송파삼전점"]
 TARGET_STORES: list[str] = ["송파삼전점"]
 
-UPSTREAM_POS_TASKS = []
-
-
-def _truthy(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    return str(value).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
-
-
-def wait_for_upstream_pos(**context) -> str:
-    """정기 실행에서 POS 원천 수집 DAG 완료를 확인한다.
-
-    수동 정정 실행은 기본적으로 대기하지 않는다. 수동 실행에서도 상류 완료를
-    강제하고 싶으면 dag_run.conf에 {"wait_upstreams": true}를 넣는다.
-    """
-    import time
-
-    from airflow import settings
-    from airflow.exceptions import AirflowException
-    from airflow.models.dagrun import DagRun
-    from airflow.models.taskinstance import TaskInstance
-
-    dag_run = context.get("dag_run")
-    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    run_type = str(getattr(dag_run, "run_type", "") or "").lower()
-    is_manual = "manual" in run_type or bool(getattr(dag_run, "external_trigger", False))
-
-    if is_manual and not _truthy(conf.get("wait_upstreams")):
-        logger.info("수동 실행: 상류 POS 대기 스킵 (wait_upstreams=true 아님)")
-        return "수동 실행: 상류 POS 대기 스킵"
-
-    logical_date = context.get("logical_date") or getattr(dag_run, "logical_date", None) or getattr(dag_run, "execution_date", None)
-    if logical_date is None:
-        raise AirflowException("logical_date를 확인할 수 없어 상류 POS 대기 불가")
-
-    timeout_seconds = int(conf.get("upstream_wait_timeout_seconds") or 60 * 60 * 6)
-    poke_interval = int(conf.get("upstream_wait_poke_interval") or 60)
-    deadline = time.monotonic() + timeout_seconds
-
-    while True:
-        pending: list[str] = []
-        completed: list[str] = []
-        session = settings.Session()
-        try:
-            for spec in UPSTREAM_POS_TASKS:
-                target_logical_date = logical_date - spec["execution_delta"]
-                upstream_run = (
-                    session.query(DagRun)
-                    .filter(DagRun.dag_id == spec["dag_id"])
-                    .filter(DagRun.execution_date == target_logical_date)
-                    .one_or_none()
-                )
-                label = f"{spec['dag_id']}.{spec['task_id']}@{target_logical_date}"
-                if upstream_run is None:
-                    pending.append(f"{label}: dag_run 없음")
-                    continue
-                run_label = f"{label} run_id={upstream_run.run_id}"
-
-                ti = (
-                    session.query(TaskInstance)
-                    .filter(TaskInstance.dag_id == spec["dag_id"])
-                    .filter(TaskInstance.task_id == spec["task_id"])
-                    .filter(TaskInstance.run_id == upstream_run.run_id)
-                    .one_or_none()
-                )
-                if ti is None:
-                    pending.append(f"{run_label}: task_instance 없음")
-                    continue
-
-                state = str(ti.state or "").lower()
-                if state in {"success", "skipped"}:
-                    completed.append(f"{run_label}: state={state}")
-                    continue
-                if state in {"failed", "upstream_failed"}:
-                    raise AirflowException(f"상류 POS 실패: {run_label} state={ti.state}")
-                pending.append(f"{run_label}: state={ti.state}")
-        finally:
-            session.close()
-
-        if not pending:
-            logger.info("상류 POS 완료 확인: %s", " | ".join(completed[:10]))
-            return "상류 POS 완료 확인"
-
-        if time.monotonic() >= deadline:
-            raise AirflowException("상류 POS 대기 timeout: " + " | ".join(pending[:10]))
-
-        logger.info("상류 POS 대기 중: %s", " | ".join(pending[:10]))
-        time.sleep(poke_interval)
-
-
 def resolve_date(**context) -> str:
     """conf['sale_date'] → XCom push (정정 모드). 없으면 None push."""
     dag_run   = context.get("dag_run")
@@ -301,7 +209,7 @@ def report_posfeed_exclusions(**context) -> str:
 
 
 def sync_posfeed_blacklist(**context) -> str:
-    """fin_product_posfeed_whitelist.csv의 N 항목을 기존 parquet에 소급 적용 (매 실행마다)."""
+    """fin_product_grp.csv의 posfeed N 항목을 기존 parquet에 소급 적용 (매 실행마다)."""
     return "송파삼전점 Launch 범위 밖 - posfeed blacklist 동기화 스킵"
 
 
@@ -369,11 +277,6 @@ with DAG(
     t1 = PythonOperator(
         task_id="resolve_date",
         python_callable=resolve_date,
-    )
-
-    t_wait = PythonOperator(
-        task_id="wait_for_upstream_pos",
-        python_callable=wait_for_upstream_pos,
     )
 
     t3 = PythonOperator(
@@ -459,4 +362,4 @@ with DAG(
     )
 
     # 순차 실행: 같은 날짜 parquet에 동시 write 방지
-    t1 >> t_wait >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5b >> t5c >> t_baemin >> t_coupang >> t6 >> t6a >> t6b >> t7 >> t8 >> t9
+    t1 >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5b >> t5c >> t_baemin >> t_coupang >> t6 >> t6a >> t6b >> t7 >> t8 >> t9

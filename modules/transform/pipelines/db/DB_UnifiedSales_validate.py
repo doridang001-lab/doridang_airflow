@@ -5,7 +5,7 @@ unified_sales 일별/월별 검증 파이프라인.
 1. 대상일 1일을 결정한다.
 2. MART_DB/unified_sales_grp/unified_sales_*.parquet 에서 sale_date+store 기준 total_price를 집계한다.
 3. ToOrder 일별 store/platform parquet에서 같은 기준으로 집계한다.
-4. 수동 교정 기준을 쓰는 TEST_STORES는 토더 기준 검증에서 제외한다.
+4. TEST_STORES를 포함해 토더 기준 검증을 수행한다.
 5. outer join 으로 비교하고 오차율 2% 이상 매장을 Telegram으로 알림 발송한다.
 6. 일별 결과: MART_DB/unified_sales_grp_error_list/unified_sales_error_YYYY-MM-DD.csv
 7. 월별 결과: MART_DB/unified_sales_grp_error_list/unified_sales_monthly_YYYY-MM.csv
@@ -79,20 +79,17 @@ _COL_LABELS = {
     "status": "상태",
 }
 
-BAEMIN_MANUAL_TEST_STORES = {"해운대중동점", "법흥리점", "송파삼전점"}
-COUPANG_MANUAL_TEST_STORES = {"해운대중동점", "송파삼전점"}
-VALIDATION_EXCLUDED_TEST_STORES = BAEMIN_MANUAL_TEST_STORES | COUPANG_MANUAL_TEST_STORES
-VALIDATION_SCOPE_NOTE = "기준: TEST_STORES 제외, 나머지 매장 토더↔unified 비교"
+VALIDATION_SCOPE_NOTE = "기준: TEST_STORES 포함, 전체 매장 토더↔unified 비교"
 
 
 def _apply_validation_scope(df: pd.DataFrame) -> pd.DataFrame:
-    """TEST_STORES는 수동 교정 기준이 달라 토더 기준 검증에서 제외한다."""
+    """검증 대상 범위를 적용한다."""
     if df.empty or "store" not in df.columns:
         return df
 
     scoped = df.copy()
     scoped["store"] = scoped["store"].astype(str).str.strip()
-    return scoped[~scoped["store"].isin(VALIDATION_EXCLUDED_TEST_STORES)].copy()
+    return scoped
 
 
 def _filter_target_stores(df: pd.DataFrame, target_stores: list[str] | None = None) -> pd.DataFrame:

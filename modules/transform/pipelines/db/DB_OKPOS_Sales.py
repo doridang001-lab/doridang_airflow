@@ -2166,11 +2166,10 @@ def _transform_okpos_daily_df(df: pd.DataFrame, store_name: str, sale_date: str)
     )
     if row_amount_sum == 0 and data["일자"].map(_is_zero_business_days_marker).any():
         logger.info(
-            "daily '영업일수합: 0 일' 감지 → OKPOS 미마감/매출없음으로 판단, empty 반환: %s | %s",
+            "daily '영업일수합: 0 일' 감지: 수집 지연 후보로 판단, 추후 order 기반 유도 처리: %s | %s",
             sale_date,
             store_name,
         )
-        return pd.DataFrame(), sale_date[:7]
 
     out = pd.DataFrame([{
         "sale_date": sale_date,
@@ -2595,13 +2594,29 @@ def save_to_raw(**context) -> str:
 
                 if page_type == "daily":
                     df, ym = _transform_okpos_daily_df(raw_df, store_name, sale_date)
-                    if df.empty or (
-                        {"총매출액", "총할인액", "실매출액", "영수건수"}.issubset(df.columns)
-                        and int(df[["총매출액", "총할인액", "실매출액", "영수건수"]].apply(_to_int_series).sum(axis=1).iloc[0]) == 0
-                    ):
+                    is_zero_daily = False
+                    if df.empty:
+                        is_zero_daily = True
+                    elif {"총매출액", "총할인액", "실매출액", "영수건수"}.issubset(df.columns):
+                        is_zero_daily = int(df[["총매출액", "총할인액", "실매출액", "영수건수"]].apply(_to_int_series).sum(axis=1).iloc[0]) == 0
+
+                    if is_zero_daily:
                         derived = _derive_daily_from_order_csv(store_short, store_name, sale_date, ym)
                         if not derived.empty:
                             df = derived
+                        else:
+                            if likely_okpos:
+                                logger.info(
+                                    "daily 0원 + 유효 order 없음으로 판단해 NO_DATA 마킹: %s | %s",
+                                    page_type,
+                                    key,
+                                )
+                                _mark_no_data(store_short, ym, csv_name, sale_date, reason=f"{page_type}:zero_daily_no_order")
+                                src.unlink(missing_ok=True)
+                                continue
+                            logger.warning(f"daily 0원 처리 실패(헤더 의심) → 스킵: {page_type} | {key}")
+                            save_errors.append(f"{page_type}:{key}:zero_daily_unexpected")
+                            continue
                 else:
                     df, ym = _transform_okpos_df(raw_df, store_name, sale_date)
                 if df.empty:
@@ -3118,13 +3133,32 @@ def reconcile_against_daily_summary(target_stores: list | None = None, **context
                 likely_okpos = _is_likely_okpos_report(raw_df)
                 if page_type == "daily":
                     df_new, ym_new = _transform_okpos_daily_df(raw_df, store_name, sale_date)
-                    if df_new.empty or (
-                        {"총매출액", "총할인액", "실매출액", "영수건수"}.issubset(df_new.columns)
-                        and int(df_new[["총매출액", "총할인액", "실매출액", "영수건수"]].apply(_to_int_series).sum(axis=1).iloc[0]) == 0
-                    ):
+                    is_zero_daily = False
+                    if df_new.empty:
+                        is_zero_daily = True
+                    elif {"총매출액", "총할인액", "실매출액", "영수건수"}.issubset(df_new.columns):
+                        is_zero_daily = int(df_new[["총매출액", "총할인액", "실매출액", "영수건수"]].apply(_to_int_series).sum(axis=1).iloc[0]) == 0
+
+                    if is_zero_daily:
                         derived = _derive_daily_from_order_csv(store_short, store_name, sale_date, ym_new)
                         if not derived.empty:
                             df_new = derived
+                        else:
+                            if likely_okpos:
+                                _mark_no_data(
+                                    store_short,
+                                    ym_new,
+                                    csv_stem,
+                                    sale_date,
+                                    reason=f"daily_reconcile:{page_type}:zero_no_order({attempt_tag})",
+                                )
+                            else:
+                                logger.warning(
+                                    "daily 0원 처리 실패(헤더 의심) → 재수집 스킵: %s | %s",
+                                    attempt_tag,
+                                    key,
+                                )
+                            continue
                 else:
                     df_new, ym_new = _transform_okpos_df(raw_df, store_name, sale_date)
                 if df_new.empty:

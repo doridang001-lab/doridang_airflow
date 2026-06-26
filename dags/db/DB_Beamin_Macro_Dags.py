@@ -87,7 +87,7 @@ TARGET_STORES = [
 ]  # exact match; empty list means all stores
 # None: 전체 수집, "상위": 가나다순 상위 절반, "하위": 가나다순 하위 절반(나머지)
 # ex ) COLLECT_RANGE="상위" → 가나다순 상위 절반만 수집
-COLLECT_RANGE: str | None = '상위' # 상위, 하위, None
+COLLECT_RANGE: str | None = None # 상위, 하위, None
 
 # ─── 주문내역 백필 제어 ────────────────────────────────────────────────────────
 # None  → 어제 1일만 수집 (기본)

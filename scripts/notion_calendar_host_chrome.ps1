@@ -19,7 +19,8 @@ param(
     [switch]$UseDefaultProfile,
     [string]$ProfileDir = "C:\notion_calendar_edge_profile",
     [string]$ProfileDirectory = "",
-    [int]$Port = 9223
+    [int]$Port = 9223,
+    [string]$RemoteDebugAddress = "127.0.0.1"
 )
 
 [Console]::InputEncoding = [System.Text.Encoding]::UTF8
@@ -93,7 +94,7 @@ if ($UseDefaultProfile) {
 
 $chromeArgs = @(
     "--remote-debugging-port=$Port",
-    "--remote-debugging-address=127.0.0.1",
+    "--remote-debugging-address=$RemoteDebugAddress",
     "--remote-allow-origins=*",
     "--user-data-dir=$ProfileDir",
     "--no-first-run",

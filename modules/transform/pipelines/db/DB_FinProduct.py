@@ -22,9 +22,9 @@ import pandas as pd
 from modules.transform.utility.paths import (
     ANALYTICS_DB,
     FIN_PRODUCT_CSV_PATH,
+    FIN_PRODUCT_GRP_TRAIN_JSON_PATH,
     FIN_PRODUCT_REVIEW_CSV_PATH,
     FIN_PRODUCT_ALIAS_CSV_PATH,
-    FIN_PRODUCT_MART_CSV_PATH,
     MART_DB,
 )
 from modules.transform.utility.mailer import send_email
@@ -70,7 +70,63 @@ _EASYPOS_COL_MAP = {
     "판매단가": "판매가",
 }
 
-_CLASSIFY_LABELS = ["메인", "1인", "사이드", "기타"]
+_CLASSIFY_LABELS = ["메인", "1인", "사이드", "토핑", "옵션", "주류", "음료", "이벤트", "기타"]
+_TRAIN_EXAMPLES_PER_LABEL = 30
+_DIRECT_RULE_CONFIDENCE = 90
+_DIRECT_EXAMPLE_CONFIDENCE = 85
+_TRAIN_RULES = {
+    "version": 1,
+    "allowed_labels": _CLASSIFY_LABELS,
+    "decision_order": ["주류", "음료", "이벤트", "기타", "옵션", "토핑", "사이드", "1인", "메인"],
+    "hard_rules": [
+        "배달비, 할인, 직원호출, 쿠폰, 리뷰 안내처럼 실제 판매 음식이 아닌 항목은 기타",
+        "맵기, 맛, 단계, 선택, 변경처럼 조리 옵션을 고르는 항목은 옵션",
+        "사리, 떡, 버섯, 분모자, 당면, 치즈, 우삼겹, 대창, 묵은지, 파김치, 미나리 추가는 토핑",
+        "소주, 맥주, 막걸리, 하이볼, 참이슬, 처음처럼, 카스, 테라, 켈리는 주류",
+        "콜라, 사이다, 환타, 제로, 생수, 음료는 음료",
+        "리뷰, 이벤트, 서비스, 증정 목적의 항목은 이벤트",
+        "닭도리탕, 곱도리탕, 닭한마리, 전골, 찜닭처럼 주문 중심이 되는 본품은 메인",
+        "메인이 아니면 is_main_candidate는 반드시 N",
+    ],
+    "label_rules": {
+        "메인": {
+            "description": "주문의 중심이 되는 대표 음식 메뉴",
+            "keywords": ["닭도리탕", "곱도리탕", "닭한마리", "전골", "찜닭", "세트", "정식"],
+        },
+        "1인": {
+            "description": "1인 전용 메인 메뉴 또는 혼밥형 본품",
+            "keywords": ["1인", "혼밥", "나홀로"],
+        },
+        "사이드": {
+            "description": "단독 사이드 음식",
+            "keywords": ["공기밥", "볶음밥", "주먹밥", "계란찜", "튀김", "전", "감자전"],
+        },
+        "토핑": {
+            "description": "메인 메뉴에 추가되는 재료",
+            "keywords": ["추가", "사리", "떡", "버섯", "분모자", "당면", "치즈", "우삼겹", "대창", "묵은지", "파김치", "미나리", "누룽지"],
+        },
+        "옵션": {
+            "description": "맛, 맵기, 단계, 조리 방식, 선택값",
+            "keywords": ["맵기", "맛", "단계", "선택", "변경", "순한맛", "보통맛", "매운맛"],
+        },
+        "주류": {
+            "description": "술",
+            "keywords": ["소주", "맥주", "막걸리", "하이볼", "참이슬", "처음처럼", "카스", "테라", "켈리", "새로"],
+        },
+        "음료": {
+            "description": "비주류 음료",
+            "keywords": ["콜라", "사이다", "환타", "제로", "생수", "음료", "토닉워터"],
+        },
+        "이벤트": {
+            "description": "리뷰, 증정, 프로모션성 메뉴",
+            "keywords": ["리뷰", "이벤트", "서비스", "증정"],
+        },
+        "기타": {
+            "description": "배달비, 할인, 호출, 시스템성 항목",
+            "keywords": ["배달비", "할인", "직원호출", "쿠폰", "봉투"],
+        },
+    },
+}
 _CHANGE_KEYS = ["대메뉴", "중메뉴", "상품명"]
 
 _XCOM_OKPOS = "okpos_df_json"
@@ -354,17 +410,253 @@ def _read_master() -> pd.DataFrame:
     return df
 
 
-def _build_few_shot(master: pd.DataFrame) -> str:
-    """확정된 분류(llm_check=N) 기준 카테고리별 예시 3개씩 추출."""
-    confirmed = master[master.get("llm_check", pd.Series(["N"] * len(master))) != "Y"] if "llm_check" in master.columns else master
-    if "exclude_check" in confirmed.columns:
-        confirmed = confirmed[confirmed["exclude_check"].fillna("").astype(str).str.strip().str.upper() != "Y"]
-    lines = []
+def _example_row(row: pd.Series) -> dict:
+    return {
+        "source": str(row.get("source", "")).strip(),
+        "구분": str(row.get("구분", "")).strip(),
+        "대메뉴": str(row.get("대메뉴", "")).strip(),
+        "중메뉴": str(row.get("중메뉴", "")).strip(),
+        "상품명": str(row.get("상품명", "")).strip(),
+        "판매단가": str(row.get("판매단가", "")).strip(),
+        "수동분류": str(row.get("수동분류", "")).strip(),
+        "is_main_candidate": str(row.get("is_main_candidate", "")).strip().upper() or "N",
+    }
+
+
+def _build_train_payload(master: pd.DataFrame) -> dict:
+    df = master.copy()
+    for col in ["source", "수동분류", "llm_check", "exclude_check", "is_latest", "상품명", "updated_at"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    df["source"] = df["source"].fillna("").astype(str).str.strip().str.lower()
+    df["수동분류"] = df["수동분류"].fillna("").astype(str).str.strip()
+    df["llm_check"] = df["llm_check"].fillna("").astype(str).str.strip().str.upper().replace({"": "N"})
+    df["exclude_check"] = df["exclude_check"].fillna("").astype(str).str.strip().str.upper().replace({"": "N"})
+    df["is_latest"] = df["is_latest"].fillna("").astype(str).str.strip().str.upper()
+    df["_ts"] = pd.to_datetime(df["updated_at"], errors="coerce").fillna(pd.Timestamp.min)
+
+    confirmed = df[
+        (df["source"] != "posfeed")
+        & (df["llm_check"] != "Y")
+        & (df["exclude_check"] != "Y")
+        & (df["수동분류"].isin(_CLASSIFY_LABELS))
+        & (df["상품명"].fillna("").astype(str).str.strip() != "")
+    ].copy()
+    latest = confirmed[confirmed["is_latest"] == "Y"].copy()
+    if not latest.empty:
+        confirmed = latest
+
+    label_rules = json.loads(json.dumps(_TRAIN_RULES["label_rules"], ensure_ascii=False))
+    counts = confirmed["수동분류"].value_counts().to_dict() if not confirmed.empty else {}
+
     for label in _CLASSIFY_LABELS:
-        samples = confirmed[confirmed["수동분류"] == label].head(3)
-        for _, row in samples.iterrows():
-            lines.append(f'  상품명="{row["상품명"]}", 중메뉴="{row["중메뉴"]}", 대메뉴="{row["대메뉴"]}" → 수동분류="{label}"')
-    return "\n".join(lines) if lines else "  (예시 없음)"
+        label_df = confirmed[confirmed["수동분류"] == label].copy()
+        if label_df.empty:
+            label_rules[label]["examples"] = []
+            continue
+        label_df["_name_key"] = label_df["상품명"].fillna("").astype(str).str.strip()
+        label_df = (
+            label_df.sort_values(["_ts", "_name_key"], ascending=[False, True])
+            .drop_duplicates(subset=["_name_key"], keep="first")
+            .head(_TRAIN_EXAMPLES_PER_LABEL)
+        )
+        label_rules[label]["examples"] = [_example_row(row) for _, row in label_df.iterrows()]
+
+    return {
+        "version": _TRAIN_RULES["version"],
+        "source": str(FIN_PRODUCT_CSV_PATH),
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "allowed_labels": _CLASSIFY_LABELS,
+        "decision_order": _TRAIN_RULES["decision_order"],
+        "hard_rules": _TRAIN_RULES["hard_rules"],
+        "label_counts": {label: int(counts.get(label, 0)) for label in _CLASSIFY_LABELS},
+        "label_rules": label_rules,
+    }
+
+
+def _load_train_payload(master: pd.DataFrame) -> dict:
+    if FIN_PRODUCT_GRP_TRAIN_JSON_PATH.exists():
+        try:
+            data = json.loads(FIN_PRODUCT_GRP_TRAIN_JSON_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("allowed_labels") and data.get("label_rules"):
+                return data
+        except Exception as exc:
+            logger.warning("fin_product_grp_train.json 로드 실패, 즉시 생성값 사용: %s", exc)
+    return _build_train_payload(master)
+
+
+def _normalize_match_text(value: str) -> str:
+    text = re.sub(r"[\[\](){}]", "", str(value))
+    return re.sub(r"[^가-힣a-zA-Z0-9一-鿿]", "", text).lower()
+
+
+def _tokenize_match_text(value: str) -> set[str]:
+    normalized = _normalize_match_text(value)
+    raw_tokens = re.split(r"[^가-힣a-zA-Z0-9一-鿿]+", str(value).lower())
+    tokens = {token for token in raw_tokens if len(token) >= 2}
+    tokens.update(
+        keyword
+        for keyword in [
+            "닭도리탕", "곱도리탕", "닭한마리", "묵은지", "우삼겹", "대창", "파김치",
+            "미나리", "누룽지", "추가", "토핑", "사리", "콜라", "사이다", "소주", "맥주",
+            "배달비", "할인", "리뷰",
+        ]
+        if keyword in normalized
+    )
+    return tokens
+
+
+def _item_match_text(item: dict) -> str:
+    return " ".join(
+        str(item.get(col, "")).strip()
+        for col in ("대메뉴", "중메뉴", "상품명")
+    )
+
+
+def _rule_based_classify(item: dict, train_payload: dict) -> str:
+    text = _item_match_text(item)
+    main_keywords = train_payload.get("label_rules", {}).get("메인", {}).get("keywords", [])
+    topping_markers = ["추가", "토핑", "사리"]
+    if any(keyword in text for keyword in main_keywords) and not any(marker in text for marker in topping_markers):
+        return "메인"
+
+    label_rules = train_payload.get("label_rules", {})
+    for label in train_payload.get("decision_order", _CLASSIFY_LABELS):
+        keywords = label_rules.get(label, {}).get("keywords", [])
+        if any(str(keyword) and str(keyword) in text for keyword in keywords):
+            return label
+    return "기타"
+
+
+def _match_train_json(item: dict, train_payload: dict) -> dict:
+    text = _item_match_text(item)
+    norm_text = _normalize_match_text(text)
+    label_rules = train_payload.get("label_rules", {})
+
+    main_keywords = label_rules.get("메인", {}).get("keywords", [])
+    topping_markers = ["추가", "토핑", "사리"]
+    if any(_normalize_match_text(keyword) in norm_text for keyword in main_keywords) and not any(marker in norm_text for marker in topping_markers):
+        return {
+            "label": "메인",
+            "confidence": _DIRECT_RULE_CONFIDENCE,
+            "method": "json_rule",
+            "reason": "메인 키워드 일치 및 추가/토핑 표현 없음",
+            "evidence": [],
+        }
+
+    for label in train_payload.get("decision_order", _CLASSIFY_LABELS):
+        keywords = label_rules.get(label, {}).get("keywords", [])
+        hit_keywords = [
+            keyword for keyword in keywords
+            if keyword and _normalize_match_text(keyword) in norm_text
+        ]
+        if hit_keywords:
+            return {
+                "label": label,
+                "confidence": _DIRECT_RULE_CONFIDENCE,
+                "method": "json_rule",
+                "reason": "키워드 일치: " + ", ".join(hit_keywords[:5]),
+                "evidence": [],
+            }
+
+    item_tokens = _tokenize_match_text(text)
+    candidates = []
+    for label, rule in label_rules.items():
+        if label not in _CLASSIFY_LABELS:
+            continue
+        for example in rule.get("examples", []):
+            ex_text = " ".join(str(example.get(col, "")) for col in ("대메뉴", "중메뉴", "상품명"))
+            ex_tokens = _tokenize_match_text(ex_text)
+            if not ex_tokens:
+                continue
+            overlap = item_tokens & ex_tokens
+            if not overlap:
+                continue
+            score = int(100 * len(overlap) / max(len(item_tokens), len(ex_tokens), 1))
+            if _normalize_match_text(example.get("상품명", "")) == _normalize_match_text(item.get("상품명", "")):
+                score = 100
+            candidates.append({
+                "label": label,
+                "score": score,
+                "overlap": sorted(overlap),
+                "example": example,
+            })
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    if candidates and candidates[0]["score"] >= _DIRECT_EXAMPLE_CONFIDENCE:
+        top = candidates[0]
+        return {
+            "label": top["label"],
+            "confidence": top["score"],
+            "method": "json_example",
+            "reason": "유사 확정 예시 일치",
+            "evidence": candidates[:5],
+        }
+
+    return {
+        "label": "",
+        "confidence": candidates[0]["score"] if candidates else 0,
+        "method": "needs_llm",
+        "reason": "확정 규칙/예시만으로 판정 불충분",
+        "evidence": candidates[:5],
+    }
+
+
+def _format_llm_evidence_prompt(item: dict, train_payload: dict, match: dict) -> str:
+    lines = [
+        "아래 JSON 검색 결과의 후보와 근거만 참고해 분류하세요.",
+        "전체 룰북을 추측하지 말고 허용 분류 중 하나만 선택하세요.",
+        "허용 수동분류: " + ", ".join(train_payload.get("allowed_labels", _CLASSIFY_LABELS)),
+        "메인이 아니면 is_main_candidate는 N입니다.",
+        "",
+        "대상:",
+        f'- 대메뉴="{item.get("대메뉴", "")}", 중메뉴="{item.get("중메뉴", "")}", 상품명="{item.get("상품명", "")}", 판매단가="{item.get("판매단가", "")}"',
+        "",
+        f'JSON 검색 후보: {match.get("label", "") or "없음"}',
+        f'검색 신뢰도: {match.get("confidence", 0)}',
+        f'검색 사유: {match.get("reason", "")}',
+        "",
+        "유사 확정 예시:",
+    ]
+    for evidence in match.get("evidence", [])[:5]:
+        ex = evidence.get("example", {})
+        lines.append(
+            f'- score={evidence.get("score", 0)}, 분류="{evidence.get("label", "")}", '
+            f'상품명="{ex.get("상품명", "")}", 중메뉴="{ex.get("중메뉴", "")}"'
+        )
+    if not match.get("evidence"):
+        lines.append("- 없음")
+    lines.append("")
+    lines.append('JSON만 응답: {"수동분류": "...", "is_main_candidate": "Y|N"}')
+    return "\n".join(lines)
+
+
+def _normalize_classify_result(label: str) -> dict:
+    if label not in _CLASSIFY_LABELS:
+        label = "기타"
+    return {"수동분류": label, "is_main_candidate": "Y" if label == "메인" else "N"}
+
+
+def _classify_with_llm_evidence(item: dict, train_payload: dict, match: dict) -> dict:
+    import json as _json
+    client, model = _get_gpt_client()
+    prompt = _format_llm_evidence_prompt(item, train_payload, match)
+    response = client.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": "당신은 F&B 상품 분류 보조자입니다. 반드시 JSON만 응답하세요."},
+            {"role": "user", "content": prompt},
+        ],
+        stream=False,
+    )
+    raw = response.get("message", {}).get("content", "")
+    if "```json" in raw:
+        raw = raw.split("```json")[1].split("```")[0].strip()
+    elif "```" in raw:
+        raw = raw.split("```")[1].split("```")[0].strip()
+    result = _json.loads(raw.strip())
+    return _normalize_classify_result(str(result.get("수동분류", "")).strip())
 
 
 def _get_gpt_client():
@@ -379,52 +671,36 @@ def _get_gpt_client():
     raise RuntimeError(f"사용 가능한 LLM 모델 없음. 설치 목록: {model_names}")
 
 
-def _classify_one(item: dict, few_shot: str) -> dict:
-    """gpt-oss:20b로 단일 항목 분류. 실패 시 폴백값 반환."""
+def _classify_one(item: dict, train_payload: dict) -> dict:
+    """train JSON 직접 매칭을 우선 적용하고, 애매할 때만 LLM을 보조로 사용."""
+    match = _match_train_json(item, train_payload)
+    if match["label"] and match["confidence"] >= _DIRECT_EXAMPLE_CONFIDENCE:
+        result = _normalize_classify_result(match["label"])
+        result.update({
+            "llm_error": False,
+            "classified_by": match["method"],
+            "classification_reason": match["reason"],
+        })
+        return result
+
     try:
-        import json as _json
-        client, model = _get_gpt_client()
-
-        system_prompt = (
-            "당신은 F&B 상품 분류 전문가입니다. 반드시 JSON만 응답하세요.\n"
-            f"수동분류 카테고리: {', '.join(_CLASSIFY_LABELS)}\n"
-            "확정된 기존 분류 예시 (학습 데이터):\n"
-            f"{few_shot}\n\n"
-            '응답 형식: {"수동분류": "메인", "is_main_candidate": "Y"}'
-        )
-        prompt = (
-            f'대메뉴: {item["대메뉴"]}, 중메뉴: {item["중메뉴"]}, '
-            f'상품명: {item["상품명"]}, 판매단가: {item["판매단가"]}'
-        )
-        response = client.chat(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            stream=False,
-        )
-        raw = response.get("message", {}).get("content", "")
-
-        # JSON 블록 추출
-        if "```json" in raw:
-            raw = raw.split("```json")[1].split("```")[0].strip()
-        elif "```" in raw:
-            raw = raw.split("```")[1].split("```")[0].strip()
-        result = _json.loads(raw.strip())
-
-        분류 = result.get("수동분류", "기타")
-        if 분류 not in _CLASSIFY_LABELS:
-            분류 = "기타"
-        is_main = result.get("is_main_candidate", "N")
-        if is_main not in ("Y", "N"):
-            is_main = "Y" if 분류 == "메인" else "N"
-
-        return {"수동분류": 분류, "is_main_candidate": is_main, "llm_error": False}
-
+        result = _classify_with_llm_evidence(item, train_payload, match)
+        result.update({
+            "llm_error": False,
+            "classified_by": "llm_evidence",
+            "classification_reason": match["reason"],
+        })
+        return result
     except Exception as e:
-        logger.warning("LLM 분류 실패 (%s): %s", item.get("상품명"), e)
-        return {"수동분류": "기타", "is_main_candidate": "N", "llm_error": True}
+        logger.warning("LLM 보조 분류 실패 (%s): %s", item.get("상품명"), e)
+        label = _rule_based_classify(item, train_payload)
+        result = _normalize_classify_result(label)
+        result.update({
+            "llm_error": True,
+            "classified_by": "json_fallback",
+            "classification_reason": "LLM 실패 후 JSON 룰 fallback",
+        })
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +842,27 @@ def detect_product_changes(**context) -> str:
     return f"변경 감지 {len(changes)}건"
 
 
+def build_fin_product_grp_train_json(**context) -> str:
+    """확정된 fin_product_grp.csv 분류를 LLM 학습용 JSON으로 저장."""
+    df_master = _read_master()
+    payload = _build_train_payload(df_master)
+    FIN_PRODUCT_GRP_TRAIN_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = FIN_PRODUCT_GRP_TRAIN_JSON_PATH.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _safe_replace(tmp, FIN_PRODUCT_GRP_TRAIN_JSON_PATH)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    counts = payload.get("label_counts", {})
+    count_msg = ", ".join(f"{label}={counts.get(label, 0)}" for label in _CLASSIFY_LABELS)
+    logger.info("fin_product_grp_train.json 저장: %s | %s", FIN_PRODUCT_GRP_TRAIN_JSON_PATH, count_msg)
+    return f"train_json 저장: {count_msg}"
+
+
 def classify_with_llm(enable_llm: bool = True, **context) -> str:
     """신규/변경 항목을 LLM으로 분류.
 
@@ -617,7 +914,7 @@ def classify_with_llm(enable_llm: bool = True, **context) -> str:
         context["ti"].xcom_push(key=_XCOM_CLASSIFIED, value=json.dumps(classified, ensure_ascii=False))
         return f"LLM OFF - 분류 스킵: {len(classified)}건"
 
-    few_shot = _build_few_shot(df_master)
+    train_payload = _load_train_payload(df_master)
     reused_cnt, llm_cnt = 0, 0
 
     classified = []
@@ -636,7 +933,7 @@ def classify_with_llm(enable_llm: bool = True, **context) -> str:
             logger.info("[%s] %s → 확정분류 재사용: %s", item.get("_change_type"), item.get("상품명"), prev)
             reused_cnt += 1
         else:
-            result = _classify_one(item, few_shot)
+            result = _classify_one(item, train_payload)
             item.update(result)
             logger.info("[%s] %s → LLM: %s", item.get("_change_type"), item.get("상품명"), result["수동분류"])
             llm_cnt += 1
@@ -902,12 +1199,12 @@ def finalize_unionpos_pending(enable_llm: bool = True, **context) -> str:
     )
     pending = pending.drop(columns=["_updated_at_ts"], errors="ignore")
 
-    few_shot = _build_few_shot(df_master)
+    train_payload = _load_train_payload(df_master)
 
     rows = []
     for _, row in pending.iterrows():
         item = row.to_dict()
-        result = _classify_one(item, few_shot)
+        result = _classify_one(item, train_payload)
 
         out = row.to_dict()
         out["수동분류"] = result.get("수동분류", out.get("수동분류", "기타"))
@@ -939,7 +1236,7 @@ def finalize_unionpos_pending(enable_llm: bool = True, **context) -> str:
 
 
 def build_fin_product_mart(**context) -> str:
-    """fin_product_grp.csv → fin_product_mart.csv 생성.
+    """fin_product_grp.csv에 중복 플래그와 launch_date를 갱신.
 
     - 컬럼: source, 상품코드, 상품명, is_main_candidate, 수동분류, 중복_수동분류, launch_date
     - 동일 source+상품코드에 수동분류가 2가지 이상이면 이메일 알림 발송.
@@ -1005,7 +1302,7 @@ def build_fin_product_mart(**context) -> str:
         try:
             from modules.transform.utility.mailer import send_email, text_to_html
             send_email(
-                subject=f"[fin_product_mart] 수동분류 충돌 {len(conflicts)}건 수정 필요",
+                subject=f"[fin_product] 수동분류 충돌 {len(conflicts)}건 수정 필요",
                 html_content=text_to_html(conflict_body),
                 to_emails=[ALERT_EMAIL],
             )
@@ -1015,26 +1312,6 @@ def build_fin_product_mart(**context) -> str:
     conflict_keys = set(
         zip(conflicts["source"].astype(str), conflicts["상품코드"].astype(str))
     ) if not conflicts.empty else set()
-
-    # fin_product_grp.csv에 중복_수동분류 플래그 write-back
-    if FIN_PRODUCT_CSV_PATH.exists():
-        full_master = _read_master()
-        full_master["_key"] = list(
-            zip(full_master["source"].astype(str), full_master["상품코드"].astype(str))
-        )
-        full_master["중복_수동분류"] = full_master["_key"].apply(
-            lambda k: "Y" if k in conflict_keys else "N"
-        )
-        full_master = full_master.drop(columns=["_key"])
-        tmp_grp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
-        try:
-            full_master.to_csv(tmp_grp, index=False, encoding="utf-8-sig")
-            _safe_replace(tmp_grp, FIN_PRODUCT_CSV_PATH)
-        finally:
-            try:
-                tmp_grp.unlink(missing_ok=True)
-            except Exception:
-                pass
 
     # 마트 생성: source+상품코드 기준 중복 제거 (수동분류 충돌 시 첫 번째 값 유지)
     df["중복_수동분류"] = df.apply(
@@ -1080,11 +1357,30 @@ def build_fin_product_mart(**context) -> str:
         .reset_index(drop=True)
     )
 
-    FIN_PRODUCT_MART_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = FIN_PRODUCT_MART_CSV_PATH.with_suffix(".tmp")
+    updated_master = master.copy()
+    updated_master["_key"] = list(
+        zip(updated_master["source"].astype(str).str.strip(), updated_master["상품코드"].astype(str).str.strip())
+    )
+    updated_master["중복_수동분류"] = updated_master["_key"].apply(
+        lambda k: "Y" if k in conflict_keys else "N"
+    )
+    launch_date_map = mart.set_index(["source", "상품코드"])["launch_date"].fillna("").to_dict()
+    previous_launch_date = (
+        updated_master["launch_date"].fillna("").astype(str)
+        if "launch_date" in updated_master.columns
+        else pd.Series([""] * len(updated_master), index=updated_master.index)
+    )
+    updated_master["launch_date"] = [
+        launch_date_map.get(k, previous)
+        for k, previous in zip(updated_master["_key"], previous_launch_date)
+    ]
+    updated_master = updated_master.drop(columns=["_key"])
+
+    FIN_PRODUCT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
     try:
-        mart.to_csv(tmp, index=False, encoding="utf-8-sig")
-        _safe_replace(tmp, FIN_PRODUCT_MART_CSV_PATH)
+        updated_master.to_csv(tmp, index=False, encoding="utf-8-sig")
+        _safe_replace(tmp, FIN_PRODUCT_CSV_PATH)
     finally:
         try:
             tmp.unlink(missing_ok=True)
@@ -1092,8 +1388,8 @@ def build_fin_product_mart(**context) -> str:
             pass
 
     conflict_msg = f", 충돌 {len(conflicts)}건 알림" if not conflicts.empty else ""
-    logger.info("fin_product_mart.csv 저장: %d행%s", len(mart), conflict_msg)
-    return f"마트 생성: {len(mart)}행{conflict_msg}"
+    logger.info("fin_product_grp.csv launch_date write-back: %d행%s", len(mart), conflict_msg)
+    return f"grp 업데이트: {len(mart)}행{conflict_msg}"
 
 
 def _build_first_sale_dates() -> pd.DataFrame:
@@ -1139,11 +1435,14 @@ def _build_first_sale_dates() -> pd.DataFrame:
 
 def build_launch_tracking(**context) -> str:
     """신규 메인 메뉴의 출시 후 30일 매출 성과 집계."""
-    if not FIN_PRODUCT_MART_CSV_PATH.exists():
-        logger.warning("fin_product_mart.csv 없음 - 스킵")
-        return "스킵: mart 없음"
+    if not FIN_PRODUCT_CSV_PATH.exists():
+        logger.warning("fin_product_grp.csv 없음 - 스킵")
+        return "스킵: grp 없음"
 
-    mart = pd.read_csv(FIN_PRODUCT_MART_CSV_PATH, dtype=str).fillna("")
+    mart = pd.read_csv(FIN_PRODUCT_CSV_PATH, dtype=str, encoding="utf-8-sig").fillna("")
+    if "is_latest" in mart.columns:
+        mart = mart[mart["is_latest"].astype(str).str.upper() == "Y"]
+    mart = mart.drop_duplicates(subset=["source", "상품코드"], keep="first")
     is_main = (
         mart["is_main_candidate"].astype(str).str.strip().str.upper()
         if "is_main_candidate" in mart.columns
@@ -1228,7 +1527,7 @@ def build_launch_tracking(**context) -> str:
     result["orders_30d"] = result["orders_30d"].astype(int)
     result["revenue_30d"] = result["revenue_30d"].astype(int)
 
-    out_path = FIN_PRODUCT_MART_CSV_PATH.parent / "fin_product_launch_tracking.csv"
+    out_path = FIN_PRODUCT_CSV_PATH.parent / "fin_product_launch_tracking.csv"
     result.to_csv(out_path, index=False, encoding="utf-8-sig")
     logger.info("launch_tracking 저장: %d건", len(result))
     return f"launch_tracking {len(result)}건 저장"

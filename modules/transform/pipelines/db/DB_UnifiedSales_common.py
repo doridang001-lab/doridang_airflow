@@ -9,12 +9,13 @@ unified_sales 채널별 파이프라인 공통 모듈.
 
 import logging
 import hashlib
+import os
 import re
 from datetime import datetime
 
 import pandas as pd
 
-from modules.transform.utility.paths import FIN_PRODUCT_CSV_PATH, MART_DB, ONEDRIVE_DB, POSFEED_WHITELIST_CSV_PATH
+from modules.transform.utility.paths import FIN_PRODUCT_CSV_PATH, MART_DB, ONEDRIVE_DB
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,8 @@ _FIN_PRODUCT_CACHE_MTIME: float | None = None
 
 _POSFEED_WHITELIST_CACHE: dict[str, set[str] | None] | None = None
 _POSFEED_WHITELIST_CACHE_MTIME: float | None = None
+
+POSFEED_CONTROL_COLUMNS = ["item_name", "is_valid", "store", "review_needed", "classified_by"]
 
 
 def _load_fin_product_latest() -> pd.DataFrame:
@@ -158,20 +161,123 @@ def _normalize_item_key(name: str) -> str:
     return s
 
 
+def _safe_replace(src, dst) -> None:
+    try:
+        os.replace(src, dst)
+    except (PermissionError, OSError):
+        dst.write_bytes(src.read_bytes())
+
+
+def _load_posfeed_control_df() -> pd.DataFrame:
+    """fin_product_grp.csv의 source=posfeed 행을 posfeed 관리 테이블 형태로 로드."""
+    try:
+        df = pd.read_csv(FIN_PRODUCT_CSV_PATH, dtype=str, encoding="utf-8-sig").fillna("")
+    except FileNotFoundError:
+        return pd.DataFrame(columns=POSFEED_CONTROL_COLUMNS)
+    except Exception as exc:
+        logger.warning("posfeed control 로드 실패: %s", exc)
+        return pd.DataFrame(columns=POSFEED_CONTROL_COLUMNS)
+
+    for col in ["source", "상품명", "exclude_check", "중메뉴", "llm_check"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    posfeed = df[df["source"].fillna("").astype(str).str.strip().str.lower() == "posfeed"].copy()
+    if posfeed.empty:
+        return pd.DataFrame(columns=POSFEED_CONTROL_COLUMNS)
+
+    exclude_check = posfeed["exclude_check"].fillna("").astype(str).str.strip().str.upper()
+    llm_check = posfeed["llm_check"].fillna("").astype(str).str.strip().str.upper()
+    result = pd.DataFrame({
+        "item_name": posfeed["상품명"].fillna("").astype(str).str.strip(),
+        "is_valid": exclude_check.map(lambda v: "N" if v == "Y" else "Y"),
+        "store": posfeed["중메뉴"].fillna("").astype(str).str.strip(),
+        "review_needed": llm_check.map(lambda v: "Y" if v == "Y" else "N"),
+        "classified_by": "",
+    })
+    result = result[result["item_name"] != ""]
+    return result.reindex(columns=POSFEED_CONTROL_COLUMNS, fill_value="").reset_index(drop=True)
+
+
+def _write_posfeed_control_df(control_df: pd.DataFrame) -> None:
+    """posfeed 관리 행을 fin_product_grp.csv의 source=posfeed 행으로 교체 저장."""
+    try:
+        master = pd.read_csv(FIN_PRODUCT_CSV_PATH, dtype=str, encoding="utf-8-sig").fillna("")
+    except FileNotFoundError:
+        master = pd.DataFrame()
+
+    for col in [
+        "source",
+        "구분",
+        "대메뉴",
+        "중메뉴",
+        "상품코드",
+        "상품명",
+        "판매단가",
+        "수동분류",
+        "is_main_candidate",
+        "llm_check",
+        "exclude_check",
+        "updated_at",
+        "approve",
+        "is_latest",
+        "중복_수동분류",
+        "launch_date",
+    ]:
+        if col not in master.columns:
+            master[col] = ""
+
+    control_df = control_df.reindex(columns=POSFEED_CONTROL_COLUMNS, fill_value="").fillna("")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+    for _, row in control_df.iterrows():
+        item_name = str(row["item_name"]).strip()
+        if not item_name:
+            continue
+        new_row = {col: "" for col in master.columns}
+        new_row.update({
+            "source": "posfeed",
+            "구분": "배달",
+            "중메뉴": str(row["store"]).strip(),
+            "상품코드": _normalize_item_key(item_name),
+            "상품명": item_name,
+            "is_main_candidate": "N",
+            "llm_check": "Y" if str(row["review_needed"]).strip().upper() == "Y" else "N",
+            "exclude_check": "Y" if str(row["is_valid"]).strip().upper() == "N" else "N",
+            "updated_at": now,
+            "is_latest": "Y",
+            "중복_수동분류": "N",
+        })
+        rows.append(new_row)
+
+    non_posfeed = master[master["source"].fillna("").astype(str).str.strip().str.lower() != "posfeed"]
+    updated = pd.concat([non_posfeed, pd.DataFrame(rows, columns=master.columns)], ignore_index=True)
+
+    FIN_PRODUCT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
+    try:
+        updated.to_csv(tmp, index=False, encoding="utf-8-sig")
+        _safe_replace(tmp, FIN_PRODUCT_CSV_PATH)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def _load_posfeed_blacklist() -> dict[str, set[str] | None]:
-    """fin_product_posfeed_whitelist.csv에서 is_valid=N 항목을 store-aware dict로 반환.
+    """fin_product_grp.csv의 source=posfeed, exclude_check=Y 항목을 store-aware dict로 반환.
 
     반환값: {normalize(item_name): None | set[str]}
     - None → 전체 매장에서 제외
     - set[str] → 해당 매장에서만 제외 (store 컬럼의 쉼표 구분 값)
 
-    - 필수 컬럼: item_name, is_valid
-    - store 컬럼 없거나 값이 비면 전체 매장 제외
-    - 파일 없거나 N 항목 없으면 빈 dict 반환 → 필터링 비활성.
+    - 중메뉴 값이 비면 전체 매장 제외
+    - source=posfeed 행 또는 N 항목이 없으면 빈 dict 반환 → 필터링 비활성.
     """
     global _POSFEED_WHITELIST_CACHE, _POSFEED_WHITELIST_CACHE_MTIME
     try:
-        mtime = POSFEED_WHITELIST_CSV_PATH.stat().st_mtime
+        mtime = FIN_PRODUCT_CSV_PATH.stat().st_mtime
     except FileNotFoundError:
         _POSFEED_WHITELIST_CACHE = {}
         _POSFEED_WHITELIST_CACHE_MTIME = None
@@ -180,19 +286,7 @@ def _load_posfeed_blacklist() -> dict[str, set[str] | None]:
     if _POSFEED_WHITELIST_CACHE is not None and _POSFEED_WHITELIST_CACHE_MTIME == mtime:
         return _POSFEED_WHITELIST_CACHE
 
-    try:
-        df = pd.read_csv(POSFEED_WHITELIST_CSV_PATH, dtype=str).fillna("")
-    except Exception as e:
-        logger.warning("posfeed whitelist 로드 실패: %s", e)
-        _POSFEED_WHITELIST_CACHE = {}
-        _POSFEED_WHITELIST_CACHE_MTIME = mtime
-        return _POSFEED_WHITELIST_CACHE
-
-    if not {"item_name", "is_valid"}.issubset(df.columns):
-        logger.warning("posfeed whitelist 컬럼 오류 (필요: item_name, is_valid)")
-        _POSFEED_WHITELIST_CACHE = {}
-        _POSFEED_WHITELIST_CACHE_MTIME = mtime
-        return _POSFEED_WHITELIST_CACHE
+    df = _load_posfeed_control_df()
 
     result: dict[str, set[str] | None] = {}
     for _, row in df[df["is_valid"].str.strip().str.upper() == "N"].iterrows():

@@ -4,15 +4,15 @@ import json
 import logging
 import os
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
 
 from modules.transform.utility.paths import (
     FIN_PRODUCT_MAP_CSV_PATH,
-    FIN_PRODUCT_MAP_JSON_PATH,
     FIN_PRODUCT_MAP_REVIEW_CSV_PATH,
+    FIN_PRODUCT_MAP_TRAIN_JSON_PATH,
     MART_DB,
 )
 
@@ -60,7 +60,7 @@ EDIT_COLUMN_ALIASES = {
     "메뉴중분류": "메뉴중분류_edit",
     "review_status": "review_status_edit",
 }
-VALID_CATEGORIES = ["메인", "1인", "사이드", "기타"]
+VALID_CATEGORIES = ["메인", "1인", "사이드", "기타", "주류", "음료", "토핑", "옵션", "세트"]
 VALID_MENU_MAJOR = ["메인메뉴", "추가메뉴", "사이드", "기타"]
 VALID_PARENT_METHODS = ["상품 단독 분류", "menu_name 필요", "주문번호 기준 추론", ""]
 MODEL_CANDIDATES = ["gpt-oss:20b", "gpt-oss:latest", "gpt-oss", "qwen2.5:7b", "qwen2.5:latest"]
@@ -71,6 +71,7 @@ OLLAMA_HOSTS = [
 ]
 BATCH_SIZE = 5
 TODAY = str(date.today())
+_TRAIN_EXAMPLES_PER_LABEL = 10
 
 logger = logging.getLogger(__name__)
 
@@ -380,6 +381,8 @@ def _review_reason(row: pd.Series) -> str:
         reasons.append("기타 분류 확인")
     if menu_count > 1 and label in {"메인", "1인"}:
         reasons.append("부모메뉴 후보 다수")
+    if not reasons and _strip_text(row.get("classified_by")) == "llm":
+        reasons.append("LLM 분류 확인")
     return ", ".join(dict.fromkeys(reasons))
 
 
@@ -511,6 +514,21 @@ def build_prompt(batch: list[dict], examples: list[dict]) -> str:
 """
 
 
+def _load_map_examples() -> list[dict]:
+    if FIN_PRODUCT_MAP_TRAIN_JSON_PATH.exists():
+        try:
+            data = json.loads(FIN_PRODUCT_MAP_TRAIN_JSON_PATH.read_text(encoding="utf-8"))
+            examples = []
+            for label_data in data.get("label_rules", {}).values():
+                examples.extend(label_data.get("examples", []))
+            if examples:
+                logger.info("train JSON에서 예시 %d건 로드", len(examples))
+                return examples
+        except Exception as e:
+            logger.warning("train JSON 로드 실패, map_df fallback: %s", e)
+    return []
+
+
 def _get_ollama_client():
     import ollama
 
@@ -593,6 +611,72 @@ def build_examples(map_df: pd.DataFrame) -> list[dict]:
     )
 
 
+def _build_map_train_payload(map_df: pd.DataFrame) -> dict:
+    approved = map_df[
+        (map_df["review_status_edit"].fillna("").astype(str).str.strip() == "Y")
+        & (map_df["수동분류_edit"].fillna("").astype(str).str.strip().isin(VALID_CATEGORIES))
+        & (map_df["item_name"].fillna("").astype(str).str.strip() != "")
+    ].copy()
+
+    counts = approved["수동분류_edit"].value_counts().to_dict() if not approved.empty else {}
+    label_rules: dict[str, dict] = {}
+    for label in VALID_CATEGORIES:
+        label_df = approved[approved["수동분류_edit"] == label].copy()
+        if label_df.empty:
+            label_rules[label] = {"examples": []}
+            continue
+        label_df = (
+            label_df
+            .drop_duplicates(subset=["item_name"], keep="last")
+            .head(_TRAIN_EXAMPLES_PER_LABEL)
+        )
+        label_rules[label] = {
+            "examples": [
+                {
+                    "item_name": str(row["item_name"]).strip(),
+                    "표준_메뉴명_edit": str(row.get("표준_메뉴명_edit", "")).strip(),
+                    "수동분류_edit": str(row.get("수동분류_edit", "")).strip(),
+                    "메뉴대분류_edit": str(row.get("메뉴대분류_edit", "")).strip(),
+                    "main_menu_edit": str(row.get("main_menu_edit", "")).strip(),
+                }
+                for _, row in label_df.iterrows()
+            ]
+        }
+
+    return {
+        "version": "1.0",
+        "source": str(FIN_PRODUCT_MAP_CSV_PATH),
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "allowed_categories": VALID_CATEGORIES,
+        "label_counts": {label: int(counts.get(label, 0)) for label in VALID_CATEGORIES},
+        "label_rules": label_rules,
+    }
+
+
+def build_fin_product_map_train_json(dry_run: bool = False, **context) -> dict:
+    map_df = load_map()
+    payload = _build_map_train_payload(map_df)
+    counts = payload.get("label_counts", {})
+    count_msg = ", ".join(f"{label}={counts.get(label, 0)}" for label in VALID_CATEGORIES)
+
+    if dry_run:
+        logger.info("dry-run: train JSON 저장 생략 | %s", count_msg)
+    else:
+        FIN_PRODUCT_MAP_TRAIN_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = FIN_PRODUCT_MAP_TRAIN_JSON_PATH.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            _safe_replace(tmp, FIN_PRODUCT_MAP_TRAIN_JSON_PATH)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+        logger.info("fin_product_map_train.json 저장: %s | %s", FIN_PRODUCT_MAP_TRAIN_JSON_PATH, count_msg)
+
+    return {"label_counts": counts, "dry_run": dry_run}
+
+
 def _classify_batch(batch: list[dict], examples: list[dict]) -> list[dict]:
     results = call_llm(build_prompt(batch, examples))
     by_name = {str(r.get("item_name", "")).strip(): r for r in results}
@@ -626,7 +710,7 @@ def classify_unmapped(unmapped: pd.DataFrame, map_df: pd.DataFrame, limit: int |
     if unmapped.empty:
         return []
 
-    examples = build_examples(map_df)
+    examples = _load_map_examples() or build_examples(map_df)
     new_rows = []
     batches = [
         unmapped.iloc[i:i + BATCH_SIZE].to_dict("records")
@@ -649,33 +733,6 @@ def classify_unmapped(unmapped: pd.DataFrame, map_df: pd.DataFrame, limit: int |
                 except Exception as item_error:
                     logger.warning("단건 분류 실패: %s | %s", item["item_name"], item_error)
     return new_rows
-
-
-def export_json(map_df: pd.DataFrame, dry_run: bool = False) -> None:
-    if dry_run:
-        logger.info("dry-run: JSON 저장 생략")
-        return
-    status = map_df["review_status_edit"].fillna("").astype(str).str.strip().apply(_normalize_review_status)
-    valid = (
-        (map_df["표준_메뉴명_edit"].fillna("").astype(str).str.strip() != "")
-        & (map_df["수동분류_edit"].fillna("").astype(str).str.strip().isin(VALID_CATEGORIES))
-    )
-    needs_review = map_df.apply(_review_reason, axis=1).fillna("").astype(str).str.strip() != ""
-    approved = map_df[valid & ((status == "Y") | ~needs_review)]
-    result: dict[str, list[str]] = {}
-    for _, row in approved.iterrows():
-        std = str(row["표준_메뉴명_edit"]).strip()
-        item = str(row["item_name"]).strip()
-        if not std or not item:
-            continue
-        result.setdefault(std, [])
-        if item not in result[std]:
-            result[std].append(item)
-    FIN_PRODUCT_MAP_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
-    FIN_PRODUCT_MAP_JSON_PATH.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    logger.info("JSON 저장: %s (%d 표준명)", FIN_PRODUCT_MAP_JSON_PATH, len(result))
 
 
 def migrate_product_map(dry_run: bool = False, **context) -> dict:
@@ -781,5 +838,4 @@ def llm_product_map(dry_run: bool = False, limit: int | None = None, **context) 
     else:
         logger.info("신규 분류 대상 없음")
 
-    export_json(map_df, dry_run=dry_run)
     return summary

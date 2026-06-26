@@ -23,6 +23,7 @@ from modules.transform.utility.schedule import DB_FIN_PRODUCT_TIME
 from modules.transform.pipelines.db.DB_FinProduct import (
     load_okpos_product_xlsx,
     detect_product_changes,
+    build_fin_product_grp_train_json,
     classify_with_llm,
     update_product_master,
     send_alert_email,
@@ -77,42 +78,47 @@ with DAG(
     )
 
     t3 = PythonOperator(
+        task_id="build_fin_product_grp_train_json",
+        python_callable=build_fin_product_grp_train_json,
+    )
+
+    t4 = PythonOperator(
         task_id="classify_with_llm",
         python_callable=classify_with_llm,
         op_kwargs={"enable_llm": ENABLE_LLM},
     )
 
-    t4 = PythonOperator(
+    t5 = PythonOperator(
         task_id="update_product_master",
         python_callable=update_product_master,
     )
 
-    t5 = PythonOperator(
+    t6 = PythonOperator(
         task_id="send_alert_email",
         python_callable=send_alert_email,
     )
 
-    t6 = PythonOperator(
+    t7 = PythonOperator(
         task_id="finalize_unionpos_pending",
         python_callable=finalize_unionpos_pending,
         op_kwargs={"enable_llm": ENABLE_LLM},
     )
 
-    t7 = PythonOperator(
+    t8 = PythonOperator(
         task_id="apply_review_approvals",
         python_callable=apply_review_approvals,
     )
 
-    t8 = PythonOperator(
+    t9 = PythonOperator(
         task_id="build_fin_product_mart",
         python_callable=build_fin_product_mart,
         trigger_rule="all_done",
     )
 
-    t9 = PythonOperator(
+    t10 = PythonOperator(
         task_id="build_launch_tracking",
         python_callable=build_launch_tracking,
         trigger_rule="all_done",
     )
 
-    t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7 >> t8 >> t9
+    t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7 >> t8 >> t9 >> t10

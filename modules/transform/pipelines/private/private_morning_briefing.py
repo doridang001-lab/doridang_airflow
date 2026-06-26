@@ -48,10 +48,17 @@ _NOTION_CALENDAR_URL_TEMPLATE = os.getenv(
     "NOTION_CALENDAR_URL_TEMPLATE",
     "https://calendar.notion.so/{year}/{month}",
 )
-_NOTION_CHROME_DEBUGGER = os.getenv(
-    "NOTION_CHROME_DEBUGGER",
-    "host.docker.internal:9223" if os.getenv("AIRFLOW_HOME") else "",
-).strip()
+_NOTION_CHROME_DEBUGGER = os.getenv("NOTION_CHROME_DEBUGGER", "").strip()
+if not _NOTION_CHROME_DEBUGGER and os.getenv("AIRFLOW_HOME"):
+    _copang_debugger = os.getenv("COUPANG_CHROME_DEBUGGER", "").strip()
+    if _copang_debugger:
+        host_part = _copang_debugger.split(":", 1)[0].strip()
+        if host_part:
+            _NOTION_CHROME_DEBUGGER = f"{host_part}:9223"
+        else:
+            _NOTION_CHROME_DEBUGGER = "host.docker.internal:9223"
+    else:
+        _NOTION_CHROME_DEBUGGER = "host.docker.internal:9223"
 _NOTION_BROWSER_ATTACH_ONLY = os.getenv(
     "NOTION_BROWSER_ATTACH_ONLY",
     "1" if os.getenv("AIRFLOW_HOME") else "0",
@@ -324,6 +331,7 @@ def _attach_to_notion_chrome():
     if not _NOTION_CHROME_DEBUGGER:
         if _NOTION_BROWSER_ATTACH_ONLY:
             raise RuntimeError("NOTION_CHROME_DEBUGGER 미설정: 컨테이너 내부 Chrome 실행을 차단했습니다")
+        logger.info("NOTION_CHROME_DEBUGGER 미설정: Notion Calendar 수집을 컨테이너 Chrome으로 진행")
         return None
 
     logger.info("Notion Calendar 호스트 Chrome attach 시도 (debuggerAddress=%s)", _NOTION_CHROME_DEBUGGER)
@@ -631,10 +639,12 @@ def _normalize_notion_status(text: str | None) -> str:
 def _should_keep_notion_calendar_event(event: dict) -> bool:
     title = event.get("title") or ""
     status = _normalize_notion_status(event.get("status") or "")
-    if status:
-        return status not in _NOTION_DONE_STATUS_LABELS
+    if event.get("attending") is False:
+        return False
     if any(pattern in title for pattern in _NOTION_STATUSLESS_EXCLUDE_PATTERNS):
         return False
+    if status:
+        return status not in _NOTION_DONE_STATUS_LABELS
     return any(prefix in title for prefix in _NOTION_STATUSLESS_WORK_PREFIXES)
 
 
@@ -1159,6 +1169,100 @@ def _click_notion_today_button(driver) -> bool:
         return False
 
 
+def _close_notion_calendar_detail(driver) -> None:
+    try:
+        driver.execute_script(
+            """
+            document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape', code:'Escape', bubbles:true}));
+            document.body.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape', code:'Escape', bubbles:true}));
+            """
+        )
+    except Exception:
+        pass
+    time.sleep(0.2)
+
+
+def _click_notion_calendar_chip(driver, chip_idx: str | None) -> bool:
+    if not chip_idx:
+        return False
+    try:
+        return bool(
+            driver.execute_script(
+                """
+                return (function(chipIdx) {
+                  var el = document.querySelector('[data-codex-calendar-chip-idx="' + chipIdx + '"]');
+                  if (!el) return false;
+                  try { el.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
+                  try {
+                    el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+                    return true;
+                  } catch (e2) {
+                    try { el.click(); return true; } catch (e3) {}
+                  }
+                  return false;
+                })(arguments[0]);
+                """,
+                str(chip_idx),
+            )
+        )
+    except Exception:
+        return False
+
+
+def _read_notion_calendar_detail_status(driver, chip_idx: str | None, title: str) -> str:
+    if not chip_idx:
+        return ""
+    if not _click_notion_calendar_chip(driver, chip_idx):
+        return ""
+
+    labels = _NOTION_INCOMPLETE_STATUS_LABELS + _NOTION_DONE_STATUS_LABELS
+    compact_labels = [(label, re.sub(r"\s+", "", label)) for label in labels]
+    deadline = time.time() + 5
+    status = ""
+    try:
+        while time.time() < deadline:
+            time.sleep(0.3)
+            text = driver.execute_script(
+                """
+                return (function() {
+                  function visible(el) {
+                    if (!el) return false;
+                    var rect = el.getBoundingClientRect();
+                    var style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                  }
+                  var selectors = [
+                    '[role="dialog"]',
+                    '[aria-modal="true"]',
+                    '[data-overlay]',
+                    '[data-testid*="peek"]',
+                    '[class*="modal"]',
+                    '[class*="peek"]'
+                  ];
+                  var chunks = [];
+                  selectors.forEach(function(sel) {
+                    Array.prototype.slice.call(document.querySelectorAll(sel)).forEach(function(el) {
+                      if (visible(el)) chunks.push(el.innerText || el.textContent || '');
+                    });
+                  });
+                  return chunks.join('\\n');
+                })();
+                """
+            ) or ""
+            if not text.strip():
+                continue
+            compact_text = re.sub(r"\s+", "", text)
+            if title and re.sub(r"\s+", "", title) not in compact_text and time.time() < deadline:
+                continue
+            for label, compact_label in compact_labels:
+                if compact_label and compact_label in compact_text:
+                    status = label
+                    return status
+        return ""
+    finally:
+        _close_notion_calendar_detail(driver)
+
+
 def _read_notion_calendar_events_for_day(driver, date_str: str) -> list[dict]:
     raw = driver.execute_script(
         """
@@ -1206,6 +1310,22 @@ def _read_notion_calendar_events_for_day(driver, date_str: str) -> list[dict]:
           }
           function isCompletedChip(chip) {
             return !!chip.querySelector('path[fill-rule="evenodd"][clip-rule="evenodd"]');
+          }
+          function hasWorkPrefix(text) {
+            var prefixes = ['[로드맵/', '[프로젝트/', '[노션/', '[TF]'];
+            for (var i = 0; i < prefixes.length; i++) {
+              if (text.indexOf(prefixes[i]) >= 0) return true;
+            }
+            return false;
+          }
+          function workMarkerCount(text) {
+            var prefixes = ['[로드맵/', '[프로젝트/', '[노션/', '[TF]'];
+            var count = 0;
+            for (var i = 0; i < prefixes.length; i++) {
+              var idx = -1;
+              while ((idx = text.indexOf(prefixes[i], idx + 1)) >= 0) count++;
+            }
+            return count;
           }
           function timeFromChip(chip) {
             var aria = normalizeText(chip.getAttribute('aria-label') || chip.getAttribute('title') || '');
@@ -1270,7 +1390,7 @@ def _read_notion_calendar_events_for_day(driver, date_str: str) -> list[dict]:
               for (var depth = 0; cur && depth < 8; depth++, cur = cur.parentElement) {
                 if (!isVisible(cur)) continue;
                 var rect = cur.getBoundingClientRect();
-                if (rect.width >= 40 && rect.height >= 80 && rect.top < 260 && rect.left > 180) {
+                if (rect.width >= 40 && rect.height >= 70 && rect.top > -120 && rect.top < (window.innerHeight + 300)) {
                   out.push(cur);
                   break;
                 }
@@ -1283,12 +1403,19 @@ def _read_notion_calendar_events_for_day(driver, date_str: str) -> list[dict]:
           if (!containers.length) containers = uniqueElements(fallbackDateContainers());
 
           var chips = [];
+          var chipSeq = 0;
+          function addChip(chip) {
+            if (!chip || chip.getAttribute('data-codex-calendar-chip-idx')) return;
+            chipSeq += 1;
+            chip.setAttribute('data-codex-calendar-chip-idx', String(chipSeq));
+            chips.push(chip);
+          }
           containers.forEach(function(container) {
             Array.prototype.slice.call(container.querySelectorAll('[data-event-chip-key]')).forEach(function(chip) {
               if (!isVisible(chip)) return;
               var chipRect = chip.getBoundingClientRect();
               var containerRect = container.getBoundingClientRect();
-              if (containsRect(containerRect, chipRect)) chips.push(chip);
+              if (containsRect(containerRect, chipRect)) addChip(chip);
             });
           });
           var columnRects = mainDateColumnRects();
@@ -1299,14 +1426,40 @@ def _read_notion_calendar_events_for_day(driver, date_str: str) -> list[dict]:
               var title = titleFromChip(chip);
               if (!title || title.length < 3) return;
               var chipRect = chip.getBoundingClientRect();
-              if (chipRect.height < 10 || chipRect.height > 80 || chipRect.top < 100 || chipRect.top > 1250) return;
+              if (chipRect.height < 10 || chipRect.height > 80) return;
               if (!intersectsColumn(columnRect, chipRect)) return;
-              chips.push(chip);
+              addChip(chip);
             });
+          });
+          columnRects.forEach(function(columnRect) {
+            Array.prototype.slice.call(document.querySelectorAll('div, span, button, a')).forEach(function(chip) {
+              if (!isVisible(chip)) return;
+              var title = titleFromChip(chip);
+              if (!title || title.length < 8) return;
+              if (!hasWorkPrefix(title) && title.indexOf(']') < 0) return;
+              if (workMarkerCount(title) !== 1) return;
+              var chipRect = chip.getBoundingClientRect();
+              if (chipRect.width < 30 || chipRect.height < 12) return;
+              if (!intersectsColumn(columnRect, chipRect)) return;
+              var text = title;
+              if (!hasWorkPrefix(text) && text.indexOf('[') !== 0) return;
+              addChip(chip);
+            });
+          });
+          Array.prototype.slice.call(document.querySelectorAll('div, span, button, a')).forEach(function(chip) {
+            if (!isVisible(chip)) return;
+            var title = titleFromChip(chip);
+            if (!title || title.length < 8 || !hasWorkPrefix(title)) return;
+            if (workMarkerCount(title) !== 1) return;
+            var chipRect = chip.getBoundingClientRect();
+            if (chipRect.width < 80 || chipRect.height < 12 || chipRect.height > 120) return;
+            if (chipRect.top < 0 || chipRect.top > window.innerHeight + 120) return;
+            addChip(chip);
           });
 
           return uniqueElements(chips).map(function(chip) {
             return {
+              chip_idx: chip.getAttribute('data-codex-calendar-chip-idx') || '',
               time: timeFromChip(chip),
               title: titleFromChip(chip),
               status: statusFromChip(chip),
@@ -1322,6 +1475,9 @@ def _read_notion_calendar_events_for_day(driver, date_str: str) -> list[dict]:
     for ev in raw:
         item = _build_calendar_event(ev.get("time"), ev.get("title"), ev.get("attending", True))
         item["status"] = _normalize_calendar_text(ev.get("status"))
+        detail_status = _read_notion_calendar_detail_status(driver, ev.get("chip_idx"), item["title"])
+        if detail_status:
+            item["status"] = detail_status
         if _should_keep_notion_calendar_event(item):
             events.append(item)
     return events
