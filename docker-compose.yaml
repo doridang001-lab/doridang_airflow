@@ -72,6 +72,9 @@ x-airflow-common:
     MART_DB: '/opt/airflow/onedrive_mart'
     LLM_OUTPUT_DIR: '/opt/airflow/onedrive_llm'
     TEMP_DIR: '/opt/airflow/Local_DB/temp'
+    TMPDIR: '/tmp'
+    TMP: '/tmp'
+    TEMP: '/tmp'
     PLAYWRIGHT_BROWSERS_PATH: '/ms-playwright'
     PLAYWRIGHT_AUTO_INSTALL: '1'
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
@@ -116,6 +119,7 @@ x-airflow-common:
     - "${DORIDANG_ROOT:-c:/Doridang}:/opt/airflow/Doridang"
     - "${DOWN_DIR:-e:/down}:/opt/airflow/download"
     - "${D_DOWN_DIR:-e:/d_down}:/opt/airflow/manual_download"
+    - "${AIRFLOW_TMP_ROOT:-e:/trash/airflow_tmp}:/tmp"
     - ./logs:/opt/airflow/logs
   user: "0:0"
   depends_on:
