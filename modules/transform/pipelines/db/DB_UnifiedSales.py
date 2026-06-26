@@ -12,6 +12,7 @@ from modules.transform.pipelines.db.DB_UnifiedSales_common import (
     UNIFIED_COLUMNS,
     UNIFIED_ROOT,
     reclassify_hall_platform,
+    refresh_store_meta_in_unified_sales,
     resave_existing_unified_sales,
 )
 from modules.transform.pipelines.db.DB_UnifiedSales_okpos import (
@@ -67,5 +68,6 @@ __all__ = [
     "backfill_hall_viz",
     "resave_existing_unified_sales",
     "reclassify_hall_platform",
+    "refresh_store_meta_in_unified_sales",
     "upsert_fin_product_grp_from_unionpos",
 ]

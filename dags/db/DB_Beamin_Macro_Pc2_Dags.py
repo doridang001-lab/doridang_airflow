@@ -11,6 +11,7 @@ import os
 import random
 import re
 import shutil
+import hashlib
 import time
 import warnings
 from datetime import timedelta
@@ -195,33 +196,57 @@ def _safe_run_id_part(value: str | None) -> str:
     return re.sub(r"[^A-Za-z0-9_.~-]+", "_", str(value or "manual")).strip("_")[:120]
 
 
+def _flat_export_name(run_part: str, rel: str) -> str:
+    dataset = rel.split("/", 1)[0]
+    digest = hashlib.sha1(rel.encode("utf-8")).hexdigest()[:12]
+    basename = re.sub(r"[^A-Za-z0-9_.=-]+", "_", Path(rel).name).strip("_")
+    dataset = re.sub(r"[^A-Za-z0-9_.=-]+", "_", dataset).strip("_")
+    return f"baemin_pc2__{run_part}__{dataset}__{digest}__{basename}"
+
+
 def _export_staging_to_inbox(local_baemin: Path, run_id: str | None) -> Path:
     if not local_baemin.exists():
         raise RuntimeError(f"staging 경로 없음: {local_baemin}")
 
-    inbox = COLLECT_DB / "영업관리부_수집" / "_baemin_pc2_inbox"
+    inbox = COLLECT_DB
     inbox.mkdir(parents=True, exist_ok=True)
     ts = pendulum.now(KST).format("YYYYMMDD_HHmmss")
-    safe = _safe_run_id_part(run_id)
-    tmp_run = inbox / f"_tmp_{safe}_{ts}"
-    final_run = inbox / f"{safe}_{ts}"
-    dst = tmp_run / "baemin_macro"
+    run_part = f"{_safe_run_id_part(run_id)}_{ts}"
+    tmp_manifest = inbox / f"_tmp_baemin_pc2_manifest__{run_part}.json"
+    final_manifest = inbox / f"baemin_pc2_manifest__{run_part}.json"
 
-    if tmp_run.exists():
-        shutil.rmtree(tmp_run)
-    shutil.copytree(str(local_baemin), str(dst), dirs_exist_ok=True)
-
-    manifest: dict[str, int] = {}
-    for p in dst.rglob("*"):
+    manifest: dict[str, dict[str, str | int]] = {}
+    for p in local_baemin.rglob("*"):
         if p.is_file():
-            manifest[str(p.relative_to(tmp_run)).replace("\\", "/")] = p.stat().st_size
-    (tmp_run / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2),
+            rel = Path("baemin_macro") / p.relative_to(local_baemin)
+            rel_text = str(rel).replace("\\", "/")
+            final_name = _flat_export_name(run_part, rel_text)
+            tmp_name = f"_tmp_{final_name}"
+            tmp_path = inbox / tmp_name
+            final_path = inbox / final_name
+            if tmp_path.exists():
+                tmp_path.unlink()
+            shutil.copy2(p, tmp_path)
+            tmp_path.rename(final_path)
+            manifest[final_name] = {
+                "rel": rel_text,
+                "size": final_path.stat().st_size,
+            }
+
+    if tmp_manifest.exists():
+        tmp_manifest.unlink()
+    tmp_manifest.write_text(
+        json.dumps(
+            {"run": run_part, "files": manifest},
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
         encoding="utf-8",
     )
-    tmp_run.rename(final_run)
-    logger.info("PC2 inbox export 완료: %s", final_run)
-    return final_run
+    tmp_manifest.rename(final_manifest)
+    logger.info("PC2 flat inbox export 완료: %s (%d files)", final_manifest, len(manifest))
+    return final_manifest
 
 
 def collect_all(**context) -> str:

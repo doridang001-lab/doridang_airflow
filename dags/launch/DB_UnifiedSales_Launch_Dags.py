@@ -182,7 +182,7 @@ def reconcile_baemin(**context) -> str:
     return reconcile_baemin_for_test_stores(
         stores=TEST_STORES,
         sale_date=sale_date,
-        lookback_days=LOOKBACK_DAYS or 7,
+        lookback_days=LOOKBACK_DAYS,
     )
 
 
@@ -199,7 +199,7 @@ def reconcile_coupang(**context) -> str:
     return reconcile_coupang_for_test_stores(
         stores=stores,
         sale_date=sale_date,
-        lookback_days=LOOKBACK_DAYS or 7,
+        lookback_days=LOOKBACK_DAYS,
     )
 
 
@@ -243,7 +243,7 @@ def enforce_baemin_manual_only(**context) -> str:
     return enforce_baemin_manual_only_for_test_stores(
         stores=TEST_STORES,
         sale_date=sale_date,
-        lookback_days=LOOKBACK_DAYS or 7,
+        lookback_days=LOOKBACK_DAYS,
     )
 
 
@@ -260,7 +260,7 @@ def enforce_coupang_manual_only(**context) -> str:
     return enforce_coupang_manual_only_for_test_stores(
         stores=stores,
         sale_date=sale_date,
-        lookback_days=LOOKBACK_DAYS or 7,
+        lookback_days=LOOKBACK_DAYS,
     )
 
 

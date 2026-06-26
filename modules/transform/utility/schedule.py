@@ -10,7 +10,7 @@ DAG에서 사용하는 cron 표현식과 이메일 설정을 관리
 SMD_ORDERS_TIME      = "33 16 * * 1,5"    # 매주 월요일 15:15 실행
 SMD_VISIT_LOG        = "0 12 * * 1,3,5" # 매주 월,수,금 12:00 실행
 
-SMP_TOORDER_VOC_TIME = "30 9 * * *"     # 매일 09:30 실행
+SMP_TOORDER_VOC_TIME = "20 8 * * *"     # 매일 08:20 실행
 SMP_FDAM_CS_TIME     = "5 7 * * *"      # 매일 07:05 실행
 
 SMP_DELIVERY_ALERT_TIME  = "5 9 * * 1,2,3,4,5"  # 매주 월~금 09:00 실행
@@ -53,7 +53,7 @@ SMD_TOORDER_SALES_REPORT_TIME = "5 6 * * *"  # 매일 6:05 실행
 
 DB_TOORDER_STORE_PLATFORM_TIME = "10 7 * * *"  # 매일 07:10 실행 (SMD_TOORDER_SALES_REPORT 이후)
 
-DB_UNIFIED_REVIEW_TIME         = "49 7 * * *"  # 매일 07:49 실행 (ToOrderVOC 완료 기준으로 직전 실행 추적)
+DB_UNIFIED_REVIEW_TIME         = "28 8 * * *"  # 매일 08:28 실행 (직전 1일 ToOrderReview 성공 실행 조회)
 
 SMD_BAEMIN_COLLECT_TIME = "10 3 * * *"  # 매일 KST 07:15 실행 (토더 매출 수집 완료 후)
 

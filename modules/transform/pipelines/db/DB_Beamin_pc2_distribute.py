@@ -13,14 +13,15 @@ import pendulum
 
 from modules.transform.pipelines.db.DB_Beamin_03_shop_change import CSV_COLUMNS, _row_signature
 from modules.transform.pipelines.db.beamin_store_io import read_file, read_table, write_table
-from modules.transform.utility.paths import ANALYTICS_DB, COLLECT_DB
+from modules.transform.utility.paths import ANALYTICS_DB, COLLECT_DB, LOCAL_DB
 
 logger = logging.getLogger(__name__)
 KST = pendulum.timezone("Asia/Seoul")
 
-INBOX = COLLECT_DB / "영업관리부_수집" / "_baemin_pc2_inbox"
-PROCESSING = INBOX / "_processing"
-LOCK_DIR = INBOX / "_lock"
+INBOX = COLLECT_DB
+MANIFEST_PREFIX = "baemin_pc2_manifest__"
+PROCESSING = LOCAL_DB / "baemin_pc2_inbox_processing"
+LOCK_DIR = LOCAL_DB / "baemin_pc2_inbox_lock"
 MIN_AGE_MINUTES = 30
 
 _CSV_DATASETS = {
@@ -37,7 +38,7 @@ def _as_str_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _acquire_lock() -> bool:
-    INBOX.mkdir(parents=True, exist_ok=True)
+    LOCK_DIR.parent.mkdir(parents=True, exist_ok=True)
     try:
         LOCK_DIR.mkdir()
     except FileExistsError:
@@ -60,30 +61,46 @@ def _release_lock() -> None:
         logger.warning("PC2 inbox lock 해제 실패(무시): %s", exc)
 
 
-def _load_manifest(run_dir: Path) -> dict[str, int] | None:
-    manifest_path = run_dir / "manifest.json"
+def _age_minutes(path: Path) -> float:
+    return (pendulum.now(KST) - pendulum.from_timestamp(path.stat().st_mtime, tz=KST)).total_seconds() / 60
+
+
+def _load_manifest(manifest_path: Path) -> dict | None:
     if not manifest_path.exists():
-        logger.info("PC2 inbox run skip: manifest 없음 %s", run_dir)
+        logger.info("PC2 inbox run skip: manifest 없음 %s", manifest_path)
         return None
     try:
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception as exc:
-        logger.warning("PC2 inbox run skip: manifest 읽기 실패 %s (%s)", run_dir, exc)
+        logger.warning("PC2 inbox run skip: manifest 읽기 실패 %s (%s)", manifest_path, exc)
         return None
-    if not isinstance(data, dict):
-        logger.warning("PC2 inbox run skip: manifest 형식 오류 %s", run_dir)
+    if not isinstance(data, dict) or not isinstance(data.get("files"), dict):
+        logger.warning("PC2 inbox run skip: manifest 형식 오류 %s", manifest_path)
         return None
-    return {str(k): int(v) for k, v in data.items()}
+    return data
 
 
-def _manifest_ready(run_dir: Path, manifest: dict[str, int]) -> bool:
-    newest_mtime = 0.0
-    for rel, expected_size in manifest.items():
-        path = run_dir / rel
+def _flat_manifest_ready(manifest_path: Path, manifest: dict) -> bool:
+    manifest_age = _age_minutes(manifest_path)
+    if manifest_age < MIN_AGE_MINUTES:
+        logger.info(
+            "PC2 inbox manifest skip: mtime %.1f분 경과, 최소 %d분 필요 %s",
+            manifest_age,
+            MIN_AGE_MINUTES,
+            manifest_path,
+        )
+        return False
+
+    for filename, info in manifest["files"].items():
+        if not isinstance(info, dict) or not info.get("rel"):
+            logger.warning("PC2 inbox manifest skip: 파일 메타 형식 오류 %s %s", manifest_path, filename)
+            return False
+        path = INBOX / filename
         if not path.exists() or not path.is_file():
             logger.info("PC2 inbox run skip: 파일 미동기화 %s", path)
             return False
         actual_size = path.stat().st_size
+        expected_size = int(info.get("size", -1))
         if actual_size != expected_size:
             logger.info(
                 "PC2 inbox run skip: size 불일치 %s expected=%s actual=%s",
@@ -92,17 +109,13 @@ def _manifest_ready(run_dir: Path, manifest: dict[str, int]) -> bool:
                 actual_size,
             )
             return False
-        newest_mtime = max(newest_mtime, path.stat().st_mtime)
-
-    if newest_mtime:
-        newest = pendulum.from_timestamp(newest_mtime, tz=KST)
-        age_minutes = (pendulum.now(KST) - newest).total_seconds() / 60
-        if age_minutes < MIN_AGE_MINUTES:
+        file_age = _age_minutes(path)
+        if file_age < MIN_AGE_MINUTES:
             logger.info(
-                "PC2 inbox run skip: mtime %.1f분 경과, 최소 %d분 필요 %s",
-                age_minutes,
+                "PC2 inbox file skip: mtime %.1f분 경과, 최소 %d분 필요 %s",
+                file_age,
                 MIN_AGE_MINUTES,
-                run_dir,
+                path,
             )
             return False
     return True
@@ -114,8 +127,28 @@ def _candidate_runs() -> list[Path]:
     return sorted(
         p
         for p in INBOX.iterdir()
-        if p.is_dir() and not p.name.startswith("_") and p.name != PROCESSING.name
+        if p.is_file()
+        and p.suffix.lower() == ".json"
+        and p.name.startswith(MANIFEST_PREFIX)
+        and not p.name.startswith("_tmp_")
     )
+
+
+def _claim_flat_run(manifest_path: Path, manifest: dict) -> Path:
+    run_name = str(manifest.get("run") or manifest_path.stem.removeprefix(MANIFEST_PREFIX))
+    run_name = "".join(ch if ch.isalnum() or ch in "._=-" else "_" for ch in run_name)[:160]
+    run_dir = PROCESSING / run_name
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(manifest_path), str(run_dir / "manifest.json"))
+    for filename, info in manifest["files"].items():
+        rel = Path(str(info["rel"]))
+        src = INBOX / filename
+        dst = run_dir / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+    return run_dir
 
 
 def _analytics_path(incoming: Path, baemin_root: Path) -> Path:
@@ -232,26 +265,25 @@ def ingest_baemin_pc2_inbox(**context) -> str:
     total_counts: Counter = Counter()
     try:
         PROCESSING.mkdir(parents=True, exist_ok=True)
-        for run_dir in _candidate_runs():
-            manifest = _load_manifest(run_dir)
-            if manifest is None or not _manifest_ready(run_dir, manifest):
+        for manifest_path in _candidate_runs():
+            manifest = _load_manifest(manifest_path)
+            if manifest is None or not _flat_manifest_ready(manifest_path, manifest):
                 continue
 
-            claimed = PROCESSING / run_dir.name
             try:
-                shutil.move(str(run_dir), str(claimed))
+                run_dir = _claim_flat_run(manifest_path, manifest)
             except Exception as exc:
-                logger.info("PC2 inbox run claim 실패, skip: %s (%s)", run_dir, exc)
+                logger.info("PC2 inbox flat run claim 실패, skip: %s (%s)", manifest_path, exc)
                 continue
 
             try:
-                counts = _process_run(claimed)
+                counts = _process_run(run_dir)
                 total_counts.update(counts)
                 processed += 1
-                shutil.rmtree(claimed)
-                logger.info("PC2 inbox run 처리 완료: %s %s", claimed.name, dict(counts))
+                shutil.rmtree(run_dir)
+                logger.info("PC2 inbox flat run 처리 완료: %s %s", run_dir.name, dict(counts))
             except Exception:
-                logger.exception("PC2 inbox run 처리 실패, 보존: %s", claimed)
+                logger.exception("PC2 inbox flat run 처리 실패, 보존: %s", run_dir)
                 raise
     finally:
         _release_lock()

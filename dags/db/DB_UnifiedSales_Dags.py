@@ -27,6 +27,7 @@ from modules.transform.pipelines.db.DB_UnifiedSales import (
     backfill_unionpos as pipeline_backfill_unionpos,
     upsert_fin_product_grp_from_unionpos as pipeline_upsert_unionpos_products,
     reclassify_hall_platform as pipeline_reclassify,
+    refresh_store_meta_in_unified_sales as pipeline_refresh_store_meta,
     run_lookback_okpos as pipeline_lookback_okpos,
     run_lookback_unionpos as pipeline_lookback_unionpos,
     run_okpos as pipeline_run_okpos,
@@ -87,8 +88,8 @@ default_args = {
 LOOKBACK_DAYS: int | None = None
 
 # 배민·쿠팡 직수집 교정 대상 테스트 매장 (검증 완료 후 확대)
-#  ["해운대중동점", "법흥리점", "송파삼전점", "동탄영천점", "중랑면목점", "시흥배곧점", "동두천지행점", "평택비전점"]
-TEST_STORES: list[str] = ["해운대중동점", "법흥리점", "송파삼전점"]
+#  ["동탄영천점", "중랑면목점", "시흥배곧점", "동두천지행점", "평택비전점"]
+TEST_STORES: list[str] = ["해운대중동점", "법흥리점", "송파삼전점", "동탄영천점", "중랑면목점", "시흥배곧점", "동두천지행점", "평택비전점"]
 
 UPSTREAM_POS_TASKS = [
     {
@@ -354,7 +355,7 @@ def reconcile_coupang(**context) -> str:
     return reconcile_coupang_for_test_stores(
         stores=TEST_STORES,
         sale_date=sale_date,
-        lookback_days=LOOKBACK_DAYS or 7,
+        lookback_days=LOOKBACK_DAYS,
     )
 
 
@@ -376,6 +377,11 @@ def generate_posfeed_whitelist_draft(**context) -> str:
 def build_daily_summary(**context) -> str:
     """unified_sales → 일별×store×brand×order_type×platform 요약 parquet (LLM broadcast)."""
     return pipeline_build_daily_summary()
+
+
+def refresh_store_meta(**context) -> str:
+    """sales_employee.csv 기준으로 unified_sales 매장 메타를 최신화."""
+    return pipeline_refresh_store_meta()
 
 
 def reclassify_platform(**context) -> str:
@@ -414,7 +420,7 @@ def enforce_coupang_manual_only(**context) -> str:
     return enforce_coupang_manual_only_for_test_stores(
         stores=TEST_STORES,
         sale_date=sale_date,
-        lookback_days=LOOKBACK_DAYS or 7,
+        lookback_days=LOOKBACK_DAYS,
     )
 
 
@@ -508,6 +514,11 @@ with DAG(
         python_callable=enforce_coupang_manual_only,
     )
 
+    t6c = PythonOperator(
+        task_id="refresh_store_meta",
+        python_callable=refresh_store_meta,
+    )
+
     t7 = PythonOperator(
         task_id="validate_sales",
         python_callable=validate_sales,
@@ -524,4 +535,4 @@ with DAG(
     )
 
     # 순차 실행: 같은 날짜 parquet에 동시 write 방지
-    t1 >> t_ingest_pc2 >> t_wait >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5b >> t5c >> t_baemin >> t_coupang >> t6 >> t6a >> t6b >> t7 >> t8 >> t9
+    t1 >> t_ingest_pc2 >> t_wait >> t3 >> t3a >> t4 >> t5 >> t5a >> t5a3 >> t5b >> t5c >> t_baemin >> t_coupang >> t6 >> t6a >> t6b >> t6c >> t7 >> t8 >> t9

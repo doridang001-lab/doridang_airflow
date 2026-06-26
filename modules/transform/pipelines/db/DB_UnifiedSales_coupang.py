@@ -48,14 +48,12 @@ _DEDUP_COLUMNS = [
 def reconcile_coupang_for_test_stores(
     stores: list[str],
     sale_date: str | None = None,
-    lookback_days: int = 7,
+    lookback_days: int | None = 7,
 ) -> str:
     """TEST_STORES의 쿠팡이츠 행을 coupang_macro 직수집 기준으로 교정."""
-    if sale_date:
-        dates = [str(sale_date)]
-    else:
-        kst_now = pendulum.now("Asia/Seoul")
-        dates = [(kst_now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(lookback_days)]
+    dates = _resolve_coupang_target_dates(stores, sale_date, lookback_days)
+    if not dates:
+        return "쿠팡수동 교정 스킵 | 대상 날짜 없음"
     ym_list = sorted({date[:7] for date in dates})
 
     total_added = 0
@@ -103,17 +101,15 @@ def reconcile_coupang_for_test_stores(
 def enforce_coupang_manual_only_for_test_stores(
     stores: list[str],
     sale_date: str | None = None,
-    lookback_days: int = 7,
+    lookback_days: int | None = 7,
 ) -> str:
     """TEST_STORES의 쿠팡이츠 최종 방어막."""
     if not stores:
         return "TEST_STORES 없음 - 쿠팡수동 최종 정리 스킵"
 
-    if sale_date:
-        dates = [str(sale_date)]
-    else:
-        kst_now = pendulum.now("Asia/Seoul")
-        dates = [(kst_now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(lookback_days)]
+    dates = _resolve_coupang_target_dates(stores, sale_date, lookback_days)
+    if not dates:
+        return "쿠팡수동 최종 정리 스킵 | 대상 날짜 없음"
 
     store_set = {str(store).strip() for store in stores if str(store).strip()}
     total_removed = 0
@@ -148,6 +144,109 @@ def enforce_coupang_manual_only_for_test_stores(
         )
 
     return f"쿠팡수동 최종 정리 완료 | 파일={changed_files} 제거={total_removed}행"
+
+
+def _resolve_coupang_target_dates(
+    stores: list[str],
+    sale_date: str | None,
+    lookback_days: int | None,
+) -> list[str]:
+    """교정 대상 날짜 결정.
+
+    - sale_date 지정: 단일 날짜
+    - lookback_days 정수: 최근 N일
+    - lookback_days None: 쿠팡수동 원천과 기존 unified 쿠팡수동/중복 날짜 전체
+    """
+    if sale_date:
+        return [str(sale_date)]
+
+    if lookback_days is not None:
+        kst_now = pendulum.now("Asia/Seoul")
+        return [
+            (kst_now - timedelta(days=i)).strftime("%Y-%m-%d")
+            for i in range(lookback_days)
+        ]
+
+    dates: set[str] = set()
+    for store in stores:
+        dates.update(_collect_coupang_source_dates(store))
+    dates.update(_collect_existing_unified_coupang_manual_dates(stores))
+    dates.update(_collect_existing_coupang_duplicate_dates(stores))
+    return sorted(d for d in dates if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d))
+
+
+def _find_all_coupang_files(store: str) -> list[str]:
+    base = ANALYTICS_DB / "coupang_macro" / "orders"
+    pattern = str(base / "brand=*" / f"store={store}" / "ym=*" / "orders_*.parquet")
+    return sorted(glob(pattern))
+
+
+def _collect_coupang_source_dates(store: str) -> set[str]:
+    dates: set[str] = set()
+    for file_path in _find_all_coupang_files(store):
+        try:
+            df = pd.read_parquet(file_path, columns=["order_date"])
+        except Exception as exc:
+            logger.warning("쿠팡 날짜 수집 실패: %s | %s", file_path, exc)
+            continue
+        parsed = df["order_date"].map(_parse_coupang_datetime)
+        dates.update(date for date, _ in parsed if date)
+    return dates
+
+
+def _collect_existing_unified_coupang_manual_dates(stores: list[str]) -> set[str]:
+    store_set = {str(store).strip() for store in stores if str(store).strip()}
+    if not store_set or not UNIFIED_ROOT.exists():
+        return set()
+
+    dates: set[str] = set()
+    for path in sorted(UNIFIED_ROOT.glob("unified_sales_*.parquet")):
+        try:
+            df = pd.read_parquet(path, columns=["sale_date", "store", "platform", "source"])
+        except Exception as exc:
+            logger.warning("unified 쿠팡수동 날짜 수집 실패: %s | %s", path, exc)
+            continue
+
+        mask = (
+            df["store"].fillna("").astype(str).str.strip().isin(store_set)
+            & df["platform"].fillna("").astype(str).str.strip().isin(COUPANG_REPLACED_PLATFORMS)
+            & df["source"].fillna("").astype(str).str.strip().eq(COUPANG_SOURCE)
+        )
+        if mask.any():
+            dates.update(df.loc[mask, "sale_date"].fillna("").astype(str).str.strip().tolist())
+    return dates
+
+
+def _collect_existing_coupang_duplicate_dates(stores: list[str]) -> set[str]:
+    store_set = {str(store).strip() for store in stores if str(store).strip()}
+    if not store_set or not UNIFIED_ROOT.exists():
+        return set()
+
+    dates: set[str] = set()
+    for path in sorted(UNIFIED_ROOT.glob("unified_sales_*.parquet")):
+        try:
+            df = pd.read_parquet(path, columns=["sale_date", "store", "platform", "source"])
+        except Exception as exc:
+            logger.warning("unified 쿠팡 중복 날짜 수집 실패: %s | %s", path, exc)
+            continue
+
+        df = df.copy()
+        df["sale_date"] = df["sale_date"].fillna("").astype(str).str.strip()
+        df["store"] = df["store"].fillna("").astype(str).str.strip()
+        df["platform"] = df["platform"].fillna("").astype(str).str.strip()
+        df["source"] = df["source"].fillna("").astype(str).str.strip()
+        sub = df[
+            df["store"].isin(store_set)
+            & df["platform"].isin(COUPANG_REPLACED_PLATFORMS)
+        ]
+        if sub.empty:
+            continue
+
+        source_sets = sub.groupby(["sale_date", "store", "platform"])["source"].agg(set)
+        for (sale_date, _, _), sources in source_sets.items():
+            if COUPANG_SOURCE in sources and any(source != COUPANG_SOURCE for source in sources):
+                dates.add(str(sale_date).strip())
+    return dates
 
 
 def _find_coupang_files(store: str, ym: str) -> list[str]:

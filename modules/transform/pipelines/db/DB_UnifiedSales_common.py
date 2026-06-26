@@ -722,6 +722,58 @@ def repartition_unified_sales_by_sale_date() -> str:
     return result
 
 
+def refresh_store_meta_in_unified_sales() -> str:
+    """현재 sales_employee.csv 기준으로 unified_sales 매장 메타를 일괄 갱신."""
+    files = sorted(UNIFIED_ROOT.glob("unified_sales_*.parquet")) if UNIFIED_ROOT.exists() else []
+    if not files:
+        msg = f"unified_sales parquet 없음, 스킵 | {UNIFIED_ROOT}"
+        logger.warning(msg)
+        return msg
+
+    store_map = _load_store_map()
+    total_rows = 0
+    changed_files = 0
+    skipped = 0
+
+    for path in files:
+        try:
+            df = pd.read_parquet(path)
+        except Exception as exc:
+            logger.warning("매장 메타 갱신 parquet 로드 실패, 스킵: %s | %s", path, exc)
+            skipped += 1
+            continue
+
+        if df.empty or "store" not in df.columns:
+            continue
+
+        df = df.copy()
+        before = df.reindex(columns=["담당자", "region", "실오픈일"], fill_value="")
+        store_key = df["store"].fillna("").astype(str).str.strip().str.split().str[-1]
+        known_mask = store_key.isin(store_map)
+        for field in ("담당자", "region", "실오픈일"):
+            if field not in df.columns:
+                df[field] = ""
+            df.loc[known_mask, field] = store_key.loc[known_mask].map(
+                lambda key: _lookup_store_meta(store_map, key, field)
+            )
+
+        after = df[["담당자", "region", "실오픈일"]]
+        if before.equals(after):
+            continue
+
+        df = df.reindex(columns=UNIFIED_COLUMNS, fill_value="")
+        df.to_parquet(path, index=False, engine="pyarrow")
+        changed_files += 1
+        total_rows += len(df)
+
+    result = (
+        f"unified_sales 매장 메타 갱신 완료 | 파일={changed_files} "
+        f"행={total_rows} 스킵={skipped}"
+    )
+    logger.info(result)
+    return result
+
+
 def purge_source_from_unified_sales(source: str = "toorder") -> str:
     """Remove all rows of target source from all unified_sales parquet files."""
     src = str(source).strip().lower()
