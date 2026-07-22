@@ -11,9 +11,11 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+from modules.transform.utility.mail_recipients import MAIL_CMJ_PM
+
 logger = logging.getLogger(__name__)
 
-_ALERT_EMAILS = ["a17019@kakao.com"]
+_ALERT_EMAILS = [MAIL_CMJ_PM]
 HEAL_QUEUE_PATH = Path(os.getenv("HEAL_QUEUE_PATH", "/opt/airflow/logs/heal_queue.jsonl"))
 _TELEGRAM_TRIGGER = "해결해라"
 
@@ -71,6 +73,14 @@ _DATA_FILE_PATTERNS = [
     r"xlsx zip open failed",
 ]
 
+_ALLOCATOR_ERROR_PATTERNS = [
+    r"상품\s*슬롯\s*초과",
+    r"slot\s*overflow",
+    r"manual_item_block_size",
+    r"item_id\s*배정\s*실패",
+    r"store_seq=.*\d+\s*/\s*\d+",
+]
+
 _CODE_ERROR_PATTERNS = [
     r"syntaxerror",
     r"indentationerror",
@@ -86,21 +96,23 @@ _CODE_ERROR_PATTERNS = [
 
 
 def _get_telegram_creds() -> tuple[str, str]:
+    token = ""
+    chat_id = ""
     try:
         from airflow.models import Variable
 
         token = Variable.get("TELEGRAM_BOT_TOKEN", default_var="")
         chat_id = Variable.get("TELEGRAM_CHAT_ID", default_var="")
-        return token, chat_id
     except Exception:
-        return "", ""
+        pass
+    return token or os.getenv("TELEGRAM_BOT_TOKEN", ""), chat_id or os.getenv("TELEGRAM_CHAT_ID", "")
 
 
-def send_telegram(text: str) -> None:
+def send_telegram(text: str) -> bool:
     token, chat_id = _get_telegram_creds()
     if not token or not chat_id:
         logger.warning("Telegram credentials missing; skip send")
-        return
+        return False
     try:
         payload = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
         url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -113,8 +125,39 @@ def send_telegram(text: str) -> None:
         with urllib.request.urlopen(req, timeout=10):
             pass
         logger.info("Telegram alert sent")
+        return True
     except Exception as e:
         logger.warning("Telegram send failed (ignored): %s", e)
+        return False
+
+
+def send_telegram_chunks(text: str, limit: int = 4000) -> bool:
+    lines = (text or "").split("\n")
+    chunks: list[str] = []
+    buf: list[str] = []
+    cur = 0
+    for line in lines:
+        while len(line) > limit:
+            if buf:
+                chunks.append("\n".join(buf))
+                buf = []
+                cur = 0
+            chunks.append(line[:limit])
+            line = line[limit:]
+        add = len(line) + (1 if buf else 0)
+        if cur + add > limit:
+            chunks.append("\n".join(buf))
+            buf = [line]
+            cur = len(line)
+        else:
+            buf.append(line)
+            cur += add
+    if buf:
+        chunks.append("\n".join(buf))
+    ok = True
+    for chunk in chunks:
+        ok = send_telegram(chunk) and ok
+    return ok
 
 
 def _send_email_alert(subject: str, body: str) -> None:
@@ -128,11 +171,14 @@ def _send_email_alert(subject: str, body: str) -> None:
 
 
 def classify_failure(text: str) -> str:
-    """Classify conservatively so runtime crashes do not trigger code edits."""
+    """Classify failures for alerting and auto-heal routing."""
     normalized = (text or "").lower()
     for pattern in _DATA_FILE_PATTERNS:
         if re.search(pattern, normalized, re.IGNORECASE):
             return "data_file_error"
+    for pattern in _ALLOCATOR_ERROR_PATTERNS:
+        if re.search(pattern, normalized, re.IGNORECASE):
+            return "allocator_error"
     for pattern in _DATA_OR_ACCOUNT_PATTERNS:
         if re.search(pattern, normalized, re.IGNORECASE):
             return "data_or_account"
@@ -157,11 +203,18 @@ def _append_heal_queue(entry: dict) -> bool:
         return False
 
 
+def _is_airflow_temporary_run(run_id: object) -> bool:
+    return "temporary_run" in str(run_id or "")
+
+
 def enqueue_heal_task(context) -> bool:
     ti = context.get("task_instance") or context.get("ti")
     if ti is None:
         logger.warning("heal_queue append skipped: missing task_instance")
         return False
+    if _is_airflow_temporary_run(getattr(ti, "run_id", "")):
+        logger.info("heal_queue append skipped: temporary run_id=%s", getattr(ti, "run_id", ""))
+        return True
 
     exception = context.get("exception", "")
     error_text = str(exception or "")
@@ -188,10 +241,13 @@ def enqueue_heal_task(context) -> bool:
     return _append_heal_queue(entry)
 
 
-def on_failure_callback(context) -> None:
+def _handle_failure_callback(context, *, telegram_enabled: bool) -> None:
     ti = context.get("task_instance") or context.get("ti")
     if ti is None:
         logger.warning("failure callback skipped: missing task_instance")
+        return
+    if _is_airflow_temporary_run(getattr(ti, "run_id", "")):
+        logger.info("failure callback skipped: temporary run_id=%s", getattr(ti, "run_id", ""))
         return
 
     execution_date = ti.execution_date.strftime("%Y-%m-%d %H:%M")
@@ -212,15 +268,29 @@ def on_failure_callback(context) -> None:
     )
 
     _send_email_alert(subject, body)
-    send_telegram(f"{body}\n{_TELEGRAM_TRIGGER}")
+    if telegram_enabled:
+        send_telegram(f"{body}\n{_TELEGRAM_TRIGGER}")
     if not enqueue_heal_task(context):
-        send_telegram(f"[Auto-Heal] heal_queue_write_failed=true\ndag_id={ti.dag_id}\ntask_id={ti.task_id}")
+        if telegram_enabled:
+            send_telegram(f"[Auto-Heal] heal_queue_write_failed=true\ndag_id={ti.dag_id}\ntask_id={ti.task_id}")
+
+
+def on_failure_callback(context) -> None:
+    _handle_failure_callback(context, telegram_enabled=True)
+
+
+def on_failure_callback_no_telegram(context) -> None:
+    """이메일과 자동복구 큐는 유지하되 태스크별 Telegram은 보내지 않는다."""
+    _handle_failure_callback(context, telegram_enabled=False)
 
 
 def on_retry_callback(context) -> None:
     ti = context.get("task_instance") or context.get("ti")
     if ti is None:
         logger.warning("retry callback skipped: missing task_instance")
+        return
+    if _is_airflow_temporary_run(getattr(ti, "run_id", "")):
+        logger.info("retry callback skipped: temporary run_id=%s", getattr(ti, "run_id", ""))
         return
 
     execution_date = ti.execution_date.strftime("%Y-%m-%d %H:%M")

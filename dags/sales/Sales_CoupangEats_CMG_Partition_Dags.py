@@ -21,6 +21,7 @@ from modules.transform.pipelines.sales.SMD_CoupangEats_CMG_Partition import (
 )
 from modules.transform.utility.paths import ANALYTICS_DB
 from modules.transform.utility.notifier import on_failure_callback
+from modules.transform.utility.mail_recipients import MAIL_CMJ_PM
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +110,7 @@ def validate_cmg(**context) -> str:
     send_email(
         subject=f"[쿠팡CMG검증실패] {total_dates}일 불일치",
         html_content=html,
-        to_emails="a17019@kakao.com",
+        to_emails=MAIL_CMJ_PM,
     )
     logger.warning("CMG 검증 실패 이메일 발송: %d일", total_dates)
     return f"검증 실패 이메일 발송 ({total_dates}일)"

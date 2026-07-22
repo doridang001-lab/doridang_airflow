@@ -80,6 +80,9 @@ x-airflow-common:
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
     LOCAL_GPT_OSS_20B_ENDPOINT: 'http://host.docker.internal:11434/v1/chat/completions'
     LOCAL_GPT_OSS_20B_MODEL: 'gpt-oss:20b'
+    OKPOS_ID: ${OKPOS_ID:-}
+    OKPOS_PW: ${OKPOS_PW:-}
+    BAEMIN_MACRO_ROLE: ${BAEMIN_MACRO_ROLE:-}
     # Coupang collection attaches to the minimized real Chrome launched on the Windows host.
     # Chrome DevTools rejects host.docker.internal as a Host header; use Docker Desktop's host IP.
     COUPANG_CHROME_DEBUGGER: '192.168.65.254:9222'
@@ -106,6 +109,10 @@ x-airflow-common:
     - ./config:/opt/airflow/config
     - ./keys:/opt/airflow/keys
     - ./modules:/opt/airflow/modules
+    - ./phases:/opt/airflow/phases
+    - ./harness:/opt/airflow/harness
+    - ./scripts:/opt/airflow/scripts
+    - ./AGENTS.md:/opt/airflow/AGENTS.md:ro
     - ./requirements.txt:/opt/airflow/requirements.txt
     - ./.git:/opt/airflow/.git:ro
     - ./chrome_profiles:/opt/airflow/chrome_profiles

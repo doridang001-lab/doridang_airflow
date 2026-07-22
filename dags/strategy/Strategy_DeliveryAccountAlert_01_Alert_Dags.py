@@ -1,17 +1,17 @@
-﻿"""
-ToOrder 諛곕떖 怨꾩젙 愿由??꾪솴 ?섏쭛 ???뚮┝ 諛쒖넚 DAG
+"""
+ToOrder 배달 계정 관리 현황 수집 및 알림 발송 DAG
 
-泥섎━ ?먮쫫:
-    1. crawl_delivery_account  : ToOrder 諛곕떖 怨꾩젙 愿由?Excel ?ㅼ슫濡쒕뱶 (Selenium)
-    2. filter_alert_targets    : ?ㅻ쪟 留ㅼ옣 ?꾪꽣留?+ ?대떦??留ㅽ븨
-    3. save_to_csv             : OneDrive CSV ???+ ???寃利?    4. send_alert_emails       : ?대떦?먮퀎 HTML ?대찓??諛쒖넚
+처리 흐름:
+    1. crawl_delivery_account  : ToOrder 배달 계정 관리 Excel 다운로드 (Selenium)
+    2. filter_alert_targets    : 오류 매장 필터링 및 담당자 매핑
+    3. save_to_csv             : CSV 저장 및 검증
+    4. send_alert_emails       : 담당자별 HTML 이메일 발송
 
-?ㅼ?以? 留ㅼ씪 09:35 KST (SMP_DELIVERY_ALERT_TIME)
-TEST_MODE=True: 紐⑤뱺 ?대찓?쇱쓣 a17019@kakao.com ?⑤룆 ?섏떊?쇰줈 ?꾪솚
+실행 주기: 매일 09:35 KST (SMP_DELIVERY_ALERT_TIME)
+TEST_MODE=True: 모든 이메일을 관리자 수신자로만 발송
 """
 
 import importlib
-import os
 import logging
 from pathlib import Path
 from datetime import timedelta
@@ -26,8 +26,7 @@ from modules.transform.utility.notifier import enqueue_heal_task, send_telegram
 from modules.transform.utility.schedule import SMP_DELIVERY_ALERT_TIME
 
 # ============================================================
-# TEST_MODE: True ???뚯뒪???섏떊??a17019@kakao.com)濡쒕쭔 諛쒖넚
-#            False ???대떦????諛쒖넚 + CC
+# TEST_MODE: True 이면 관리자에게만 발송, False 이면 담당자에게 발송 + 관리자 CC
 # ============================================================
 TEST_MODE = False
 
@@ -39,9 +38,9 @@ logger = logging.getLogger(__name__)
 
 def _on_task_failure(context):
     """
-    ?ㅽ뙣 利됱떆 ?뚮┝ 諛쒖넚.
-    - 1?뚯감 ?ㅽ뙣: 利됱떆 ?뚮┝ (?ъ떆???덉젙 ?덈궡)
-    - 理쒖쥌 ?ㅽ뙣: ?ъ떆???뚯쭊 ??異붽? ?뚮┝
+    실패 즉시 알림 발송.
+    - 1회차 실패: 즉시 알림 (재시도 예정 안내)
+    - 최종 실패: 재시도 소진 후 추가 알림
     """
     try:
         ti = context.get("ti") or context.get("task_instance")
@@ -90,20 +89,21 @@ def _on_task_failure(context):
         logger.exception("Failure alert callback failed")
     try:
         _ti2 = context.get("task_instance") or context.get("ti")
-        _exc2 = context.get("exception", "?????놁쓬")
+        _exc2 = context.get("exception", "예외 정보 없음")
         _rd2 = getattr(_ti2, "execution_date", None)
         _ed2 = _rd2.strftime("%Y-%m-%d %H:%M") if _rd2 else ""
         _retry2 = getattr(_ti2, "try_number", 1) - 1
         send_telegram(
-            f"DAG: {_ti2.dag_id}\nTask: {_ti2.task_id}\n?ъ떆?? {_retry2}?뚯감\n"
-            f"?ㅽ뻾?쇱떆: {_ed2}\n?먮윭: {_exc2}\n濡쒓렇: {_ti2.log_url}\n?닿껐?대씪"
+            f"DAG: {_ti2.dag_id}\nTask: {_ti2.task_id}\n재시도: {_retry2}회차\n"
+            f"실행일시: {_ed2}\n에러: {_exc2}\n로그: {_ti2.log_url}\n해결 필요"
         )
         enqueue_heal_task(context)
     except Exception:
         pass
 
 # ============================================================
-# ?뚯씠?꾨씪??紐⑤뱢 ?숈쟻 ?꾪룷??# ============================================================
+# 파이프라인 모듈 동적 임포트
+# ============================================================
 _pipeline = importlib.import_module(
     "modules.transform.pipelines.strategy.SMP_delivery_account_alert_01"
 )
@@ -115,11 +115,11 @@ send_delivery_alert_emails = _pipeline.send_delivery_alert_emails
 cleanup_downloaded_excel = _pipeline.cleanup_downloaded_excel
 
 # ============================================================
-# DAG ?뺤쓽
+# DAG 정의
 # ============================================================
 with DAG(
     dag_id=Path(__file__).stem,
-    description="ToOrder 諛곕떖 怨꾩젙 ?곌껐 ?ㅻ쪟 留ㅼ옣 ?쇱씪 ?뚮┝",
+    description="ToOrder 배달 계정 연결 오류 매장 일일 알림",
     schedule=SMP_DELIVERY_ALERT_TIME,
     start_date=pendulum.datetime(2025, 1, 1, tz="Asia/Seoul"),
     catchup=False,

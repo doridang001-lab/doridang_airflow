@@ -232,15 +232,6 @@ def do_login(driver, account_id: str, password: str) -> bool:
         log("  ✗ PW 필드 없음", account_id)
         return False
 
-    time.sleep(0.3)
-    # 기업회원 체크박스
-    try:
-        cb = driver.find_element(By.CSS_SELECTOR, "input[name='isCompany']")
-        driver.execute_script("arguments[0].click();", cb)
-        log("  ✓ 기업회원 체크", account_id)
-    except Exception:
-        pass
-
     time.sleep(0.5)
     # 로그인 버튼
     try:
@@ -788,10 +779,11 @@ def run_toorder_voc_crawling(
 # ============================================================================
 
 if __name__ == "__main__":
+    from modules.transform.utility.account import get_pw
     test_df = pd.DataFrame([{
         "channel": "toorder",
         "id": "doridang15",
-        "pw": "ehfl5233!",
+        "pw": get_pw("toorder", "doridang15"),
     }])
 
     result = run_toorder_voc_crawling(

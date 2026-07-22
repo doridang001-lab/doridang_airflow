@@ -1136,12 +1136,13 @@ def run_toorder_review_crawling(
 # ============================================================================
 
 if __name__ == "__main__":
-    
+    from modules.transform.utility.account import get_pw
+
     test_account_df = pd.DataFrame([
         {
             "channel": "toorder",
             "id": "doridang15",
-            "pw": "ehfl5233!",
+            "pw": get_pw("toorder", "doridang15"),
         },
     ])
     

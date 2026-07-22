@@ -2,7 +2,7 @@
 fin_product_map 송파삼전점 표준화 DAG
 
 매일 자동 실행하며 송파삼전점 대상 fin_product_map CSV/JSON을 갱신한다.
-사람은 fin_product_map_review.csv만 검수하고, 전체 map은 파이프라인이 병합한다.
+사람은 fin_product_map_review_input.csv를 검수하고, 전체 map은 파이프라인이 병합한다.
 수동 테스트 실행은 DAG 실행 conf에 {"dry_run": true}를 명시한다.
 """
 
@@ -72,7 +72,7 @@ def run_migrate(**context) -> dict:
 def run_build_train_json(**context) -> dict:
     conf = _dag_conf(context)
     dry_run = _conf_bool(conf, "dry_run", DRY_RUN_BY_DEFAULT)
-    logger.info("fin_product_map_train_json 빌드 시작: dry_run=%s", dry_run)
+    logger.info("fin_product_map_train_json 및 rules_json 빌드 시작: dry_run=%s", dry_run)
     return build_fin_product_map_train_json(dry_run=dry_run)
 
 
@@ -83,13 +83,19 @@ def run_llm(**context) -> dict:
     limit = _conf_int(conf, "limit", default_limit)
     logger.info("fin_product_map llm 시작: dry_run=%s limit=%s", dry_run, limit)
     result = llm_product_map(dry_run=dry_run, limit=limit)
-    new_count = int(result.get("new_classified") or 0)
-    if not dry_run and new_count > 0:
+    new_pending = int(result.get("new_pending") or 0)
+    if not dry_run and new_pending > 0:
+        pending_count = int(result.get("pending") or 0)
+        samples = result.get("new_item_samples") or []
+        sample_text = "\n".join(f"- {item}" for item in samples[:5])
+        if sample_text:
+            sample_text = f"\n신규 샘플:\n{sample_text}\n"
         send_telegram(
-            "[상품 매핑] 신규 상품 분류 완료\n"
-            f"신규 상품: {new_count}건\n"
-            f"검수 대상: {result.get('review_rows', 0)}건\n"
-            "fin_product_map_review.csv를 확인해주세요."
+            "[상품 매핑] 신규 상품 검수 필요\n"
+            f"신규 검수 필요: {new_pending}건\n"
+            f"미검수(검수유무=0): {pending_count}건\n"
+            f"{sample_text}"
+            "fin_product_map_review_input.csv에서 표준명과 분류를 확인해주세요."
         )
     return result
 

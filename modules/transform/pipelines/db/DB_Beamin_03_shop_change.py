@@ -50,6 +50,11 @@ KST = pendulum.timezone("Asia/Seoul")
 KNOWN_BRANDS = ["나홀로", "도리당"]
 BRAND_COLLECTION_ORDER = {"나홀로": 0, "도리당": 1}
 
+
+def _short_error(exc: Exception) -> str:
+    text = str(exc).splitlines()[0].strip()
+    return text[:240]
+
 SHOP_CHANGE_URL = "https://self.baemin.com/history/change/shop"
 SHOP_OPERATION_URL = "https://self.baemin.com/shops/{store_id}/manage/operation"
 OP_HOUR_P_CSS = "p[class*='ShopOperationHourBody-module']"
@@ -359,7 +364,7 @@ def collect_shop_change_for_driver(driver, store_list: list[dict]) -> None:
         driver.set_page_load_timeout(25)
         driver.get(SHOP_CHANGE_URL)
     except Exception as e:
-        logger.warning("변경이력 페이지 첫 진입 타임아웃 (계속): %s", e)
+        logger.info("변경이력 페이지 첫 진입 지연(계속): %s", _short_error(e))
 
     if not wait_for_page(driver, SELECT_CSS, timeout=30):
         logger.warning("변경이력 페이지 select 로드 실패 → 수집 건너뜀")
@@ -429,7 +434,7 @@ def collect_shop_change_for_driver(driver, store_list: list[dict]) -> None:
                 len(rows),
             )
         else:
-            logger.warning("데이터 없음: %s", target_label)
+            logger.info("데이터 없음(정상): %s", target_label)
 
         time.sleep(random.uniform(1.5, 3.0))
 
@@ -447,7 +452,7 @@ def collect_shop_change_for_driver(driver, store_list: list[dict]) -> None:
         if op_rows:
             _save_operation_csv(op_rows, store_info["brand"], store_info["store"])
         else:
-            logger.warning("운영시간 데이터 없음: %s", _format_store_target(store_info))
+            logger.info("운영시간 데이터 없음(정상): %s", _format_store_target(store_info))
         time.sleep(random.uniform(1.0, 2.0))
 
     # 월간 영업시간·영업일수 계산
@@ -497,7 +502,7 @@ def _load_shop_change_store_list(
         driver.set_page_load_timeout(25)
         driver.get(SHOP_CHANGE_URL)
     except Exception as e:
-        logger.warning("변경이력 페이지 진입 타임아웃 (계속 진행): %s", e)
+        logger.info("변경이력 페이지 진입 지연(계속 진행): %s", _short_error(e))
 
     if not wait_for_page(driver, SELECT_CSS, timeout=30):
         logger.warning("변경이력 페이지 select 로드 실패: %s", account_id)
@@ -567,7 +572,7 @@ def _ensure_shop_change_page(driver, target_label: str) -> bool:
         driver.set_page_load_timeout(25)
         driver.get(SHOP_CHANGE_URL)
     except Exception as e:
-        logger.warning("변경이력 페이지 재진입 타임아웃 (%s): %s", target_label, e)
+        logger.info("변경이력 페이지 재진입 지연 (%s): %s", target_label, _short_error(e))
 
     return wait_for_page(driver, SELECT_CSS, timeout=30)
 
@@ -1123,7 +1128,9 @@ def _collect_one_store_operation(driver, store_info: dict, full_name: str) -> li
         driver.set_page_load_timeout(25)
         driver.get(url)
     except Exception as e:
-        logger.warning("운영시간 페이지 로드 타임아웃 (%s): %s", store_id, e)
+        if is_driver_crash_error(e):
+            raise
+        logger.info("운영시간 페이지 로드 지연 (%s): %s", store_id, _short_error(e))
 
     if not wait_for_page(driver, OP_HOUR_P_CSS, timeout=15):
         logger.warning("운영시간 요소 로드 실패: %s", store_id)
@@ -1293,7 +1300,9 @@ def collect_shop_change_for_driver(driver, store_list: list[dict]) -> None:
         driver.set_page_load_timeout(25)
         driver.get(SHOP_CHANGE_URL)
     except Exception as exc:
-        logger.warning("변경이력 페이지 진입 지연: %s", exc)
+        if is_driver_crash_error(exc):
+            raise
+        logger.info("변경이력 페이지 진입 지연: %s", _short_error(exc))
 
     if not wait_for_page(driver, SELECT_CSS, timeout=30):
         raise RuntimeError("shop_change select load failed")

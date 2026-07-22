@@ -31,6 +31,7 @@ from modules.extract.crawling_toorder_sales_report import (
 from modules.transform.utility.paths import ANALYTICS_DB, DOWN_DIR
 from modules.transform.utility.schedule import SMD_TOORDER_SALES_REPORT_TIME
 from modules.transform.utility.notifier import on_failure_callback
+from modules.transform.utility.account import get_default_account
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +39,7 @@ logger = logging.getLogger(__name__)
 # 설정
 # ============================================================
 
-TOORDER_ID = "doridang15"
-TOORDER_PW = "ehfl5233!"
+TOORDER_ID, TOORDER_PW = get_default_account("toorder")
 
 LOOKBACK_DAYS = 7
 BACKFILL_START = "2026-01-01"

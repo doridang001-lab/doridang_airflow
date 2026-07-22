@@ -445,6 +445,43 @@ Utils = {
     });
   },
 
+  async checkDownloadBeacon(storeName, targetDateStr, purpose) {
+    const cleanStr = (str) => String(str || '').replace(/[\\/:*?"<>|\s]/g, '_').substring(0, 30);
+    const prefix = `coupangeats_${purpose}_${cleanStr(storeName)}`;
+
+    try {
+      if (!chrome.downloads?.search) {
+        return await new Promise((resolve) => {
+          chrome.runtime.sendMessage({
+            type: 'CHECK_DOWNLOAD_BEACON',
+            prefix,
+            targetDateStr
+          }, (response) => {
+            if (chrome.runtime.lastError) {
+              console.warn('[beacon] background 조회 실패:', chrome.runtime.lastError.message);
+              resolve(false);
+              return;
+            }
+            resolve(!!response?.exists);
+          });
+        });
+      }
+
+      const downloads = await chrome.downloads.search({
+        query: [prefix],
+        state: 'complete',
+        orderBy: ['-startTime'],
+        limit: 10
+      });
+      return downloads.some(d =>
+        d.filename.includes(targetDateStr) && d.filename.includes(prefix)
+      );
+    } catch (e) {
+      console.warn('[beacon] chrome.downloads.search 실패:', e.message);
+      return false;
+    }
+  },
+
   _fallbackDownload(content, filename, mimeType = 'text/csv;charset=utf-8') {
     const blob = new Blob(['\uFEFF' + content], { type: mimeType });
     const url = URL.createObjectURL(blob);
@@ -530,9 +567,13 @@ Utils = {
     const iconEl = document.getElementById(`__ms_icon_${idx}`);
     const statusEl = document.getElementById(`__ms_status_${idx}`);
     const sectionEl = document.getElementById(`__ms_section_${idx}`);
-    if (iconEl) iconEl.textContent = status === 'success' ? '✅' : '⚠️';
-    if (statusEl) { statusEl.style.color = status === 'success' ? '#34a853' : '#e67e00'; statusEl.textContent = summary; }
-    if (sectionEl) sectionEl.style.background = status === 'success' ? '#f0fff4' : '#fff8e1';
+    const isBlocked = status === 'blocked';
+    if (iconEl) iconEl.textContent = status === 'success' ? '✅' : (isBlocked ? '🚫' : '⚠️');
+    if (statusEl) {
+      statusEl.style.color = status === 'success' ? '#34a853' : (isBlocked ? '#d63384' : '#e67e00');
+      statusEl.textContent = summary;
+    }
+    if (sectionEl) sectionEl.style.background = status === 'success' ? '#f0fff4' : (isBlocked ? '#ffe3f0' : '#fff8e1');
   },
 
   finalizeMultiStoreModal() {

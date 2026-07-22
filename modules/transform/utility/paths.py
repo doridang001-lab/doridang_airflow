@@ -293,13 +293,25 @@ _RESOLVERS = {
     "TOORDER_REVIEW_ANALYTICS_DIR": lambda: _get("ANALYTICS_DB") / "toorder_review",
     # Derived — MART_DB 계열
     "COLLECTION_COMPARE_PATH":      lambda: _get("MART_DB") / "collection_compare" / "collection_compare.parquet",
-    "FIN_PRODUCT_CSV_PATH":         lambda: _get("MART_DB") / "fin_product" / "fin_product_grp.csv",
+    "DELIVERY_COMMISSION_DIR":      lambda: _get("MART_DB") / "delivery_commission",
+    "DELIVERY_COMMISSION_PATH":     lambda: _get("DELIVERY_COMMISSION_DIR") / "delivery_commission.parquet",
+    # fin_product — 브랜치 스킴(_input.csv/legacy fallback)
+    "FIN_PRODUCT_LEGACY_CSV_PATH":  lambda: _get("MART_DB") / "fin_product" / "fin_product_grp.csv",
+    "FIN_PRODUCT_CSV_PATH":         lambda: _get("MART_DB") / "fin_product" / "fin_product_grp_input.csv",
     "FIN_PRODUCT_GRP_TRAIN_JSON_PATH": lambda: _get("MART_DB") / "fin_product" / "fin_product_grp_train.json",
     "FIN_PRODUCT_REVIEW_CSV_PATH":  lambda: _get("MART_DB") / "fin_product" / "fin_product_review.csv",
     "FIN_PRODUCT_ALIAS_CSV_PATH":   lambda: _get("MART_DB") / "fin_product" / "fin_product_alias.csv",
+    "FIN_PRODUCT_MART_CSV_PATH":    lambda: _get("MART_DB") / "fin_product" / "fin_product_mart.csv",
+    "POSFEED_WHITELIST_CSV_PATH":   lambda: _get("MART_DB") / "fin_product" / "fin_product_posfeed_whitelist.csv",
     "FIN_PRODUCT_MAP_CSV_PATH":         lambda: _get("MART_DB") / "fin_product" / "fin_product_map.csv",
-    "FIN_PRODUCT_MAP_REVIEW_CSV_PATH":  lambda: _get("MART_DB") / "fin_product" / "fin_product_map_review.csv",
+    "FIN_PRODUCT_MAP_REVIEW_LEGACY_CSV_PATH": lambda: _get("MART_DB") / "fin_product" / "fin_product_map_review.csv",
+    "FIN_PRODUCT_MAP_REVIEW_CSV_PATH":  lambda: _get("MART_DB") / "fin_product" / "fin_product_map_review_input.csv",
+    "FIN_PRODUCT_MAP_RECENTLY_CSV_PATH": lambda: _get("MART_DB") / "fin_product" / "fin_product_map_recently.csv",
+    "FIN_PRODUCT_MAP_JOIN_CSV_PATH":   lambda: _get("MART_DB") / "fin_product" / "fin_product_map_join.csv",
     "FIN_PRODUCT_MAP_TRAIN_JSON_PATH": lambda: _get("MART_DB") / "fin_product" / "fin_product_map_train.json",
+    "FIN_PRODUCT_RULES_JSON_PATH":  lambda: _get("MART_DB") / "fin_product" / "fin_product_rules.json",
+    "FIN_PRODUCT_RULES_MANUAL_JSON_PATH": lambda: _get("MART_DB") / "fin_product" / "fin_product_rules_manual.json",
+    "ORDER_CROSS_DIR":              lambda: _get("MART_DB") / "order_cross_analysis",
     "UNIFIED_REVIEW_MART_DIR":      lambda: _get("MART_DB") / "unified_review",
     # Derived — STORE_SALES 계열
     "STORE_SALES_TARGET_DIR":        lambda: _get("ANALYTICS_DB") / "store_sales_target",
@@ -313,3 +325,13 @@ def __getattr__(name: str):
     if name in _RESOLVERS:
         return _get(name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def existing_fin_product_csv_path() -> Path:
+    csv = _get("FIN_PRODUCT_CSV_PATH")
+    return csv if csv.exists() else _get("FIN_PRODUCT_LEGACY_CSV_PATH")
+
+
+def existing_fin_product_map_review_csv_path() -> Path:
+    review = _get("FIN_PRODUCT_MAP_REVIEW_CSV_PATH")
+    return review if review.exists() else _get("FIN_PRODUCT_MAP_REVIEW_LEGACY_CSV_PATH")

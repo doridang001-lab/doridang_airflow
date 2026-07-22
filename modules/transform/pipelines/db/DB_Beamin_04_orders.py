@@ -4,6 +4,7 @@
   account_id/password → 매장별 독립 Chrome 세션
     → orders/history 이동
     → 가게 필터 선택 (store_id) → 날짜 필터 어제 설정
+    → 배달완료 주문만 수집
     → 전 페이지 수집 (행별 개별 expand/extract/collapse → 페이지네이션)
     → CSV 저장 (upsert by 주문번호)
     → Chrome quit (팝업 메모리 해제)
@@ -26,13 +27,14 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 
 from modules.extract.croling_beamin import (
+    clean_chrome_profile,
     human_click,
     launch_browser,
     login_baemin,
     wait_for_page,
 )
 from modules.transform.utility.paths import BAEMIN_ORDERS_DB
-from modules.transform.pipelines.db.beamin_store_io import read_table, write_table
+from modules.transform.pipelines.db.beamin_store_io import order_ym, read_table, write_table
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +60,69 @@ _TABLE_ROW_CSS = "tr.Table_b_r4ax_1dwbr4on[data-index]"
 _MAX_PAGES = 50
 _PAGE_TRANSITION_TIMEOUT = 25
 _MAX_VALIDATION_RETRY = 2
-_ORDER_COLLECTION_ATTEMPTS = 5
+_ORDER_COLLECTION_ATTEMPTS = 2
+_ORDERS_PAGE_LOAD_TIMEOUT_SEC = 75
+_ORDERS_SHELL_WAIT_SEC = 30
+_ORDERS_TABLE_WAIT_SEC = 30
+
+
+def _short_error(exc: Exception) -> str:
+    text = str(exc).splitlines()[0].strip()
+    return text[:240]
+
+
+def _wait_for_orders_table(driver, timeout: int = _ORDERS_TABLE_WAIT_SEC) -> bool:
+    try:
+        WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, _TABLE_ROW_CSS))
+        )
+        return True
+    except TimeoutException:
+        return False
+
+
+def _wait_for_orders_page_shell(driver, timeout: int = _ORDERS_SHELL_WAIT_SEC) -> bool:
+    """주문 row가 없어도 필터 조작이 가능한 orders 페이지 shell이면 준비 완료로 본다."""
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: d.execute_script(
+                """
+                const href = location.href || '';
+                const filterBtns = [...document.querySelectorAll('button')]
+                    .filter(b => (b.className || '').includes('Filter'));
+                const hasStoreFilter = filterBtns.some(b =>
+                    b.querySelector('.Badge_b_r4ax_19agxiso')
+                );
+                const hasDateFilter = filterBtns.some(b =>
+                    !b.querySelector('.Badge_b_r4ax_19agxiso') &&
+                    (
+                        (b.textContent || '').includes('날짜') ||
+                        /\\d{4}\\.\\s*\\d{2}\\.\\s*\\d{2}/.test(b.textContent || '')
+                    )
+                );
+                const hasStoreSelect = [...document.querySelectorAll('select')]
+                    .some(sel => sel.options && sel.options.length > 0);
+                const hasTable = !!document.querySelector('table');
+                return href.includes('/orders/history') &&
+                    (hasStoreFilter || hasStoreSelect) &&
+                    (hasDateFilter || hasTable);
+                """
+            )
+        )
+        return True
+    except TimeoutException:
+        return False
+
+
+def _open_orders_history(driver) -> None:
+    driver.set_page_load_timeout(_ORDERS_PAGE_LOAD_TIMEOUT_SEC)
+    try:
+        driver.get(ORDERS_URL)
+    except TimeoutException:
+        try:
+            driver.execute_script("window.stop();")
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -143,31 +207,6 @@ def _validate_collected(rows: list[dict], expected: dict | None) -> dict:
     }
 
 
-def _order_date_prefixes(target_date: str) -> tuple[str, str]:
-    dt = pendulum.parse(target_date, tz=KST)
-    return (
-        dt.format("YYYY. MM. DD."),
-        f"{dt.year}. {dt.month}. {dt.day}.",
-    )
-
-
-def _filter_rows_for_target_date(rows: list[dict], target_date: str, store: str) -> list[dict]:
-    if not rows:
-        return rows
-    prefixes = _order_date_prefixes(target_date)
-    filtered = [
-        row for row in rows
-        if str(row.get("주문시각", "")).strip().startswith(prefixes)
-    ]
-    if len(filtered) != len(rows):
-        sample_dates = sorted({str(row.get("주문시각", ""))[:24] for row in rows})[:5]
-        logger.warning(
-            "target_date 외 주문행 제외: %s / %s rows=%d -> %d sample_dates=%s",
-            store, target_date, len(rows), len(filtered), sample_dates,
-        )
-    return filtered
-
-
 def _csv_already_covers(
     brand: str, store: str, target_date: str, status_label: str, summary: dict
 ) -> bool:
@@ -178,8 +217,7 @@ def _csv_already_covers(
         df = read_table(stem)
         if df is None:
             return False
-        prefixes = _order_date_prefixes(target_date)
-        df = df[df["주문시각"].astype(str).str.startswith(prefixes, na=False)]
+        df = df[df["주문시각"].astype(str).str.startswith(target_date)]
         df = df[df["주문상태"].astype(str) == status_label]
         count = df["주문번호"].nunique()
         if count != summary.get("count", -1):
@@ -279,8 +317,15 @@ def _collect_with_retry_on_mismatch(
             break
 
         try:
-            driver.get(ORDERS_URL)
-            if not wait_for_page(driver, _TABLE_ROW_CSS, timeout=45):
+            try:
+                driver.get(ORDERS_URL)
+            except TimeoutException as exc:
+                logger.info("재수집 페이지 로드 지연, DOM 대기로 계속: %s / %s", store, _short_error(exc))
+                try:
+                    driver.execute_script("window.stop();")
+                except Exception:
+                    pass
+            if not wait_for_page(driver, _TABLE_ROW_CSS, timeout=30):
                 logger.warning("재수집 페이지 로드 실패, 중단: %s", store)
                 break
             if not filter_fn(driver):
@@ -327,12 +372,25 @@ def collect_orders_for_driver(
     logger.info("주문내역 수집 시작: %s (%s) / %s", store, store_id, target_date)
 
     try:
-        driver.set_page_load_timeout(45)
-        driver.get(ORDERS_URL)
+        page_ready = False
+        for page_attempt in range(2):
+            try:
+                _open_orders_history(driver)
+            except Exception as exc:
+                raise OrdersCollectionInterrupted(
+                    f"orders navigation failed before table wait: {store} / {_short_error(exc)}"
+                ) from exc
 
-        if not wait_for_page(driver, _TABLE_ROW_CSS, timeout=30):
-            logger.warning("테이블 로드 실패, 건너뜀: %s", store)
-            return {"ok": False, "validation": validation}
+            if _wait_for_orders_page_shell(driver):
+                page_ready = True
+                break
+            logger.info("주문내역 페이지 shell 미확인(%d/2): %s", page_attempt + 1, store)
+            time.sleep(2.0)
+
+        if not page_ready:
+            raise OrdersCollectionInterrupted(
+                f"Timed out receiving message from renderer: orders page shell not ready after fast waits: {store}"
+            )
 
         if not _select_order_store(driver, store_id, store):
             logger.warning("가게 필터 선택 실패, 건너뜀: %s", store)
@@ -357,16 +415,11 @@ def collect_orders_for_driver(
         if vr_normal.get("matched") is False:
             logger.warning("검증 불일치로 정상 주문 저장 생략: %s / %s", store, target_date)
             ok = False
-            rows = []
         elif rows:
-            rows = _filter_rows_for_target_date(rows, target_date, store)
-        if rows:
             saved = _save_orders_csv(rows, brand, store, target_date)
             logger.info("저장 완료(정상): brand=%s store=%s → %s (%d행)", brand, store, saved, len(rows))
         else:
             logger.info("정상 주문 없음: %s / %s", store, target_date)
-
-        logger.info("주문취소 수집 스킵: %s / %s", store, target_date)
 
         return {"ok": ok, "validation": validation}
 
@@ -414,13 +467,20 @@ def collect_orders_for_account(
 
                 if not login_baemin(driver, account_id, password):
                     logger.warning("로그인 실패: %s / %s", account_id, store)
+                    if attempt < _ORDER_COLLECTION_ATTEMPTS - 1:
+                        continue
                     break
 
-                driver.set_page_load_timeout(45)
-                driver.get(ORDERS_URL)
+                try:
+                    _open_orders_history(driver)
+                except Exception as exc:
+                    logger.warning("주문내역 페이지 이동 실패, 건너뜀: %s / %s", store, _short_error(exc))
+                    if attempt < _ORDER_COLLECTION_ATTEMPTS - 1:
+                        continue
+                    break
 
-                if not wait_for_page(driver, _TABLE_ROW_CSS, timeout=45):
-                    logger.warning("테이블 로드 실패, 건너뜀: %s", store)
+                if not _wait_for_orders_page_shell(driver):
+                    logger.warning("주문내역 페이지 shell 로드 실패, 건너뜀: %s", store)
                     if attempt < _ORDER_COLLECTION_ATTEMPTS - 1:
                         continue
                     break
@@ -448,28 +508,23 @@ def collect_orders_for_account(
                     return _select_order_store(d, _sid, _sn) and _set_date(d, _td)
 
                 rows, vr_normal = _collect_with_retry_on_mismatch(
-                    driver, store_info, "배달완료", _filter_normal,
+                    driver, store_info, "배달완료", _filter_normal, target_date=target_date,
                 )
                 validation.append(vr_normal)
 
                 if vr_normal.get("matched") is False:
                     logger.warning("검증 불일치로 정상 주문 저장 생략: %s / %s", store, target_date)
-                    rows = []
                     if attempt < _ORDER_COLLECTION_ATTEMPTS - 1:
                         validation.pop()
                         continue
                     break
                 elif rows:
-                    rows = _filter_rows_for_target_date(rows, target_date, store)
-                if rows:
                     saved = _save_orders_csv(rows, brand, store, target_date)
                     logger.info(
                         "저장 완료(정상): brand=%s store=%s → %s (%d행)", brand, store, saved, len(rows)
                     )
                 else:
                     logger.info("정상 주문 없음: %s / %s", store, target_date)
-
-                logger.info("주문취소 수집 스킵: %s / %s", store, target_date)
 
                 succeeded = True
                 break
@@ -479,6 +534,11 @@ def collect_orders_for_account(
                     "매장 수집 실패 (%s) attempt=%d/%d: %s",
                     store, attempt + 1, _ORDER_COLLECTION_ATTEMPTS, e,
                 )
+                if _is_crash(e) and attempt < _ORDER_COLLECTION_ATTEMPTS - 1:
+                    try:
+                        clean_chrome_profile(account_id)
+                    except Exception as clean_exc:
+                        logger.warning("Chrome 프로필 정리 실패(%s): %s", account_id, clean_exc)
             finally:
                 if driver:
                     try:
@@ -662,49 +722,39 @@ def _set_date_specific(driver, target_date: str) -> bool:
         target_day = dt.day
         day_label = f"{target_day}일"
 
-        # 1. 날짜 필터 버튼 클릭. 주문 페이지에서는 DatePicker.Trigger가 아니라
-        # Badge 없는 Filter 버튼으로 노출되는 경우가 있어 JS fallback을 같이 쓴다.
+        # 1. DefaultDateFilter 트리거 클릭
         clicked = driver.execute_script(
             """
-            const selectors = [
-              '[data-atelier-component="DatePicker.Trigger"]',
-              '[class*="DefaultDateFilter"] button'
-            ];
-            for (const sel of selectors) {
-              const el = document.querySelector(sel);
-              if (el) { el.click(); return sel; }
+            // data-atelier-component="DatePicker.Trigger" 또는 DefaultDateFilter 내 버튼
+            let btn = document.querySelector('[data-atelier-component="DatePicker.Trigger"]');
+            if (!btn) {
+                const wrap = document.querySelector('[class*="DefaultDateFilter"]');
+                btn = wrap && wrap.querySelector('button');
             }
-            const filterBtns = [...document.querySelectorAll('button')]
-              .filter(b => String(b.className || '').includes('Filter'));
-            const dateFilterBtn = filterBtns.find(b => !b.querySelector('[class*="Badge"]'));
-            if (dateFilterBtn) { dateFilterBtn.click(); return 'filter_no_badge'; }
-            for (const btn of document.querySelectorAll('button')) {
-              const t = (btn.textContent || '').trim();
-              if ((t.includes('날짜') || t.includes('최근') || /\\d{4}\\.\\s*\\d{1,2}/.test(t))
-                  && !btn.querySelector('[class*="Badge"]')) {
-                btn.click(); return 'text_date_button';
-              }
+            if (!btn) {
+                const filterBtns = [...document.querySelectorAll('button')]
+                    .filter(b => b.className.includes('Filter'));
+                btn = filterBtns.find(b => !b.querySelector('.Badge_b_r4ax_19agxiso'));
             }
+            if (!btn) {
+                for (const candidate of document.querySelectorAll('button')) {
+                    const text = candidate.textContent || '';
+                    if (
+                        !candidate.querySelector('.Badge_b_r4ax_19agxiso') &&
+                        (text.includes('날짜') || text.match(/\\d{4}\\.\\s*\\d{2}\\.\\s*\\d{2}/))
+                    ) {
+                        btn = candidate;
+                        break;
+                    }
+                }
+            }
+            if (btn) { btn.click(); return true; }
             return false;
             """
         )
         if not clicked:
-            logger.warning("날짜 필터 버튼 미발견")
+            logger.warning("DefaultDateFilter 트리거 버튼 미발견")
             return False
-        logger.info("날짜 필터 버튼 클릭: %s", clicked)
-
-        # 직접 날짜 선택 모드가 필요한 UI면 먼저 전환한다.
-        time.sleep(0.3)
-        driver.execute_script(
-            """
-            const labels = [...document.querySelectorAll('label, button, span')];
-            const target = labels.find(el => {
-              const t = (el.textContent || '').trim();
-              return ['직접설정', '직접 설정', '기간설정', '기간 설정', '날짜 직접 설정'].includes(t);
-            });
-            if (target) target.click();
-            """
-        )
 
         # 2. 달력 헤더 확인 후 목표 월로 이동
         def _get_calendar_ym(d):
@@ -720,50 +770,12 @@ def _set_date_specific(driver, target_date: str) -> bool:
             m = _re.search(r"(\d{4})[^\d]+(\d{1,2})", text)
             return (int(m.group(1)), int(m.group(2))) if m else None
 
-        # 달력이 열릴 때까지 대기. 주문 페이지가 라디오형 날짜 팝업만 노출하면
-        # target_date=KST 어제에 한해 배민 영업일 기준 "오늘" fallback을 쓴다.
-        try:
-            WebDriverWait(driver, 10).until(
-                lambda d: d.execute_script(
-                    "return !!document.querySelector('[aria-label$=\"일\"]');"
-                )
+        # 달력이 열릴 때까지 대기
+        WebDriverWait(driver, 10).until(
+            lambda d: d.execute_script(
+                "return !!document.querySelector('[aria-label$=\"일\"]');"
             )
-        except TimeoutException:
-            snapshot = driver.execute_script(
-                """
-                return {
-                  buttons: [...document.querySelectorAll('button')].map(b => (b.textContent || '').trim()).filter(Boolean).slice(0, 40),
-                  labels: [...document.querySelectorAll('label')].map(l => (l.textContent || '').trim()).filter(Boolean).slice(0, 40),
-                  radios: [...document.querySelectorAll('input[type="radio"]')].map(i => ({name: i.name, value: i.value, checked: i.checked})).slice(0, 20)
-                };
-                """
-            )
-            logger.debug("날짜 팝업 스냅샷: %s", snapshot)
-            yesterday = pendulum.yesterday(KST).format("YYYY-MM-DD")
-            if target_date != yesterday:
-                raise
-            logger.warning("달력 미노출, target_date=%s → 라디오 '오늘' fallback 시도", target_date)
-            applied = driver.execute_script(
-                """
-                const daily = document.querySelector("input[type='radio'][value='dailyWeekly']");
-                if (daily) daily.click();
-                for (const lbl of document.querySelectorAll('label')) {
-                  if ((lbl.textContent || '').trim() === '오늘') { lbl.click(); return 'label_today'; }
-                }
-                return false;
-                """
-            )
-            if not applied:
-                logger.warning("라디오 '오늘' fallback 실패")
-                return False
-            apply_btn = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, "//button[@data-atelier-component='Button'][.//span[text()='적용']]")
-                )
-            )
-            human_click(driver, apply_btn)
-            logger.info("날짜 필터 설정 완료: %s (오늘 fallback)", target_date)
-            return True
+        )
 
         # 최대 24번(2년치) 이전달 이동
         for _ in range(24):
@@ -788,7 +800,12 @@ def _set_date_specific(driver, target_date: str) -> bool:
         # 3. 시작일 클릭
         clicked_start = driver.execute_script(
             f"""
-            const btns = [...document.querySelectorAll('button[aria-label="{day_label}"]')];
+            const btns = [...document.querySelectorAll('button')].filter(b =>
+                b.getAttribute('aria-label') === '{day_label}' ||
+                b.getAttribute('aria-label')?.includes('{day_label}') ||
+                b.textContent.trim() === '{target_day}' ||
+                b.textContent.trim() === '{day_label}'
+            );
             if (btns.length > 0) {{ btns[0].click(); return true; }}
             return false;
             """
@@ -802,7 +819,12 @@ def _set_date_specific(driver, target_date: str) -> bool:
         # 4. 종료일 클릭 (같은 날 → 1일 범위)
         driver.execute_script(
             f"""
-            const btns = [...document.querySelectorAll('button[aria-label="{day_label}"]')];
+            const btns = [...document.querySelectorAll('button')].filter(b =>
+                b.getAttribute('aria-label') === '{day_label}' ||
+                b.getAttribute('aria-label')?.includes('{day_label}') ||
+                b.textContent.trim() === '{target_day}' ||
+                b.textContent.trim() === '{day_label}'
+            );
             if (btns.length > 0) btns[btns.length - 1].click();
             """
         )
@@ -841,8 +863,103 @@ def _set_date_specific(driver, target_date: str) -> bool:
 
 
 def _set_date(driver, target_date: str) -> bool:
-    """날짜 shortcut 대신 달력에서 target_date 하루를 명시 선택한다."""
+    """target_date에 맞는 날짜 필터 함수를 선택해 호출한다."""
+    today = pendulum.now(KST).format("YYYY-MM-DD")
+    yesterday = pendulum.yesterday(KST).format("YYYY-MM-DD")
+    if target_date == today:
+        return _set_date_today(driver) or _set_date_specific(driver, target_date)
+    if target_date == yesterday:
+        return _set_date_yesterday(driver)
     return _set_date_specific(driver, target_date)
+
+
+def _set_date_today(driver) -> bool:
+    """날짜 필터를 '일 → 오늘'로 설정하고 적용한다."""
+    try:
+        clicked = driver.execute_script(
+            """
+            const filterBtns = [...document.querySelectorAll('button')]
+                .filter(b => b.className.includes('Filter'));
+            const dateFilterBtn = filterBtns.find(b => !b.querySelector('.Badge_b_r4ax_19agxiso'));
+            if (dateFilterBtn) { dateFilterBtn.click(); return 'date_filter_btn'; }
+            for (const btn of document.querySelectorAll('button')) {
+                const t = btn.textContent;
+                if (t.includes('날짜') || t.match(/\\d{4}\\.\\s*\\d{2}\\.\\s*\\d{2}/)) {
+                    if (!btn.querySelector('.Badge_b_r4ax_19agxiso')) { btn.click(); return 'text_btn'; }
+                }
+            }
+            return false;
+            """
+        )
+        if not clicked:
+            logger.warning("날짜 필터 버튼 미발견 (filterBtns 없음)")
+            return False
+        logger.info("날짜 필터 버튼 클릭: %s", clicked)
+
+        daily_radio = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable(
+                (By.CSS_SELECTOR, "input[type='radio'][value='dailyWeekly']")
+            )
+        )
+        driver.execute_script("arguments[0].click();", daily_radio)
+
+        WebDriverWait(driver, 10).until(
+            lambda d: d.execute_script(
+                """
+                for (const lbl of document.querySelectorAll('label')) {
+                    if (lbl.textContent.trim() === '오늘') return true;
+                }
+                return false;
+                """
+            )
+        )
+        driver.execute_script(
+            """
+            for (const lbl of document.querySelectorAll('label')) {
+                if (lbl.textContent.trim() === '오늘') { lbl.click(); return; }
+            }
+            """
+        )
+        time.sleep(0.2)
+
+        apply_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable(
+                (By.XPATH, "//button[@data-atelier-component='Button'][.//span[text()='적용']]")
+            )
+        )
+        human_click(driver, apply_btn)
+        try:
+            WebDriverWait(driver, 10).until(
+                lambda d: d.execute_script(
+                    "for (const b of document.querySelectorAll('button')) { if (b.textContent.includes('오늘')) return true; } return false;"
+                )
+            )
+        except TimeoutException:
+            pass
+
+        confirmed = driver.execute_script(
+            """
+            const btns = document.querySelectorAll('button');
+            for (const btn of btns) {
+                if (btn.textContent.includes('오늘')) return true;
+            }
+            return false;
+            """
+        )
+        if not confirmed:
+            logger.info("날짜 '오늘' 배지 미확인, 주문 날짜 검증 단계로 계속 진행")
+
+        logger.info("날짜 필터 설정 완료: 오늘")
+        return True
+
+    except TimeoutException as e:
+        logger.warning("날짜 필터(today) 설정 오류: %s", e)
+        return False
+    except Exception as e:
+        if _is_crash(e):
+            raise
+        logger.warning("날짜 필터(today) 설정 오류: %s", e)
+        return False
 
 
 def _set_date_yesterday(driver) -> bool:
@@ -928,8 +1045,7 @@ def _set_date_yesterday(driver) -> bool:
             """
         )
         if not confirmed:
-            logger.warning("날짜 '어제' 설정 검증 실패")
-            return False
+            logger.info("날짜 '어제' 배지 미확인, 주문 날짜 검증 단계로 계속 진행")
 
         logger.info("날짜 필터 설정 완료: 어제")
         return True
@@ -942,129 +1058,6 @@ def _set_date_yesterday(driver) -> bool:
             raise
         logger.warning("날짜 필터 설정 오류: %s", e)
         return False
-
-
-# ---------------------------------------------------------------------------
-# 주문취소 status 필터
-# ---------------------------------------------------------------------------
-
-def _select_status_cancelled(driver) -> bool:
-    """통합 필터 팝업(FilterContainer-module__ccrG)을 열고 주문취소(CANCELLED)를 선택한다.
-
-    배민 orders 페이지 구조: 가게·상태·결제방법·광고서비스가 하나의 FilterContainer 버튼으로 묶여 있음.
-    가게 필터(_select_order_store)가 이미 같은 버튼을 사용하므로, 상태 변경도 같은 버튼을 재클릭.
-    CANCELLED 라디오는 input[readonly] → label.click()으로만 React 상태 변경.
-    """
-    try:
-        # 1. 통합 필터 버튼 클릭 (FilterContainer-module__ccrG)
-        opened = driver.execute_script(
-            """
-            // 날짜 필터(FilterContainer-module__vSPY) 제외한 나머지 FilterContainer 버튼
-            const btns = [...document.querySelectorAll('button[class*="FilterContainer"]')];
-            const combined = btns.find(b => !b.className.includes('vSPY'));
-            if (combined) { combined.click(); return combined.textContent.trim().slice(0, 50); }
-            return false;
-            """
-        )
-        if not opened:
-            logger.warning("통합 필터 버튼(FilterContainer-module__ccrG) 미발견")
-            return False
-        logger.info("통합 필터 버튼 클릭: %s", opened[:40])
-        # CANCELLED 라디오 나타날 때까지 대기 (고정 1.0s 제거)
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, 'input[name="status"][value="CANCELLED"]')
-            )
-        )
-
-        # 2. CANCELLED 라디오 → label 클릭 (input[readonly] 우회)
-        result = driver.execute_script(
-            """
-            const radio = document.querySelector('input[name="status"][value="CANCELLED"]');
-            if (!radio) return 'not_found';
-            const lbl = document.querySelector('label[for="' + radio.id + '"]');
-            if (lbl) { lbl.click(); return 'label_clicked'; }
-            const parent = radio.closest('[data-checked]') || radio.parentElement;
-            if (parent) { parent.click(); return 'parent_clicked'; }
-            radio.click();
-            return 'radio_fallback';
-            """
-        )
-        if result == "not_found":
-            logger.warning("주문취소 radio 미발견 (팝업 안에 input[name='status'][value='CANCELLED'] 없음)")
-            return False
-        logger.info("주문취소 라디오 클릭: %s", result)
-        time.sleep(0.5)
-
-        # 3. 적용 버튼 JS 클릭 (headless: ActionChains viewport 이탈 → 클릭 미등록 방지)
-        applied = driver.execute_script(
-            """
-            const btn = [...document.querySelectorAll('button')]
-                .find(b => b.innerText.trim() === '적용' || b.textContent.trim() === '적용');
-            if (!btn) return false;
-            btn.click();
-            return true;
-            """
-        )
-        if not applied:
-            logger.warning("주문취소 필터 적용 버튼 미발견")
-            return False
-
-        # 4. 팝업 닫힘 대기 — wait_for_page 금지
-        #    wait_for_page는 timeout 시 driver.refresh() 호출 → CANCELLED 필터 소실
-        #    → 배달완료 데이터가 주문취소 슬롯에 저장되는 오수집 발생
-        #    취소건 0건도 유효: 팝업이 닫히면 필터 적용 완료
-        try:
-            WebDriverWait(driver, 20).until(
-                EC.invisibility_of_element_located(
-                    (By.CSS_SELECTOR, 'input[name="status"][value="CANCELLED"]')
-                )
-            )
-        except TimeoutException:
-            logger.warning("주문취소 적용 후 팝업 닫힘 미확인 (20s 초과): 필터 미적용으로 간주")
-            return False
-
-        time.sleep(1.0)  # React 상태 업데이트 + 데이터 리로드 대기
-        logger.info("주문취소 status 필터 선택 완료")
-        return True
-
-    except Exception as e:
-        if _is_crash(e):
-            raise
-        logger.warning("주문취소 status 선택 오류: %s", e)
-        return False
-
-
-def _setup_cancel_filter(driver, store_id: str, store: str, target_date: str) -> bool:
-    """주문취소 필터(가게+CANCELLED+날짜)를 설정한다. 1차 실패 시 대시보드 경유 후 1회 재시도.
-
-    배민 SPA 상태가 꼬이면 통합 필터 팝업 설정이 간헐 실패한다(CLAUDE.md gotcha).
-    실패 시 대시보드를 경유해 SPA 상태를 초기화하고 orders 페이지를 다시 로드한 뒤 재시도한다.
-    드라이버 크래시는 그대로 전파(상위 복구 로직이 처리).
-    """
-    def _apply() -> bool:
-        return (
-            _select_order_store(driver, store_id, store)
-            and _select_status_cancelled(driver)
-            and _set_date(driver, target_date)
-        )
-
-    if _apply():
-        return True
-
-    logger.info("주문취소 필터 1차 실패 → 대시보드 경유 후 재시도: %s", store)
-    try:
-        driver.get("https://self.baemin.com/")
-        time.sleep(2.0)
-        driver.get(ORDERS_URL)
-        if not wait_for_page(driver, _TABLE_ROW_CSS, timeout=30):
-            return False
-    except Exception as e:
-        if _is_crash(e):
-            raise
-        return False
-
-    return _apply()
 
 
 # ---------------------------------------------------------------------------
@@ -1532,20 +1525,34 @@ _COLUMNS = [
 
 
 def _save_orders_csv(rows: list[dict], brand: str, store: str, target_date: str) -> Path:
-    """월별 파일로 upsert 저장. 같은 주문번호의 기존 행은 전부 교체."""
-    ym = target_date[:7]
-    stem = BAEMIN_ORDERS_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}" / f"orders_{ym}"
-
+    """주문시각 월별 파일로 upsert 저장. 같은 주문번호의 기존 행은 해당 월에서 교체."""
     new_df = pd.DataFrame(rows, columns=_COLUMNS).astype(str)
-    new_order_ids = set(new_df["주문번호"].unique())
+    fallback_ym = target_date[:7]
+    ym_series = order_ym(new_df["주문시각"])
+    ym_series = ym_series.where(ym_series.ne(""), fallback_ym)
 
-    existing = read_table(stem)
-    if existing is not None:
-        existing = existing[~existing["주문번호"].isin(new_order_ids)]
-        combined = pd.concat([existing, new_df], ignore_index=True)
-    else:
-        combined = new_df
+    saved: list[Path] = []
+    for ym, group in new_df.groupby(ym_series, sort=True):
+        stem = BAEMIN_ORDERS_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}" / f"orders_{ym}"
+        new_order_ids = set(group["주문번호"].unique())
 
-    out_path = write_table(combined, stem)
-    logger.info("저장 완료: %s (%d행)", out_path, len(combined))
-    return out_path
+        existing = read_table(stem)
+        if existing is not None:
+            existing = existing[~existing["주문번호"].isin(new_order_ids)]
+            combined = pd.concat([existing, group], ignore_index=True)
+        else:
+            combined = group
+
+        out_path = write_table(combined, stem)
+        logger.info("저장 완료: %s (%d행)", out_path, len(combined))
+        saved.append(out_path)
+
+    if not saved:
+        return (
+            BAEMIN_ORDERS_DB
+            / f"brand={brand}"
+            / f"store={store}"
+            / f"ym={fallback_ym}"
+            / f"orders_{fallback_ym}.parquet"
+        )
+    return next((path for path in saved if f"ym={fallback_ym}" in str(path)), saved[0])

@@ -23,7 +23,8 @@ logger = logging.getLogger(__name__)
 
 
 TOORDER_ID = "doridang15"
-TOORDER_PW = os.getenv("TOORDER_PW", "ehfl5233!")
+from modules.transform.utility.account import get_pw
+TOORDER_PW = get_pw("toorder", TOORDER_ID) or os.getenv("TOORDER_PW")
 DEBUG_DOWNLOAD_DIR = ROOT_DIR / "tmp" / "toorder_menu_debug"
 
 

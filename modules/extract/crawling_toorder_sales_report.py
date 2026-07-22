@@ -14,6 +14,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import subprocess
 import time
 import zipfile
@@ -21,15 +22,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List
 
-import undetected_chromedriver as uc
+from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-
-from modules.transform.utility.selenium_uc import launch_uc_chrome
 
 logger = logging.getLogger(__name__)
 
@@ -159,12 +159,12 @@ def _fill_react_input(driver, element, value: str, account_id: str, field_name: 
     return actual2 == value
 
 
-def _save_login_debug(driver, account_id: str, tag: str) -> None:
+def _save_login_debug(driver, account_id: str, tag: str) -> str | None:
     """로그인 실패 디버그용 스크린샷/HTML 저장."""
     try:
-        from modules.transform.utility.paths import ANALYTICS_DB
+        from modules.transform.utility.paths import TEMP_DIR
         from datetime import datetime as _dt
-        debug_dir = ANALYTICS_DB / "ai_daily_collection" / "_debug"
+        debug_dir = TEMP_DIR / "toorder_login_debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
         ts = _dt.now().strftime("%Y%m%d_%H%M%S")
         png = debug_dir / f"{tag}_{ts}.png"
@@ -172,8 +172,10 @@ def _save_login_debug(driver, account_id: str, tag: str) -> None:
         driver.save_screenshot(str(png))
         html.write_text(driver.page_source, encoding="utf-8")
         logger.error("[%s] 디버그 저장: %s", account_id, png.name)
+        return str(png)
     except Exception as exc:
         logger.warning("[%s] 디버그 저장 실패: %s", account_id, exc)
+        return None
 
 
 def _is_retriable_driver_error(message: str) -> bool:
@@ -191,6 +193,15 @@ def _is_retriable_driver_error(message: str) -> bool:
             "protocolerror",
             "connection reset by peer",
             "connecttimeouterror",
+            "tab crashed",
+            "session deleted because of page crash",
+            "page crash",
+            "chrome not reachable",
+            "disconnected: not connected to devtools",
+            "no such window",
+            "chromeoptions object",
+            "reuse the chromeoptions object",
+            "cannot reuse chromeoptions object",
         )
     )
 
@@ -280,7 +291,7 @@ def _wait_for_report_xlsx_download(
 # 브라우저 제어
 # ============================================================
 
-def _launch_browser(account_id: str, download_dir: Path) -> uc.Chrome:
+def _launch_browser(account_id: str, download_dir: Path):
     """
     undetected_chromedriver 브라우저 인스턴스를 생성한다.
 
@@ -292,6 +303,9 @@ def _launch_browser(account_id: str, download_dir: Path) -> uc.Chrome:
         초기화된 Chrome 드라이버
     """
     logger.info("[%s] 브라우저 실행 시작 (headless=%s)", account_id, HEADLESS_MODE)
+
+    import undetected_chromedriver as uc
+    from modules.transform.utility.selenium_uc import configure_uc_data_path
 
     options = uc.ChromeOptions()
 
@@ -307,6 +321,11 @@ def _launch_browser(account_id: str, download_dir: Path) -> uc.Chrome:
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_argument("--disable-features=Translate,BackForwardCache")
 
     prefs = {
         "download.default_directory": str(download_dir.absolute()),
@@ -357,8 +376,8 @@ def _launch_browser(account_id: str, download_dir: Path) -> uc.Chrome:
 
 def _build_report_browser_options(
     account_id: str, download_dir: Path
-) -> uc.ChromeOptions:
-    options = uc.ChromeOptions()
+) -> webdriver.ChromeOptions:
+    options = webdriver.ChromeOptions()
 
     chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/google-chrome")
     chrome_path = Path(chrome_bin)
@@ -372,6 +391,11 @@ def _build_report_browser_options(
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_argument("--disable-features=Translate,BackForwardCache")
 
     prefs = {
         "download.default_directory": str(download_dir.absolute()),
@@ -383,16 +407,43 @@ def _build_report_browser_options(
     return options
 
 
-def _launch_report_browser(account_id: str, download_dir: Path) -> uc.Chrome:
-    options = _build_report_browser_options(account_id, download_dir)
+def _resolve_report_chromedriver_binary() -> str:
+    env_path = os.getenv("CHROMEDRIVER_PATH")
+    candidates = [env_path] if env_path else []
+    candidates.extend(("/usr/local/bin/chromedriver", "/usr/bin/chromedriver", "chromedriver"))
 
-    def _log(message: str) -> None:
-        logger.info("[%s] %s", account_id, message)
+    for candidate in candidates:
+        if not candidate:
+            continue
+        expanded = os.path.abspath(os.path.expanduser(candidate))
+        if os.path.exists(expanded):
+            return expanded
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    raise RuntimeError("chromedriver not found")
+
+
+def _launch_report_browser(account_id: str, download_dir: Path):
+    chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/google-chrome")
+    chromedriver_bin = _resolve_report_chromedriver_binary()
 
     last_exc: Exception | None = None
     for attempt in range(1, BROWSER_LAUNCH_RETRIES + 1):
         try:
-            driver = launch_uc_chrome(options=options, account_id=account_id, log_fn=_log)
+            options = _build_report_browser_options(account_id, download_dir)
+            logger.info(
+                "[%s] 표준 chromedriver 실행: driver=%s chrome=%s attempt=%d/%d",
+                account_id,
+                chromedriver_bin,
+                chrome_bin,
+                attempt,
+                BROWSER_LAUNCH_RETRIES,
+            )
+            driver = webdriver.Chrome(
+                service=Service(executable_path=chromedriver_bin),
+                options=options,
+            )
             driver.set_window_size(1920, 1080)
             try:
                 driver.execute_cdp_cmd(
@@ -400,7 +451,17 @@ def _launch_report_browser(account_id: str, download_dir: Path) -> uc.Chrome:
                     {"behavior": "allow", "downloadPath": str(download_dir.absolute())},
                 )
             except Exception as exc:
+                cdp_error = str(exc)
                 logger.warning("[%s] Chrome download path CDP setup failed: %s", account_id, exc)
+                if _is_retriable_driver_error(cdp_error):
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                    if attempt < BROWSER_LAUNCH_RETRIES:
+                        time.sleep(PIPELINE_RETRY_BASE_SEC * attempt)
+                        continue
+                    raise
             logger.info("[%s] 브라우저 실행 완료", account_id)
             return driver
         except Exception as exc:
@@ -461,6 +522,8 @@ def _do_login(driver, account_id: str, password: str) -> bool:
         time.sleep(1.0)
     except Exception as exc:
         logger.error("[%s] 페이지 이동 실패: %s", account_id, exc)
+        if _is_retriable_driver_error(str(exc)):
+            raise
         return False
 
     try:
@@ -555,8 +618,39 @@ def _do_login(driver, account_id: str, password: str) -> bool:
     if success:
         logger.info("[%s] 로그인 성공: %s", account_id, current_url)
     else:
-        logger.error("[%s] 로그인 실패 (url=%s)", account_id, current_url)
-        _save_login_debug(driver, account_id, "login_fail")
+        debug_path = _save_login_debug(driver, account_id, "login_fail")
+        try:
+            title = driver.title or ""
+            error_texts = driver.execute_script(
+                """
+                const selectors = [
+                    '.error', '.alert', '[role="alert"]', '.toast-message',
+                    '.MuiAlert-message', '.ant-message-notice-content',
+                    '.text-red-500', '.text-danger'
+                ];
+                const errors = [];
+                for (const selector of selectors) {
+                    for (const el of document.querySelectorAll(selector)) {
+                        const text = (el.innerText || el.textContent || '').trim();
+                        if (text) errors.push(text);
+                    }
+                }
+                return errors.slice(0, 10);
+                """
+            )
+        except Exception as exc:
+            title = ""
+            error_texts = [f"diagnostic_error={exc}"]
+        error = (
+            "login failed: "
+            f"account_id={account_id}, url={current_url}, title={title!r}, "
+            f"error_texts={error_texts}, debug={debug_path or 'unavailable'}"
+        )
+        try:
+            setattr(driver, "_toorder_login_error", error)
+        except Exception:
+            pass
+        logger.error("[%s] %s", account_id, error)
     return success
 
 
@@ -643,6 +737,66 @@ def _set_date_range(
     except Exception as exc:
         logger.error("[%s] date range set failed: %s", account_id, exc)
         return False
+
+
+def _open_datedetail_report_tab(driver, account_id: str) -> bool:
+    """Open the datedetail report tab after landing on the datedetail route."""
+    try:
+        if driver.find_elements(By.CSS_SELECTOR, "input[placeholder='YY-MM-DD']"):
+            return True
+
+        wait = WebDriverWait(driver, 30)
+        wait.until(
+            lambda d: any(
+                "일별 상세 매출 보고서"
+                in ((el.text or el.get_attribute("innerText") or "").strip())
+                for el in d.find_elements(By.XPATH, "//button | //*[@role='button']")
+            )
+        )
+        candidates = driver.find_elements(By.XPATH, "//button | //*[@role='button']")
+        candidate_texts = []
+        report_tab = None
+        for candidate in candidates:
+            text = (candidate.text or candidate.get_attribute("innerText") or "").strip()
+            if text:
+                candidate_texts.append(text)
+            if "일별 상세 매출 보고서" in text:
+                report_tab = candidate
+                break
+
+        if report_tab is None:
+            logger.error("[%s] datedetail tab candidates: %s", account_id, candidate_texts[:30])
+            return False
+
+        report_tab = wait.until(EC.element_to_be_clickable(report_tab))
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", report_tab)
+        time.sleep(0.3)
+        click_errors = []
+        for submit in (
+            lambda: report_tab.click(),
+            lambda: driver.execute_script("arguments[0].click();", report_tab),
+            lambda: report_tab.send_keys(Keys.ENTER),
+        ):
+            try:
+                submit()
+                wait.until(
+                    lambda d: len(d.find_elements(By.CSS_SELECTOR, "input[placeholder='YY-MM-DD']")) >= 2
+                )
+                logger.info("[%s] 일별 상세 매출 보고서 탭 선택 완료", account_id)
+                return True
+            except Exception as exc:
+                click_errors.append(str(exc))
+                time.sleep(1.0)
+                if driver.find_elements(By.CSS_SELECTOR, "input[placeholder='YY-MM-DD']"):
+                    logger.info("[%s] 일별 상세 매출 보고서 탭 선택 완료", account_id)
+                    return True
+
+        logger.error("[%s] 일별 상세 매출 보고서 탭 클릭 실패: %s", account_id, click_errors)
+        return False
+    except Exception as exc:
+        logger.error("[%s] 일별 상세 매출 보고서 탭 선택 실패: %s", account_id, exc)
+        return False
+
 
 def _download_report_for_date(
     driver, account_id: str, target_date: str, download_dir: Path
@@ -878,7 +1032,10 @@ def run_crawling_datedetail_months(
         try:
             driver = _launch_report_browser(toorder_id, download_dir)
             if not _do_login(driver, toorder_id, toorder_pw):
-                return _datedetail_failure_results(month_spans, "login failed")
+                error = getattr(driver, "_toorder_login_error", None) or (
+                    f"login failed: account_id={toorder_id}, url={getattr(driver, 'current_url', '')}"
+                )
+                return _datedetail_failure_results(month_spans, error)
 
             logger.info("[%s] opening datedetail report page", toorder_id)
             driver.get(SALES_REPORT_DATEDETAIL_URL)
@@ -887,6 +1044,11 @@ def run_crawling_datedetail_months(
                 return _datedetail_failure_results(
                     month_spans,
                     f"datedetail page navigation failed: {driver.current_url}",
+                )
+            if not _open_datedetail_report_tab(driver, toorder_id):
+                return _datedetail_failure_results(
+                    month_spans,
+                    "datedetail report tab open failed",
                 )
 
             results: list[Dict[str, Any]] = []
@@ -1114,10 +1276,14 @@ def run_crawling_daily_date_page(
                 return result
 
             logger.info("[%s] 일별매출보고서 페이지 이동", toorder_id)
-            driver.get(SALES_REPORT_DATE_URL)
+            driver.get(SALES_REPORT_DATEDETAIL_URL)
             time.sleep(4.0)
-            if "sales-report/orderkinds" not in driver.current_url:
+            if "sales-report/datedetail" not in driver.current_url:
                 result["error"] = f"페이지 이동 실패: {driver.current_url}"
+                return result
+
+            if not _open_datedetail_report_tab(driver, toorder_id):
+                result["error"] = "일별 상세 매출 보고서 탭 선택 실패"
                 return result
 
             if not _set_date_range(driver, toorder_id, target_date):
@@ -1140,7 +1306,7 @@ def run_crawling_daily_date_page(
 
             downloaded_file = _wait_for_report_xlsx_download(
                 download_dir=download_dir,
-                expected_stem=(Path(ORIG_DATE_FILENAME).stem, Path(ORIG_FILENAME).stem),
+                expected_stem=Path(ORIG_DATEDETAIL_FILENAME).stem,
                 download_started_at=download_started_at,
                 timeout_sec=120,
             )
@@ -1150,7 +1316,7 @@ def run_crawling_daily_date_page(
                 return result
 
             yymmdd = datetime.strptime(target_date, "%Y-%m-%d").strftime("%y%m%d")
-            new_name = f"{Path(ORIG_DATE_FILENAME).stem}_{yymmdd}{Path(ORIG_DATE_FILENAME).suffix}"
+            new_name = f"{Path(ORIG_DATEDETAIL_FILENAME).stem}_{yymmdd}{Path(ORIG_DATEDETAIL_FILENAME).suffix}"
             new_path = download_dir / new_name
 
             if new_path.exists():
@@ -1229,28 +1395,60 @@ def run_crawling_date_range(
     )
 
     try:
-        driver = _launch_report_browser(toorder_id, download_dir)
+        for attempt in range(1, PIPELINE_RETRIES + 1):
+            try:
+                driver = _launch_report_browser(toorder_id, download_dir)
 
-        if not _do_login(driver, toorder_id, toorder_pw):
-            logger.error("[%s] 로그인 실패 - 전체 날짜 스킵", toorder_id)
-            for d in date_list:
-                all_results.append(
-                    {"success": False, "file": None, "date": d, "error": "로그인 실패"}
-                )
-            return all_results
+                if not _do_login(driver, toorder_id, toorder_pw):
+                    logger.error("[%s] 로그인 실패 - 전체 날짜 스킵", toorder_id)
+                    for d in date_list:
+                        all_results.append(
+                            {
+                                "success": False,
+                                "file": None,
+                                "date": d,
+                                "error": "로그인 실패",
+                            }
+                        )
+                    return all_results
 
-        if not _navigate_to_sales_report(driver, toorder_id):
-            logger.error("[%s] 보고서 페이지 이동 실패 - 전체 날짜 스킵", toorder_id)
-            for d in date_list:
-                all_results.append(
-                    {
-                        "success": False,
-                        "file": None,
-                        "date": d,
-                        "error": "보고서 페이지 이동 실패",
-                    }
-                )
-            return all_results
+                if not _navigate_to_sales_report(driver, toorder_id):
+                    logger.error("[%s] 보고서 페이지 이동 실패 - 전체 날짜 스킵", toorder_id)
+                    for d in date_list:
+                        all_results.append(
+                            {
+                                "success": False,
+                                "file": None,
+                                "date": d,
+                                "error": "보고서 페이지 이동 실패",
+                            }
+                        )
+                    return all_results
+                break
+
+            except Exception as exc:
+                msg = str(exc)
+                if (
+                    attempt < PIPELINE_RETRIES
+                    and _is_retriable_driver_error(msg)
+                ):
+                    logger.warning(
+                        "[%s] run_crawling_date_range 로그인/이동 재시도 %d/%d: %s",
+                        toorder_id,
+                        attempt,
+                        PIPELINE_RETRIES,
+                        msg,
+                    )
+                    if driver:
+                        try:
+                            driver.quit()
+                            logger.info("[%s] 브라우저 종료", toorder_id)
+                        except Exception:
+                            pass
+                        driver = None
+                    time.sleep(PIPELINE_RETRY_BASE_SEC * attempt)
+                    continue
+                raise
 
         for idx, target_date in enumerate(date_list):
             logger.info(

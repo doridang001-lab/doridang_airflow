@@ -3,10 +3,10 @@
 
 처리 요약:
 1) OKPOS 상품조회.xlsx 로드
-2) fin_product_grp.csv와 비교 → 신규/변경 감지
-3) LLM(Ollama)으로 수동분류 + is_main_candidate 자동 분류
+2) fin_product_grp_input.csv와 비교 → 신규/변경 감지
+3) 신규/변경 상품 초안 분류
 4) CSV에 append (llm_check=Y)
-5) 이메일 알림 → 사용자가 검토 후 llm_check 직접 N으로 수정
+5) 이메일 알림 → map DAG/review 파일에서 표준명과 수동분류 검수
 
 스케줄: DB_FIN_PRODUCT_TIME (매일 10:35, OKPOS Product 완료 후)
 """

@@ -9,10 +9,8 @@ import os
 import re
 from pathlib import Path
 from airflow import DAG
+from airflow.exceptions import AirflowException
 from airflow.operators.python import PythonOperator
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -22,17 +20,22 @@ filename = os.path.basename(__file__)
 from modules.transform.utility.paths import LOCAL_DB, ONEDRIVE_DB
 from modules.extract.extract_gsheet import extract_gsheet
 from modules.transform.utility.store_name_mapping import normalize_store_names
-from modules.transform.utility.notifier import on_failure_callback
+from modules.transform.utility.notifier import on_failure_callback, on_retry_callback, send_telegram_chunks
+from modules.transform.utility.mail_recipients import (
+    resolve_manager_mail,
+)
 
 # 설정
 DEFAULT_CREDENTIALS_PATH = r"/opt/airflow/config/rare-ethos-483607-i5-45c9bec5b193.json"
 EMPLOYEE_GSHEET_URL = "https://docs.google.com/spreadsheets/d/1a6-20U1-FYCQEfbOOVSDG3M0q6G2me5f/edit"
-EMPLOYEE_SHEET_NAME = None
+EMPLOYEE_SHEET_NAME = "가맹점리스트"
 EMPLOYEE_CSV_PATH = LOCAL_DB / '영업관리부_DB' / 'sales_employee.csv'
+AUTOMATION_NOTE_COL = '비고'
+AUTOMATION_NOTE_VALUE = '자동화 연결'
 
 # 저장 컬럼 정의 — 새 컬럼 추가 시 이 리스트만 수정
 BASE_FIELDS = ['오픈순서', '호점', '매장명', '사업자번호', '점주명', '담당자',
-               '실오픈일', '상세주소', '광역', '시군구', '읍면동', 'email']
+               '실오픈일', '상세주소', '광역', '시군구', '읍면동', 'email', AUTOMATION_NOTE_COL]
 PLATFORM_FIELDS = ['플랫폼', '계정ID', '계정PW', 'collected_at']
 
 
@@ -51,189 +54,60 @@ def parse_address(address_str):
     return sido, sigungu, dong
 
 
-def send_email_alert(subject, body, to_email):
-    """토더 ID/PW null값 감지 시 메일 알림"""
-    try:
-        smtp_server = "smtp.gmail.com"
-        smtp_port = 587
-        sender_email = "airflow.alarm@gmail.com"
-        sender_password = "bgtu jxdz grxj xvwu"  # Gmail App Password
-
-        try:
-            from airflow.hooks.base import BaseHook
-
-            connection = BaseHook.get_connection("doridang_conn_smtp_gmail")
-            if connection.host and connection.port and connection.login and connection.password:
-                smtp_server = connection.host
-                smtp_port = int(connection.port)
-                sender_email = connection.extra_dejson.get("from_email") or connection.login
-                sender_password = connection.password
-                smtp_login = connection.login
-            else:
-                smtp_login = sender_email
-        except Exception as conn_error:
-            print(f"[메일설정] Airflow SMTP 연결 사용 불가, 기본 설정 사용: {conn_error}")
-            smtp_login = sender_email
-        
-        msg = MIMEMultipart()
-        msg['From'] = sender_email
-        msg['To'] = to_email
-        msg['Subject'] = subject
-        
-        body_subtype = 'html' if str(body).lstrip().lower().startswith('<html') else 'plain'
-        msg.attach(MIMEText(body, body_subtype, 'utf-8'))
-        
-        if int(smtp_port) == 465:
-            with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
-                server.login(smtp_login, sender_password)
-                server.send_message(msg)
-        else:
-            with smtplib.SMTP(smtp_server, smtp_port) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(smtp_login, sender_password)
-                server.send_message(msg)
-        
-        print(f"[메일발송] {to_email} - {subject}")
-        return True
-    except Exception as e:
-        print(f"[메일발송 실패] {to_email}: {e}")
-        return False
-
-
 def check_toder_null_values(df_original):
-    """토더 ID/PW null값 있는 매장 확인 및 메일 알림"""
+    """토더 ID/PW null값 있는 매장 확인 및 텔레그램 알림"""
     if '토더ID' not in df_original.columns or '토더PW' not in df_original.columns:
+        print(f"[토더계정 알림] 스킵: 토더ID/토더PW 컬럼 없음")
         return
     
     # 토더ID 또는 토더PW가 null이고 매장명이 있는 행 찾기
     null_mask = (df_original['토더ID'].isna() | (df_original['토더ID'].astype(str).str.strip() == '')) | \
                 (df_original['토더PW'].isna() | (df_original['토더PW'].astype(str).str.strip() == ''))
     
-    null_stores = df_original[null_mask & df_original['매장명'].notna()][['호점', '매장명', '담당자', '토더ID', '토더PW']].copy()
+    manager_mask = df_original['담당자'].notna() & ~df_original['담당자'].astype(str).str.strip().isin(['', 'nan', 'None'])
+    null_stores = df_original[null_mask & df_original['매장명'].notna() & manager_mask].copy()
     
     if len(null_stores) > 0:
         print(f"\n[토더계정 알림] null값 감지: {len(null_stores)}건")
-        
-        # 메일 본문 작성
-        html_body = """
-        <html>
-        <body style="font-family: Arial, sans-serif;">
-        <h3 style="color: #d9534f;">⚠ 토더(TORDER) 계정정보 누락 알림</h3>
-        <p>다음 매장에서 토더 ID/PW가 등록되지 않았습니다.</p>
-        <table border="1" cellpadding="10" style="border-collapse: collapse; margin-top: 20px;">
-        <tr style="background-color: #f5f5f5;">
-            <th>호점</th>
-            <th>매장명</th>
-            <th>담당자</th>
-            <th>토더ID</th>
-            <th>토더PW</th>
-        </tr>
-        """
-        
+
+        def get_value(row, *columns):
+            normalized_columns = {
+                re.sub(r'\s+', '', str(row_column)): row_column
+                for row_column in row.index
+            }
+            for column in columns:
+                row_column = column if column in row.index else normalized_columns.get(re.sub(r'\s+', '', column))
+                if row_column is not None and pd.notna(row[row_column]):
+                    value = str(row[row_column]).strip()
+                    if value and value not in ['nan', 'None']:
+                        return value
+            return ''
+
+        def get_account(row, id_columns, pw_columns):
+            account_id = get_value(row, *id_columns)
+            account_pw = get_value(row, *pw_columns)
+            if not account_id and not account_pw:
+                return ''
+            return f"{account_id}   // {account_pw}"
+
+        blocks = []
         for _, row in null_stores.iterrows():
-            toder_id = str(row['토더ID']).strip() if pd.notna(row['토더ID']) else '(없음)'
-            toder_pw = str(row['토더PW']).strip() if pd.notna(row['토더PW']) else '(없음)'
-            html_body += f"""
-        <tr>
-            <td>{row['호점']}</td>
-            <td>{row['매장명']}</td>
-            <td>{row['담당자']}</td>
-            <td>{toder_id}</td>
-            <td>{toder_pw}</td>
-        </tr>
-            """
-        
-        html_body += """
-        </table>
-        <p style="margin-top: 20px; color: #666;">구글시트에서 해당 매장의 토더 ID/PW를 확인하고 등록해주세요.</p>
-        </body>
-        </html>
-        """
-        
-        subject = f"[도리당 매장관리] 토더(TORDER) 계정정보 누락 - {len(null_stores)}건"
-        return send_email_alert(subject, html_body, "a17019@kakao.com")
-    return True
+            block_lines = [
+                "[신규 매장 / 양도양수 매장 / 해지 매장]",
+                f"- 매장명 : {get_value(row, '매장명')}",
+                f"- 사업자명의 : {get_value(row, '점주명', '사업자명의')}",
+                f"- 핸드폰번호 : {get_value(row, '전화번호', '핸드폰번호', '휴대폰번호', '연락처')}",
+                f"- 매장주소 : {get_value(row, '상세주소', '매장주소', '주소')}",
+                f"- 발주매장코드 : {get_value(row, '발주매장코드')}",
+                f"- 배민 계정 : {get_account(row, ('배민ID', '배달의민족ID', '배달의 민족ID'), ('배민PW', '배달의민족PW', '배달의 민족PW'))}",
+                f"- 요기요 계정 : {get_account(row, ('요기요ID',), ('요기요PW',))}",
+                f"- 쿠팡 계정 : {get_account(row, ('쿠팡ID', '쿠팡이츠ID'), ('쿠팡PW', '쿠팡이츠PW'))}",
+                f"- 오픈일 : {get_value(row, '실오픈일', '오픈일')}",
+                f"- 프로그램 설치 가능시간 : {get_value(row, '프로그램설치가능시간', '프로그램 설치 가능시간', '설치가능시간', '설치 가능시간')}",
+            ]
+            blocks.append("\n".join(block_lines))
 
-
-def check_new_store_torder_alert(df):
-    """실오픈일 임박(7일 이내) 또는 경과 후 토더 계정 미등록 매장 알림"""
-    if '실오픈일' not in df.columns:
-        return
-
-    today = pd.Timestamp.now(tz='Asia/Seoul').normalize().tz_localize(None)
-    alert_rows = []
-
-    for _, row in df.iterrows():
-        store_name = str(row.get('매장명', '')).strip()
-        if not store_name or store_name in ('nan', 'None'):
-            continue
-
-        raw_date = str(row.get('실오픈일', '')).strip()
-        if not raw_date or raw_date in ('nan', 'None', ''):
-            continue
-
-        try:
-            open_date = pd.to_datetime(raw_date, errors='coerce')
-            if pd.isna(open_date):
-                continue
-            open_date = open_date.normalize()
-        except Exception:
-            continue
-
-        toder_id = str(row.get('토더ID', '')).strip()
-        toder_pw = str(row.get('토더PW', '')).strip()
-        toder_missing = toder_id in ('', 'nan', 'None') or toder_pw in ('', 'nan', 'None')
-
-        days_until = (open_date - today).days
-        is_upcoming = 0 <= days_until <= 7
-        is_overdue = days_until < 0 and toder_missing
-
-        if is_upcoming or is_overdue:
-            alert_rows.append(row)
-
-    if not alert_rows:
-        return
-
-    def _acct(id_val, pw_val):
-        """계정 문자열 포맷: ID // PW, 없으면 빈값"""
-        i = str(id_val).strip() if pd.notna(id_val) and str(id_val).strip() not in ('nan', 'None', '') else ''
-        p = str(pw_val).strip() if pd.notna(pw_val) and str(pw_val).strip() not in ('nan', 'None', '') else ''
-        if i and p:
-            return f"{i}   // {p}"
-        elif i:
-            return i
-        return ''
-
-    blocks = []
-    for row in alert_rows:
-        open_date_text = ''
-        open_date = pd.to_datetime(row.get('실오픈일', ''), errors='coerce')
-        if pd.notna(open_date):
-            open_date_text = open_date.strftime('%Y-%m-%d')
-
-        block = f"""[신규 매장]
-- 매장명 : {str(row.get('매장명', '')).strip()}
-- 사업자명의 : {str(row.get('점주명', '')).strip()}
-- 핸드폰번호 : {str(row.get('핸드폰번호', '')).strip()}
-- 매장주소 : {str(row.get('상세주소', '')).strip()}
-- 발주매장코드 : 
-- 배민 계정 : {_acct(row.get('배민ID'), row.get('배민PW'))}
-- 요기요 계정 : {_acct(row.get('요기요ID'), row.get('요기요PW'))}
-- 쿠팡 계정 : {_acct(row.get('쿠팡ID'), row.get('쿠팡PW'))}
-- 땡겨요 계정 : {_acct(row.get('땡겨요ID'), row.get('땡겨요PW'))}
-- 오픈일 : {open_date_text}"""
-        blocks.append(block)
-
-    body = "\n\n".join(blocks)
-    subject = f"[도리당] 토더계정을 만드세요 ({len(alert_rows)}건)"
-    sent = send_email_alert(subject, body, "a17019@kakao.com")
-    if sent:
-        print(f"[토더계정 알림] {len(alert_rows)}건 발송 완료")
-    else:
-        print(f"[토더계정 알림] {len(alert_rows)}건 발송 실패")
-    return sent
+        send_telegram_chunks("\n\n".join(blocks))
 
 
 
@@ -250,32 +124,40 @@ def load_employee_from_gsheet(**context):
         )
         
         # 2️⃣ 헤더 자동 감지 (상단 요약 데이터 건너뛰고 '호점'이 있는 행 찾기)
+        normalize_header = lambda value: re.sub(r'\s+', '', str(value)) if pd.notna(value) else ''
+        column_headers = [normalize_header(col) for col in df_raw.columns]
         header_row_idx = None
-        for idx in range(len(df_raw)):
-            row = df_raw.iloc[idx]
-            # '호점'이라는 글자가 포함된 행을 진짜 헤더로 인식
-            row_list = [str(v).strip() for v in row.tolist()]
-            if '호점' in row_list:
-                header_row_idx = idx
-                print(f"[감지] 헤더 위치: {idx+1}행")
-                break
+        if '호점' in column_headers:
+            df = df_raw.copy()
+            df.columns = column_headers
+            print("[감지] 헤더 위치: 컬럼")
+        else:
+            for idx in range(len(df_raw)):
+                row = df_raw.iloc[idx]
+                # '호점'이라는 글자가 포함된 행을 진짜 헤더로 인식
+                row_list = [normalize_header(v) for v in row.tolist()]
+                if '호점' in row_list:
+                    header_row_idx = idx
+                    print(f"[감지] 헤더 위치: {idx+1}행")
+                    break
 
-        if header_row_idx is None:
-            return "로드 실패: '호점' 컬럼이 포함된 헤더 행을 찾을 수 없습니다."
+            if header_row_idx is None:
+                raise AirflowException("로드 실패: '호점' 컬럼이 포함된 헤더 행을 찾을 수 없습니다.")
 
-        # 헤더 정제 및 데이터 슬라이싱
-        raw_header = [str(col).strip().replace('\r', '').replace('\n', '') if pd.notna(col) else '' for col in df_raw.iloc[header_row_idx].tolist()]
-        
-        # 실제 데이터는 헤더 다음 줄부터
-        df = df_raw.iloc[header_row_idx + 1:].copy()
-        df.columns = raw_header
-        df = df.reset_index(drop=True)
+            # 헤더 정제 및 데이터 슬라이싱
+            raw_header = [normalize_header(col) for col in df_raw.iloc[header_row_idx].tolist()]
+
+            # 실제 데이터는 헤더 다음 줄부터
+            df = df_raw.iloc[header_row_idx + 1:].copy()
+            df.columns = raw_header
+            df = df.reset_index(drop=True)
         
         print(f"[로드] 초기 데이터: {len(df):,}건")
-        
+    except AirflowException:
+        raise
     except Exception as e:
         print(f"[에러] 로드 단계 실패: {e}")
-        return f"로드 실패: {str(e)}"
+        raise AirflowException(f"로드 실패: {e}") from e
     
     # 3️⃣ 컬럼명 표준화 및 매핑
     # 시트의 다양한 컬럼명 표기를 코드 내부 표준명으로 변경
@@ -284,17 +166,15 @@ def load_employee_from_gsheet(**context):
         '사업자 번호': '사업자번호', '사업자번호': '사업자번호',
         '점주명': '점주명',
         '담당 S.V': '담당자', '담당 SV': '담당자', '담당SV': '담당자',
-        '핸드폰번호': '핸드폰번호', '핸드폰': '핸드폰번호',
-        '전화번호': '핸드폰번호', '전화번호\n(mobile)': '핸드폰번호',
-        '전화번호(mobile)': '핸드폰번호',
-        '전화번호 (mobile)': '핸드폰번호', '연락처': '핸드폰번호',
         '주소': '상세주소',
+        '배달의민족ID': '배민ID', '배달의민족PW': '배민PW',
         '배달의 민족ID': '배민ID', '배달의 민족PW': '배민PW',
         '요기요ID': '요기요ID', '요기요PW': '요기요PW',
         '쿠팡이츠ID': '쿠팡ID', '쿠팡이츠PW': '쿠팡PW',
         '땡겨요ID': '땡겨요ID', '땡겨요PW': '땡겨요PW',
         '토더 ID': '토더ID', '토더PW': '토더PW',
-        '실오픈일': '실오픈일'
+        '실오픈일': '실오픈일',
+        '비고': AUTOMATION_NOTE_COL,
     }
     
     # 존재하는 컬럼만 변경
@@ -303,7 +183,7 @@ def load_employee_from_gsheet(**context):
     
     # 4️⃣ 호점 기준 유효 데이터 필터링
     if '호점' not in df.columns:
-        return "로드 실패: 매핑 후 '호점' 컬럼을 찾을 수 없습니다."
+        raise AirflowException("로드 실패: 매핑 후 '호점' 컬럼을 찾을 수 없습니다.")
     
     # 호점이 비어있거나, 헤더 문자가 반복되거나, '~'가 포함된 행 제외
     df = df[df['호점'].notna()].copy()
@@ -312,16 +192,18 @@ def load_employee_from_gsheet(**context):
     df = df[~df['호점'].str.contains('~', na=False)].copy()
     
     print(f"[필터링] 유효 매장: {len(df):,}건")
+
+    if AUTOMATION_NOTE_COL in df.columns:
+        before_automation_filter = len(df)
+        df = df[df[AUTOMATION_NOTE_COL].astype(str).str.strip() == AUTOMATION_NOTE_VALUE].copy()
+        print(
+            f"[자동화 연결 필터] {before_automation_filter:,}건 -> {len(df):,}건 "
+            f"({AUTOMATION_NOTE_COL}='{AUTOMATION_NOTE_VALUE}')"
+        )
+    else:
+        print(f"[자동화 연결 필터 스킵] '{AUTOMATION_NOTE_COL}' 컬럼 없음")
     
     # 5️⃣ 이메일 매핑 및 담당자 정제
-    email_mapping = {
-        '김덕기': 'kdk1402@kakao.com',
-        '심성준': 'simjeong01@kakao.com',
-        '이병두': 'byoungd201@kakao.com',
-        '황대성': 'gjddkemf@kakao.com',
-        '김대진': 'sanbogaja81@kakao.com',
-    }
-
     if '담당자' in df.columns:
         # '김덕기 과장' -> '김덕기'로 성함만 추출하여 매핑 확률 극대화
         def extract_name(val):
@@ -330,22 +212,19 @@ def load_employee_from_gsheet(**context):
             return match.group(1) if match else val
 
         df['담당자_정제'] = df['담당자'].apply(extract_name)
-        df['email'] = df['담당자_정제'].map(email_mapping).fillna('')
+        df['email'] = df['담당자_정제'].apply(lambda name: resolve_manager_mail(name) or '')
         
         # 로그 출력용
         print(f"\n[담당자별 매칭 현황]:")
         for mgr in sorted(df['담당자_정제'].unique()):
             if mgr and mgr != 'nan':
                 count = (df['담당자_정제'] == mgr).sum()
-                has_email = "✓" if mgr in email_mapping else "✗ (메일미등록)"
+                has_email = "✓" if resolve_manager_mail(mgr) else "✗ (메일미등록/비활성)"
                 print(f"  {has_email} {mgr}: {count}건")
 
     # 6️⃣ 주소 파싱
     if '상세주소' in df.columns:
         df[['광역', '시군구', '읍면동']] = df['상세주소'].apply(lambda x: pd.Series(parse_address(x)))
-    
-    # 📧 신규매장 토더 계정 알림 (unpivot 전 전체 행 대상)
-    check_new_store_torder_alert(df)
     
     # 7️⃣ 플랫폼별 행 분리 (Unpivot)
     print(f"\n[플랫폼 분리] 시작...")
@@ -377,6 +256,8 @@ def load_employee_from_gsheet(**context):
                     rows.append(new_row)
     
     df_final = pd.DataFrame(rows)
+    if df_final.empty:
+        df_final = pd.DataFrame(columns=BASE_FIELDS + PLATFORM_FIELDS)
     
     # 8️⃣ 최종 정리 및 저장
     df_final['collected_at'] = pd.Timestamp.now(tz='Asia/Seoul').strftime('%Y-%m-%d %H:%M')
@@ -390,6 +271,10 @@ def load_employee_from_gsheet(**context):
     # 매장명 정규화 (중앙 매핑: store_name_mapping.py)
     df_final['매장명'] = normalize_store_names(df_final['매장명'])
 
+    
+    # 📧 토더 ID/PW 체크 및 메일 알림 (저장 전)
+    check_toder_null_values(df)
+    
     # CSV 저장 (2개 경로)
     EMPLOYEE_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     
@@ -397,29 +282,37 @@ def load_employee_from_gsheet(**context):
     ONEDRIVE_PATH = ONEDRIVE_DB / "sales_employee.csv"
     
     try:
-        # 1️⃣ 기존 경로에 저장
+        # 1️⃣ 수집/매크로가 읽는 필수 경로에 저장
         df_final.to_csv(EMPLOYEE_CSV_PATH, index=False, encoding='utf-8-sig')
         print(f"\n[저장완료 1/2] 경로: {EMPLOYEE_CSV_PATH}")
-        
-        # 2️⃣ OneDrive 경로에도 저장
-        ONEDRIVE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        df_final.to_csv(ONEDRIVE_PATH, index=False, encoding='utf-8-sig')
-        print(f"[저장완료 2/2] OneDrive: {ONEDRIVE_PATH}")
-        
-        print(f"\n  - 최종 행 수: {len(df_final):,}건")
-        print(f"  - 플랫폼별: {df_final['플랫폼'].value_counts().to_dict()}")
-        return f"✅ 성공: {len(df_final)}행 저장 완료 (2개 경로)"
     except Exception as e:
-        print(f"[에러] 저장 실패: {e}")
+        print(f"[에러] 필수 저장 실패: {e}")
         import traceback
         print(traceback.format_exc())
-        return f"❌ 저장 실패: {str(e)}"
+        raise AirflowException(f"저장 실패: {e}") from e
+
+    mirror_saved = False
+    try:
+        # 2️⃣ Repository 경로는 환경에 따라 읽기 전용/잠금일 수 있으므로 보조 미러로만 처리
+        ONEDRIVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        df_final.to_csv(ONEDRIVE_PATH, index=False, encoding='utf-8-sig')
+        mirror_saved = True
+        print(f"[저장완료 2/2] Repository: {ONEDRIVE_PATH}")
+    except PermissionError as e:
+        print(f"[Repository 저장 스킵] 권한 없음: {ONEDRIVE_PATH} ({e})")
+    except Exception as e:
+        print(f"[Repository 저장 스킵] {ONEDRIVE_PATH} ({e})")
+
+    print(f"\n  - 최종 행 수: {len(df_final):,}건")
+    print(f"  - 플랫폼별: {df_final['플랫폼'].value_counts().to_dict()}")
+    saved_paths = "2개 경로" if mirror_saved else "Local_DB 경로"
+    return f"✅ 성공: {len(df_final)}행 저장 완료 ({saved_paths})"
 
 
 with DAG(
     dag_id=filename.replace('.py', ''),
     description='B3 시작점 대응 및 담당자 기반 플랫폼 분리 수집',
-    schedule="15 7 * * *", # 매일 오전 7:15에 실행
+    schedule="30 2 * * *", # 매일 새벽 2시 30분 실행
     start_date=pendulum.datetime(2023, 1, 1, tz="Asia/Seoul"),
     catchup=False,
     tags=['01_employee', 'gsheet', 'load'],
@@ -427,6 +320,7 @@ with DAG(
         "retries": 1,
         "email_on_failure": False,
         "on_failure_callback": on_failure_callback,
+        "on_retry_callback": on_retry_callback,
     },
 ) as dag:
     

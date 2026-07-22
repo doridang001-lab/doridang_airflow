@@ -1,293 +1,294 @@
-"""Ingest Baemin PC2 inbox runs into analytics baemin_macro partitions."""
+"""Baemin macro inbox files distributor."""
 
 from __future__ import annotations
 
 import json
 import logging
 import shutil
-from collections import Counter
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
-import pendulum
 
-from modules.transform.pipelines.db.DB_Beamin_03_shop_change import CSV_COLUMNS, _row_signature
 from modules.transform.pipelines.db.beamin_store_io import read_file, read_table, write_table
-from modules.transform.utility.paths import ANALYTICS_DB, COLLECT_DB, LOCAL_DB
+from modules.transform.utility.paths import ANALYTICS_DB, COLLECT_DB
 
 logger = logging.getLogger(__name__)
-KST = pendulum.timezone("Asia/Seoul")
 
-INBOX = COLLECT_DB
-MANIFEST_PREFIX = "baemin_pc2_manifest__"
-PROCESSING = LOCAL_DB / "baemin_pc2_inbox_processing"
-LOCK_DIR = LOCAL_DB / "baemin_pc2_inbox_lock"
-MIN_AGE_MINUTES = 30
-
-_CSV_DATASETS = {
-    "metrics_now": ("baemin_now.csv", ["date"]),
-    "metrics_our_store_clicks": ("woori_shop_click.csv", None),
-    "shop_operation": ("shop_operation.csv", ["수집일시"]),
-    "monthly_operation": ("monthly_operation.csv", None),
-    "ad_funnel": ("baemin_ad_funnel.csv", ["target_date"]),
-}
-
-
-def _as_str_df(df: pd.DataFrame) -> pd.DataFrame:
-    return df.fillna("").astype(str)
-
-
-def _acquire_lock() -> bool:
-    LOCK_DIR.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        LOCK_DIR.mkdir()
-    except FileExistsError:
-        return False
-    payload = {"locked_at": pendulum.now(KST).to_iso8601_string()}
-    (LOCK_DIR / "lock.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    return True
-
-
-def _release_lock() -> None:
-    try:
-        lock_file = LOCK_DIR / "lock.json"
-        if lock_file.exists():
-            lock_file.unlink()
-        LOCK_DIR.rmdir()
-    except OSError as exc:
-        logger.warning("PC2 inbox lock 해제 실패(무시): %s", exc)
-
-
-def _age_minutes(path: Path) -> float:
-    return (pendulum.now(KST) - pendulum.from_timestamp(path.stat().st_mtime, tz=KST)).total_seconds() / 60
-
-
-def _load_manifest(manifest_path: Path) -> dict | None:
-    if not manifest_path.exists():
-        logger.info("PC2 inbox run skip: manifest 없음 %s", manifest_path)
-        return None
-    try:
-        data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        logger.warning("PC2 inbox run skip: manifest 읽기 실패 %s (%s)", manifest_path, exc)
-        return None
-    if not isinstance(data, dict) or not isinstance(data.get("files"), dict):
-        logger.warning("PC2 inbox run skip: manifest 형식 오류 %s", manifest_path)
-        return None
-    return data
-
-
-def _flat_manifest_ready(manifest_path: Path, manifest: dict) -> bool:
-    manifest_age = _age_minutes(manifest_path)
-    if manifest_age < MIN_AGE_MINUTES:
-        logger.info(
-            "PC2 inbox manifest skip: mtime %.1f분 경과, 최소 %d분 필요 %s",
-            manifest_age,
-            MIN_AGE_MINUTES,
-            manifest_path,
-        )
-        return False
-
-    for filename, info in manifest["files"].items():
-        if not isinstance(info, dict) or not info.get("rel"):
-            logger.warning("PC2 inbox manifest skip: 파일 메타 형식 오류 %s %s", manifest_path, filename)
-            return False
-        path = INBOX / filename
-        if not path.exists() or not path.is_file():
-            logger.info("PC2 inbox run skip: 파일 미동기화 %s", path)
-            return False
-        actual_size = path.stat().st_size
-        expected_size = int(info.get("size", -1))
-        if actual_size != expected_size:
-            logger.info(
-                "PC2 inbox run skip: size 불일치 %s expected=%s actual=%s",
-                path,
-                expected_size,
-                actual_size,
-            )
-            return False
-        file_age = _age_minutes(path)
-        if file_age < MIN_AGE_MINUTES:
-            logger.info(
-                "PC2 inbox file skip: mtime %.1f분 경과, 최소 %d분 필요 %s",
-                file_age,
-                MIN_AGE_MINUTES,
-                path,
-            )
-            return False
-    return True
-
-
-def _candidate_runs() -> list[Path]:
-    if not INBOX.exists():
-        return []
-    return sorted(
-        p
-        for p in INBOX.iterdir()
-        if p.is_file()
-        and p.suffix.lower() == ".json"
-        and p.name.startswith(MANIFEST_PREFIX)
-        and not p.name.startswith("_tmp_")
-    )
-
-
-def _claim_flat_run(manifest_path: Path, manifest: dict) -> Path:
-    run_name = str(manifest.get("run") or manifest_path.stem.removeprefix(MANIFEST_PREFIX))
-    run_name = "".join(ch if ch.isalnum() or ch in "._=-" else "_" for ch in run_name)[:160]
-    run_dir = PROCESSING / run_name
-    if run_dir.exists():
-        shutil.rmtree(run_dir)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(manifest_path), str(run_dir / "manifest.json"))
-    for filename, info in manifest["files"].items():
-        rel = Path(str(info["rel"]))
-        src = INBOX / filename
-        dst = run_dir / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(dst))
-    return run_dir
-
-
-def _analytics_path(incoming: Path, baemin_root: Path) -> Path:
-    rel = incoming.relative_to(baemin_root)
-    return ANALYTICS_DB / "baemin_macro" / rel
-
-
-def _merge_csv(incoming: Path, target: Path, key: list[str] | None) -> int:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    incoming_df = _as_str_df(read_file(incoming))
-    if key is None:
-        combined = incoming_df
-    elif target.exists():
-        existing = _as_str_df(pd.read_csv(target, dtype=str, encoding="utf-8-sig"))
-        for col in incoming_df.columns:
-            if col not in existing.columns:
-                existing[col] = ""
-        for col in existing.columns:
-            if col not in incoming_df.columns:
-                incoming_df[col] = ""
-        combined = pd.concat([existing[incoming_df.columns], incoming_df], ignore_index=True)
-        combined = combined.drop_duplicates(subset=key, keep="last")
-    else:
-        combined = incoming_df
-    combined.to_csv(target, index=False, encoding="utf-8-sig")
-    return len(incoming_df)
-
-
-def _merge_orders(incoming: Path, target: Path) -> int:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    stem = target.with_suffix("")
-    incoming_df = _as_str_df(read_file(incoming))
-    existing = read_table(stem)
-    if existing is not None and "주문번호" in incoming_df.columns:
-        existing = _as_str_df(existing)
-        existing = existing[~existing["주문번호"].isin(set(incoming_df["주문번호"]))]
-        combined = pd.concat([existing, incoming_df], ignore_index=True)
-    else:
-        combined = incoming_df
-    write_table(combined, stem)
-    return len(incoming_df)
-
-
-def _merge_shop_change(incoming: Path, target: Path) -> int:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    stem = target.with_suffix("")
-    incoming_df = _as_str_df(read_file(incoming))
-    for col in CSV_COLUMNS:
-        if col not in incoming_df.columns:
-            incoming_df[col] = ""
-    incoming_df = incoming_df[CSV_COLUMNS]
-
-    existing = read_table(stem)
-    if existing is not None:
-        existing = _as_str_df(existing)
-        for col in CSV_COLUMNS:
-            if col not in existing.columns:
-                existing[col] = ""
-        existing = existing[CSV_COLUMNS]
-        combined = pd.concat([existing, incoming_df], ignore_index=True)
-    else:
-        combined = incoming_df
-
-    combined["_sig"] = combined.apply(lambda row: str(_row_signature(row)), axis=1)
-    combined = combined.drop_duplicates(subset=["_sig"], keep="last").drop(columns=["_sig"])
-    write_table(combined, stem)
-    return len(incoming_df)
-
-
-def _merge_file(incoming: Path, baemin_root: Path) -> tuple[str, int]:
-    dataset = incoming.relative_to(baemin_root).parts[0]
-    target = _analytics_path(incoming, baemin_root)
-
-    if dataset in _CSV_DATASETS:
-        expected_name, key = _CSV_DATASETS[dataset]
-        if incoming.name != expected_name:
-            return dataset, 0
-        return dataset, _merge_csv(incoming, target, key)
-
-    if dataset == "orders" and incoming.stem.startswith("orders_"):
-        target = target.with_suffix(".parquet")
-        return dataset, _merge_orders(incoming, target)
-
-    if dataset == "shop_change" and incoming.stem == "shop_change":
-        target = target.with_suffix(".parquet")
-        return dataset, _merge_shop_change(incoming, target)
-
-    logger.info("PC2 inbox 미지원 파일 skip: %s", incoming)
-    return dataset, 0
-
-
-def _process_run(run_dir: Path) -> Counter:
-    baemin_root = run_dir / "baemin_macro"
-    counts: Counter = Counter()
-    if not baemin_root.exists():
-        logger.warning("PC2 inbox run skip: baemin_macro 없음 %s", run_dir)
-        return counts
-
-    for incoming in sorted(p for p in baemin_root.rglob("*") if p.is_file()):
-        dataset, rows = _merge_file(incoming, baemin_root)
-        if rows:
-            counts[dataset] += rows
-    return counts
+INBOX_DIR = COLLECT_DB / "영업관리부_수집" / "_baemin_pc2_inbox"
+UPLOAD_INBOX_DIR = COLLECT_DB / "영업관리부_수집" / "_baemin_upload_inbox"
+ORDER_KEY = "주문번호"
+SUPPORTED_SUFFIXES = {".parquet", ".csv"}
+ROOT_PART = "baemin_macro"
+FAILED_KEYS = ("accounts", "stores", "orders", "ads")
 
 
 def ingest_baemin_pc2_inbox(**context) -> str:
-    if not INBOX.exists():
-        return f"PC2 inbox 없음: {INBOX}"
-    if not _acquire_lock():
-        logger.info("PC2 inbox ingest skip: 다른 ingest 실행 중")
-        return "PC2 inbox ingest skip: locked"
+    """PC2 inbox의 manual__* 폴더를 analytics baemin_macro 파티션으로 적재한다."""
+    return ingest_inbox(INBOX_DIR)["summary"]
 
-    processed = 0
-    total_counts: Counter = Counter()
-    try:
-        PROCESSING.mkdir(parents=True, exist_ok=True)
-        for manifest_path in _candidate_runs():
-            manifest = _load_manifest(manifest_path)
-            if manifest is None or not _flat_manifest_ready(manifest_path, manifest):
-                continue
 
-            try:
-                run_dir = _claim_flat_run(manifest_path, manifest)
-            except Exception as exc:
-                logger.info("PC2 inbox flat run claim 실패, skip: %s (%s)", manifest_path, exc)
-                continue
+def ingest_baemin_upload_inbox(**context) -> dict[str, Any]:
+    """Upload inbox의 manual__* 폴더를 적재하고 폴더 meta를 함께 반환한다."""
+    return ingest_inbox(UPLOAD_INBOX_DIR, read_meta=True)
 
-            try:
-                counts = _process_run(run_dir)
-                total_counts.update(counts)
-                processed += 1
-                shutil.rmtree(run_dir)
-                logger.info("PC2 inbox flat run 처리 완료: %s %s", run_dir.name, dict(counts))
-            except Exception:
-                logger.exception("PC2 inbox flat run 처리 실패, 보존: %s", run_dir)
-                raise
-    finally:
-        _release_lock()
 
-    summary = f"PC2 inbox 처리 run={processed}, rows={dict(total_counts)}"
+def ingest_inbox(inbox_dir: Path, read_meta: bool = False) -> dict[str, Any]:
+    label = inbox_dir.name
+    if not inbox_dir.exists():
+        logger.info("%s 없음: %s", label, inbox_dir)
+        return {
+            "summary": f"{label} 없음: 스킵",
+            "meta": _empty_meta() if read_meta else {},
+            "stats": _empty_ingest_stats(),
+        }
+
+    folders = sorted(p for p in inbox_dir.glob("manual__*") if p.is_dir())
+    if not folders:
+        logger.info("%s 처리 대상 없음: %s", label, inbox_dir)
+        return {
+            "summary": f"{label} 처리 대상 없음: 스킵",
+            "meta": _empty_meta() if read_meta else {},
+            "stats": _empty_ingest_stats(),
+        }
+    if read_meta:
+        folder_meta_by_folder = {folder: _read_meta(folder) for folder in folders}
+        target_dates = sorted(
+            str(meta.get("target_date"))
+            for meta in folder_meta_by_folder.values()
+            if meta.get("target_date")
+        )
+        representative_date = target_dates[-1] if target_dates else None
+        logger.info("%s 대표 target_date=%s (폴더 %d개 중)", label, representative_date, len(folders))
+    else:
+        folder_meta_by_folder = {}
+        representative_date = None
+
+    processed_folders = 0
+    cleaned_folders = 0
+    skipped_folders = 0
+    failed_folders = 0
+    processed_files = 0
+    processed_rows = 0
+    subtype_counts: dict[str, int] = {}
+    meta_items: list[dict[str, Any]] = []
+
+    for folder in folders:
+        processed_folders += 1
+        files = _target_files(folder)
+        folder_files = 0
+        folder_rows = 0
+        folder_counts: dict[str, int] = {}
+        logger.info("%s 폴더 처리 시작: %s | 대상파일=%d", label, folder, len(files))
+        if not files:
+            skipped_folders += 1
+            logger.warning("%s 대상 파일 없음, cleanup 보류: %s", label, folder)
+            continue
+
+        try:
+            folder_meta = folder_meta_by_folder.get(folder, {}) if read_meta else {}
+            for src_file in files:
+                subtype, rows = _distribute_one_file(folder, src_file)
+                folder_files += 1
+                folder_rows += rows
+                folder_counts[subtype] = folder_counts.get(subtype, 0) + rows
+                logger.info(
+                    "%s 파일 분배 완료: folder=%s file=%s subtype=%s rows=%d",
+                    label,
+                    folder.name,
+                    src_file.relative_to(folder),
+                    subtype,
+                    rows,
+                )
+        except Exception:
+            failed_folders += 1
+            logger.exception("%s 폴더 처리 실패, cleanup 보류: %s", label, folder)
+            continue
+
+        _cleanup_processed_folder(folder, inbox_dir)
+        cleaned_folders += 1
+        processed_files += folder_files
+        processed_rows += folder_rows
+        if read_meta:
+            folder_date = str(folder_meta.get("target_date")) if folder_meta.get("target_date") else None
+            if representative_date is None or folder_date == representative_date:
+                meta_items.append(folder_meta)
+            else:
+                logger.warning(
+                    "%s 지난 날짜 meta는 downstream 검증에서 제외: folder=%s target_date=%s (대표날짜=%s)",
+                    label,
+                    folder.name,
+                    folder_date,
+                    representative_date,
+                )
+        for subtype, rows in folder_counts.items():
+            subtype_counts[subtype] = subtype_counts.get(subtype, 0) + rows
+        logger.info("%s 폴더 cleanup 완료: %s | files=%d rows=%d", label, folder, folder_files, folder_rows)
+
+    meta = _merge_meta(meta_items) if read_meta else {}
+    subtype_summary = ", ".join(f"{k}={v}" for k, v in sorted(subtype_counts.items())) or "없음"
+    summary = (
+        f"{label} 적재 완료 | "
+        f"folders={processed_folders} cleaned={cleaned_folders} skipped={skipped_folders} failed={failed_folders} "
+        f"files={processed_files} rows={processed_rows} subtypes={subtype_summary}"
+    )
     logger.info(summary)
-    return summary
+    return {
+        "summary": summary,
+        "meta": meta,
+        "stats": {
+            "folders": processed_folders,
+            "cleaned": cleaned_folders,
+            "skipped": skipped_folders,
+            "failed": failed_folders,
+            "files": processed_files,
+            "rows": processed_rows,
+            "subtypes": dict(sorted(subtype_counts.items())),
+        },
+    }
+
+
+def _empty_ingest_stats() -> dict[str, Any]:
+    return {
+        "folders": 0,
+        "cleaned": 0,
+        "skipped": 0,
+        "failed": 0,
+        "files": 0,
+        "rows": 0,
+        "subtypes": {},
+    }
+
+
+def _empty_meta() -> dict[str, Any]:
+    return {
+        "target_date": None,
+        "account_list": [],
+        "validation": [],
+        "ad_stores": [],
+        "store_info_per_account": [],
+        "original_failed": _empty_failed(),
+        "failed": _empty_failed(),
+    }
+
+
+def _empty_failed() -> dict[str, list]:
+    return {key: [] for key in FAILED_KEYS}
+
+
+def _read_meta(folder: Path) -> dict[str, Any]:
+    meta_path = folder / "_meta.json"
+    if not meta_path.exists():
+        logger.warning("upload inbox meta 없음: %s", meta_path)
+        return {}
+    return json.loads(meta_path.read_text(encoding="utf-8"))
+
+
+def _merge_meta(items: list[dict[str, Any]]) -> dict[str, Any]:
+    merged = _empty_meta()
+    target_dates = sorted({str(item.get("target_date")) for item in items if item.get("target_date")})
+    if len(target_dates) > 1:
+        raise ValueError(f"upload inbox target_date 혼재: {target_dates}")
+    if target_dates:
+        merged["target_date"] = target_dates[0]
+
+    seen_ad_stores: set[str] = set()
+    for item in items:
+        for key in ("account_list", "validation", "store_info_per_account"):
+            values = item.get(key) or []
+            if isinstance(values, list):
+                merged[key].extend(values)
+        for ad_store in item.get("ad_stores") or []:
+            marker = json.dumps(ad_store, ensure_ascii=False, sort_keys=True, default=str)
+            if marker in seen_ad_stores:
+                continue
+            seen_ad_stores.add(marker)
+            merged["ad_stores"].append(ad_store)
+        for failed_key in ("original_failed", "failed"):
+            failed = item.get(failed_key) or {}
+            for key in FAILED_KEYS:
+                values = failed.get(key) or []
+                if isinstance(values, list):
+                    merged[failed_key][key].extend(values)
+    return merged
+
+
+def _target_files(folder: Path) -> list[Path]:
+    return sorted(
+        p
+        for p in folder.rglob("*")
+        if p.is_file()
+        and p.suffix.lower() in SUPPORTED_SUFFIXES
+        and _is_baemin_macro_relpath(folder, p)
+    )
+
+
+def _is_baemin_macro_relpath(folder: Path, src_file: Path) -> bool:
+    try:
+        rel = src_file.relative_to(folder)
+    except ValueError:
+        return False
+    return len(rel.parts) >= 3 and rel.parts[0] == ROOT_PART
+
+
+def _distribute_one_file(folder: Path, src_file: Path) -> tuple[str, int]:
+    rel = src_file.relative_to(folder)
+    if len(rel.parts) < 3 or rel.parts[0] != ROOT_PART:
+        raise ValueError(f"inbox 대상 경로 아님: {src_file}")
+
+    subtype = rel.parts[1]
+    dst_stem = (ANALYTICS_DB / rel).with_suffix("")
+    new_df = read_file(src_file)
+    if new_df.empty:
+        raise ValueError(f"inbox 빈 파일: {src_file}")
+
+    if subtype == "orders":
+        if ORDER_KEY in new_df.columns:
+            combined = _upsert_orders(dst_stem, new_df)
+        else:
+            combined = new_df
+        out_path = write_table(combined, dst_stem)
+    else:
+        combined = new_df
+        out_path = _write_csv_table(combined, dst_stem)
+
+    logger.info("inbox write: %s -> %s | rows=%d", src_file, out_path, len(combined))
+    return subtype, len(new_df)
+
+
+def _write_csv_table(df: pd.DataFrame, stem_path: Path) -> Path:
+    stem_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_path = stem_path.with_suffix(".csv")
+    df.fillna("").astype(str).to_csv(csv_path, index=False, encoding="utf-8-sig")
+    pq_path = stem_path.with_suffix(".parquet")
+    if pq_path.exists():
+        try:
+            pq_path.unlink()
+        except OSError as exc:
+            logger.warning("비주문 parquet 삭제 실패: %s / %s", pq_path, exc)
+    return csv_path
+
+
+def _upsert_orders(dst_stem: Path, new_df: pd.DataFrame) -> pd.DataFrame:
+    existing = read_table(dst_stem)
+    if existing is None or ORDER_KEY not in existing.columns:
+        return new_df
+
+    new_ids = set(new_df[ORDER_KEY].fillna("").astype(str).unique())
+    if "" in new_ids:
+        logger.warning("orders 주문번호 빈 값 포함: %s", dst_stem)
+    existing = existing[~existing[ORDER_KEY].fillna("").astype(str).isin(new_ids)]
+    return pd.concat([existing, new_df], ignore_index=True)
+
+
+def _cleanup_processed_folder(folder: Path, inbox_dir: Path) -> None:
+    """성공 처리된 manual 폴더만 삭제한다."""
+    folder = folder.resolve()
+    inbox = inbox_dir.resolve()
+    if folder.parent != inbox:
+        raise ValueError(f"inbox cleanup 대상 부모 경로 불일치: {folder}")
+    if not folder.name.startswith("manual__"):
+        raise ValueError(f"inbox cleanup 대상 폴더명 아님: {folder}")
+    if not folder.is_dir():
+        raise ValueError(f"inbox cleanup 대상 폴더 없음: {folder}")
+    shutil.rmtree(folder)

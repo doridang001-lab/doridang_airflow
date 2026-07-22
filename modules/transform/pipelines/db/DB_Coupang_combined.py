@@ -9,7 +9,6 @@ import random
 import re
 import time
 
-import pandas as pd
 import pendulum
 
 from modules.extract.croling_coupang import (
@@ -25,12 +24,11 @@ from modules.transform.pipelines.db.DB_Coupang_01_orders import (
     collect_orders_for_driver,
     save_orders_csv,
 )
-from modules.transform.utility.paths import ONEDRIVE_DB
+from modules.transform.utility.account import load_automation_account_df
 
 logger = logging.getLogger(__name__)
 
 KST = pendulum.timezone("Asia/Seoul")
-_CSV_PATH = ONEDRIVE_DB / "sales_employee.csv"
 
 _KNOWN_BRANDS = ["도리당", "나홀로"]
 _MAX_COLLECT_ATTEMPTS = 3
@@ -54,15 +52,11 @@ def load_coupang_accounts(target_stores: list[str], exact: bool = True) -> list[
     반환: [{"account_id", "password", "store_name", "brand", "store"}]
     store_id는 여기서 알 수 없음 → collect 단계에서 URL 추출.
     """
-    df = pd.read_csv(_CSV_PATH, dtype=str)
-    df = df[df["플랫폼"] == "쿠팡이츠"].copy()
-
-    if target_stores:
-        if exact:
-            df = df[df["매장명"].isin(target_stores)]
-        else:
-            pattern = "|".join(target_stores)
-            df = df[df["매장명"].str.contains(pattern, na=False)]
+    df = load_automation_account_df(
+        platform="쿠팡이츠",
+        target_stores=target_stores,
+        exact=exact,
+    )
 
     accounts = []
     for _, row in df.iterrows():
@@ -309,25 +303,24 @@ def collect_orders_for_account(account: dict, target_date: str) -> dict:
 
 def load_coupang_accounts(target_stores: list[str], exact: bool = True) -> list[dict]:
     """Override loader using the current CSV schema."""
-    df = pd.read_csv(_CSV_PATH, dtype=str)
-    df = df[df["플랫폼"].astype(str).str.strip() == "쿠팡이츠"].copy()
-
-    if target_stores:
-        normalized_targets = [str(s).strip() for s in target_stores if str(s).strip()]
-        if exact:
-            df = df[df["매장명"].astype(str).str.strip().isin(normalized_targets)]
-        else:
-            pattern = "|".join(re.escape(s) for s in normalized_targets)
-            df = df[df["매장명"].astype(str).str.contains(pattern, na=False, regex=True)]
+    df = load_automation_account_df(
+        platform="쿠팡이츠",
+        target_stores=target_stores,
+        exact=exact,
+    )
 
     accounts = []
     for _, row in df.iterrows():
         store_name = str(row["매장명"]).strip()
+        account_id = str(row["계정ID"]).strip()
+        password = str(row["계정PW"]).strip()
+        if not account_id or not password:
+            continue
         brand, store = _parse_brand_store(store_name)
         accounts.append(
             {
-                "account_id": str(row["계정ID"]).strip(),
-                "password": str(row["계정PW"]).strip(),
+                "account_id": account_id,
+                "password": password,
                 "store_name": store_name,
                 "brand": brand,
                 "store": store,

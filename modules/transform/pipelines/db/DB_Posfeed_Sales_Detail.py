@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+import pendulum
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -30,11 +31,25 @@ from modules.load.load_onedrive import onedrive_csv_save
 
 logger = logging.getLogger(__name__)
 
+
+def _get_airflow_variable(key: str) -> str:
+    try:
+        from airflow.models import Variable
+
+        return (Variable.get(key, default_var=None) or "").strip()
+    except Exception:
+        return ""
+
+
+def _resolve_secret(key: str, default: str) -> str:
+    return (os.getenv(key) or _get_airflow_variable(key) or default).strip()
+
+
 # ============================================================
 # 상수
 # ============================================================
-POSFEED_ID = "siw2222@naver.com"
-POSFEED_PW = "ehfl8877!!"
+POSFEED_ID = _resolve_secret("POSFEED_ID", "siw2222@naver.com")
+POSFEED_PW = _resolve_secret("POSFEED_PW", "ehfl8877!!")
 LOGIN_URL   = "https://admin.posfeed.co.kr/#/login?redirect=%2Fdashboard"
 ORDER_DETAIL_URL = "https://admin.posfeed.co.kr/#/order/edit/{code}"
 HEADLESS_MODE = os.getenv("AIRFLOW_HOME") is not None
@@ -1235,3 +1250,32 @@ def scrape_missing_order_details(collect_mode: str = "yesterday", target_store: 
 
     # 기존 scrape_order_details 로직을 그대로 재사용 (입력 stores만 missing으로 교체)
     return scrape_order_details(ti=_TiShim({"stores": missing_stores}))
+
+
+def extract_today_order_codes(**context) -> str:
+    """Today DAG의 sale_date 기준으로 주문 상세 대상 코드를 추출한다."""
+    ti = context.get("ti")
+    sale_date = ti.xcom_pull(task_ids="resolve_today", key="sale_date") if ti else None
+    if not sale_date:
+        conf = (getattr(context.get("dag_run"), "conf", None) or {})
+        sale_date = conf.get("sale_date")
+    if not sale_date:
+        sale_date = pendulum.now("Asia/Seoul").format("YYYY-MM-DD")
+
+    return extract_order_codes(collect_mode=str(sale_date), **context)
+
+
+def scrape_today_details(**context) -> str:
+    """Today DAG의 extract_order_codes 결과만 상세 크롤링한다."""
+    payload = context["ti"].xcom_pull(task_ids="extract_order_codes", key="order_codes")
+    if not payload or not payload.get("stores"):
+        raise AirflowSkipException("당일 신규 주문 코드 없음")
+
+    class _TiShim:
+        def __init__(self, shim_payload: dict):
+            self._payload = shim_payload
+
+        def xcom_pull(self, *args, **kwargs):
+            return self._payload
+
+    return scrape_order_details(ti=_TiShim(payload))

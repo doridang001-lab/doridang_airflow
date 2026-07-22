@@ -74,6 +74,13 @@ def _cleanup_download_dir(download_dir: Path) -> None:
                     path.unlink(missing_ok=True)
                 except Exception:
                     continue
+    for pattern in ("*.crdownload", "*.tmp", "*.part", "downloads.html", "download.html"):
+        for path in download_dir.glob(pattern):
+            if path.is_file():
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    continue
 
 
 def _filename_matches(path: Path) -> bool:
@@ -844,30 +851,20 @@ def validate_okpos_card_lookback(lookback_days: int = 7, min_date: str = OKPOS_C
     return msg
 
 
-def download_okpos_card_test(**context) -> str:
-    sale_date = _resolve_sale_date(**context)
-    download_dir = OKPOS_CARD_DOWNLOAD_DIR
-    _cleanup_download_dir(download_dir)
+def _download_one_date(driver, wait: WebDriverWait, download_dir: Path, sale_date: str) -> Path | None:
+    driver.get(OKPOS_CARD_APPROVAL_URL)
+    time.sleep(2)
+    _dismiss_alert(driver)
 
-    driver = _launch_browser(download_dir=download_dir)
+    _set_date_hyphen(driver, wait, sale_date, "startDate")
+    _dismiss_alert(driver)
+    _set_date_hyphen(driver, wait, sale_date, "endDate")
+    _dismiss_alert(driver)
+
+    _click_search_btn(driver, wait)
+    time.sleep(3)
+    _dismiss_alert(driver)
     try:
-        wait = WebDriverWait(driver, WAIT_TIMEOUT)
-        _setup_download_dir(driver, download_dir)
-        _login(driver, wait)
-
-        driver.get(OKPOS_CARD_APPROVAL_URL)
-        time.sleep(2)
-        _dismiss_alert(driver)
-
-        _set_date_hyphen(driver, wait, sale_date, "startDate")
-        _dismiss_alert(driver)
-        _set_date_hyphen(driver, wait, sale_date, "endDate")
-        _dismiss_alert(driver)
-
-        # 매장선택 없이 전체 조회 → IBSheet에 어제자 전 매장 승인현황 표시
-        _click_search_btn(driver, wait)
-        time.sleep(3)
-        _dismiss_alert(driver)
         _wait_for_store_in_results(
             driver,
             wait,
@@ -875,37 +872,100 @@ def download_okpos_card_test(**context) -> str:
             OKPOS_CARD_STORE["shopCd"],
             download_dir,
         )
-        # 매장명 셀 클릭 → 매장현황 팝업 오픈
-        _click_store_row_in_results(driver, wait, OKPOS_CARD_STORE["shopCd"], OKPOS_CARD_STORE["name"], download_dir)
-        _wait_for_popup(driver, wait)
+    except TimeoutException:
+        logger.warning("OKPOS card: 매장 행 없음(승인 0건 추정) sale_date=%s -> skip", sale_date)
+        return None
 
-        existing_files = {path for path in download_dir.iterdir() if path.is_file()}
-        _click_excel_button(driver, wait)
-        downloaded = _wait_for_download(
-            download_dir,
-            existing_files,
-            timeout=DOWNLOAD_TIMEOUT,
-            expected_suffixes={".xlsx"},
-            filename_predicate=_filename_matches,
+    _click_store_row_in_results(driver, wait, OKPOS_CARD_STORE["shopCd"], OKPOS_CARD_STORE["name"], download_dir)
+    _wait_for_popup(driver, wait)
+
+    existing_files = {path for path in download_dir.iterdir() if path.is_file()}
+    _click_excel_button(driver, wait)
+    downloaded = _wait_for_download(
+        download_dir,
+        existing_files,
+        timeout=DOWNLOAD_TIMEOUT,
+        expected_suffixes={".xlsx"},
+        filename_predicate=_filename_matches,
+    )
+    if downloaded is None:
+        candidates = sorted(
+            [p for p in download_dir.iterdir() if p.is_file() and _filename_matches(p)],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
         )
+        downloaded = candidates[0] if candidates else None
+    return downloaded
+
+
+def _missing_lookback_dates(
+    primary: str,
+    lookback_days: int = 7,
+    min_date: str = OKPOS_CARD_MIN_VALIDATE_DATE,
+) -> list[str]:
+    anchor = datetime.strptime(primary, "%Y-%m-%d").date() + timedelta(days=1)
+    min_dt = datetime.strptime(min_date, "%Y-%m-%d").date()
+    targets = [
+        (anchor - timedelta(days=i)).strftime("%Y-%m-%d")
+        for i in range(1, lookback_days + 1)
+        if (anchor - timedelta(days=i)) >= min_dt
+    ]
+
+    history = _load_store_history()
+    present: set[str] = set()
+    if not history.empty:
+        history = _canonicalize_card_df(history)
+        if "승인구분" in history.columns and "sale_date" in history.columns:
+            approved = history[history["승인구분"].astype(str).str.strip() == "승인"]
+            present = set(approved["sale_date"].astype(str).str.strip())
+
+    return [date for date in targets if date not in present and date != primary]
+
+
+def download_okpos_card_test(**context) -> str:
+    sale_date = _resolve_sale_date(**context)
+    download_dir = OKPOS_CARD_DOWNLOAD_DIR
+    _cleanup_download_dir(download_dir)
+
+    driver = _launch_browser(download_dir=download_dir)
+    backfilled: list[str] = []
+    empty_days: list[str] = []
+    try:
+        wait = WebDriverWait(driver, WAIT_TIMEOUT)
+        _setup_download_dir(driver, download_dir)
+        _login(driver, wait)
+
+        downloaded = _download_one_date(driver, wait, download_dir, sale_date)
         if downloaded is None:
-            candidates = sorted(
-                [p for p in download_dir.iterdir() if p.is_file() and _filename_matches(p)],
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
+            raise TimeoutException(
+                f"OKPOS card primary download failed: sale_date={sale_date}, "
+                f"download_dir={download_dir}"
             )
-            if candidates:
-                downloaded = candidates[0]
-                logger.info("OKPOS card approval fallback picked existing xlsx: %s", downloaded.name)
-            else:
-                raise TimeoutException(
-                    f"OKPOS card approval download timed out after {DOWNLOAD_TIMEOUT}s. "
-                    f"download_dir={download_dir}"
-                )
+        primary_path = download_dir / f"primary_{sale_date}_{downloaded.name}"
+        if primary_path != downloaded:
+            primary_path.unlink(missing_ok=True)
+            downloaded = downloaded.replace(primary_path)
 
         context["ti"].xcom_push(key="downloaded_path", value=str(downloaded))
-        logger.info("OKPOS card approval downloaded: %s", downloaded)
-        return f"downloaded: {downloaded}"
+        logger.info("OKPOS card approval primary downloaded: %s", downloaded)
+
+        for missing_date in _missing_lookback_dates(sale_date):
+            _cleanup_download_dir(download_dir)
+            backfill_file = _download_one_date(driver, wait, download_dir, missing_date)
+            if backfill_file is None:
+                empty_days.append(missing_date)
+                continue
+
+            normalized = _parse_okpos_card_workbook(backfill_file, missing_date)
+            _upsert_okpos_card_csv(normalized)
+            backfill_file.unlink(missing_ok=True)
+            backfilled.append(missing_date)
+            logger.info("OKPOS card 자동 백필 완료: %s | rows=%d", missing_date, len(normalized))
+
+        context["ti"].xcom_push(key="backfilled_dates", value=backfilled)
+        context["ti"].xcom_push(key="empty_dates", value=empty_days)
+        logger.info("OKPOS card download 완료: primary=%s, backfilled=%s, empty=%s", sale_date, backfilled, empty_days)
+        return f"downloaded primary={sale_date}, backfilled={backfilled}, empty={empty_days}"
     finally:
         try:
             driver.quit()

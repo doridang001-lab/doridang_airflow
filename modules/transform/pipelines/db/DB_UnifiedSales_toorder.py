@@ -10,6 +10,7 @@ Output:
 """
 
 import logging
+import re
 from datetime import datetime, timedelta
 from functools import lru_cache
 
@@ -21,6 +22,8 @@ from modules.transform.utility.store_normalize import (
     strip_brand as _strip_brand,
 )
 from modules.transform.pipelines.db.DB_UnifiedSales_common import (
+    DELIVERY_PLATFORM_FAMILIES,
+    TOORDER_MANUAL_STORES,
     UNIFIED_COLUMNS,
     _load_store_map,
     _lookup_store_meta,
@@ -33,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 TOORDER_PARQUET = ANALYTICS_DB / "toorder_daily_store_platform" / "toorder_store_platform_daily.parquet"
 TOORDER_SOURCE = "toorder"
+_MANUAL_DELIVERY_PLATFORMS = set().union(*DELIVERY_PLATFORM_FAMILIES.values())
 
 _PLATFORM_MAP = {
     "\ubc30\ubbfc1": "\ubc30\ub2ec\uc758\ubbfc\uc871",
@@ -173,3 +177,80 @@ def run_lookback_toorder(days: int = 7) -> str:
 
 def backfill_toorder() -> str:
     return "SKIP: toorder 채널 비활성화 (unified_sales 제외)"
+
+
+def _resolve_manual_stores(stores=None) -> list[str]:
+    base = {str(store).strip() for store in TOORDER_MANUAL_STORES if str(store).strip()}
+    if stores is None:
+        return sorted(base)
+    req = {str(store).strip() for store in stores if str(store).strip()}
+    return sorted(base & req)
+
+
+def run_toorder_manual_stores(date_str: str, stores=None, overwrite: bool = False) -> str:
+    """POS 없는 수동매장의 배민·쿠팡 제외 채널을 toorder로 적재."""
+    target = _resolve_manual_stores(stores)
+    if not target:
+        return f"SKIP: toorder 수동매장 대상 없음 ({date_str})"
+
+    df = _transform_df(_load_parquet(), date_str)
+    if df.empty:
+        return f"SKIP: toorder {date_str} 해당일 데이터 없음"
+
+    store = df["store"].fillna("").astype(str).str.strip()
+    platform = df["platform"].fillna("").astype(str).str.strip()
+    df = df[store.isin(target) & ~platform.isin(_MANUAL_DELIVERY_PLATFORMS)].copy()
+    if df.empty:
+        return f"SKIP: toorder {date_str} 대상 매장 비배민·쿠팡 채널 없음"
+
+    saved = _save_unified_daily(df, date_str, overwrite=overwrite, replace_stores=target)
+    return f"toorder(수동매장) {date_str}: {saved}행 저장 (stores={target})"
+
+
+def run_lookback_toorder_manual_stores(days: int = 14, stores=None) -> str:
+    today = datetime.now()
+    total = 0
+    for i in range(days):
+        date_str = (today - timedelta(days=i)).strftime("%Y-%m-%d")
+        try:
+            result = run_toorder_manual_stores(date_str, stores=stores, overwrite=False)
+            logger.info(result)
+            if result.startswith("toorder(수동매장)"):
+                try:
+                    total += int(result.split(":", 1)[1].strip().split("행", 1)[0].strip())
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning("toorder(수동매장) lookback error: %s | %s", date_str, exc)
+    return f"toorder(수동매장) lookback({days}일): {total}행 저장"
+
+
+def backfill_toorder_manual_stores(stores=None) -> str:
+    target = _resolve_manual_stores(stores)
+    if not target:
+        return "SKIP: toorder 수동매장 대상 없음"
+
+    df_all = _load_parquet()
+    if df_all.empty:
+        return "SKIP: toorder parquet 없음"
+
+    pattern = "|".join(re.escape(store) for store in target)
+    store_col = df_all["store"].fillna("").astype(str)
+    sub = df_all[store_col.str.contains(pattern, na=False)]
+    dates = sorted({str(date).strip() for date in sub["date"].dropna().unique() if str(date).strip()})
+    if not dates:
+        return "SKIP: 대상 매장 유효 date 없음"
+
+    total = 0
+    for date_str in dates:
+        try:
+            result = run_toorder_manual_stores(date_str, stores=stores, overwrite=True)
+            logger.info(result)
+            if result.startswith("toorder(수동매장)"):
+                try:
+                    total += int(result.split(":", 1)[1].strip().split("행", 1)[0].strip())
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning("toorder(수동매장) backfill 실패: %s | %s", date_str, exc)
+    return f"toorder(수동매장) backfill 완료: {len(dates)}일 / {total}행 저장"

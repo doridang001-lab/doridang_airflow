@@ -10,20 +10,19 @@ unified_sales - UnionPOS 채널 전용 모듈.
 - MART_DB/unified_sales_grp/unified_sales_YYMMDD.parquet (공통 _save_unified_daily 사용)
 
 추가:
-- fin_product_grp.csv(ANALYTICS_DB/fin_product/fin_product_grp.csv)를 사용해 menu_name(대표메뉴) 산정
+- fin_product_grp_input.csv(ANALYTICS_DB/fin_product/fin_product_grp_input.csv)를 사용해 menu_name(대표메뉴) 산정
 """
 
 import hashlib
 import logging
 import os
 import re
-import time
 from datetime import datetime
 from functools import lru_cache
 
 import pandas as pd
 
-from modules.transform.utility.paths import FIN_PRODUCT_CSV_PATH, RAW_UNIONPOS_SALES
+from modules.transform.utility.paths import FIN_PRODUCT_CSV_PATH, RAW_UNIONPOS_SALES, existing_fin_product_csv_path
 from modules.transform.pipelines.db.DB_UnifiedSales_common import (
     UNIFIED_COLUMNS,
     _apply_fin_item_name,
@@ -37,6 +36,12 @@ from modules.transform.pipelines.db.DB_UnifiedSales_common import (
     _to_int_series,
 )
 from modules.transform.pipelines.db.DB_FinProduct import _mark_is_latest
+from modules.transform.pipelines.db.DB_ItemIdAllocator import (
+    allocate_manual_item_ids,
+    canonical_source,
+    ensure_allocator_columns,
+    validate_fin_product_codes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,55 +49,54 @@ UNIONPOS_BRAND_ROOT = RAW_UNIONPOS_SALES / "brand=도리당"
 UNIONPOS_SOURCE = "unionpos"
 UNIONPOS_BRAND = "도리당"
 
-
-def _replace_fin_product_csv_with_retry(tmp) -> None:
-    """OneDrive 잠금/권한 지연에 대비해 fin_product_grp.csv 교체를 짧게 재시도한다."""
-    attempts = 3
-    delay_seconds = 2
-    last_exc: Exception | None = None
-
-    for attempt in range(1, attempts + 1):
-        try:
-            os.replace(tmp, FIN_PRODUCT_CSV_PATH)
-            return
-        except (PermissionError, OSError) as exc:
-            last_exc = exc
-            logger.warning(
-                "fin_product_grp.csv 파일 교체 실패 (%d/%d): %s",
-                attempt,
-                attempts,
-                exc,
-            )
-            if attempt < attempts:
-                time.sleep(delay_seconds * attempt)
-
-    for attempt in range(1, attempts + 1):
-        try:
-            FIN_PRODUCT_CSV_PATH.write_bytes(tmp.read_bytes())
-            return
-        except (PermissionError, OSError) as exc:
-            last_exc = exc
-            logger.warning(
-                "fin_product_grp.csv 파일 덮어쓰기 실패 (%d/%d): %s",
-                attempt,
-                attempts,
-                exc,
-            )
-            if attempt < attempts:
-                time.sleep(delay_seconds * attempt)
-
-    if last_exc is not None:
-        raise last_exc
-
 # 월 단위 캐시 (DAG 실행 단위로 재사용)
 _UNIONPOS_MONTH_CACHE: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
 
 
+def _write_fin_product_grp_csv_from_unionpos(df: pd.DataFrame) -> tuple[bool, str]:
+    """UnionPOS 상품 마스터 반영 결과를 저장한다.
+
+    OneDrive/FUSE 마운트에서 대상 CSV가 잠겨 있으면 DAG 전체를 실패시키지 않고
+    pending CSV를 남긴다. 다음 실행이나 수동 확인 때 다시 반영할 수 있다.
+    """
+    FIN_PRODUCT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
+    pending = FIN_PRODUCT_CSV_PATH.with_name(
+        f"{FIN_PRODUCT_CSV_PATH.stem}.unionpos_pending_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    )
+
+    df = ensure_allocator_columns(df)
+    validate_fin_product_codes(df, allow_legacy_blank=True)
+    df.to_csv(tmp, index=False, encoding="utf-8-sig")
+    try:
+        os.replace(tmp, FIN_PRODUCT_CSV_PATH)
+        return True, str(FIN_PRODUCT_CSV_PATH)
+    except (PermissionError, OSError) as replace_exc:
+        try:
+            FIN_PRODUCT_CSV_PATH.write_bytes(tmp.read_bytes())
+            tmp.unlink(missing_ok=True)
+            return True, str(FIN_PRODUCT_CSV_PATH)
+        except (PermissionError, OSError) as write_exc:
+            try:
+                os.replace(tmp, pending)
+                saved_path = pending
+            except Exception:
+                saved_path = tmp
+            logger.warning(
+                "fin_product_grp_input.csv 쓰기 권한 오류로 UnionPOS 상품 반영 보류: target=%s pending=%s replace=%s write=%s",
+                FIN_PRODUCT_CSV_PATH,
+                saved_path,
+                replace_exc,
+                write_exc,
+            )
+            return False, str(saved_path)
+
+
 @lru_cache(maxsize=1)
 def _load_fin_product() -> pd.DataFrame:
-    """fin_product_grp.csv 로드 (menu_name / 메인 경계 판단용)."""
+    """fin_product_grp_input.csv 로드 (menu_name / 메인 경계 판단용)."""
     try:
-        df = pd.read_csv(FIN_PRODUCT_CSV_PATH, dtype=str).fillna("")
+        df = pd.read_csv(existing_fin_product_csv_path(), dtype=str).fillna("")
     except Exception as e:
         logger.warning("fin_product_grp 로드 실패, fallback 사용: %s", e)
         return pd.DataFrame(columns=["상품코드", "상품명", "is_main_candidate", "exclude_check"])
@@ -158,6 +162,29 @@ def _load_unionpos_month(ym: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     list_df = pd.concat(list_dfs, ignore_index=True) if list_dfs else pd.DataFrame()
     item_df = pd.concat(item_dfs, ignore_index=True) if item_dfs else pd.DataFrame()
 
+    # 수집 반복(append)으로 같은 영수증/품목이 여러 collected_at·sale_date로 중복 적재된다.
+    # per-day 처리(sale_date 필터) 전에 월 단위로 dedup해야 중복이 날짜별로 흩어지지 않는다.
+    # 1) sale_date를 실거래 시각(판매일시) 기준으로 일관되게 재계산
+    # 2) 수집 메타(collected_at/sale_date 등)를 제외한 자연키로 dedup
+    for _df in (list_df, item_df):
+        if not _df.empty and "판매일시" in _df.columns:
+            _df["sale_date"] = _df["판매일시"].astype(str).str.strip().str[:10]
+    if not list_df.empty:
+        _lk = [c for c in ("_store_partition", "포스번호", "영수증번호", "판매일시", "판매타입") if c in list_df.columns]
+        if _lk:
+            list_df = list_df.drop_duplicates(subset=_lk, keep="last").reset_index(drop=True)
+    if not item_df.empty:
+        _ik = [c for c in (
+            "_store_partition", "영수증번호", "판매일시", "번호",
+            "상품코드", "상품명", "단가", "수량", "합계", "할인", "분류명", "판매타입",
+        ) if c in item_df.columns]
+        if _ik:
+            before = len(item_df)
+            item_df = item_df.drop_duplicates(subset=_ik, keep="last").reset_index(drop=True)
+            item_df["_row_in_file"] = pd.RangeIndex(len(item_df)).astype(int)
+            if before != len(item_df):
+                logger.info("UnionPOS 월 수집중복 제거: items -%d행 | ym=%s", before - len(item_df), ym)
+
     logger.info("UnionPOS 월 로드: list %d행, items %d행 | ym=%s", len(list_df), len(item_df), ym)
     _UNIONPOS_MONTH_CACHE[ym] = (list_df, item_df)
     return list_df, item_df
@@ -218,7 +245,7 @@ def _normalize_unionpos_item_name(raw: str) -> str:
 def _resolve_menu_name_unionpos(df: pd.DataFrame) -> pd.Series:
     """order_id 기준 menu_name(대표메뉴) 산정.
 
-    - fin_product_grp.csv의 is_main_candidate=Y를 메인 경계로 사용
+    - fin_product_grp_input.csv의 is_main_candidate=Y를 메인 경계로 사용
     - Y 후보가 없으면 금액(절대값) 최대 품목을 대표메뉴로 사용
     """
     prod_df = _load_fin_product()
@@ -284,6 +311,19 @@ def _transform_unionpos_df(list_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.D
     if "_store_partition" not in item.columns:
         # store 파티션이 누락된 경우(비정상): 빈값으로 처리
         item["_store_partition"] = ""
+
+    # 영수증 상세품목도 수집 반복(collected_at 다름)으로 동일 라인이 중복 적재된다.
+    # 라인 자연키(수집 메타 제외) 기준 1행만 유지하여 매출 이중집계를 막는다.
+    _item_dedup_key = [
+        c for c in (
+            "_store_partition", "영수증번호", "판매일시", "번호",
+            "상품코드", "상품명", "단가", "수량", "합계", "할인", "분류명", "판매타입",
+        )
+        if c in item.columns
+    ]
+    if _item_dedup_key:
+        item = item.drop_duplicates(subset=_item_dedup_key, keep="first").reset_index(drop=True)
+
     if "_row_in_file" not in item.columns:
         item = item.reset_index(drop=True)
         item["_row_in_file"] = pd.RangeIndex(len(item)).astype(int)
@@ -326,6 +366,16 @@ def _transform_unionpos_df(list_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.D
             "_pk": "item_pk",
         }
     )
+
+    # 영수증 헤더가 수집 반복으로 같은 (매장, 영수증번호, 판매일시)에 여러 행 적재될 수 있다.
+    # 그대로 items와 머지하면 품목이 헤더 중복수만큼 복제되어 매출이 이중집계된다.
+    # items에는 포스번호가 없어 포스 단위 분리가 불가하므로, 머지 키 기준 헤더를 1행만 유지한다.
+    _dedup_key = ["_store_partition", "영수증번호", "판매일시"]
+    if "collected_at" in order.columns:
+        order = order.sort_values("collected_at").drop_duplicates(subset=_dedup_key, keep="last")
+    else:
+        order = order.drop_duplicates(subset=_dedup_key, keep="first")
+    order = order.reset_index(drop=True)
 
     merged = pd.merge(
         order,
@@ -426,13 +476,18 @@ def _transform_unionpos_df(list_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.D
     keep_item = (merged["item_id"].fillna("").astype(str).str.strip() != "") | (merged["item_name"].fillna("").astype(str).str.strip() != "")
     merged = merged[keep_item].reset_index(drop=True)
 
+    merged["item_id"] = allocate_manual_item_ids(
+        merged[["source", "brand", "store", "item_id", "item_name", "unit_price"]],
+        persist=True,
+    )
+
     # cleanup
     for c in ("_line_amt", "_qty_int", "_fee_like", "_is_main", "_unit_abs"):
         if c in merged.columns:
             merged = merged.drop(columns=[c])
 
     merged = merged.reindex(columns=UNIFIED_COLUMNS, fill_value="")
-    # item_id(상품코드) 기준으로 item_name을 fin 상품명으로 정합(LEFT JOIN 100% 목표)
+    # scoped item_id 기준으로 item_name 정합
     merged = _apply_fin_item_name(merged)
     return merged
 
@@ -441,10 +496,10 @@ def upsert_fin_product_grp_from_unionpos(
     ym: str | None = None,
     dry_run: bool = False,
 ) -> str:
-    """UnionPOS receipt_items 기반으로 fin_product_grp.csv에 미등록 상품코드를 append.
+    """UnionPOS receipt_items 기반으로 fin_product_grp_input.csv에 미등록 상품코드를 append.
 
     - 신규 항목은 llm_check=Y로 추가 (추후 DB_FinProduct/LLM로 분류 보강)
-    - 대메뉴: unionpos_receipt_list.csv의 '매장명' 사용
+    - 대메뉴: 브랜드명 사용, 매장명은 store 컬럼에 보존
     - 중메뉴: unionpos_receipt_items.csv의 '분류명' 사용
     """
     # 소스 로드
@@ -477,8 +532,10 @@ def upsert_fin_product_grp_from_unionpos(
 
     # 상품 테이블로 변환
     prod = pd.DataFrame({
-        "source": UNIONPOS_SOURCE,
-        "대메뉴": uni.get("store", "").map(lambda s: f"{UNIONPOS_BRAND} {s}".strip() if str(s).strip() else UNIONPOS_BRAND),
+        "source": canonical_source(UNIONPOS_SOURCE),
+        "brand": UNIONPOS_BRAND,
+        "store": uni.get("store", "").fillna("").astype(str).str.strip(),
+        "대메뉴": UNIONPOS_BRAND,
         "중메뉴": "",  # 아래에서 채움
         "상품코드": uni.get("item_id", "").fillna("").astype(str).str.strip(),
         "상품명": uni.get("item_name", "").fillna("").astype(str).str.strip(),
@@ -521,8 +578,9 @@ def upsert_fin_product_grp_from_unionpos(
     prod = prod[prod["상품코드"] != ""].drop_duplicates(subset=["상품코드"], keep="last")
 
     # 기존 마스터 로드
-    if FIN_PRODUCT_CSV_PATH.exists():
-        master = pd.read_csv(FIN_PRODUCT_CSV_PATH, dtype=str).fillna("")
+    source_path = existing_fin_product_csv_path()
+    if source_path.exists():
+        master = pd.read_csv(source_path, dtype=str, encoding="utf-8-sig").fillna("")
     else:
         master = pd.DataFrame(columns=list(prod.columns))
 
@@ -536,8 +594,8 @@ def upsert_fin_product_grp_from_unionpos(
     to_add = prod[~prod["상품코드"].isin(existing)].copy()
 
     # 기존 상품코드인데 상품명/중메뉴/판매단가가 바뀐 경우:
-    # fin_product_grp.csv는 "코드별 마지막 행(last)"을 최신으로 가정하므로 overwrite가 아니라 append(히스토리)로 누적한다.
-    to_change = pd.DataFrame(columns=list(prod.columns))
+    # fin_product_grp_input.csv는 "코드별 마지막 행(last)"을 최신으로 가정하므로 overwrite가 아니라 append(히스토리)로 누적한다.
+    to_change = pd.DataFrame(columns=list(master.columns))
     if not master.empty:
         master_latest = (
             master.copy()
@@ -583,21 +641,22 @@ def upsert_fin_product_grp_from_unionpos(
                     .reindex(ch["상품코드"].tolist())
                     .reset_index()
                 )
-                for c in prod.columns:
+                for c in master.columns:
                     if c not in base.columns:
                         base[c] = ""
-                base = base.reindex(columns=list(prod.columns), fill_value="")
+                base = base.reindex(columns=list(master.columns), fill_value="")
 
                 base["상품명"] = ch["상품명"].tolist()
                 base["중메뉴"] = ch["중메뉴"].tolist()
                 base["판매단가"] = ch["판매단가"].tolist()
+                base["source"] = base["source"].map(canonical_source)
                 # 변경분은 LLM 분류 대상이 아니므로 llm_check=N으로 둔다
                 base["llm_check"] = "N"
                 base["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 to_change = base.copy()
 
     if to_add.empty and to_change.empty:
-        return "fin_product_grp.csv 변경 없음 (미등록/변경 상품코드 없음)"
+        return "fin_product_grp_input.csv 변경 없음 (미등록/변경 상품코드 없음)"
 
     if dry_run:
         msg = []
@@ -605,31 +664,24 @@ def upsert_fin_product_grp_from_unionpos(
             msg.append(f"+{len(to_add)}행(신규)")
         if not to_change.empty:
             msg.append(f"+{len(to_change)}행(변경)")
-        return f"dry_run: fin_product_grp.csv {' '.join(msg)} 추가 예정"
+        return f"dry_run: fin_product_grp_input.csv {' '.join(msg)} 추가 예정"
 
     out = pd.concat([master, to_add, to_change], ignore_index=True)
+    out = ensure_allocator_columns(out)
     out = _mark_is_latest(out)
-
-    FIN_PRODUCT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
-    try:
-        out.to_csv(tmp, index=False, encoding="utf-8-sig")
-        _replace_fin_product_csv_with_retry(tmp)
-    finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
 
     parts = []
     if not to_add.empty:
         parts.append(f"+{len(to_add)}행(신규)")
     if not to_change.empty:
         parts.append(f"+{len(to_change)}행(변경)")
-    return f"fin_product_grp.csv 업데이트: {' '.join(parts)} (unionpos)"
+    saved, path = _write_fin_product_grp_csv_from_unionpos(out)
+    if not saved:
+        return f"fin_product_grp_input.csv 업데이트 보류: {' '.join(parts)} | 권한 오류 | pending={path}"
+    return f"fin_product_grp_input.csv 업데이트: {' '.join(parts)} (unionpos)"
 
 
-def run_unionpos(date_str: str, overwrite: bool = False) -> str:
+def run_unionpos(date_str: str, overwrite: bool = False, stores: list[str] | None = None) -> str:
     """특정 일자의 UnionPOS raw CSV를 unified_sales로 append/overwrite."""
     try:
         list_df, item_df = _load_unionpos_by_date(date_str)
@@ -641,7 +693,13 @@ def run_unionpos(date_str: str, overwrite: bool = False) -> str:
     if df.empty:
         return f"스킵 (데이터 없음 | {date_str})"
 
-    saved = _save_unified_daily(df, date_str, overwrite=overwrite)
+    store_scope = {str(store).strip() for store in (stores or []) if str(store).strip()}
+    if store_scope:
+        df = df[df["store"].fillna("").astype(str).str.strip().isin(store_scope)].copy()
+        if df.empty:
+            return f"스킵 (unionpos 대상 매장 데이터 없음 | {date_str} | stores={sorted(store_scope)})"
+
+    saved = _save_unified_daily(df, date_str, overwrite=overwrite, replace_stores=stores)
     result = f"unified_sales(unionpos) 저장 | {date_str} | {saved}행"
     logger.info(result)
     return result

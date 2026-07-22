@@ -14,12 +14,12 @@ import pandas as pd
 import pendulum
 
 from modules.extract.crawling_toorder_sales_report import run_crawling_datedetail_months
+from modules.transform.utility.account import get_default_account, get_pw
 from modules.transform.utility.paths import ANALYTICS_DB, DOWN_DIR
 
 logger = logging.getLogger(__name__)
 
-_TOORDER_ID = os.getenv("TOORDER_ID", "doridang15")
-_TOORDER_PW = os.getenv("TOORDER_PW", "ehfl5233!")
+_DEFAULT_TOORDER_ID, _ = get_default_account("toorder")
 _DEFAULT_DEST = ANALYTICS_DB / "toorder_daily_store_platform"
 _PARQUET_NAME = "toorder_store_platform_daily.parquet"
 _DATEDETAIL_PREFIX = "\uc885\ud569\ubcf4\uace0\uc11c_\uc77c\ubcc4\uc0c1\uc138_\ub9e4\ucd9c\ubcf4\uace0\uc11c"
@@ -30,6 +30,38 @@ _STORE_COL_START = 5
 _STORE_COL_STRIDE = 4
 _DATA_ROW_START = 6
 _OUTPUT_COLUMNS = ["date", "store", "platform", "price", "receipts_num"]
+
+
+def _get_airflow_variable(key: str) -> str:
+    try:
+        from airflow.models import Variable
+        value = Variable.get(key, default_var=None)
+        return (value or "").strip()
+    except Exception:
+        return ""
+
+
+def _resolve_toorder_id(explicit: str | None = None) -> str:
+    if explicit and get_pw("toorder", explicit):
+        return explicit
+    if explicit:
+        logger.warning("자동화 연결 대상이 아닌 ToOrder 계정 무시: account_id=%s", explicit)
+    for key in ("TOORDER_ID", "TOORDER_VOC_ACCOUNT_ID", "TOORDER_DELIVERY_ACCOUNT_ID"):
+        value = (os.getenv(key) or _get_airflow_variable(key)).strip()
+        if value and get_pw("toorder", value):
+            return value
+        if value:
+            logger.warning("자동화 연결 대상이 아닌 ToOrder 계정 무시: key=%s account_id=%s", key, value)
+    return _DEFAULT_TOORDER_ID
+
+
+def _resolve_toorder_password(account_id: str, explicit: str | None = None) -> str:
+    if explicit:
+        logger.warning("명시적 ToOrder 비밀번호는 자동화 연결 필터 우회를 막기 위해 무시합니다.")
+    account_pw = get_pw("toorder", account_id)
+    if account_pw:
+        return account_pw
+    return ""
 
 
 def run_toorder_store_platform_daily(
@@ -58,6 +90,13 @@ def run_toorder_store_platform_daily(
     )
     resolved_dest = Path(dest_dir) if dest_dir else _DEFAULT_DEST
     resolved_manual = Path(manual_dir) if manual_dir else DOWN_DIR
+    resolved_toorder_id = _resolve_toorder_id(toorder_id)
+    resolved_toorder_pw = _resolve_toorder_password(resolved_toorder_id, toorder_pw)
+    if not resolved_toorder_id or not resolved_toorder_pw:
+        raise RuntimeError(
+            "ToOrder datedetail 계정 해석 실패: "
+            "sales_employee.csv 자동화 계정 또는 내장 fallback 계정을 확인하세요."
+        )
     parquet_path = resolved_dest / _PARQUET_NAME
     resolved_dest.mkdir(parents=True, exist_ok=True)
     resolved_manual.mkdir(parents=True, exist_ok=True)
@@ -75,23 +114,28 @@ def run_toorder_store_platform_daily(
             logger.info("%sUsing pending datedetail workbook: %s", log_prefix, xlsx_path.name)
 
     downloaded_by_month: dict[str, Path] = {}
+    failed_download_months: list[str] = []
+    empty_months: list[str] = []
+    download_results: list[dict] = []
     if missing_spans:
         logger.info(
             "%sDownloading ToOrder datedetail months: %s",
             log_prefix,
             ", ".join(month_start[:7] for month_start, _month_end in missing_spans),
         )
-        results = run_crawling_datedetail_months(
-            toorder_id=toorder_id or _TOORDER_ID,
-            toorder_pw=toorder_pw or _TOORDER_PW,
+        download_results = run_crawling_datedetail_months(
+            toorder_id=resolved_toorder_id,
+            toorder_pw=resolved_toorder_pw,
             month_spans=missing_spans,
             download_dir=resolved_manual,
         )
-        for result in results:
+        for result in download_results:
             month_token = str(result.get("month") or "")
             if result.get("success") and result.get("file"):
                 downloaded_by_month[month_token] = Path(str(result["file"]))
             else:
+                if month_token and month_token not in failed_download_months:
+                    failed_download_months.append(month_token)
                 logger.warning(
                     "%sDatedetail download failed: %s (%s)",
                     log_prefix,
@@ -104,11 +148,15 @@ def run_toorder_store_platform_daily(
         month_token = month_start[:7]
         xlsx_path = pending_by_month.get(month_token) or downloaded_by_month.get(month_token)
         if xlsx_path is None:
+            if month_token not in failed_download_months:
+                failed_download_months.append(month_token)
             logger.warning("%sSkipping ToOrder datedetail month without workbook: %s", log_prefix, month_token)
             continue
 
         month_df = _parse_datedetail_xlsx(xlsx_path)
         if month_df.empty:
+            if month_token not in empty_months:
+                empty_months.append(month_token)
             logger.warning("%sDatedetail workbook parsed empty: %s", log_prefix, xlsx_path.name)
         else:
             month_df = month_df[
@@ -118,6 +166,10 @@ def run_toorder_store_platform_daily(
             if not month_df.empty:
                 all_dfs.append(month_df)
                 logger.info("%sParsed datedetail %s: %d rows", log_prefix, month_token, len(month_df))
+            else:
+                if month_token not in empty_months:
+                    empty_months.append(month_token)
+                logger.warning("%sDatedetail workbook has no in-range rows: %s", log_prefix, month_token)
         _rename_to_raw(xlsx_path)
 
     if all_dfs:
@@ -125,6 +177,27 @@ def run_toorder_store_platform_daily(
         _upsert_parquet(new_df, parquet_path)
     else:
         logger.warning("%sNo ToOrder datedetail rows collected: %s~%s", log_prefix, resolved_from, resolved_to)
+
+    login_failures = [
+        str(result.get("error") or "")
+        for result in download_results
+        if "login failed" in str(result.get("error") or "").lower()
+    ]
+    if login_failures:
+        raise RuntimeError(
+            "ToOrder datedetail 인증 실패: "
+            f"account_id={resolved_toorder_id}, "
+            f"download_failed={failed_download_months}, "
+            f"range={resolved_from}~{resolved_to}, "
+            f"error={login_failures[0]}"
+        )
+
+    if failed_download_months or empty_months or not all_dfs:
+        raise RuntimeError(
+            f"ToOrder datedetail 수집 실패(데이터 없음): "
+            f"download_failed={failed_download_months}, empty={empty_months}, "
+            f"range={resolved_from}~{resolved_to}, parquet={parquet_path}"
+        )
 
     return str(parquet_path)
 

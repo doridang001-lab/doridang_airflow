@@ -1,18 +1,18 @@
-﻿"""
-?댁??ъ뒪(EasyPOS) 留ㅼ텧 ?곸닔利??섏쭛 DAG
+"""
+이지포스(EasyPOS) 매출 영수증 수집 DAG
 
-泥섎━ ?먮쫫:
-1. ?ㅽ뻾 ?좎쭨 寃곗젙 (conf['date_from'/'date_to'] ?먮뒗 conf['sale_date'] ?먮뒗 ?댁젣)
-2. Playwright濡?EasyPOS ?뱀씪留ㅼ텧?댁뿭 ???곸닔利앸퀎 ?곹뭹?댁뿭 ?섏쭛
-3. OneDrive easypos_sales_raw/ym={YYYY-MM}/receipts.csv ?곸옱
+처리 흐름:
+1. 실행 날짜 결정 (conf['date_from'/'date_to'] 또는 conf['sale_date'] 또는 어제)
+2. Playwright로 EasyPOS 당일매출내역, 영수증별 상품내역, 상품조회 파일 수집
+3. OneDrive easypos_sales_raw/ym={YYYY-MM}/receipts.csv 적재
 
-?좎쭨 踰붿쐞 ?ㅼ젙:
-- DATE_FROM / DATE_TO ?곸닔(肄붾뱶)濡?湲곕낯媛??ㅼ젙 媛??(None?대㈃ ?댁젣 1??
-- ?고???conf {"date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD"} 濡?override
-- conf {"sale_date": "YYYY-MM-DD"} (?⑥씪 ?좎쭨) ???명솚
+날짜 범위 설정:
+- DATE_FROM / DATE_TO 상수(코드)로 기본값 설정 가능(None이면 어제 1일)
+- 수동 실행 conf {"date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD"} 로 override
+- conf {"sale_date": "YYYY-MM-DD"} 단일 날짜 호환
 
-?ㅼ?以? 留ㅼ씪 07:50 (DB_EASYPOS_SALES_TIME)
-?섏쭛 寃쎈줈: ANALYTICS_DB/easypos_sales_raw/ym=YYYY-MM/receipts.csv
+스케줄: 매일 04:45 (DB_EASYPOS_SALES_TIME)
+수집 경로: ANALYTICS_DB/easypos_sales_raw/ym=YYYY-MM/receipts.csv
 """
 
 import logging
@@ -25,6 +25,7 @@ from airflow.operators.python import PythonOperator
 
 from modules.transform.utility.notifier import enqueue_heal_task, send_telegram
 from modules.transform.utility.schedule import DB_EASYPOS_SALES_TIME
+from modules.transform.utility.mail_recipients import MAIL_CMJ_PM
 from modules.transform.pipelines.db.DB_EasyPOS_Sales import (
     resolve_sale_dates,
     collect_receipts,
@@ -40,52 +41,52 @@ logger = logging.getLogger(__name__)
 
 dag_id = Path(__file__).stem
 
-# ?좎쭨 踰붿쐞 ?ㅼ젙 (None?대㈃ ?댁젣留? ?ㅼ젙?섎㈃ ?대떦 湲곌컙 ?섏쭛)
-# ?고???conf(date_from/date_to ?먮뒗 sale_date)媛 ?덉쑝硫?conf ?곗꽑
-DATE_FROM = None   # ?? "2026-04-01"
-DATE_TO   = None   # ?? "2026-04-03"
+# 날짜 범위 설정 (None이면 어제만, 설정하면 해당 기간 수집)
+# 수동 실행 conf(date_from/date_to 또는 sale_date)가 있으면 conf 우선
+DATE_FROM = None   # 예: "2026-04-01"
+DATE_TO   = None   # 예: "2026-04-03"
 
-# LOOKBACK_DAYS: DATE_FROM/DATE_TO/conf 誘몄?????理쒓렐 N??以?raw ?뚯씪 ?녿뒗 ?좊쭔 ?섏쭛
-# None ???댁젣 1?쇰쭔, int ??理쒓렐 N??raw ?뚯씪 議댁옱 ?뺤씤 ???꾨씫遺꾨쭔 ?섏쭛
+# LOOKBACK_DAYS: DATE_FROM/DATE_TO/conf 미지정 시 최근 N일 중 raw 파일 없는 날짜만 수집
+# None 이면 어제 1일만, int 이면 최근 N일 raw 파일 존재 확인 후 누락분만 수집
 LOOKBACK_DAYS: int | None = 7
 
-_ALERT_EMAILS = ["a17019@kakao.com"]
+_ALERT_EMAILS = [MAIL_CMJ_PM]
 
 
 def _send_alert(subject: str, body: str) -> None:
     from modules.transform.utility.mailer import send_email, text_to_html
     try:
         send_email(subject=subject, html_content=text_to_html(body), to_emails=_ALERT_EMAILS)
-        logger.info(f"?뚮┝ 諛쒖넚 ?꾨즺: {_ALERT_EMAILS}")
+        logger.info("알림 발송 완료: %s", _ALERT_EMAILS)
     except Exception as e:
-        logger.error(f"?뚮┝ 諛쒖넚 ?ㅽ뙣: {e}")
+        logger.error("알림 발송 실패: %s", e)
 
 
 def _on_failure_callback(context):
-    """Task 理쒖쥌 ?ㅽ뙣 ???대찓???뚮┝"""
+    """Task 최종 실패 시 이메일/텔레그램 알림"""
     ti             = context.get("task_instance")
     execution_date = ti.execution_date.strftime("%Y-%m-%d %H:%M")
-    exception      = context.get("exception", "?????놁쓬")
+    exception      = context.get("exception", "알 수 없음")
 
     _send_alert(
-        subject=f"[Airflow ?ㅽ뙣] {ti.dag_id} / {ti.task_id}",
+        subject=f"[Airflow 실패] {ti.dag_id} / {ti.task_id}",
         body=(
             f"DAG: {ti.dag_id}\n"
             f"Task: {ti.task_id}\n"
-            f"?ㅽ뻾?쇱떆: {execution_date}\n"
-            f"?먮윭: {exception}\n"
-            f"濡쒓렇: {ti.log_url}"
+            f"실행일시: {execution_date}\n"
+            f"에러: {exception}\n"
+            f"로그: {ti.log_url}"
         ),
     )
     try:
         _ti = context.get('task_instance')
-        _exc = context.get('exception', '?????놁쓬')
+        _exc = context.get('exception', '알 수 없음')
         _rd = getattr(_ti, 'execution_date', None)
         _ed = _rd.strftime('%Y-%m-%d %H:%M') if _rd else ''
         _retry = getattr(_ti, 'try_number', 1) - 1
         send_telegram(
-            f"DAG: {_ti.dag_id}\nTask: {_ti.task_id}\n?ъ떆?? {_retry}?뚯감\n"
-            f"?ㅽ뻾?쇱떆: {_ed}\n?먮윭: {_exc}\n濡쒓렇: {_ti.log_url}\n?닿껐?대씪"
+            f"DAG: {_ti.dag_id}\nTask: {_ti.task_id}\n재시도 {_retry}회차\n"
+            f"실행일시: {_ed}\n에러: {_exc}\n로그: {_ti.log_url}\n해결해라"
         )
         enqueue_heal_task(context)
     except Exception:
@@ -93,21 +94,21 @@ def _on_failure_callback(context):
 
 
 def _on_retry_callback(context):
-    """Task ?ъ떆?????대찓???뚮┝"""
+    """Task 재시도 시 이메일 알림"""
     ti             = context.get("task_instance")
     execution_date = ti.execution_date.strftime("%Y-%m-%d %H:%M")
-    exception      = context.get("exception", "?????놁쓬")
+    exception      = context.get("exception", "알 수 없음")
     retry_number   = ti.try_number - 1
 
     _send_alert(
-        subject=f"[Airflow ?ъ떆??{retry_number}?? {ti.dag_id} / {ti.task_id}",
+        subject=f"[Airflow 재시도 {retry_number}회] {ti.dag_id} / {ti.task_id}",
         body=(
             f"DAG: {ti.dag_id}\n"
             f"Task: {ti.task_id}\n"
-            f"?ъ떆?? {retry_number}?뚯감\n"
-            f"?ㅽ뻾?쇱떆: {execution_date}\n"
-            f"?먮윭: {exception}\n"
-            f"濡쒓렇: {ti.log_url}"
+            f"재시도 {retry_number}회차\n"
+            f"실행일시: {execution_date}\n"
+            f"에러: {exception}\n"
+            f"로그: {ti.log_url}"
         ),
     )
 
@@ -141,6 +142,7 @@ with DAG(
     t2 = PythonOperator(
         task_id="collect_receipts",
         python_callable=collect_receipts,
+        pool="selenium_pool",
     )
 
     t3 = PythonOperator(
@@ -156,6 +158,7 @@ with DAG(
     t5 = PythonOperator(
         task_id="download_easypos_product",
         python_callable=download_easypos_product,
+        pool="selenium_pool",
     )
 
     t6 = PythonOperator(

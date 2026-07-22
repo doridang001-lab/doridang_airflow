@@ -7,6 +7,7 @@
   - MART_DB/hall_sales_target/hall_marketing_target.csv (마케팅, 기준일자 join)
 출력:
   - MART_DB/hall_sales_target/hall_daily_report.xlsx  (고정명, 월별 시트)
+  - MART_DB/hall_sales_target/hall_daily_report.csv   (고정명, 최신 CSV)
   - MART_DB/hall_sales_target/hall_daily_report_6m.xlsx 등 월별 파일
 
 구조:
@@ -29,6 +30,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from modules.transform.pipelines.db.DB_Hall_Sales_Target import classify_hall_time_slots
+from modules.transform.pipelines.db.DB_UnifiedSales_common import iter_unified_sales_files
 from modules.transform.utility.paths import MART_DB
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,7 @@ STORE_NAME   = "송파삼전점"
 UNIFIED_ROOT = MART_DB / "unified_sales_grp"
 MKT_CSV      = MART_DB / "hall_sales_target" / "hall_marketing_target.csv"
 OUTPUT_XLSX  = MART_DB / "hall_sales_target" / "hall_daily_report.xlsx"
+OUTPUT_CSV   = MART_DB / "hall_sales_target" / "hall_daily_report.csv"
 
 # ── 스타일 ─────────────────────────────────────────────────────
 _NAVY    = "1F3864"
@@ -81,7 +84,7 @@ def _c(ws, row, col, val, font=None, fill=None, align=None, fmt=None, border=Tru
 # ── 데이터 로드 ────────────────────────────────────────────────
 
 def _load_sales(ym: str | None = None) -> pd.DataFrame:
-    files = sorted(UNIFIED_ROOT.glob("unified_sales_*.parquet"))
+    files = iter_unified_sales_files()
     if not files:
         raise FileNotFoundError(f"unified_sales parquet 없음: {UNIFIED_ROOT}")
     df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
@@ -347,6 +350,216 @@ def _write_excel_files(sales_df: pd.DataFrame, months: list[str], daily_target: 
     _save_workbook_replace(month_wb, _month_file_path(latest_ym))
     _save_workbook_replace(wb, OUTPUT_XLSX)
     return updated
+
+
+def _safe_div(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else 0
+
+
+def _int0(value) -> int:
+    if pd.isna(value):
+        return 0
+    return int(value)
+
+
+def _month_target(ym: str, monthly_targets: dict, daily_target: dict, key: str) -> int:
+    if ym in monthly_targets:
+        return int(monthly_targets[ym].get(key, 0))
+    year, month = int(ym[:4]), int(ym[5:7])
+    return int(daily_target.get(key, 0) * calendar.monthrange(year, month)[1])
+
+
+def _marketing_month_target(ym: str, marketing_monthly_targets: dict, key: str) -> int:
+    return int(marketing_monthly_targets.get(ym, {}).get(key, 0))
+
+
+def _forecast_value(actual: pd.Series, current_day: int, fallback: int = 0) -> int:
+    values = pd.to_numeric(actual, errors="coerce").fillna(0)
+    observed = values[values != 0]
+    if observed.empty:
+        return int(fallback)
+    return int(round(observed.sum() / max(current_day, len(observed))))
+
+
+def _monthly_csv_rows(
+    sales_df: pd.DataFrame,
+    ym: str,
+    monthly_targets: dict,
+    marketing_monthly_targets: dict,
+    daily_target: dict,
+) -> list[dict]:
+    rows = _build_month_rows(sales_df, ym)
+    if not rows:
+        return []
+
+    df = pd.DataFrame(rows)
+    df["sale_date"] = pd.to_datetime(df["date"])
+    df["day"] = df["sale_date"].dt.day
+
+    max_actual = sales_df["sale_date"].max() if not sales_df.empty else pd.NaT
+    current_ym = date.today().strftime("%Y-%m")
+    if pd.isna(max_actual):
+        actual_cutoff = pd.Timestamp.min
+    elif ym < current_ym:
+        actual_cutoff = df["sale_date"].max()
+    else:
+        actual_cutoff = min(pd.Timestamp(max_actual), df["sale_date"].max())
+
+    actual_mask = df["sale_date"] <= actual_cutoff
+    current_day = int(actual_mask.sum()) if actual_mask.any() else 0
+
+    forecast = {
+        "daily_sale": _forecast_value(df.loc[actual_mask, "daily_sale"], current_day, daily_target.get("sale", 0)),
+        "lunch_sale": _forecast_value(df.loc[actual_mask, "lunch_sale"], current_day, daily_target.get("lunch_sale", 0)),
+        "dinner_sale": _forecast_value(df.loc[actual_mask, "dinner_sale"], current_day, daily_target.get("dinner_sale", 0)),
+        "lunch_cnt": _forecast_value(df.loc[actual_mask, "lunch_cnt"], current_day, daily_target.get("lunch_orders", 0)),
+        "dinner_cnt": _forecast_value(df.loc[actual_mask, "dinner_cnt"], current_day, daily_target.get("dinner_orders", 0)),
+        "place": _forecast_value(df.loc[actual_mask, "place"], current_day, daily_target.get("place", 0)),
+        "leaflet_cum": _forecast_value(df.loc[actual_mask, "leaflet_cum"], current_day, daily_target.get("홍보물_배포", 0)),
+        "coupon": _forecast_value(df.loc[actual_mask, "coupon"], current_day, daily_target.get("coupon", 0)),
+        "insta": _forecast_value(df.loc[actual_mask, "insta"], current_day, daily_target.get("insta", 0)),
+        "karrot": _forecast_value(df.loc[actual_mask, "karrot"], current_day, daily_target.get("karrot", 0)),
+        "naver": _forecast_value(df.loc[actual_mask, "naver"], current_day, daily_target.get("naver", 0)),
+    }
+
+    output = []
+    cumul = {
+        "sale": 0,
+        "orders": 0,
+        "lunch_sale": 0,
+        "lunch_orders": 0,
+        "dinner_sale": 0,
+        "dinner_orders": 0,
+        "place": 0,
+        "leaflet": 0,
+        "coupon": 0,
+        "insta": 0,
+        "karrot": 0,
+        "naver": 0,
+    }
+
+    month_sale_target = _month_target(ym, monthly_targets, daily_target, "sale")
+    month_aov_target = _month_target(ym, monthly_targets, daily_target, "aov")
+    month_order_target = _month_target(ym, monthly_targets, daily_target, "orders")
+    month_lunch_sale_target = _month_target(ym, monthly_targets, daily_target, "lunch_sale")
+    month_dinner_sale_target = _month_target(ym, monthly_targets, daily_target, "dinner_sale")
+    month_place_target = _marketing_month_target(ym, marketing_monthly_targets, "플레이스_유입")
+    month_leaflet_target = _marketing_month_target(ym, marketing_monthly_targets, "홍보물_배포")
+    month_insta_target = _marketing_month_target(ym, marketing_monthly_targets, "인스타_노출")
+    month_karrot_target = _marketing_month_target(ym, marketing_monthly_targets, "당근_노출")
+
+    for _, row in df.iterrows():
+        is_actual = row["sale_date"] <= actual_cutoff
+        lunch_sale = _int0(row["lunch_sale"]) if is_actual else forecast["lunch_sale"]
+        dinner_sale = _int0(row["dinner_sale"]) if is_actual else forecast["dinner_sale"]
+        total_amt = _int0(row["daily_sale"]) if is_actual else forecast["daily_sale"]
+        lunch_cnt = _int0(row["lunch_cnt"]) if is_actual else forecast["lunch_cnt"]
+        dinner_cnt = _int0(row["dinner_cnt"]) if is_actual else forecast["dinner_cnt"]
+        total_orders = lunch_cnt + dinner_cnt
+        place = _int0(row["place"]) if is_actual else forecast["place"]
+        leaflet = _int0(row["leaflet_cum"]) if is_actual else forecast["leaflet_cum"]
+        coupon = _int0(row["coupon"]) if is_actual else forecast["coupon"]
+        insta = _int0(row["insta"]) if is_actual else forecast["insta"]
+        karrot = _int0(row["karrot"]) if is_actual else forecast["karrot"]
+        naver = _int0(row["naver"]) if is_actual else forecast["naver"]
+
+        cumul["sale"] += total_amt
+        cumul["orders"] += total_orders
+        cumul["lunch_sale"] += lunch_sale
+        cumul["lunch_orders"] += lunch_cnt
+        cumul["dinner_sale"] += dinner_sale
+        cumul["dinner_orders"] += dinner_cnt
+        cumul["place"] += place
+        cumul["leaflet"] = max(cumul["leaflet"], leaflet)
+        cumul["coupon"] += coupon
+        cumul["insta"] += insta
+        cumul["karrot"] += karrot
+        cumul["naver"] += naver
+
+        output.append({
+            "sale_date": row["sale_date"].strftime("%Y-%m-%d"),
+            "ym": ym.replace("-", "_"),
+            "구분": "실제값" if is_actual else "예측값",
+            "total_amt": total_amt,
+            "월매출_목표": month_sale_target,
+            "누적매출": cumul["sale"],
+            "tot_order_cnt": total_orders,
+            "일영수건수_목표": month_order_target,
+            "누적주문수": cumul["orders"],
+            "일영수건수(일평균)": _safe_div(cumul["orders"], row["day"]),
+            "객단가": _safe_div(total_amt, total_orders),
+            "객단가_목표": month_aov_target,
+            "누적_객단가": _safe_div(cumul["sale"], cumul["orders"]),
+            "점심_매출": lunch_sale,
+            "점심_일매출목표": month_lunch_sale_target,
+            "누적_점심_매출": cumul["lunch_sale"],
+            "점심_주문건수": lunch_cnt,
+            "누적_점심_주문건수": cumul["lunch_orders"],
+            "점심_객단가": _safe_div(lunch_sale, lunch_cnt),
+            "누적_점심_객단가": _safe_div(cumul["lunch_sale"], cumul["lunch_orders"]),
+            "저녁_매출": dinner_sale,
+            "저녁_일매출목표": month_dinner_sale_target,
+            "누적_저녁_매출": cumul["dinner_sale"],
+            "저녁_주문건수": dinner_cnt,
+            "누적_저녁_주문건수": cumul["dinner_orders"],
+            "저녁_객단가": _safe_div(dinner_sale, dinner_cnt),
+            "누적_저녁_객단가": _safe_div(cumul["dinner_sale"], cumul["dinner_orders"]),
+            "플레이스_유입": place,
+            "플레이스_유입_목표": month_place_target,
+            "플레이스_유입_누적": cumul["place"],
+            "플레이스_유입_일평균": _safe_div(cumul["place"], row["day"]),
+            "플레이스_유입_일평균_목표": daily_target.get("place", 0),
+            "홍보물_배포": leaflet,
+            "홍보물_배포_목표": month_leaflet_target,
+            "홍보물_배포_누적": cumul["leaflet"],
+            "쿠폰_회수건수": coupon,
+            "쿠폰_회수율_목표": 0.7,
+            "쿠폰_회수건수_누적": cumul["coupon"],
+            "쿠폰_회수율": 0.7,
+            "인스타_노출": insta,
+            "인스타_노출_목표": month_insta_target,
+            "인스타_노출_누적": cumul["insta"],
+            "당근_노출": karrot,
+            "당근_노출_목표": month_karrot_target,
+            "당근_노출_누적": cumul["karrot"],
+            "네이버_오더": naver,
+            "네이버_오더_일평균_목표": daily_target.get("naver", 0),
+            "네이버_오더_누적": cumul["naver"],
+            "네이버_오더_일평균": _safe_div(cumul["naver"], row["day"]),
+            "점심_영수건수_목표": daily_target.get("lunch_orders", 0) * row["day"],
+            "점심_테이블단가_목표": daily_target.get("lunch_aov", 0),
+            "점심_일매출_일평균_목표": daily_target.get("lunch_sale", 0),
+            "저녁_영수건수_목표": daily_target.get("dinner_orders", 0) * row["day"],
+            "저녁_테이블단가_목표": daily_target.get("dinner_aov", 0),
+            "저녁_일매출_일평균_목표": daily_target.get("dinner_sale", 0),
+        })
+
+    return output
+
+
+def build_daily_tracking_csv(
+    monthly_targets: dict,
+    marketing_monthly_targets: dict,
+    daily_target: dict,
+) -> str:
+    sales_df = _load_sales()
+    months = _available_months(sales_df)
+    rows = []
+    for ym in sorted(months):
+        rows.extend(
+            _monthly_csv_rows(
+                sales_df,
+                ym,
+                monthly_targets,
+                marketing_monthly_targets,
+                daily_target,
+            )
+        )
+
+    OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+    logger.info("일단위 트래킹 CSV 저장 완료: %d행 → %s", len(rows), OUTPUT_CSV)
+    return f"완료 {len(rows)}행 → {OUTPUT_CSV}"
 
 
 # ── 메인 함수 ──────────────────────────────────────────────────

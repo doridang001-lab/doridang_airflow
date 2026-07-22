@@ -43,6 +43,14 @@ logger = logging.getLogger(__name__)
 
 KST = pendulum.timezone("Asia/Seoul")
 KNOWN_BRANDS = ["도리당", "나홀로"]
+_ORIGINAL_BAEMIN_OUR_STORE_CLICKS_DB = BAEMIN_OUR_STORE_CLICKS_DB
+
+
+def _short_error(exc: Exception) -> str:
+    text = str(exc).splitlines()[0].strip()
+    return text[:240]
+
+
 _CRASH_KEYWORDS = (
     "Remote end closed",
     "Connection aborted",
@@ -60,7 +68,12 @@ _CRASH_KEYWORDS = (
 
 
 def _is_driver_crash_error(exc: Exception) -> bool:
-    return any(keyword in str(exc) for keyword in _CRASH_KEYWORDS)
+    msg = str(exc).lower()
+    return any(keyword.lower() in msg for keyword in _CRASH_KEYWORDS)
+
+
+def _is_renderer_timeout(exc: Exception) -> bool:
+    return "timed out receiving message from renderer" in str(exc).lower()
 
 _TABLE_CSS = "table[data-atelier-component='Table']"
 _TABLE_TIMEOUT = 18  # seconds
@@ -136,8 +149,8 @@ def collect_woori_shop_click(account_list: list[dict]) -> str:
                         driver.set_page_load_timeout(45)
                         driver.get(url)
                     except Exception as e:
-                        logger.warning(
-                            "페이지 로드 타임아웃 (%s %s): %s", store_id, ym, e
+                        logger.info(
+                            "페이지 로드 지연/F5 재시도 (%s %s): %s", store_id, ym, _short_error(e)
                         )
 
                     # 배민 SPA: 직접 URL 접근 시 빈 상태 → 새로고침(F5)으로 데이터 로드
@@ -159,8 +172,8 @@ def collect_woori_shop_click(account_list: list[dict]) -> str:
                             saved,
                         )
                     else:
-                        logger.warning(
-                            "데이터 없음: brand=%s store=%s ym=%s", store_info["brand"], store_info["store"], ym
+                        logger.info(
+                            "데이터 없음(정상): brand=%s store=%s ym=%s", store_info["brand"], store_info["store"], ym
                         )
 
                     time.sleep(random.uniform(1.5, 3.0))
@@ -400,7 +413,7 @@ def _save_csv(rows: list[dict], brand: str, store: str, ym: str) -> Path:
 
 
 def _navigate_to_woori_url(driver, store_id: str, ym: str, url: str) -> None:
-    """우가클 URL로 이동. 페이지 로드 타임아웃은 무시하고 계속 진행."""
+    """우가클 URL로 이동. 세션 문제는 상위 복구 흐름으로 전파한다."""
     # 이전 페이지 DOM 해제 → Chrome 메모리 압박 감소
     try:
         driver.set_page_load_timeout(5)
@@ -413,7 +426,7 @@ def _navigate_to_woori_url(driver, store_id: str, ym: str, url: str) -> None:
     except Exception as e:
         if _is_driver_crash_error(e):
             raise
-        logger.warning("페이지 이동 타임아웃 (%s %s): %s", store_id, ym, e)
+        logger.info("페이지 이동 지연/F5 재시도 (%s %s): %s", store_id, ym, _short_error(e))
 
 
 def collect_woori_for_driver(driver, store_list: list[dict]) -> None:
@@ -463,8 +476,8 @@ def collect_woori_for_driver(driver, store_list: list[dict]) -> None:
                     store_info["brand"], store_info["store"], ym, saved,
                 )
             else:
-                logger.warning(
-                    "데이터 없음: brand=%s store=%s ym=%s",
+                logger.info(
+                    "데이터 없음(정상): brand=%s store=%s ym=%s",
                     store_info["brand"], store_info["store"], ym,
                 )
 
@@ -482,14 +495,25 @@ def _woori_csv_path(brand: str, store: str, ym: str) -> Path:
 
 
 def _existing_woori_row_count(brand: str, store: str, ym: str) -> int:
-    out_path = _woori_csv_path(brand, store, ym)
-    if not out_path.exists():
-        return 0
-    try:
-        return len(pd.read_csv(out_path, dtype=str))
-    except Exception as e:
-        logger.warning("기존 우리가게 클릭 CSV 읽기 실패 (%s): %s", out_path, e)
-        return 0
+    candidates = [_woori_csv_path(brand, store, ym)]
+    original_path = (
+        _ORIGINAL_BAEMIN_OUR_STORE_CLICKS_DB
+        / f"brand={brand}"
+        / f"store={store}"
+        / f"ym={ym}"
+        / "woori_shop_click.csv"
+    )
+    if original_path != candidates[0]:
+        candidates.append(original_path)
+
+    for out_path in candidates:
+        if not out_path.exists():
+            continue
+        try:
+            return len(pd.read_csv(out_path, dtype=str))
+        except Exception as e:
+            logger.warning("기존 우리가게 클릭 CSV 읽기 실패 (%s): %s", out_path, e)
+    return 0
 
 
 def _retry_woori_after_empty(driver, store_info: dict, ym: str, url: str) -> list[dict]:
@@ -542,18 +566,19 @@ def collect_woori_for_driver(driver, store_list: list[dict]) -> None:
                 store_info["brand"], store_info["store"], ym
             )
 
-            if not rows and (ym == previous_month and existing_count > 0):
+            if not rows and existing_count > 0:
                 logger.info("재시도1 (F5): %s %s", store_info["store"], ym)
                 try:
+                    driver.set_page_load_timeout(20)
                     driver.refresh()
                 except Exception as e:
-                    if _is_driver_crash_error(e):
+                    if _is_driver_crash_error(e) and not _is_renderer_timeout(e):
                         raise
-                    logger.warning("우가클 F5 실패 (%s %s): %s", store_info["store"], ym, e)
+                    logger.info("우가클 F5 지연(빈값 처리 계속) (%s %s): %s", store_info["store"], ym, _short_error(e))
                 time.sleep(8.0)
                 rows = _extract_table_rows(driver, store_id, f"{store_info['brand']} {store_info['store']}", ym)
 
-            if not rows and (ym == previous_month and existing_count > 0):
+            if not rows and existing_count > 0:
                 rows = _retry_woori_after_empty(driver, store_info, ym, url)
 
             if rows:
@@ -566,7 +591,7 @@ def collect_woori_for_driver(driver, store_list: list[dict]) -> None:
                 if _woori_empty_is_expected(store_info):
                     logger.info("우가클 데이터없음(정상): brand=%s store=%s ym=%s", store_info["brand"], store_info["store"], ym)
                 else:
-                    logger.warning("데이터 없음: brand=%s store=%s ym=%s", store_info["brand"], store_info["store"], ym)
+                    logger.info("데이터 없음(정상): brand=%s store=%s ym=%s", store_info["brand"], store_info["store"], ym)
                 if ym == previous_month and existing_count > 0 and not _woori_empty_is_expected(store_info):
                     raise RuntimeError(
                         f"woori previous month unexpectedly empty: "

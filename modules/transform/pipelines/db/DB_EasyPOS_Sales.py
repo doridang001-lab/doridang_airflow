@@ -29,6 +29,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+from airflow.exceptions import AirflowSkipException
 from playwright.sync_api import sync_playwright, Frame, Page, TimeoutError as PlaywrightTimeoutError
 from playwright._impl._errors import TargetClosedError
 
@@ -54,6 +55,7 @@ DEBUG_DIR     = TEMP_DIR / "easypos_debug"
 DEBUG_MODE    = os.getenv("EASYPOS_DEBUG", "0").strip() in {"1", "true", "True", "YES", "yes"}
 STRICT_MODE   = os.getenv("EASYPOS_STRICT", "0").strip() in {"1", "true", "True", "YES", "yes"}
 USE_MOUSE_CLICKS = os.getenv("EASYPOS_USE_MOUSE", "1").strip() in {"1", "true", "True", "YES", "yes"}
+ALLOW_NAV_SKIP = os.getenv("EASYPOS_ALLOW_NAV_SKIP", "0").strip() in {"1", "true", "True", "YES", "yes"}
 
 # NexacroN element IDs — 로그인
 _ID_OUTER     = "mainframe_childframe_form_divMain_edtId"
@@ -64,6 +66,8 @@ _LOGIN_BTN    = "mainframe_childframe_form_divMain_btnLogin"
 _PASSWD_POPUP_CLOSE = (
     "mainframe_childframe_popupChangePasswd_form_div_popup_bottom_btnClose"
 )
+_PASSWD_POPUP_TITLE_CLOSE = "mainframe_childframe_popupChangePasswd_titlebar_closebutton"
+_PASSWD_POPUP_CANCEL = "mainframe_childframe_popupChangePasswd_form_div_popup_bottom_btnCancel"
 _AD_POPUP_CLOSE = "mainframe_childframe_placeAdPopup_titlebar_closebutton"
 
 # NexacroN element IDs — 메뉴 & 조회
@@ -206,6 +210,91 @@ def _is_page_closed(page: "Page | None") -> bool:
         return True
 
 
+def _has_dashboard_menu(page: Page) -> bool:
+    try:
+        for frame in page.frames:
+            try:
+                if frame.query_selector(f"#{_MENU_SALES_BRIEF}") is not None:
+                    return True
+                text = (frame.locator("body").inner_text(timeout=1000) or "").strip()
+                if any(token in text for token in ("영업속보", "영업일보", "로그아웃", "당일매출")):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
+def _looks_like_easypos_app(page: Page) -> bool:
+    """로그인 입력칸은 없지만 EasyPOS 메인 앱이 살아있는 상태를 감지."""
+    selectors = [
+        f"#{_MENU_SALES_BRIEF}",
+        "[id*='grdLeft_body_gridrow_']",
+        "xpath=//*[contains(normalize-space(.),'영업속보')]",
+        "xpath=//*[contains(normalize-space(.),'로그아웃')]",
+        "xpath=//*[contains(normalize-space(.),'당일매출')]",
+    ]
+    try:
+        for frame in page.frames:
+            if frame.name != "main":
+                continue
+            for selector in selectors:
+                try:
+                    if frame.query_selector(selector) is not None:
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        return False
+    return False
+
+
+def _fill_easypos_login_fallback(page: Page, mf: Frame) -> bool:
+    """고정 Nexacro ID가 바뀐 로그인 화면에서 보이는 일반 input으로 로그인한다."""
+    try:
+        inputs = [
+            el for el in mf.query_selector_all("input")
+            if el.bounding_box() is not None and (el.get_attribute("type") or "").lower() not in {"hidden", "checkbox"}
+        ]
+        if len(inputs) < 2:
+            return False
+        inputs[0].fill(EASYPOS_ID)
+        inputs[1].fill(EASYPOS_PW)
+        logger.info("EasyPOS 로그인 입력 fallback 사용")
+        for selector in [
+            f"#{_LOGIN_BTN}",
+            "xpath=//*[contains(normalize-space(.),'로그인')]",
+            "input[type='button']",
+            "button",
+        ]:
+            try:
+                btn = mf.query_selector(selector)
+                if btn is not None and btn.bounding_box() is not None:
+                    btn.click()
+                    logger.info("EasyPOS 로그인 버튼 fallback 클릭: %s", selector)
+                    return True
+            except Exception:
+                continue
+        try:
+            box = inputs[1].bounding_box()
+            if box is not None:
+                page.mouse.click(box["x"] + box["width"] + 45, box["y"] + box["height"] / 2)
+                logger.info("EasyPOS 로그인 버튼 fallback 좌표 클릭")
+                return True
+        except Exception:
+            pass
+        try:
+            inputs[1].press("Enter")
+            logger.info("EasyPOS 로그인 fallback Enter")
+            return True
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning("EasyPOS 로그인 fallback 실패: %s", e)
+    return False
+
+
 def _get_main_frame(page: Page) -> Frame:
     """NexacroN main 프레임 반환 — 모든 UI 요소가 name='main' 프레임 안에 있음"""
     candidates = [f for f in page.frames if f.name == "main"]
@@ -242,6 +331,30 @@ def _get_main_frame(page: Page) -> Frame:
             best_score = score
 
     return best or candidates[0]
+
+
+def _goto_login_page(page: Page, *, label: str = "login") -> None:
+    """EasyPOS 진입.
+
+    NexacroN은 백그라운드 요청이 길게 남는 경우가 있어 networkidle을 로드 성공
+    기준으로 쓰면 로그인 화면이 떠 있어도 타임아웃이 날 수 있다.
+    """
+    try:
+        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
+    except PlaywrightTimeoutError:
+        if any(f.name == "main" for f in page.frames):
+            logger.warning("EasyPOS %s domcontentloaded 타임아웃이나 main 프레임 감지됨 — 계속 진행", label)
+        else:
+            raise
+
+    try:
+        page.wait_for_load_state("load", timeout=15_000)
+    except PlaywrightTimeoutError:
+        logger.warning("EasyPOS %s load 상태 대기 타임아웃 — main 프레임 폴링으로 계속 진행", label)
+    except Exception as e:
+        if _is_page_closed(page):
+            raise TargetClosedError(f"EasyPOS {label} load 상태 대기 중 페이지 종료") from e
+        logger.warning("EasyPOS %s load 상태 대기 실패 — main 프레임 폴링으로 계속 진행: %s", label, e)
 
 
 def _debug_dump(page: Page, label: str) -> None:
@@ -852,6 +965,61 @@ def _coord_click(page: Page, mf: Frame, element_id: str, label: str = "") -> boo
         return False
 
 
+def _close_blocking_popups(page: Page, mf: Frame) -> None:
+    """로그인 직후/메뉴 진입 전 화면을 막는 Nexacro 팝업을 닫는다."""
+    exact_ids = [
+        (_PASSWD_POPUP_CLOSE, "비밀번호 변경 팝업"),
+        (_PASSWD_POPUP_TITLE_CLOSE, "비밀번호 변경 팝업 X"),
+        (_PASSWD_POPUP_CANCEL, "비밀번호 변경 팝업 취소"),
+        (_AD_POPUP_CLOSE,     "광고 팝업"),
+        ("mainframe_childframe_alertDialog_titlebar_closebutton", "알림 팝업"),
+        ("mainframe_childframe_confirmDialog_titlebar_closebutton", "확인 팝업"),
+    ]
+    broad_selectors = [
+        "[id$='titlebar_closebutton']",
+        "[id*='titlebar_closebutton']",
+        "[id*='closebutton']",
+        "[id*='btnClose']",
+        "[id*='btnCancel']",
+        "xpath=//*[normalize-space(.)='취소' or normalize-space(.)='닫기']",
+    ]
+
+    for round_idx in range(1, 5):
+        clicked = False
+        try:
+            mf = _get_main_frame(page)
+        except Exception:
+            return
+
+        for popup_id, popup_label in exact_ids:
+            if _coord_click(page, mf, popup_id, popup_label):
+                clicked = True
+                time.sleep(0.5)
+
+        for selector in broad_selectors:
+            try:
+                handles = mf.query_selector_all(selector)
+            except Exception:
+                continue
+            for idx, btn in enumerate(handles[:20], start=1):
+                try:
+                    box = btn.bounding_box()
+                    if not box:
+                        continue
+                    page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                    logger.info("차단 팝업 닫기 클릭 round=%d selector=%s #%d", round_idx, selector, idx)
+                    clicked = True
+                    time.sleep(0.5)
+                    break
+                except Exception as e:
+                    logger.info("차단 팝업 닫기 실패 round=%d selector=%s #%d: %s", round_idx, selector, idx, e)
+            if clicked:
+                break
+
+        if not clicked:
+            time.sleep(0.8)
+
+
 def _get_row_indices_pw(mf: Frame, id_fragment: str) -> list:
     """NexacroN 그리드 행 인덱스 동적 탐지 (gridrow_{N} 패턴)"""
     elements = mf.query_selector_all(f"[id*='{id_fragment}']")
@@ -1111,7 +1279,7 @@ def _upsert_daily_total_csv(sale_date: str, total: int, source: str) -> None:
 
 def _login(page: Page) -> Frame:
     """EasyPOS 로그인 → 팝업 닫기 → main 프레임 반환"""
-    page.goto(LOGIN_URL, wait_until="networkidle", timeout=60_000)
+    _goto_login_page(page, label="initial")
     logger.info("EasyPOS 접속 완료, NexacroN 렌더링 대기...")
 
     # 고정 sleep 대신 적극 폴링: main 프레임이 나타날 때까지 최대 30초 대기
@@ -1142,25 +1310,74 @@ def _login(page: Page) -> Frame:
             logger.warning("NexacroN 프레임 재획득 시도 %d/5", _fr_attempt + 1)
             time.sleep(5)
 
+    if _has_dashboard_menu(page) and mf.query_selector(f"#{_ID_INPUT}") is None:
+        logger.info("이미 로그인된 EasyPOS 세션 감지 — 로그인 입력 단계 생략")
+        _close_blocking_popups(page, mf)
+        return mf
+
+    used_login_fallback = False
+    if mf.query_selector(f"#{_ID_INPUT}") is None and _fill_easypos_login_fallback(page, mf):
+        used_login_fallback = True
+        time.sleep(6)
+        mf = _get_main_frame(page)
+
     # ID 입력 — 외부 컴포넌트 클릭 후 fill()로 NexacroN 내부 상태 갱신
-    id_outer = mf.query_selector(f"#{_ID_OUTER}")
-    if id_outer:
-        id_outer.click()
-        time.sleep(0.3)
-    mf.query_selector(f"#{_ID_INPUT}").fill(EASYPOS_ID)
-    logger.info(f"ID 입력 완료: {EASYPOS_ID!r}")
+    if not used_login_fallback:
+        try:
+            mf.wait_for_selector(f"#{_ID_INPUT}", timeout=60_000)
+            mf.wait_for_selector(f"#{_PW_INPUT}", timeout=60_000)
+        except PlaywrightTimeoutError as e:
+            mf = _get_main_frame(page)
+            if _has_dashboard_menu(page) or _looks_like_easypos_app(page):
+                logger.info("로그인 입력 필드는 없지만 EasyPOS 메인 앱 감지 — 로그인 완료로 처리")
+                _close_blocking_popups(page, mf)
+                return mf
+            if _fill_easypos_login_fallback(page, mf):
+                used_login_fallback = True
+                time.sleep(6)
+                mf = _get_main_frame(page)
+            else:
+                raise RuntimeError("EasyPOS 로그인 입력 필드 렌더링 대기 실패") from e
+        else:
+            used_login_fallback = False
 
-    # PW 입력
-    pw_outer = mf.query_selector(f"#{_PW_OUTER}")
-    if pw_outer:
-        pw_outer.click()
-        time.sleep(0.3)
-    mf.query_selector(f"#{_PW_INPUT}").fill(EASYPOS_PW)
-    logger.info("PW 입력 완료")
+    if not used_login_fallback:
+        id_outer = mf.query_selector(f"#{_ID_OUTER}")
+        if id_outer:
+            try:
+                id_outer.click()
+            except Exception as e:
+                logger.warning("ID 외부 컴포넌트 클릭 실패(무시): %s", e)
+                mf = _get_main_frame(page)
+                if _has_dashboard_menu(page) or _looks_like_easypos_app(page):
+                    logger.info("ID 클릭 실패 후 EasyPOS 메인 앱 감지 — 로그인 완료로 처리")
+                    _close_blocking_popups(page, mf)
+                    return mf
+            time.sleep(0.3)
+        try:
+            mf.locator(f"#{_ID_INPUT}").fill(EASYPOS_ID)
+        except PlaywrightTimeoutError:
+            if _has_dashboard_menu(page) or _looks_like_easypos_app(page):
+                logger.info("ID 입력 대기 타임아웃이나 EasyPOS 메인 앱 감지 — 로그인 완료로 처리")
+                _close_blocking_popups(page, _get_main_frame(page))
+                return _get_main_frame(page)
+            raise
+        logger.info(f"ID 입력 완료: {EASYPOS_ID!r}")
 
-    # 로그인 버튼 클릭
-    mf.query_selector(f"#{_LOGIN_BTN}").click()
-    logger.info("로그인 버튼 클릭")
+        # PW 입력
+        pw_outer = mf.query_selector(f"#{_PW_OUTER}")
+        if pw_outer:
+            try:
+                pw_outer.click()
+            except Exception as e:
+                logger.warning("PW 외부 컴포넌트 클릭 실패(무시): %s", e)
+            time.sleep(0.3)
+        mf.locator(f"#{_PW_INPUT}").fill(EASYPOS_PW)
+        logger.info("PW 입력 완료")
+
+        # 로그인 버튼 클릭
+        mf.query_selector(f"#{_LOGIN_BTN}").click()
+        logger.info("로그인 버튼 클릭")
 
     # NexacroN 중복 세션(WebKillSession) 팝업을 즉시 처리하기 위해 폴링 대기.
     # 기존 time.sleep(5) 방식은 팝업이 0.3~2초 내 닫혀버려 TargetClosedError를 유발함.
@@ -1202,7 +1419,7 @@ def _login(page: Page) -> Frame:
     # (이전 세션이 정리됐으므로 새 로그인은 대부분 성공함)
     if _page_force_closed:
         logger.warning("로그인 후 페이지 강제 종료 감지 (WebKillSession) → 재접속 시도")
-        page.goto(LOGIN_URL, wait_until="networkidle", timeout=60_000)
+        _goto_login_page(page, label="relogin")
         _fr2_deadline = time.time() + 30
         while time.time() < _fr2_deadline:
             if any(f.name == "main" for f in page.frames):
@@ -1211,28 +1428,23 @@ def _login(page: Page) -> Frame:
         time.sleep(3)
         mf = _get_main_frame(page)
         id_outer = mf.query_selector(f"#{_ID_OUTER}")
-        if id_outer:
+        if id_outer and mf.query_selector(f"#{_ID_INPUT}") and mf.query_selector(f"#{_PW_INPUT}"):
             id_outer.click()
             time.sleep(0.3)
-        mf.query_selector(f"#{_ID_INPUT}").fill(EASYPOS_ID)
-        pw_outer = mf.query_selector(f"#{_PW_OUTER}")
-        if pw_outer:
-            pw_outer.click()
-            time.sleep(0.3)
-        mf.query_selector(f"#{_PW_INPUT}").fill(EASYPOS_PW)
-        mf.query_selector(f"#{_LOGIN_BTN}").click()
+            mf.query_selector(f"#{_ID_INPUT}").fill(EASYPOS_ID)
+            pw_outer = mf.query_selector(f"#{_PW_OUTER}")
+            if pw_outer:
+                pw_outer.click()
+                time.sleep(0.3)
+            mf.query_selector(f"#{_PW_INPUT}").fill(EASYPOS_PW)
+            mf.query_selector(f"#{_LOGIN_BTN}").click()
+        elif not _fill_easypos_login_fallback(page, mf):
+            raise RuntimeError("EasyPOS 재로그인 입력 필드를 찾을 수 없음")
         logger.info("재로그인 버튼 클릭")
         time.sleep(6)
 
-    # 팝업 닫기 (비밀번호 변경 안내, 광고)
-    for popup_id, popup_label in [
-        (_PASSWD_POPUP_CLOSE, "비밀번호 변경 팝업"),
-        (_AD_POPUP_CLOSE,     "광고 팝업"),
-        ("mainframe_childframe_alertDialog_form_btn_ok",   "알림 팝업"),
-        ("mainframe_childframe_confirmDialog_form_btn_ok", "확인 팝업"),
-    ]:
-        if _coord_click(page, mf, popup_id, popup_label):
-            time.sleep(1)
+    # 팝업 닫기 (비밀번호 변경 안내, 광고 등)
+    _close_blocking_popups(page, mf)
 
     # 로그인 성공 확인 — 영업속보 메뉴 존재 여부
     mf = _get_main_frame(page)
@@ -1258,6 +1470,8 @@ def _navigate_to_daily_totals_inquiry(page: Page, mf: Frame) -> Frame:
       gridrow_3: "일자별 매출내역" → 더블클릭으로 실제 조회 화면 오픈
     """
     # ① 상단 영업속보 탭 클릭 → grdLeft 좌측 메뉴 로드
+    mf = _get_main_frame(page)
+    _close_blocking_popups(page, mf)
     mf = _get_main_frame(page)
     tab_el = mf.query_selector(f"#{_MENU_SALES_BRIEF}")
     if tab_el is None:
@@ -1402,6 +1616,8 @@ def _navigate_to_daily_sales(page: Page, mf: Frame, *, _reload_retry: bool = Fal
     도달하지 않아 navigation 불가. grdLeft DOM 직접 클릭만 동작.
     """
     mf = _get_main_frame(page)
+    _close_blocking_popups(page, mf)
+    mf = _get_main_frame(page)
 
     # 영업속보 탭 클릭 (grdLeft 좌측 메뉴 로드)
     tab_el = mf.query_selector(f"#{_MENU_SALES_BRIEF}")
@@ -1514,6 +1730,16 @@ def _navigate_to_daily_sales(page: Page, mf: Frame, *, _reload_retry: bool = Fal
         logger.info("당일매출내역 메뉴 탐색 실패했으나 그리드 확인 — 계속 진행")
         return mf
 
+    try:
+        logger.warning("당일매출내역 좌측메뉴 진입 실패 — 메뉴검색 fallback 시도")
+        if _navigate_via_find_menu(page, "당일매출내역"):
+            mf = _get_main_frame(page)
+            _wait_for_any_selector(mf, _DAILY_VIEW_READY_SELECTORS, timeout_ms=WAIT_TIMEOUT)
+            logger.info("메뉴검색 fallback으로 당일매출내역 화면 로드 성공")
+            return _get_main_frame(page)
+    except Exception as e:
+        logger.warning("메뉴검색 fallback 실패: %s", e)
+
     # grdLeft가 계속 비어있으면 페이지 새로고침 후 1회 재시도
     if not _reload_retry:
         logger.warning("당일매출내역 메뉴 탐색 전체 실패 — 페이지 새로고침 후 재로그인 1회 재시도")
@@ -1586,6 +1812,9 @@ def _collect_all_receipts(page: Page, mf: Frame, sale_date: str) -> list:
     """그리드의 전체 영수증을 순서대로 클릭하며 상품내역 수집"""
     rows = []
 
+    if _is_page_closed(page):
+        raise TargetClosedError(f"영수증 수집 시작 시 페이지가 종료됨: {sale_date}")
+
     # 그리드 데이터 로드 대기
     try:
         mf.wait_for_selector(
@@ -1602,6 +1831,9 @@ def _collect_all_receipts(page: Page, mf: Frame, sale_date: str) -> list:
 
     for row_idx in row_indices:
         try:
+            if _is_page_closed(page):
+                raise TargetClosedError(f"영수증 수집 중 페이지 종료 감지: row={row_idx}, sale_date={sale_date}")
+
             # 1. 매출구분 (정상/반품)
             sale_type = _pw_text(
                 mf,
@@ -1744,9 +1976,8 @@ def resolve_sale_dates(dag_date_from=None, dag_date_to=None, lookback_days=None,
         if sale_dates:
             logger.info(f"lookback {lookback_days}일: 누락 {len(sale_dates)}일 → {sale_dates}")
         else:
-            yesterday = (_kst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
-            sale_dates = [yesterday]
-            logger.info(f"lookback {lookback_days}일: 누락 없음 → 어제({yesterday}) 수집")
+            logger.info(f"lookback {lookback_days}일: 누락 없음 → 수집 스킵")
+            raise AirflowSkipException(f"EasyPOS lookback {lookback_days}일 누락 없음")
     else:
         yesterday = (_kst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
         sale_dates = [yesterday]
@@ -1781,9 +2012,15 @@ _NEXACRO_INIT_SCRIPT = """
 
 def collect_receipts(**context) -> str:
     """EasyPOS 영수증 수집 → TEMP_DIR parquet 저장 (Playwright)"""
-    sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates")
+    ti = context["ti"]
+    sale_dates = ti.xcom_pull(task_ids="resolve_dates", key="sale_dates")
+    source_task_id = "resolve_dates"
+    if not sale_dates:
+        sale_dates = ti.xcom_pull(task_ids="resolve_today", key="sale_dates")
+        source_task_id = "resolve_today"
     if not sale_dates:
         raise ValueError("sale_dates XCom 값이 없습니다.")
+    logger.info("sale_dates XCom 로드: task_id=%s, sale_dates=%s", source_task_id, sale_dates)
 
     manual_totals = _load_manual_daily_totals()
     auto_totals: dict[str, int] = {}
@@ -1842,12 +2079,13 @@ def collect_receipts(**context) -> str:
             return browser2, bctx2, page2
 
         try:
-            for _init_attempt in range(2):
+            _LOGIN_REOPEN_MAX = 4
+            for _init_attempt in range(_LOGIN_REOPEN_MAX):
                 try:
                     mf = _login(page)
                     break
-                except (TargetClosedError, RuntimeError) as e:
-                    if _init_attempt == 1:
+                except (TargetClosedError, PlaywrightTimeoutError, RuntimeError) as e:
+                    if _init_attempt >= _LOGIN_REOPEN_MAX - 1:
                         raise
                     logger.warning("초기 EasyPOS 로그인 실패 (%s) → 브라우저 재시작", e)
                     try:
@@ -1877,9 +2115,9 @@ def collect_receipts(**context) -> str:
             except Exception as e:
                 _debug_dump(page, "navigation_failed")
                 logger.exception("당일매출내역 화면 진입 실패: %s", e)
-                if STRICT_MODE:
+                if STRICT_MODE or not ALLOW_NAV_SKIP:
                     raise
-                logger.warning("STRICT_MODE=0 이므로 실패 대신 스킵 처리 (parquet_path=None)")
+                logger.warning("EASYPOS_ALLOW_NAV_SKIP=1 이므로 실패 대신 스킵 처리 (parquet_path=None)")
                 context["ti"].xcom_push(key="parquet_path", value=None)
                 return f"스킵: 당일매출내역 화면 진입 실패 ({e})"
 
@@ -1905,37 +2143,49 @@ def collect_receipts(**context) -> str:
 
                 MAX_RETRY = 3
                 for retry in range(1, MAX_RETRY + 1):
-                    rows = _collect_all_receipts(page, mf, sale_date)
-                    clicked_total = sum(_parse_amount(r.get("line_amount", 0)) for r in rows)
+                    try:
+                        rows = _collect_all_receipts(page, mf, sale_date)
+                        clicked_total = sum(_parse_amount(r.get("line_amount", 0)) for r in rows)
 
-                    if ref_total is None:
-                        break  # 비교 기준 없으면 그냥 진행
+                        if ref_total is None:
+                            break  # 비교 기준 없으면 그냥 진행
 
-                    diff = clicked_total - ref_total
-                    logger.info(
-                        "EasyPOS 합계 비교(%s) [%d/%d]: %s | clicked=%s | ref=%s | diff=%s",
-                        ref_source, retry, MAX_RETRY, sale_date, clicked_total, ref_total, diff,
-                    )
-                    if diff == 0:
-                        break
-
-                    if retry < MAX_RETRY:
-                        logger.warning("합계 불일치 — 재수집 시도 %d/%d: %s", retry, MAX_RETRY, sale_date)
-                        time.sleep(2.0)
-                        try:
-                            mf = _navigate_by_direct_input(page, sale_date)
-                        except Exception as _nav_e:
-                            logger.warning("재수집 재내비게이션 실패(계속): %s", _nav_e)
-                            mf = _get_main_frame(page)
-                    else:
-                        raise RuntimeError(
-                            f"EasyPOS 총매출 불일치({ref_source}): {sale_date} "
-                            f"(clicked={clicked_total}, ref={ref_total}, diff={diff}) "
-                            f"— {MAX_RETRY}회 재시도 후에도 불일치"
+                        diff = clicked_total - ref_total
+                        logger.info(
+                            "EasyPOS 합계 비교(%s) [%d/%d]: %s | clicked=%s | ref=%s | diff=%s",
+                            ref_source, retry, MAX_RETRY, sale_date, clicked_total, ref_total, diff,
                         )
+                        if diff == 0:
+                            break
 
-                all_rows.extend(rows)
-                logger.info("수집 완료: %s → %d건", sale_date, len(rows))
+                        if retry < MAX_RETRY:
+                            logger.warning("합계 불일치 — 재수집 시도 %d/%d: %s", retry, MAX_RETRY, sale_date)
+                            time.sleep(2.0)
+                            try:
+                                mf = _navigate_by_direct_input(page, sale_date)
+                            except Exception as _nav_e:
+                                logger.warning("재수집 재내비게이션 실패(계속): %s", _nav_e)
+                                mf = _get_main_frame(page)
+                        else:
+                            raise RuntimeError(
+                                f"EasyPOS 총매출 불일치({ref_source}): {sale_date} "
+                                f"(clicked={clicked_total}, ref={ref_total}, diff={diff}) "
+                                f"— {MAX_RETRY}회 재시도 후에도 불일치"
+                            )
+                    except TargetClosedError as e:
+                        logger.warning("영수증 수집 중 페이지 종료 감지 (%d/%d): %s", retry, MAX_RETRY, e)
+                        if retry >= MAX_RETRY:
+                            raise
+                        try:
+                            browser, bctx, page = _reopen_session(sale_date)
+                            mf = _get_main_frame(page)
+                        except Exception as reopen_err:
+                            raise RuntimeError(f"세션 재오픈 실패: {reopen_err}") from e
+                        logger.info("영수증 수집 실패 후 재오픈 성공: %s", sale_date)
+                        continue
+
+                    all_rows.extend(rows)
+                    logger.info("수집 완료: %s → %d건", sale_date, len(rows))
 
         finally:
             try:

@@ -2,7 +2,8 @@
 리뷰 데이터마트 집계 파이프라인.
 
 입력:
-- ANALYTICS_DB/toorder_review/toorder_voc_YYYYMMDD.parquet (일별 누적)
+- ANALYTICS_DB/toorder_review/toorder_voc_YYYYMM.parquet (월별 누적)
+- ANALYTICS_DB/toorder_review/toorder_voc_YYYYMMDD.parquet (레거시 일별 누적)
 
 출력:
 - MART_DB/unified_review/unified_review.parquet
@@ -10,8 +11,9 @@
 
 실행 모드:
 - mode="all"      → 전체 parquet 재집계 (conf backfill=true)
-- mode="lookback" → 오늘 기준 최근 days일치 파일만 (기본 2일)
+- mode="lookback" → 오늘 기준 최근 days일치 파일만 (기본 30일)
 - mode="date"     → 특정 날짜 1개 파일 (conf sale_date)
+- mode="range"    → 지정 기간 파일 (conf start_date + end_date)
 """
 
 import logging
@@ -31,10 +33,9 @@ from modules.transform.utility.paths import (
 logger = logging.getLogger(__name__)
 
 _FILE_DATE_RE = re.compile(r"toorder_voc_(\d{8})\.parquet$")
+_FILE_MONTH_RE = re.compile(r"toorder_voc_(\d{6})\.parquet$")
 _GROUP_KEYS = ["작성일자", "매장명", "토픽", "감정수준"]
-_NAVER_REVIEW_KEY = ["작성일자", "매장명", "채널", "작성자", "리뷰내용"]
-_OTHER_REVIEW_KEY = ["번호", "작성일자", "매장명", "채널"]
-DEFAULT_LOOKBACK_DAYS = 2
+_REVIEW_COUNT_DEDUP_KEYS = ["작성일자", "매장명", "채널", "작성자", "리뷰내용"]
 _MIN_REVIEW_DATE = date(2020, 1, 1)
 _MAX_REVIEW_DATE = date(2100, 12, 31)
 
@@ -47,6 +48,34 @@ def _parse_file_date(path: Path) -> date | None:
         return date(int(m.group(1)[:4]), int(m.group(1)[4:6]), int(m.group(1)[6:8]))
     except ValueError:
         return None
+
+
+def _parse_file_month_range(path: Path) -> tuple[date, date] | None:
+    m = _FILE_MONTH_RE.search(path.name)
+    if not m:
+        return None
+    try:
+        year = int(m.group(1)[:4])
+        month = int(m.group(1)[4:6])
+        start = date(year, month, 1)
+        if month == 12:
+            end = date(year + 1, 1, 1) - timedelta(days=1)
+        else:
+            end = date(year, month + 1, 1) - timedelta(days=1)
+        return start, end
+    except ValueError:
+        return None
+
+
+def _file_overlaps_range(path: Path, start_dt: date, end_dt: date) -> bool:
+    parsed_date = _parse_file_date(path)
+    if parsed_date is not None:
+        return start_dt <= parsed_date <= end_dt
+    parsed_month = _parse_file_month_range(path)
+    if parsed_month is None:
+        return False
+    month_start, month_end = parsed_month
+    return month_start <= end_dt and month_end >= start_dt
 
 
 def _normalize_date_only(value: str | date | int | float | None) -> date | None:
@@ -111,6 +140,22 @@ def _drop_invalid_written_dates(df: pd.DataFrame) -> pd.DataFrame:
     return df[valid_mask].copy()
 
 
+def _filter_written_date_range(
+    df: pd.DataFrame,
+    start_dt: date | None = None,
+    end_dt: date | None = None,
+) -> pd.DataFrame:
+    if "작성일자" not in df.columns or (start_dt is None and end_dt is None):
+        return df
+    normalized = df["작성일자"].map(_normalize_date_only)
+    mask = pd.Series(True, index=df.index)
+    if start_dt is not None:
+        mask &= normalized.map(lambda value: value is not None and value >= start_dt)
+    if end_dt is not None:
+        mask &= normalized.map(lambda value: value is not None and value <= end_dt)
+    return df[mask].copy()
+
+
 def _ensure_target_date_rows(df: pd.DataFrame, mode: str, target_date: str | None) -> pd.DataFrame:
     """mode=date에서 target_date에 행이 없으면 전날 데이터를 복제해 target_date 한 줄로 보정."""
     if mode != "date" or "작성일자" not in df.columns:
@@ -136,7 +181,20 @@ def _ensure_target_date_rows(df: pd.DataFrame, mode: str, target_date: str | Non
     return pd.concat([df, fallback_rows], ignore_index=True)
 
 
-def _collect_files(mode: str, days: int = DEFAULT_LOOKBACK_DAYS, target_date: str | None = None) -> list[Path]:
+def _require_date(value: str | date | int | float | None, field_name: str) -> date:
+    parsed = _normalize_date_only(value)
+    if parsed is None:
+        raise ValueError(f"{field_name} must be YYYY-MM-DD format: {value}")
+    return parsed
+
+
+def _collect_files(
+    mode: str,
+    days: int = 30,
+    target_date: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[Path]:
     all_files = sorted(TOORDER_REVIEW_ANALYTICS_DIR.glob("toorder_voc_*.parquet"))
     if not all_files:
         return []
@@ -145,47 +203,60 @@ def _collect_files(mode: str, days: int = DEFAULT_LOOKBACK_DAYS, target_date: st
         return all_files
 
     if mode == "date" and target_date:
-        date_str = target_date.replace("-", "")
-        matched = [f for f in all_files if date_str in f.name]
+        target_dt = _require_date(target_date, "target_date")
+        return [f for f in all_files if _file_overlaps_range(f, target_dt, target_dt)]
+
+    if mode == "range" and start_date and end_date:
+        start_dt = _require_date(start_date, "start_date")
+        end_dt = _require_date(end_date, "end_date")
+        if start_dt > end_dt:
+            raise ValueError(f"start_date > end_date: {start_dt} > {end_dt}")
+        matched = [
+            f
+            for f in all_files
+            if _file_overlaps_range(f, start_dt, end_dt)
+        ]
         return matched
 
-    dated_files = [(d, f) for f in all_files if (d := _parse_file_date(f)) is not None]
-    dated_files.sort(key=lambda item: item[0])
-    return [f for _, f in dated_files[-max(days, 1):]]
+    # lookback: 오늘 기준 최근 days일
+    cutoff = date.today() - timedelta(days=days)
+    return [f for f in all_files if _file_overlaps_range(f, cutoff, date.max)]
 
 
-def _dedupe_review_rows(df: pd.DataFrame, extra_keys: list[str] | None = None) -> pd.DataFrame:
-    extra_keys = extra_keys or []
-    is_naver = df["채널"].astype("string").str.contains("네이버|naver", case=False, na=False)
+def _file_target_date(path: Path) -> str | None:
+    parsed = _parse_file_date(path)
+    return parsed.isoformat() if parsed else None
 
-    naver_key = [*_NAVER_REVIEW_KEY, *extra_keys]
-    other_key = [*_OTHER_REVIEW_KEY, *extra_keys]
 
-    naver_df = df[is_naver].drop_duplicates(subset=naver_key)
-    other_df = df[~is_naver].drop_duplicates(subset=other_key)
-    return pd.concat([other_df, naver_df], ignore_index=True)
+def _resolve_filter_range(
+    mode: str,
+    days: int = 30,
+    target_date: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> tuple[date | None, date | None]:
+    if mode == "date" and target_date:
+        target_dt = _require_date(target_date, "target_date")
+        return target_dt, target_dt
+    if mode == "range" and start_date and end_date:
+        return _require_date(start_date, "start_date"), _require_date(end_date, "end_date")
+    if mode == "lookback":
+        return date.today() - timedelta(days=days), None
+    return None, None
 
 
 def _load_and_aggregate(
     files: list[Path],
     mode: str = "lookback",
+    days: int = 30,
     target_date: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> pd.DataFrame:
     dfs = []
     for f in files:
         try:
-            dfs.append(
-                pd.read_parquet(
-                    f,
-                    columns=[
-                        "번호",
-                        *_GROUP_KEYS,
-                        "채널",
-                        "작성자",
-                        "리뷰내용",
-                    ],
-                )
-            )
+            dfs.append(pd.read_parquet(f, columns=["번호", *_GROUP_KEYS]))
         except Exception as e:
             logger.warning("파일 로드 실패 %s: %s", f.name, e)
 
@@ -193,10 +264,18 @@ def _load_and_aggregate(
         return pd.DataFrame(columns=[*_GROUP_KEYS, "언급수"])
 
     df = pd.concat(dfs, ignore_index=True)
-    df = _ensure_target_date_rows(df, mode=mode, target_date=target_date)
+    if mode == "date":
+        df = _ensure_target_date_rows(df, mode=mode, target_date=target_date)
     df = _coerce_written_date_to_text(df)
     df = _drop_invalid_written_dates(df)
-    df = _dedupe_review_rows(df, extra_keys=["토픽", "감정수준"])
+    start_dt, end_dt = _resolve_filter_range(
+        mode=mode,
+        days=days,
+        target_date=target_date,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    df = _filter_written_date_range(df, start_dt=start_dt, end_dt=end_dt)
 
     result = (
         df.groupby(_GROUP_KEYS, dropna=False)["번호"]
@@ -222,14 +301,33 @@ def _save_mart(df: pd.DataFrame) -> int:
     return saved
 
 
-def run_review(mode: str = "lookback", days: int = DEFAULT_LOOKBACK_DAYS, target_date: str | None = None) -> str:
-    files = _collect_files(mode=mode, days=days, target_date=target_date)
+def run_review(
+    mode: str = "lookback",
+    days: int = 30,
+    target_date: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> str:
+    files = _collect_files(
+        mode=mode,
+        days=days,
+        target_date=target_date,
+        start_date=start_date,
+        end_date=end_date,
+    )
     if not files:
         logger.warning("집계할 parquet 파일 없음 (mode=%s, days=%d)", mode, days)
         return f"스킵: 파일 없음 (mode={mode})"
 
     logger.info("집계 대상 파일 %d개 (mode=%s)", len(files), mode)
-    df = _load_and_aggregate(files, mode=mode, target_date=target_date)
+    df = _load_and_aggregate(
+        files,
+        mode=mode,
+        days=days,
+        target_date=target_date,
+        start_date=start_date,
+        end_date=end_date,
+    )
 
     if df.empty:
         logger.warning("집계 결과 없음")
@@ -239,7 +337,7 @@ def run_review(mode: str = "lookback", days: int = DEFAULT_LOOKBACK_DAYS, target
     return f"저장 완료: {len(df)}행, {saved_files}개 파일 (mode={mode}, 원천 {len(files)}개)"
 
 
-def run_lookback_review(days: int = DEFAULT_LOOKBACK_DAYS) -> str:
+def run_lookback_review(days: int = 30) -> str:
     return run_review(mode="lookback", days=days)
 
 
@@ -248,49 +346,51 @@ def backfill_review() -> str:
 
 
 def build_daily_review_count(
-    mode: str = "lookback", days: int = DEFAULT_LOOKBACK_DAYS, target_date: str | None = None
+    mode: str = "lookback",
+    days: int = 30,
+    target_date: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> str:
-    """일별 매장별 리뷰 수 집계. unified_review_count.parquet upsert 저장."""
-    files = _collect_files(mode=mode, days=days, target_date=target_date)
+    """일별 매장별 리뷰 수 집계 (실제 리뷰키 기준 중복 제거). unified_review_count.parquet upsert 저장."""
+    files = _collect_files(
+        mode=mode,
+        days=days,
+        target_date=target_date,
+        start_date=start_date,
+        end_date=end_date,
+    )
     if not files:
         return f"스킵: 파일 없음 (mode={mode})"
 
     dfs = []
     for f in files:
         try:
-            dfs.append(
-                pd.read_parquet(
-                    f,
-                    columns=["번호", "작성일자", "매장명", "채널", "작성자", "리뷰내용"],
-                )
-            )
+            dfs.append(pd.read_parquet(f, columns=_REVIEW_COUNT_DEDUP_KEYS))
         except Exception as e:
             logger.warning("파일 로드 실패 %s: %s", f.name, e)
 
     if not dfs:
         return "스킵: 로드 실패"
 
-    df = pd.concat(dfs, ignore_index=True)
-    df = _ensure_target_date_rows(df, mode=mode, target_date=target_date)
+    df = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=_REVIEW_COUNT_DEDUP_KEYS)
+    if mode == "date":
+        df = _ensure_target_date_rows(df, mode=mode, target_date=target_date)
     df = _coerce_written_date_to_text(df)
     df = _drop_invalid_written_dates(df)
-
-    df = _dedupe_review_rows(df)
-    is_naver = df["채널"].astype("string").str.contains("네이버|naver", case=False, na=False)
-    naver_df = df[is_naver]
-    other_df = df[~is_naver]
-
-    other_count_df = (
-        other_df.groupby(["작성일자", "매장명", "채널"], dropna=False)["번호"]
-        .nunique()
-        .reset_index(name="리뷰수")
+    start_dt, end_dt = _resolve_filter_range(
+        mode=mode,
+        days=days,
+        target_date=target_date,
+        start_date=start_date,
+        end_date=end_date,
     )
-    naver_count_df = (
-        naver_df.groupby(["작성일자", "매장명", "채널"], dropna=False)
+    df = _filter_written_date_range(df, start_dt=start_dt, end_dt=end_dt)
+    count_df = (
+        df.groupby(["작성일자", "매장명", "채널"], dropna=False)
         .size()
         .reset_index(name="리뷰수")
     )
-    count_df = pd.concat([other_count_df, naver_count_df], ignore_index=True)
 
     out_path = UNIFIED_REVIEW_MART_DIR / "unified_review_count.parquet"
     UNIFIED_REVIEW_MART_DIR.mkdir(parents=True, exist_ok=True)

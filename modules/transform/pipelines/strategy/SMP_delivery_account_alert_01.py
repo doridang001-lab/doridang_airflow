@@ -27,7 +27,16 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from modules.transform.utility.selenium_uc import configure_uc_data_path
+from modules.transform.utility.account import get_default_account, get_pw
 from modules.transform.utility.mailer import send_email, text_to_html
+from modules.transform.utility.mail_recipients import (
+    MAIL_CEO,
+    MAIL_CMJ_PM,
+    MAIL_KIM_DAEJIN,
+    MAIL_OH_NAYOUNG,
+    apply_manager_mail_variables,
+    resolve_mail_recipients,
+)
 from modules.transform.utility.paths import DOWN_DIR, LOCAL_DB, MART_DB, ONEDRIVE_DB, TEMP_DIR
 
 logger = logging.getLogger(__name__)
@@ -37,7 +46,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # NOTE: Airflow Variable을 사용하면 컨테이너 재시작 없이도 값 변경이 가능하므로,
 # 런타임에 resolve 하는 헬퍼를 사용한다.
-_TOORDER_ID_DEFAULT = "doridang15"
+_TOORDER_ID_DEFAULT, _ = get_default_account("toorder")
 _TARGET_STORES_RAW = (
     os.getenv("TOORDER_TARGET_STORES")
     or os.getenv("TOORDER_TARGET_STORE")
@@ -51,9 +60,7 @@ DELIVERY_URL = (
 HEADLESS_MODE = os.getenv("AIRFLOW_HOME") is not None
 
 ALERT_CON = ["등록 실패", "연결 오류", "가게없음", "매장연결 필요", "매장 연결 필요"]
-ADMIN_EMAIL = ["a17019@kakao.com", "sanbogaja81@kakao.com","bulu1017@kakao.com", "siw22222@kakao.com"]
-# bulu1017@kakao.com 오나영 차장
-# siw22222@kakao.com 대표님
+ADMIN_EMAIL = [MAIL_CMJ_PM, MAIL_KIM_DAEJIN, MAIL_OH_NAYOUNG, MAIL_CEO]
 CC_EMAILS = ADMIN_EMAIL  # list[str]
 
 CSV_PATH = MART_DB / "torder_delivery_account_monitoring" / "torder_delivery_account_alt.csv"
@@ -121,9 +128,8 @@ def crawl_delivery_account_excel(**context) -> str:
     toorder_pw = _resolve_toorder_pw(toorder_id)
     if not toorder_pw:
         raise RuntimeError(
-            "ToOrder 비밀번호가 비어있습니다. "
-            "환경변수 `TOORDER_DELIVERY_ACCOUNT_PW` 또는 "
-            f"`TOORDER_PW_{toorder_id.upper()}`(권장) 또는 `TOORDER_PW` 를 설정해주세요."
+            "ToOrder 자동화 연결 계정 비밀번호가 비어있습니다. "
+            "sales_employee.csv에 토더 행과 비고='자동화 연결' 값이 필요합니다."
         )
 
     last_error: Exception | None = None
@@ -224,7 +230,7 @@ def send_delivery_alert_emails(test_mode: bool = True, **context) -> None:
     parquet → 담당자별 그룹화 → HTML 이메일 발송.
 
     Parameters:
-        test_mode: True이면 a17019@kakao.com 단독 발송 (CC 없음)
+        test_mode: True이면 ADMIN_EMAIL 단독 발송 (CC 없음)
                    False이면 담당자 이메일 + CC_EMAILS
     """
     ti = context["task_instance"]
@@ -242,8 +248,9 @@ def send_delivery_alert_emails(test_mode: bool = True, **context) -> None:
         logger.warning("email 컬럼 없음 → 발송 스킵")
         return
 
-    df["email"] = df["email"].fillna(ADMIN_EMAIL[0]).astype(str).str.strip()
-    df.loc[df["email"] == "", "email"] = ADMIN_EMAIL[0]
+    fallback_email = resolve_mail_recipients(ADMIN_EMAIL)[0]
+    df["email"] = df["email"].fillna(fallback_email).astype(str).str.strip()
+    df.loc[df["email"] == "", "email"] = fallback_email
 
     for recipient_email, group_df in df.groupby("email"):
         try:
@@ -537,6 +544,29 @@ def _save_login_debug_artifacts(driver, attempt: int) -> None:
         logger.warning("로그인 실패 HTML 저장 실패: %s", exc)
 
 
+def _save_delivery_page_debug_artifacts(driver, tag: str) -> None:
+    """배달 계정 관리 페이지 탐색 실패 시점의 스크린샷/HTML 저장."""
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    debug_dir = TEMP_DIR / "toorder_delivery_account_debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_tag = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in tag)
+    png_path = debug_dir / f"{safe_tag}_{ts}.png"
+    html_path = debug_dir / f"{safe_tag}_{ts}.html"
+
+    try:
+        driver.save_screenshot(str(png_path))
+        logger.info("배달 계정 관리 디버그 스크린샷 저장: %s", png_path)
+    except Exception as exc:
+        logger.warning("배달 계정 관리 디버그 스크린샷 저장 실패: %s", exc)
+
+    try:
+        html_path.write_text(driver.page_source or "", encoding="utf-8", errors="replace")
+        logger.info("배달 계정 관리 디버그 HTML 저장: %s", html_path)
+    except Exception as exc:
+        logger.warning("배달 계정 관리 디버그 HTML 저장 실패: %s", exc)
+
+
 def _human_type(element, text: str) -> None:
     """사람처럼 타이핑"""
     element.clear()
@@ -549,50 +579,12 @@ def _human_type(element, text: str) -> None:
 
 def _resolve_toorder_pw(account_id: str) -> str:
     """
-    ToOrder 비밀번호 환경변수 해석.
-    우선순위:
-      1) TOORDER_DELIVERY_ACCOUNT_PW / TOORDER_DELIVERY_PW
-      2) TOORDER_PW_{ACCOUNT_ID_UPPER}
-      2-1) (Airflow Variable) 위 키들
-      3) TOORDER_PW (레거시/공용)
+    ToOrder 비밀번호 해석.
+    sales_employee.csv에서 비고='자동화 연결'인 토더 행만 허용한다.
     """
-    pw = os.getenv("TOORDER_DELIVERY_ACCOUNT_PW") or os.getenv("TOORDER_DELIVERY_PW")
-    if pw:
-        return pw
-
-    key = f"TOORDER_PW_{str(account_id).upper()}"
-    pw = os.getenv(key)
-    if pw:
-        return pw
-
-    # Airflow Variable fallback (재시작 없이 UI에서 즉시 반영 가능)
-    for var_key in ("TOORDER_DELIVERY_ACCOUNT_PW", "TOORDER_DELIVERY_PW", key):
-        pw = _get_airflow_variable(var_key)
-        if pw:
-            return pw
-
-    legacy = os.getenv("TOORDER_PW")
-    if legacy:
-        if str(account_id) not in ("doridang1", "doridang01"):
-            logger.warning(
-                "비밀번호가 레거시 `TOORDER_PW`에서 로드되었습니다. "
-                "계정(%s)에 맞는지 확인해주세요. (권장: %s)",
-                account_id,
-                key,
-            )
-        return legacy
-
-    legacy_var = _get_airflow_variable("TOORDER_PW")
-    if legacy_var:
-        if str(account_id) not in ("doridang1", "doridang01"):
-            logger.warning(
-                "비밀번호가 레거시 Airflow Variable `TOORDER_PW`에서 로드되었습니다. "
-                "계정(%s)에 맞는지 확인해주세요. (권장: %s)",
-                account_id,
-                key,
-            )
-        return legacy_var
-
+    account_pw = get_pw("toorder", account_id)
+    if account_pw:
+        return account_pw
     return ""
 
 
@@ -613,13 +605,19 @@ def _resolve_toorder_id() -> str:
       2) (Airflow Variable) TOORDER_DELIVERY_ACCOUNT_ID / TOORDER_DELIVERY_ID
       3) default
     """
-    env_id = os.getenv("TOORDER_DELIVERY_ACCOUNT_ID") or os.getenv("TOORDER_DELIVERY_ID")
-    if env_id and env_id.strip():
-        return env_id.strip()
+    for key in ("TOORDER_DELIVERY_ACCOUNT_ID", "TOORDER_DELIVERY_ID"):
+        env_id = (os.getenv(key) or "").strip()
+        if env_id and get_pw("toorder", env_id):
+            return env_id
+        if env_id:
+            logger.warning("자동화 연결 대상이 아닌 ToOrder 계정 무시: key=%s account_id=%s", key, env_id)
 
-    var_id = _get_airflow_variable("TOORDER_DELIVERY_ACCOUNT_ID") or _get_airflow_variable("TOORDER_DELIVERY_ID")
-    if var_id and var_id.strip():
-        return var_id.strip()
+    for key in ("TOORDER_DELIVERY_ACCOUNT_ID", "TOORDER_DELIVERY_ID"):
+        var_id = _get_airflow_variable(key)
+        if var_id and get_pw("toorder", var_id):
+            return var_id
+        if var_id:
+            logger.warning("자동화 연결 대상이 아닌 ToOrder 계정 무시: Airflow Variable=%s account_id=%s", key, var_id)
 
     return _TOORDER_ID_DEFAULT
 
@@ -631,36 +629,41 @@ def _download_delivery_excel(driver) -> Path:
     """
     logger.info("배달 계정 관리 페이지 이동")
     driver.get(DELIVERY_URL)
-    time.sleep(random.uniform(2.0, 3.0))
+    time.sleep(random.uniform(3.0, 5.0))
+    logger.info("배달 계정 관리 현재 URL: %s", driver.current_url)
 
     if "delivery-manage-company" not in driver.current_url:
+        _save_delivery_page_debug_artifacts(driver, "unexpected_url")
         raise RuntimeError(f"페이지 이동 실패: {driver.current_url}")
 
     # 다운로드 전 파일 스냅샷
     existing_files = set(DOWN_DIR.glob("배달 계정 관리*.xlsx"))
 
     # '내보내기' 버튼 클릭
-    wait = WebDriverWait(driver, 20)
-    export_btn = wait.until(
-        EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[aria-label="내보내기"]'))
-    )
-    driver.execute_script("arguments[0].click();", export_btn)
+    export_btn = _find_export_button(driver)
+    if export_btn is None:
+        _save_delivery_page_debug_artifacts(driver, "export_button_not_found")
+        raise RuntimeError("'내보내기' 버튼을 찾을 수 없음")
+
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", export_btn)
+    time.sleep(0.5)
+    try:
+        export_btn.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", export_btn)
     logger.info("내보내기 버튼 클릭")
     time.sleep(random.uniform(1.5, 2.5))
 
     # 드롭다운 메뉴에서 "Excel로 내보내기" 클릭
-    menu_items = wait.until(
-        EC.presence_of_all_elements_located((By.CSS_SELECTOR, "li[role='menuitem']"))
-    )
-    excel_item = None
-    for item in menu_items:
-        if "Excel로 내보내기" in item.text:
-            excel_item = item
-            break
+    excel_item = _find_excel_export_item(driver)
     if excel_item is None:
+        _save_delivery_page_debug_artifacts(driver, "excel_export_item_not_found")
         raise RuntimeError("'Excel로 내보내기' 메뉴 항목을 찾을 수 없음")
 
-    driver.execute_script("arguments[0].click();", excel_item)
+    try:
+        excel_item.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", excel_item)
     logger.info("'Excel로 내보내기' 클릭")
 
     # 다운로드 완료 대기 (최대 30초)
@@ -680,6 +683,100 @@ def _download_delivery_excel(driver) -> Path:
 
     logger.info("다운로드 완료: %s", downloaded.name)
     return downloaded
+
+
+def _normalize_click_text(text: str) -> str:
+    return "".join(str(text or "").split()).lower()
+
+
+def _find_export_button(driver):
+    """ToOrder UI 변경에 견디도록 텍스트/속성 기반으로 내보내기 버튼 탐색."""
+    deadline = time.time() + 30
+    selectors = [
+        (By.CSS_SELECTOR, 'button[aria-label="내보내기"]'),
+        (By.XPATH, "//button[contains(., '내보내기')]"),
+        (By.XPATH, "//button[contains(., '다운로드')]"),
+        (By.XPATH, "//button[contains(., 'Excel') or contains(., '엑셀')]"),
+    ]
+    keywords = ("내보내기", "다운로드", "excel", "export", "download", "xlsx", "엑셀")
+
+    while time.time() < deadline:
+        for by, selector in selectors:
+            try:
+                for candidate in driver.find_elements(by, selector):
+                    if candidate.is_displayed() and candidate.is_enabled():
+                        return candidate
+            except Exception:
+                continue
+
+        candidates = []
+        try:
+            buttons = driver.find_elements(By.CSS_SELECTOR, "button")
+        except Exception:
+            buttons = []
+
+        for candidate in buttons:
+            try:
+                if not candidate.is_displayed() or not candidate.is_enabled():
+                    continue
+                raw = " ".join(
+                    [
+                        candidate.text or "",
+                        candidate.get_attribute("aria-label") or "",
+                        candidate.get_attribute("title") or "",
+                    ]
+                )
+                compact = _normalize_click_text(raw)
+                if any(keyword in compact for keyword in keywords):
+                    priority = 0 if "내보내기" in raw else 1
+                    candidates.append((priority, candidate, raw.strip()))
+            except Exception:
+                continue
+
+        if candidates:
+            candidates.sort(key=lambda item: item[0])
+            logger.info("내보내기 후보 버튼 발견: %s", candidates[0][2])
+            return candidates[0][1]
+
+        time.sleep(1.0)
+
+    return None
+
+
+def _find_excel_export_item(driver):
+    """열린 메뉴에서 Excel 다운로드 항목을 찾는다."""
+    deadline = time.time() + 20
+    keywords = ("excel", "xlsx", "엑셀", "내보내기", "다운로드")
+    selectors = [
+        (By.CSS_SELECTOR, "li[role='menuitem']"),
+        (By.CSS_SELECTOR, "[role='menuitem']"),
+        (By.XPATH, "//button[contains(., 'Excel') or contains(., '엑셀') or contains(., 'xlsx')]"),
+        (By.XPATH, "//li[contains(., 'Excel') or contains(., '엑셀') or contains(., 'xlsx')]"),
+        (By.XPATH, "//*[@role='option' and (contains(., 'Excel') or contains(., '엑셀') or contains(., 'xlsx'))]"),
+    ]
+
+    while time.time() < deadline:
+        for by, selector in selectors:
+            try:
+                for candidate in driver.find_elements(by, selector):
+                    if not candidate.is_displayed():
+                        continue
+                    raw = " ".join(
+                        [
+                            candidate.text or "",
+                            candidate.get_attribute("aria-label") or "",
+                            candidate.get_attribute("title") or "",
+                        ]
+                    )
+                    compact = _normalize_click_text(raw)
+                    if any(keyword in compact for keyword in keywords):
+                        logger.info("Excel 내보내기 후보 항목 발견: %s", raw.strip())
+                        return candidate
+            except Exception:
+                continue
+        time.sleep(0.5)
+
+    return None
 
 
 # ============================================================
@@ -861,6 +958,7 @@ def _join_sales_employee(df: pd.DataFrame) -> pd.DataFrame:
 
     keep = [c for c in ["매장명", "담당자", "email"] if c in emp.columns]
     emp = emp[keep].drop_duplicates(subset=["매장명"], keep="first")
+    emp = apply_manager_mail_variables(emp)
 
     if "매장명" in df.columns and "매장명" in emp.columns:
         # 매장명 정규화 키로 JOIN ("도리당 청라점" ↔ "청라점" 매칭)
@@ -884,7 +982,7 @@ def _join_sales_employee(df: pd.DataFrame) -> pd.DataFrame:
         df["담당자"] = ""
         df["email"] = ""
 
-    return df
+    return apply_manager_mail_variables(df)
 
 
 def _save_to_parquet(df: pd.DataFrame, ds_nodash: str) -> Path:
@@ -915,11 +1013,11 @@ def _send_single_alert(
     n_stores = len(group_df)
 
     if test_mode:
-        to_emails = ADMIN_EMAIL
+        to_emails = resolve_mail_recipients(ADMIN_EMAIL)
         cc_list = []
     else:
-        to_emails = [recipient_email]
-        cc_list = CC_EMAILS
+        to_emails = resolve_mail_recipients(recipient_email)
+        cc_list = resolve_mail_recipients(CC_EMAILS)
 
     subject = f"[토더 배달계정 미연결] {manager_name} 담당 {n_stores}개 매장 연결 오류"
     html_content = _build_alert_html(manager_name, group_df)
@@ -1058,7 +1156,12 @@ def _send_with_cc(
         msg["Cc"] = ", ".join(cc_emails)
     msg.attach(MIMEText(html_content, "html", "utf-8"))
 
-    all_recipients = to_emails + cc_emails
+    to_emails = resolve_mail_recipients(to_emails)
+    cc_emails = resolve_mail_recipients(cc_emails)
+    all_recipients = resolve_mail_recipients(to_emails, cc_emails)
+    if not all_recipients:
+        logger.warning("이메일 수신자 없음 - 발송 스킵: %s", subject)
+        return
 
     with smtplib.SMTP(conn.host, conn.port) as server:
         server.starttls()

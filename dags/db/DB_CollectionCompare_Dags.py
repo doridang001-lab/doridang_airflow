@@ -10,8 +10,8 @@ from airflow.sensors.external_task import ExternalTaskSensor
 
 from modules.transform.pipelines.db.DB_CollectionCompare import build_collection_compare
 from modules.transform.pipelines.db.DB_BaeminManual_load import (
-    load_manual_baemin_orders,
-    cleanup_manual_baemin_orders,
+    load_manual_baemin_files,
+    cleanup_manual_baemin_files,
 )
 from modules.transform.pipelines.db.DB_Beamin_pc2_distribute import ingest_baemin_pc2_inbox
 from modules.transform.utility.schedule import DB_COLLECTION_COMPARE_TIME
@@ -64,12 +64,12 @@ with DAG(
 
     ingest_baemin = PythonOperator(
         task_id="ingest_manual_baemin_orders",
-        python_callable=load_manual_baemin_orders,
+        python_callable=load_manual_baemin_files,
     )
 
     cleanup_baemin = PythonOperator(
         task_id="cleanup_manual_baemin_orders",
-        python_callable=cleanup_manual_baemin_orders,
+        python_callable=cleanup_manual_baemin_files,
     )
 
     ensure_coupang_macro_loaded = ExternalTaskSensor(

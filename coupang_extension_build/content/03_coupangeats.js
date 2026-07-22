@@ -1,16 +1,25 @@
-// ===================================================================================
+﻿// ===================================================================================
 // ================= 03_coupangeats.js : 쿠팡이츠 수집 로직 =================
 // ===================================================================================
 
 Sites['coupangeats'] = {
   name: '쿠팡이츠',
   match: (url) => url.includes('store.coupangeats.com') || url.includes('advertising.coupangeats.com'),
+  ORDERS_STORE_BUDGET_MS: 480000,
+  ORDERS_STORE_BUDGET_EXTENSION_MS: 480000,
+  ORDERS_STORE_BUDGET_MAX_EXTENSIONS: 2,
   _stopFlag: false,
   
   async collect(opts = {}) {
     this._stopFlag = false;
     this._collectSource = opts.source || 'manual';
+    this._hardThrottled = false;
     this._resumeReloadCount = 0; // 새 수집 시작 → F5 재개 누적 초기화
+    this._ordersThrottleCount = 0;
+    this._lastOrdersThrottleAt = 0;
+    this._lastOrdersTransientErrorAt = 0;
+    this._lastOrdersCollectResult = null;
+    this._nextManualOrdersBreakAt = 8 + Math.floor(Math.random() * 8);
     this._setupEscListener();
 
     const shopInfo = this._getShopInfo();
@@ -57,8 +66,193 @@ Sites['coupangeats'] = {
   },
 
   _manualOrdersPace(min, max) {
-    if (this._collectSource !== 'manual') return Promise.resolve();
-    return this._randomDelay(min, max);
+    if (this._collectSource === 'manual') return this._randomDelay(min, max);
+    if (this._collectSource === 'batch') {
+      const batchMin = Math.max(Math.floor(min * 1.15), min + 250);
+      const batchMax = Math.max(Math.floor(max * 1.35), max + 600);
+      return this._randomDelay(batchMin, batchMax);
+    }
+    return Promise.resolve();
+  },
+
+  _isSafeOrdersPacingEnabled() {
+    return this._collectSource === 'manual' || this._collectSource === 'batch';
+  },
+
+  _lastOrdersSearchAt: 0,
+  _ordersSearchCooldownUntil: 0,
+  _ordersThrottleCount: 0,
+  _lastOrdersThrottleAt: 0,
+  _lastOrdersTransientErrorAt: 0,
+  _nextManualOrdersBreakAt: 12,
+  _hardThrottled: false,
+  ERROR_CONTAINER_SELECTORS: ['.modal.show', '.ant-modal', '[role="dialog"]', '.popup-wrapper', '.toast', '[role="alert"]'],
+
+  _findOrdersThrottleSignal() {
+    const emptySignal = { matched: false, keyword: '', snippet: '' };
+    const keywords = [
+      '10056',
+      '10057',
+      'ACCESS_DENIDE',
+      'ACCESS_DENIED',
+      'ACCESS_DENY',
+      '\uACFC\uB3C4\uD55C \uC694\uCCAD',
+      '일시적으로 제한',
+      '\uB2E8\uC2DC\uAC04 \uB0B4 \uBC18\uBCF5 \uC694\uCCAD'
+    ];
+    const makeSignal = (text, keyword, index) => ({
+      matched: true,
+      keyword,
+      snippet: text.slice(Math.max(0, index - 30), index + keyword.length + 30).replace(/\s+/g, ' ').trim()
+    });
+
+    for (const selector of this.ERROR_CONTAINER_SELECTORS) {
+      for (const el of document.querySelectorAll(selector)) {
+        const text = el.textContent || '';
+        for (const keyword of keywords) {
+          const index = text.indexOf(keyword);
+          if (index >= 0) return makeSignal(text, keyword, index);
+        }
+      }
+    }
+
+    if (this._hasNoOrdersNotice()) return emptySignal;
+
+    const bodyText = document.body?.innerText || '';
+    const contextualCode = /(?:^|\D)1005[67](?:\D|$)/g;
+    let match;
+    while ((match = contextualCode.exec(bodyText)) !== null) {
+      const context = bodyText.slice(Math.max(0, match.index - 80), match.index + match[0].length + 80);
+      if (context.includes('제한') || context.includes('\uACFC\uB3C4\uD55C \uC694\uCCAD')) {
+        const keyword = match[0].trim();
+        return makeSignal(bodyText, keyword, match.index);
+      }
+    }
+
+    const bodyKeywords = [
+      '일시적으로 제한',
+      '서비스 이용이 일시적',
+      '\uB2E8\uC2DC\uAC04 \uB0B4 \uBC18\uBCF5 \uC694\uCCAD',
+      '\uACFC\uB3C4\uD55C \uC694\uCCAD',
+      'ACCESS_DENIDE',
+      'ACCESS_DENIED',
+      'ACCESS_DENY'
+    ];
+    for (const keyword of bodyKeywords) {
+      const index = bodyText.indexOf(keyword);
+      if (index >= 0) return makeSignal(bodyText, keyword, index);
+    }
+    return emptySignal;
+  },
+
+  _isOrdersThrottleVisible() {
+    return this._findOrdersThrottleSignal().matched;
+  },
+
+  _markOrdersTransientError() {
+    this._lastOrdersTransientErrorAt = Date.now();
+  },
+
+  _hadRecentOrdersTransientError(windowMs = 120000) {
+    return Date.now() - this._lastOrdersTransientErrorAt < windowMs;
+  },
+
+  _tryExtendStoreBudget({ extensions, idCount, lastExtensionIdCount }) {
+    if (this._stopFlag) return false;
+    if (extensions >= this.ORDERS_STORE_BUDGET_MAX_EXTENSIONS) return false;
+    if (idCount <= lastExtensionIdCount) return false;
+    if (this._isOrdersThrottleVisible()) return false;
+    if (this._hadRecentOrdersTransientError()) return false;
+    return true;
+  },
+
+  _ordersThrottleDelayMs() {
+    const ranges = [
+      [55000, 75000],
+      [90000, 130000],
+      [150000, 210000]
+    ];
+    const idx = Math.min(Math.max(this._ordersThrottleCount - 1, 0), ranges.length - 1);
+    const [min, max] = ranges[idx];
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  },
+
+  async _waitAfterOrdersBlockedStore() {
+    if (!this._isSafeOrdersPacingEnabled()) return;
+    const waitMs = 60000 + Math.floor(Math.random() * 30001);
+    Utils.updateProgressModal({ debug: `⏳ 10057 예방 대기 ${Math.ceil(waitMs / 1000)}초 후 다음 매장 진행` });
+    await new Promise(r => setTimeout(r, waitMs));
+  },
+
+  _markOrdersHardThrottle(signal = null) {
+    if (this._hardThrottled === true) return;
+    const throttleSignal = signal || this._findOrdersThrottleSignal();
+    this._ordersThrottleCount++;
+    this._lastOrdersThrottleAt = Date.now();
+    this._markOrdersTransientError();
+    this._hardThrottled = true;
+    Utils.updateProgressModal({ debug: `⛔ 쿠팡 제한(10057) 감지 — 현재 매장 패스 | keyword=${throttleSignal.keyword} | ...${throttleSignal.snippet}...` });
+  },
+
+  _checkOrdersHardThrottle() {
+    const signal = this._findOrdersThrottleSignal();
+    if (!signal.matched) return false;
+    this._markOrdersHardThrottle(signal);
+    return true;
+  },
+
+  async _waitBeforeOrdersSearch() {
+    const MIN_SEARCH_INTERVAL_MS = this._isSafeOrdersPacingEnabled()
+      ? 25000 + Math.floor(Math.random() * 15001)
+      : 10000;
+
+    if (this._checkOrdersHardThrottle()) return false;
+
+    const waitUntil = Math.max(
+      this._ordersSearchCooldownUntil,
+      this._lastOrdersSearchAt + MIN_SEARCH_INTERVAL_MS
+    );
+    const waitMs = waitUntil - Date.now();
+    if (waitMs > 0) {
+      Utils.updateProgressModal({ debug: `⏳ 조회 요청 간격 보호 대기 ${Math.ceil(waitMs / 1000)}초` });
+      await new Promise(r => setTimeout(r, waitMs));
+    }
+    return true;
+  },
+
+  async _humanizeManualOrdersBeforeClick(el) {
+    if (!this._isSafeOrdersPacingEnabled() || !el) return;
+    try {
+      const isBatch = this._collectSource === 'batch';
+      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      await this._randomDelay(isBatch ? 385 : 150, isBatch ? 1060 : 530);
+      el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+      await this._randomDelay(isBatch ? 130 : 50, isBatch ? 415 : 155);
+      el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
+      if (typeof el.focus === 'function') el.focus();
+      await this._randomDelay(isBatch ? 265 : 105, isBatch ? 825 : 385);
+    } catch (_) {}
+  },
+
+  async _humanizeManualOrdersAfterItem(index) {
+    if (!this._isSafeOrdersPacingEnabled()) return;
+    const isBatch = this._collectSource === 'batch';
+    const breakAt = this._nextManualOrdersBreakAt;
+    if (index + 1 >= breakAt) {
+      Utils.updateProgressModal({ debug: 'batch short pacing break' });
+      await this._randomDelay(isBatch ? 1475 : 2065, isBatch ? 3835 : 5310);
+      this._nextManualOrdersBreakAt += (isBatch ? 9 : 8) + Math.floor(Math.random() * (isBatch ? 7 : 8));
+    }
+  },
+
+  async _humanizeManualOrdersAfterPage() {
+    if (!this._isSafeOrdersPacingEnabled()) return;
+    const isBatch = this._collectSource === 'batch';
+    await this._randomDelay(isBatch ? 1060 : 885, isBatch ? 2655 : 2655);
+    if (Math.random() < (isBatch ? 0.2 : 0.22)) {
+      Utils.updateProgressModal({ debug: 'batch page transition stabilization wait' });
+      await this._randomDelay(isBatch ? 2655 : 3540, isBatch ? 5900 : 7080);
+    }
   },
 
   _isDashboardBatchOrders(opts = {}) {
@@ -318,15 +512,23 @@ Sites['coupangeats'] = {
     return new Set(opts.targetStores.map(s => this._normalizeStoreName(s)).filter(Boolean));
   },
 
+  _storeBranchKey(name) {
+    const parts = String(name || '').replace(/\s+/g, ' ').trim().split(' ');
+    return parts.length ? parts[parts.length - 1] : '';
+  },
+
   _filterTargetStores(storeNames, opts = {}) {
     const targetSet = this._targetStoreSet(opts);
     const brandStores = (storeNames || []).filter(storeName => this._isTargetBrandStoreName(storeName));
     if (!targetSet) return brandStores;
     const candidates = storeNames || [];
     const targets = [...targetSet];
+    const targetBranches = new Set((opts.targetStores || []).map(name => this._storeBranchKey(name)).filter(Boolean));
     return candidates.filter(storeName => {
       const normalized = this._normalizeStoreName(storeName);
-      return targets.some(target => normalized === target || normalized.includes(target) || target.includes(normalized));
+      const directMatch = targets.some(target => normalized === target || normalized.includes(target) || target.includes(normalized));
+      if (directMatch) return true;
+      return this._isTargetBrandStoreName(storeName) && targetBranches.has(this._storeBranchKey(storeName));
     });
   },
 
@@ -336,6 +538,36 @@ Sites['coupangeats'] = {
     const normalized = this._normalizeStoreName(storeName);
     return [...targetSet]
       .some(target => normalized === target || normalized.includes(target) || target.includes(normalized));
+  },
+
+  _resolveBatchTargetDate(opts = {}) {
+    const raw = String(opts.targetDate || '').trim();
+    let m = raw.match(/^(\d{4})(\d{2})(\d{2})$/) || raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (m) {
+      const d = new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10));
+      if (!isNaN(d.getTime())) {
+        d.setHours(0, 0, 0, 0);
+        return d;
+      }
+    }
+    const d = new Date();
+    if (opts.targetDateMode !== 'today') d.setDate(d.getDate() - 1);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  },
+
+  _batchTargetDateLabel(opts = {}) {
+    return opts.targetDateMode === 'today' ? '오늘' : '어제';
+  },
+
+  _ordersDownloadDateStr() {
+    const range = this._readOrdersDateRange?.();
+    const endMs = parseInt(range?.end, 10);
+    if (!isNaN(endMs)) {
+      const d = new Date(endMs);
+      if (!isNaN(d.getTime())) return this._formatDate(d).replace(/-/g, '');
+    }
+    return Utils.getTodayStr();
   },
 
   // ✅ 완전히 재작성된 CMG 수집 함수
@@ -401,11 +633,17 @@ Sites['coupangeats'] = {
       return;
     }
 
-    // 날짜 목록 생성 (오늘/미래 → 어제로 clamp)
-    const yd = new Date(); yd.setDate(yd.getDate() - 1); yd.setHours(0, 0, 0, 0);
     let { startDate, endDate } = dateRange;
-    if (startDate > yd) startDate = new Date(yd);
-    if (endDate > yd) endDate = new Date(yd);
+    if (this._isDashboardBatchOrders(opts)) {
+      const targetDate = this._resolveBatchTargetDate(opts);
+      startDate = new Date(targetDate);
+      endDate = new Date(targetDate);
+    } else {
+      // 수동 수집은 기존 캘린더 날짜를 쓰되 오늘/미래는 어제로 clamp
+      const yd = new Date(); yd.setDate(yd.getDate() - 1); yd.setHours(0, 0, 0, 0);
+      if (startDate > yd) startDate = new Date(yd);
+      if (endDate > yd) endDate = new Date(yd);
+    }
 
     const dates = [];
     const cur = new Date(startDate);
@@ -414,10 +652,12 @@ Sites['coupangeats'] = {
     // 도리당 먼저 정렬
     matchingStores.sort((a, b) => this._targetBrandRank(a) - this._targetBrandRank(b));
 
-    // 체크포인트 로드
-    const today = Utils.getTodayStr();
+    // 실행 기준일별 체크포인트 로드
+    const cmgCheckpointDate = dates.length > 0
+      ? this._formatDate(dates[dates.length - 1]).replace(/-/g, '')
+      : Utils.getTodayStr();
     const checkpoint = await this._loadCMGCheckpoint();
-    const completedStores = (checkpoint?.date === today)
+    const completedStores = (checkpoint?.date === cmgCheckpointDate)
       ? (checkpoint.completedStores || []).filter(store => {
           const completedKey = this._normalizeStoreName(store);
           return matchingStores.some(name => this._normalizeStoreName(name) === completedKey);
@@ -428,7 +668,7 @@ Sites['coupangeats'] = {
     Utils.showMultiStoreProgressModal(matchingStores);
     Utils.updateProgressModal({ debug: `📅 수집 기간: ${this._formatDate(startDate)} ~ ${this._formatDate(endDate)} (${dates.length}일)` });
     if (completedStores.length > 0) {
-      Utils.updateProgressModal({ debug: `📌 오늘 완료된 매장: ${completedStores.join(', ')} → 건너뜀` });
+      Utils.updateProgressModal({ debug: `📌 기준일 완료된 매장: ${completedStores.join(', ')} → 건너뜀` });
     }
 
     for (let i = 0; i < matchingStores.length; i++) {
@@ -438,9 +678,20 @@ Sites['coupangeats'] = {
       const storeName = matchingStores[i];
 
       if (completedStores.some(store => this._normalizeStoreName(store) === this._normalizeStoreName(storeName))) {
-        Utils.updateProgressModal({ debug: `⏭️ 오늘 이미 완료됨, 건너뜀` });
-        Utils.updateMultiStoreStoreResult('success', '⏭️ 오늘 이미 수집됨');
-        storeResults.push({ storeName, completed: true, status: 'ok', skipped: true, note: '오늘 이미 수집됨' });
+        Utils.updateProgressModal({ debug: `⏭️ 기준일 이미 완료됨, 건너뜀` });
+        Utils.updateMultiStoreStoreResult('success', '⏭️ 기준일 이미 수집됨');
+        storeResults.push({ storeName, completed: true, status: 'ok', skipped: true, note: '기준일 이미 수집됨' });
+        continue;
+      }
+
+      const cmgEndDateStr = dates.length > 0
+        ? this._formatDate(dates[dates.length - 1]).replace(/-/g, '')
+        : Utils.getTodayStr();
+      const cmgBeacon = await Utils.checkDownloadBeacon(storeName, cmgEndDateStr, 'cmg');
+      if (cmgBeacon) {
+        Utils.updateProgressModal({ debug: `📁 CMG beacon 확인됨(${cmgEndDateStr}), 건너뜀: ${storeName}` });
+        Utils.updateMultiStoreStoreResult('success', '📁 이미 수집됨 (beacon)');
+        storeResults.push({ storeName, completed: true, status: 'ok', skipped: true, note: 'beacon: 다운로드 파일 확인' });
         continue;
       }
 
@@ -483,7 +734,7 @@ Sites['coupangeats'] = {
 
       if (!this._stopFlag) {
         completedStores.push(storeName);
-        await this._saveCMGCheckpoint({ date: today, completedStores: [...completedStores] });
+        await this._saveCMGCheckpoint({ date: cmgCheckpointDate, completedStores: [...completedStores] });
         Utils.updateProgressModal({ debug: `💾 체크포인트 저장 (${completedStores.length}/${matchingStores.length})` });
       }
     }
@@ -667,6 +918,7 @@ Sites['coupangeats'] = {
     const selectedStore = storeText.replace(/\s*\(\d+개?\)?\s*$/, '').trim();
 
     let startDate, endDate;
+    let parseResult = {};
 
     if (!this._isDashboardBatchOrders(opts)) {
       // 수동 수집: 현재 캘린더에 설정된 날짜 그대로 사용 (prompt 없음)
@@ -678,6 +930,11 @@ Sites['coupangeats'] = {
       startDate = dateRange.startDate;
       endDate = dateRange.endDate;
       Utils.updateProgressModal({ debug: `📅 수동 수집: 현재 캘린더 날짜 사용 (${this._formatDate(startDate)} ~ ${this._formatDate(endDate)})` });
+    } else if (opts.targetDate || opts.targetDateMode) {
+      const targetDate = this._resolveBatchTargetDate(opts);
+      startDate = new Date(targetDate);
+      endDate = new Date(targetDate);
+      Utils.updateProgressModal({ debug: `📅 배치 수집: ${this._batchTargetDateLabel(opts)} 날짜 사용 (${this._formatDate(targetDate)})` });
     } else {
       // 배치/일반 수집: 날짜 범위 입력 prompt
       const rangeInput = prompt(
@@ -696,7 +953,7 @@ Sites['coupangeats'] = {
         return;
       }
 
-      const parseResult = this._parseDateRange(rangeInput);
+      parseResult = this._parseDateRange(rangeInput);
       console.log('[CMG-DEBUG] parseResult:', JSON.stringify(parseResult, null, 2), 'raw:', parseResult);
 
       if (parseResult.error) {
@@ -713,12 +970,14 @@ Sites['coupangeats'] = {
       }
     }
 
-    // 오늘/미래 날짜 → 어제로 clamp, 역순이면 swap
-    const yd = new Date();
-    yd.setDate(yd.getDate() - 1);
-    yd.setHours(0, 0, 0, 0);
-    if (startDate > yd) { startDate = new Date(yd); }
-    if (endDate > yd) { endDate = new Date(yd); }
+    // 수동/프롬프트 수집은 오늘/미래 날짜 → 어제로 clamp. 배치 버튼 날짜는 그대로 허용.
+    if (!(opts.targetDate || opts.targetDateMode)) {
+      const yd = new Date();
+      yd.setDate(yd.getDate() - 1);
+      yd.setHours(0, 0, 0, 0);
+      if (startDate > yd) { startDate = new Date(yd); }
+      if (endDate > yd) { endDate = new Date(yd); }
+    }
     if (startDate > endDate) {
       const tmp = new Date(startDate);
       startDate = new Date(endDate);
@@ -1303,6 +1562,45 @@ ${filename}`;
     return false;
   },
 
+  async _clickNextOrderPage() {
+    const currentPage = this._getCurrentPage();
+    const targetPage = currentPage + 1;
+    Utils.updateProgressModal({ debug: `페이지 이동 시작 - ${this._ordersDiag({ targetPage })}` });
+    if (this._clickPageNumber(targetPage)) {
+      Utils.updateProgressModal({ debug: `페이지 번호 직접 클릭 - ${this._ordersDiag({ targetPage })}` });
+      return { moved: true, stalled: false };
+    }
+
+    const nextBtn = document.querySelector('.merchant-pagination button[data-at="next-btn"], button[data-at="next-btn"]')
+      || Array.from(document.querySelectorAll('.merchant-pagination button')).find(btn => {
+        const label = `${btn.getAttribute('aria-label') || ''} ${btn.getAttribute('title') || ''} ${btn.textContent || ''}`.trim();
+        return /next|다음|›|>|»/i.test(label);
+      });
+    const isHidden = !nextBtn || nextBtn.classList.contains('hide-btn');
+    const isDisabled = nextBtn?.disabled || nextBtn?.getAttribute('aria-disabled') === 'true';
+    if (!nextBtn || isHidden || isDisabled) {
+      Utils.updateProgressModal({ debug: `다음 페이지 버튼 사용 불가 - ${this._ordersDiag({ targetPage, hasNextBtn: !!nextBtn, hidden: !!isHidden, disabled: !!isDisabled })}` });
+      return { moved: false, stalled: false };
+    }
+
+    nextBtn.click();
+    Utils.updateProgressModal({ debug: `${targetPage}페이지 번호창 이동 중 - ${this._ordersDiag({ targetPage })}` });
+    for (let i = 0; i < 15 && !this._stopFlag; i++) {
+      await this._randomDelay(180, 300);
+      if (this._getCurrentPage() === targetPage) {
+        Utils.updateProgressModal({ debug: `페이지 이동 확인 - ${this._ordersDiag({ targetPage, poll: i + 1 })}` });
+        return { moved: true, stalled: false };
+      }
+      if (this._clickPageNumber(targetPage)) {
+        Utils.updateProgressModal({ debug: `번호창에서 목표 페이지 클릭 - ${this._ordersDiag({ targetPage, poll: i + 1 })}` });
+        return { moved: true, stalled: false };
+      }
+    }
+    const moved = this._getCurrentPage() === targetPage;
+    Utils.updateProgressModal({ debug: `페이지 이동 결과 - ${this._ordersDiag({ targetPage, moved })}` });
+    return { moved, stalled: !moved };
+  },
+
   // 현재 페이지네이션 창에 보이는 숫자 버튼 목록 (first/prev/next/last 컨트롤 제외)
   _getVisiblePageNumbers() {
     const btns = document.querySelectorAll('.merchant-pagination ul li button');
@@ -1364,6 +1662,33 @@ ${filename}`;
       }
     }
     return 0;
+  },
+
+  _markExistingNoticesStale() {
+    // SPA 전환 중 직전 매장의 0건 공지를 새 조회 결과로 오인하지 않게 한다.
+    for (const el of document.querySelectorAll('.order-search-notice')) {
+      el.setAttribute('data-collector-stale', '1');
+    }
+  },
+
+  _hasNoOrdersNotice() {
+    return [...document.querySelectorAll('.order-search-notice:not([data-collector-stale])')]
+      .some(el => (el.textContent || '').includes('조회할 내역이 없습니다'));
+  },
+
+  _isNormalZeroOrders({ requireNotice = false } = {}) {
+    const hasNotice = this._hasNoOrdersNotice();
+    if (requireNotice && !hasNotice) return false;
+    if (hasNotice && !this._findOrdersThrottleSignal().matched) {
+      this._lastOrdersTransientErrorAt = 0;
+      this._ordersThrottleCount = 0;
+      return true;
+    }
+    return this._getExpectedOrderCount() === 0
+      && this._getExpectedSalesTotal() === 0
+      && (hasNotice || !requireNotice)
+      && !this._isOrdersThrottleVisible()
+      && !this._hadRecentOrdersTransientError();
   },
 
   _showMismatchDialog(collected, expected) {
@@ -1436,9 +1761,28 @@ ${filename}`;
   _getFirstOrderId() {
     const firstItem = document.querySelector('.order-search-result-content > li.col-12');
     if (!firstItem) return '';
-    const orderSection = firstItem.querySelector('.order-item');
+    return this._getOrderItemId(firstItem);
+  },
+
+  _getOrderItemId(item) {
+    const orderSection = item?.querySelector('.order-item');
     const cols = orderSection?.querySelectorAll('[class*="col-4"]');
     return cols?.[0]?.childNodes[0]?.textContent.trim() || '';
+  },
+
+  _ordersDiag(extra = {}) {
+    const visibleOrderCount = document.querySelectorAll('.order-search-result-content > li.col-12').length;
+    const visiblePages = this._getVisiblePageNumbers().map(x => x.num).join(',');
+    const parts = [
+      `page=${this._getCurrentPage()}`,
+      `cards=${visibleOrderCount}`,
+      `first=${this._getFirstOrderId() || '-'}`,
+      `visiblePages=${visiblePages || '-'}`
+    ];
+    for (const [key, value] of Object.entries(extra)) {
+      if (value !== undefined && value !== null && value !== '') parts.push(`${key}=${value}`);
+    }
+    return parts.join(' | ');
   },
 
   async _waitForPageLoad(prevFirstOrderId, timeout = 10000) {
@@ -1491,12 +1835,7 @@ ${filename}`;
   // 에러 팝업 닫기 함수 추가
   async _closeErrorPopups() {
     // 모달 팝업 찾기
-    const modalSelectors = [
-      '.modal.show',
-      '.ant-modal',
-      '[role="dialog"]',
-      '.popup-wrapper'
-    ];
+    const modalSelectors = this.ERROR_CONTAINER_SELECTORS;
     
     for (const selector of modalSelectors) {
       const modals = document.querySelectorAll(selector);
@@ -1591,8 +1930,14 @@ ${filename}`;
     for (let attempt = 0; attempt < 3 && !detailLoaded && !this._stopFlag; attempt++) {
       const icon = item.querySelector('.order-expand-btn .icon-ce-arrowdown-bold');
       if (icon) {
-        icon.closest('button')?.click();
-        await this._randomDelay(400, 600);
+        const btn = icon.closest('button');
+        await this._humanizeManualOrdersBeforeClick(btn);
+        btn?.click();
+        if (this._isSafeOrdersPacingEnabled()) {
+          await this._randomDelay(530, 1355);
+        } else {
+          await this._randomDelay(400, 600);
+        }
       }
 
       for (let r = 0; r < 12 && !this._stopFlag; r++) {
@@ -1603,7 +1948,11 @@ ${filename}`;
           detailLoaded = true;
           break;
         }
-        await this._randomDelay(200, 300);
+        if (this._isSafeOrdersPacingEnabled()) {
+          await this._randomDelay(105, 305);
+        } else {
+          await this._randomDelay(200, 300);
+        }
       }
     }
 
@@ -1761,7 +2110,7 @@ ${filename}`;
     return { rows, order_id, isCancelled, captured };
   },
 
-  async _collectCurrentPageData(shopInfo, iso, currentPage) {
+  async _collectCurrentPageData(shopInfo, iso, currentPage, storeDeadlineMs = 0, collectedOrderIds = new Set(), budgetState = null) {
     let stable = await this._waitForStableState(6000);
     if (!stable && !this._stopFlag) {
       await this._closeErrorPopups();
@@ -1769,27 +2118,81 @@ ${filename}`;
       stable = await this._waitForStableState(4000);
     }
     const stableTimedOut = !stable && !this._stopFlag;
+    const isStoreDeadlineExceeded = () => {
+      const deadlineMs = budgetState?.deadlineMs || storeDeadlineMs;
+      return deadlineMs > 0 && Date.now() > deadlineMs;
+    };
 
     let orderItems = Array.from(document.querySelectorAll('.order-search-result-content > li.col-12'));
 
     if (orderItems.length === 0) {
-      Utils.updateProgressModal({ debug: `⚠️ ${currentPage}페이지 주문 없음 - 재시도` });
+      if (this._isNormalZeroOrders({ requireNotice: true })) {
+        Utils.updateProgressModal({ debug: `${currentPage}페이지 0건 확인 - 재시도 없이 빈 페이지 처리` });
+        return { rows: [], pageComplete: true, missingOrderIds: [], stableTimedOut: false, skippedCount: 0 };
+      }
+      Utils.updateProgressModal({ debug: `${currentPage}페이지 주문 없음 - 재시도` });
       await this._randomDelay(500, 800);
       await this._closeErrorPopups();
       orderItems = Array.from(document.querySelectorAll('.order-search-result-content > li.col-12'));
       if (orderItems.length === 0) {
-        Utils.updateProgressModal({ debug: `❌ ${currentPage}페이지 재시도 실패 - 빈 페이지로 반환` });
-        return { rows: [], pageComplete: true, missingOrderIds: [], stableTimedOut };
+        if (this._isNormalZeroOrders({ requireNotice: true })) {
+          Utils.updateProgressModal({ debug: `${currentPage}페이지 0건 재확인 - 정상 빈 결과` });
+          return { rows: [], pageComplete: true, missingOrderIds: [], stableTimedOut: false, skippedCount: 0 };
+        }
+        Utils.updateProgressModal({ debug: `${currentPage}페이지 재시도 실패 - 빈 페이지로 반환` });
+        return { rows: [], pageComplete: true, missingOrderIds: [], stableTimedOut, skippedCount: 0 };
       }
-      Utils.updateProgressModal({ debug: `✅ 재시도 성공 - ${orderItems.length}개 주문 발견` });
+      Utils.updateProgressModal({ debug: `재시도 성공 - ${orderItems.length}개 주문 발견` });
     }
 
     const orderMap = new Map();
     let missing = [];
+    let capturedCount = 0;
+    let skippedCount = 0;
+    let consecutiveFail = 0;
+    let detailBlocked = false;
+    let storeDeadlineExceeded = false;
     const totalItems = orderItems.length;
+    const shouldBailForSilentThrottle = () => this._getExpectedOrderCount() > 0
+      && ((consecutiveFail >= 5 && capturedCount === 0)
+        || (consecutiveFail >= 4 && (this._isOrdersThrottleVisible() || this._hadRecentOrdersTransientError())));
 
     for (let i = 0; i < totalItems; i++) {
       if (this._stopFlag) break;
+      if (isStoreDeadlineExceeded()) {
+        const progressIdCount = collectedOrderIds.size + capturedCount;
+        if (budgetState
+            && budgetState.lastExtendedPage !== currentPage
+            && this._tryExtendStoreBudget({
+              extensions: budgetState.extensions,
+              idCount: progressIdCount,
+              lastExtensionIdCount: budgetState.lastExtensionIdCount
+            })) {
+          budgetState.extensions++;
+          budgetState.deadlineMs = Date.now() + this.ORDERS_STORE_BUDGET_EXTENSION_MS;
+          budgetState.lastExtensionIdCount = progressIdCount;
+          budgetState.lastExtendedPage = currentPage;
+          Utils.updateProgressModal({
+            debug: `⏳ 매장 예산 연장 (${budgetState.extensions}/${this.ORDERS_STORE_BUDGET_MAX_EXTENSIONS}) — ${currentPage}페이지 ${i + 1}/${totalItems}부터 계속 수집 | ${this._ordersDiag({ captured: capturedCount, skipped: skippedCount, ids: progressIdCount })}`
+          });
+          continue;
+        }
+        storeDeadlineExceeded = true;
+        Utils.updateProgressModal({
+          debug: `⏱ 매장 예산 도달 — 연장 판단 대기 | ${this._ordersDiag({ item: `${i + 1}/${totalItems}`, captured: capturedCount, skipped: skippedCount, ids: collectedOrderIds.size })}`
+        });
+        break;
+      }
+
+      const knownOrderId = this._getOrderItemId(orderItems[i]);
+      if (knownOrderId && collectedOrderIds?.has(knownOrderId)) {
+        skippedCount++;
+        Utils.updateProgressModal({
+          message: `${currentPage}페이지 수집 중... (${i + 1}/${totalItems}건)`,
+          debug: `이미 수집한 주문 스킵: ${knownOrderId}`
+        });
+        continue;
+      }
 
       Utils.updateProgressModal({
         message: `${currentPage}페이지 수집 중... (${i + 1}/${totalItems}건)`
@@ -1797,30 +2200,55 @@ ${filename}`;
 
       try {
         const res = await this._parseOrderItem(orderItems[i], shopInfo, iso);
-        await this._manualOrdersPace(300, 600);
+        await this._manualOrdersPace(265, 795);
+        await this._humanizeManualOrdersAfterItem(i);
         const key = res.order_id || `__idx_${i}`;
         if (res.captured) {
           orderMap.set(key, res);
+          capturedCount++;
+          consecutiveFail = 0;
         } else {
+          consecutiveFail++;
           missing.push({ item: orderItems[i], order_id: res.order_id, key });
+        }
+        if (shouldBailForSilentThrottle()) {
+          detailBlocked = true;
+          this._markOrdersTransientError();
+          Utils.updateProgressModal({ debug: `🚫 ${currentPage}페이지 상세패널 연속 실패 ${consecutiveFail}건 — silent 차단 판정, 조기 종료(백필)` });
+          break;
         }
       } catch (err) {
         Utils.updateProgressModal({ debug: `❌ 주문 ${i + 1} 수집 오류: ${err.message}` });
         console.error(`[쿠팡이츠] 주문 ${i + 1} 수집 오류:`, err);
         await this._closeErrorPopups();
-        await this._manualOrdersPace(500, 900);
+        await this._manualOrdersPace(470, 1060);
+        consecutiveFail++;
         missing.push({ item: orderItems[i], order_id: '', key: `__idx_${i}` });
+        if (shouldBailForSilentThrottle()) {
+          detailBlocked = true;
+          this._markOrdersTransientError();
+          Utils.updateProgressModal({ debug: `🚫 ${currentPage}페이지 상세패널 연속 실패 ${consecutiveFail}건 — silent 차단 판정, 조기 종료(백필)` });
+          break;
+        }
       }
     }
 
-    for (let round = 0; round < 3 && missing.length && !this._stopFlag; round++) {
+    const skipRecollection = missing.length > 0
+      && (detailBlocked || storeDeadlineExceeded || this._isOrdersThrottleVisible() || this._hadRecentOrdersTransientError());
+    if (skipRecollection) {
+      if (!detailBlocked && !storeDeadlineExceeded) this._markOrdersTransientError();
+      Utils.updateProgressModal({ debug: `⚠️ ${currentPage}페이지 세부 재수집 스킵 — throttle/예산 감지, 백필로 이관` });
+    }
+    if (detailBlocked) missing = [];
+
+    for (let round = 0; round < 3 && missing.length && !skipRecollection && !this._stopFlag; round++) {
       Utils.updateProgressModal({ debug: `⚠️ ${currentPage}페이지 매출액 미수집 ${missing.length}건 - 세부 재수집 ${round + 1}/3` });
       const stillMissing = [];
       for (const it of missing) {
         await this._closeErrorPopups();
         try {
           const res = await this._parseOrderItem(it.item, shopInfo, iso);
-          await this._manualOrdersPace(500, 900);
+          await this._manualOrdersPace(470, 1060);
           const key = res.order_id || it.key;
           if (res.captured) {
             orderMap.set(key, res);
@@ -1834,7 +2262,7 @@ ${filename}`;
         }
       }
       missing = stillMissing;
-      await this._randomDelay(300, 500);
+      await this._randomDelay(175, 295);
     }
 
     const pageRows = [];
@@ -1848,7 +2276,7 @@ ${filename}`;
       Utils.updateProgressModal({ debug: `⚠️ ${currentPage}페이지 매출액 미정처리 ${missingOrderIds.length}건` });
     }
 
-    return { rows: pageRows, pageComplete, missingOrderIds, stableTimedOut };
+    return { rows: pageRows, pageComplete: pageComplete && !detailBlocked && !storeDeadlineExceeded, missingOrderIds, stableTimedOut, detailBlocked, storeDeadlineExceeded, skippedCount };
   },
 
   // targetPage 까지 "끝번호 클릭 점프 + next-btn 창 이동" 방식으로 빠르게 복귀.
@@ -1899,6 +2327,75 @@ ${filename}`;
     await this._collectOrdersWithValidation(shopInfo);
   },
 
+  _ordersHardThrottleNote() {
+    return '10057: 과도한 요청으로 인해 서비스 이용이 일시적으로 제한되었습니다.';
+  },
+
+  _makeOrdersBlockedResult(storeName) {
+    return {
+      storeName: storeName || '현재 매장',
+      completed: false,
+      blocked: true,
+      hardThrottle: true,
+      status: 'warn',
+      note: this._ordersHardThrottleNote()
+    };
+  },
+
+  async _pushOrdersBlockedCurrentStore(storeName, storeResults) {
+    Utils.updateMultiStoreStoreResult('blocked', '⛔ 쿠팡 제한(10057) — 현재 매장 패스');
+    storeResults.push(this._makeOrdersBlockedResult(storeName));
+    this._hardThrottled = false;
+    await this._waitAfterOrdersBlockedStore();
+  },
+
+  _appendRemainingOrdersBlocked(matchingStores, storeResults) {
+    const done = new Set(storeResults.map(r => this._normalizeStoreName(r.storeName || '')));
+    for (const storeName of matchingStores) {
+      const key = this._normalizeStoreName(storeName || '');
+      if (!done.has(key)) storeResults.push(this._makeOrdersBlockedResult(storeName));
+    }
+  },
+
+  _makeOrdersDeferredResult(storeName, note = '멀티매장 수집 미완료 → 백필') {
+    return {
+      storeName: storeName || '현재 매장',
+      completed: false,
+      partialThrottle: true,
+      status: 'warn',
+      note
+    };
+  },
+
+  _appendRemainingOrdersDeferred(matchingStores, storeResults, note) {
+    const done = new Set(storeResults.map(r => this._normalizeStoreName(r.storeName || '')));
+    for (const storeName of matchingStores) {
+      const key = this._normalizeStoreName(storeName || '');
+      if (!done.has(key)) storeResults.push(this._makeOrdersDeferredResult(storeName, note));
+    }
+  },
+
+  _sendOrdersCompletePayload(payload) {
+    if (window.top !== window.self) return;
+    try {
+      chrome.runtime.sendMessage({ type: 'MULTISTORE_COMPLETE', payload }).catch(() => {});
+    } catch (_) {}
+  },
+
+  _sendOrdersHardThrottleComplete(storeNames) {
+    const names = Array.isArray(storeNames) && storeNames.length ? storeNames : ['현재 매장'];
+    const storeResults = names.map(name => this._makeOrdersBlockedResult(name));
+    this._sendOrdersCompletePayload({
+      category: 'orders',
+      storeCount: storeResults.length,
+      completedCount: 0,
+      stopped: !!this._stopFlag,
+      hardThrottle: true,
+      blocked: true,
+      storeResults
+    });
+  },
+
   async _collectOrdersMultiStore(opts = {}) {
     // 수동 수집: 드롭다운/체크포인트/날짜 개입 없이 현재 페이지 그대로 수집
     if (!this._isDashboardBatchOrders(opts)) {
@@ -1916,11 +2413,15 @@ ${filename}`;
       }
       Utils.updateProgressModal({ debug: '📅 수동 수집: 날짜·드롭다운 설정 무시' });
       const prevCount = this._getExpectedOrderCount();
-      await this._manualOrdersPace(800, 1500);
+      await this._manualOrdersPace(680, 1275);
       await this._clickOrdersSearchButton();
+      if (this._hardThrottled) {
+        this._sendOrdersHardThrottleComplete([curStoreName || shopInfo.store_name || '현재 매장']);
+        return;
+      }
       await this._waitForOrdersCountChange(prevCount, 8000);
       await this._waitForOrdersDataReady(8000);
-      await this._manualOrdersPace(1500, 2500);
+      await this._manualOrdersPace(1275, 2125);
       const collected = await this._collectOrdersWithValidation(shopInfo, false);
       if (window.top === window.self) {
         try {
@@ -1976,23 +2477,31 @@ ${filename}`;
         Utils.updateProgressModal({ debug: '📅 수동 수집: 현재 날짜 그대로 사용' });
         const prevCount = this._getExpectedOrderCount();
         await this._clickOrdersSearchButton();
+        if (this._hardThrottled) {
+          this._sendOrdersHardThrottleComplete([curStoreName || shopInfo.store_name || '현재 매장']);
+          return;
+        }
         await this._waitForOrdersCountChange(prevCount, 8000);
         dataReady = await this._waitForOrdersDataReady(8000);
         if (dataReady) await this._waitForStableState(5000);
       } else {
-        Utils.showProgressModal('쿠팡이츠 수집', '날짜 설정 중 (어제)...');
-        dateSet = await this._setOrdersDateToYesterday();
+        const targetDate = this._resolveBatchTargetDate(opts);
+        Utils.showProgressModal('쿠팡이츠 수집', `날짜 설정 중 (${this._batchTargetDateLabel(opts)})...`);
+        dateSet = await this._setOrdersDateToYesterday(targetDate);
         Utils.updateProgressModal({ debug: dateSet ? '✅ 날짜 설정 완료' : '⚠️ 날짜 설정 실패, 기존 날짜로 진행' });
         if (dateSet) {
           const prevCount = this._getExpectedOrderCount();
           await this._clickOrdersSearchButton();
+          if (this._hardThrottled) {
+            this._sendOrdersHardThrottleComplete([curStoreName || shopInfo.store_name || '현재 매장']);
+            return;
+          }
           await this._waitForOrdersCountChange(prevCount, 8000);
           dataReady = await this._waitForOrdersDataReady(8000);
           if (dataReady) await this._waitForStableState(5000);
         }
       }
-      const expectedAfterSearch = this._getExpectedOrderCount();
-      const zeroOrders = dataReady && expectedAfterSearch === 0;
+      const zeroOrders = this._isNormalZeroOrders({ requireNotice: true });
       const collected = zeroOrders ? true : await this._collectOrdersWithValidation(shopInfo, false, { skipValidation: !dateSet });
       // MULTISTORE_COMPLETE 신호 (단일매장도 동일하게 전송 — runner 무한 대기 방지)
       if (window.top === window.self) {
@@ -2005,7 +2514,8 @@ ${filename}`;
               completedCount: (!this._stopFlag && collected) ? 1 : 0,
               stopped: !!this._stopFlag,
               error: !collected,
-              storeResults: [{ storeName: curStoreName || shopInfo.store_name || '현재 매장', completed: !this._stopFlag && !!collected, status: this._stopFlag ? 'warn' : (collected ? 'ok' : 'fail'), note: zeroOrders ? '0건' : (collected ? '완료' : '수집 결과 없음') }]
+              zeroOrders,
+              storeResults: [{ storeName: curStoreName || shopInfo.store_name || '현재 매장', completed: !this._stopFlag && !!collected, status: this._stopFlag ? 'warn' : (collected ? 'ok' : 'fail'), zeroOrders, note: zeroOrders ? '0건' : (collected ? '완료' : '수집 결과 없음') }]
             }
           }).catch(() => {});
         } catch (_) {}
@@ -2016,10 +2526,11 @@ ${filename}`;
     // 도리당 먼저, 나홀로 나중
     matchingStores.sort((a, b) => this._targetBrandRank(a) - this._targetBrandRank(b));
 
-    // 오늘 완료된 매장 체크포인트 로드
-    const today = Utils.getTodayStr();
+    // 실행 기준일별 완료 매장 체크포인트 로드
+    const batchTargetDate = this._resolveBatchTargetDate(opts);
+    const checkpointDate = this._formatDate(batchTargetDate).replace(/-/g, '');
     const checkpoint = await this._loadOrdersCheckpoint();
-    const completedStores = (checkpoint?.date === today)
+    const completedStores = (checkpoint?.targetDate === checkpointDate)
       ? (checkpoint.completedStores || []).filter(store => {
           const completedKey = this._normalizeStoreName(store);
           return matchingStores.some(name => this._normalizeStoreName(name) === completedKey);
@@ -2028,34 +2539,76 @@ ${filename}`;
     const storeResults = [];
     const WATCHDOG_MS = 270000;
     const watchdogDeadline = Date.now() + WATCHDOG_MS;
+    const MAX_STORE_RELOAD = matchingStores.length + 2;
+    let forcedPartialComplete = false;
 
     Utils.showMultiStoreProgressModal(matchingStores);
 
     if (completedStores.length > 0) {
-      Utils.updateProgressModal({ debug: `📌 오늘 이미 완료된 매장: ${completedStores.join(', ')} → 건너뜀` });
+      Utils.updateProgressModal({ debug: `📌 기준일 이미 완료된 매장: ${completedStores.join(', ')} → 건너뜀` });
     }
 
   for (let i = 0; i < matchingStores.length; i++) {
     if (this._stopFlag) break;
+    if (this._hardThrottled) {
+      Utils.updateProgressModal({ debug: '⛔ 이전 10057 상태 초기화 후 다음 매장 진행' });
+      this._hardThrottled = false;
+    }
     if (Date.now() > watchdogDeadline) {
       Utils.updateProgressModal({ debug: `전체 수집 watchdog 초과 — 조기 종료 (완료: ${completedStores.length}/${matchingStores.length})` });
+      this._appendRemainingOrdersDeferred(matchingStores, storeResults, '전체 수집 watchdog 초과 → 백필');
+      forcedPartialComplete = true;
       break;
     }
 
       Utils.setMultiStoreIndex(i);
       const storeName = matchingStores[i];
 
-      // 오늘 이미 수집 완료된 매장 스킵
+      // 기준일 이미 수집 완료된 매장 스킵
       if (completedStores.some(store => this._normalizeStoreName(store) === this._normalizeStoreName(storeName))) {
-        Utils.updateProgressModal({ debug: `⏭️ 오늘 이미 수집 완료됨, 건너뜀` });
-        Utils.updateMultiStoreStoreResult('success', '⏭️ 오늘 이미 수집됨');
-        storeResults.push({ storeName, completed: true, status: 'ok', skipped: true, note: '오늘 이미 수집됨' });
+        Utils.updateProgressModal({ debug: `⏭️ 기준일 이미 수집 완료됨, 건너뜀` });
+        Utils.updateMultiStoreStoreResult('success', '⏭️ 기준일 이미 수집됨');
+        storeResults.push({ storeName, completed: true, status: 'ok', skipped: true, note: '기준일 이미 수집됨' });
+        continue;
+      }
+
+      const ordersBeaconDateStr = checkpointDate;
+      const ordersBeacon = opts.targetDateMode === 'today'
+        ? null
+        : await Utils.checkDownloadBeacon(storeName, ordersBeaconDateStr, 'orders');
+      if (ordersBeacon) {
+        Utils.updateProgressModal({ debug: `📁 orders beacon 확인됨(${ordersBeaconDateStr}), 건너뜀: ${storeName}` });
+        Utils.updateMultiStoreStoreResult('success', '📁 이미 수집됨 (beacon)');
+        if (!this._stopFlag && !completedStores.some(store => this._normalizeStoreName(store) === this._normalizeStoreName(storeName))) {
+          completedStores.push(storeName);
+          await this._saveOrdersCheckpoint({ date: Utils.getTodayStr(), targetDate: checkpointDate, completedStores: [...completedStores] });
+        }
+        storeResults.push({ storeName, completed: true, status: 'ok', skipped: true, note: 'beacon: 다운로드 파일 확인' });
         continue;
       }
 
       Utils.updateProgressModal({ debug: `→ 매장 선택 시도` });
 
+      const hasPriorCompletedStore = completedStores.length > 0 || storeResults.some(r => r.completed || r.skipped);
+      // 대상이 이미 현재 표시 매장이면 매장 전환(네비게이션)이 없음 → reload 재개 예약 불필요
+      // (예약하면 진전 없이 reloadCount 만 소모되어 마지막 selected 매장이 백필 이월됨)
+      const alreadyCurrent = this._isCurrentOrdersStore(storeName);
+      if (matchingStores.length > 1 && hasPriorCompletedStore && !alreadyCurrent) {
+        const reloadCount = await this._loadOrdersBatchReloadCount();
+        if (reloadCount >= MAX_STORE_RELOAD) {
+          Utils.updateProgressModal({ debug: `⚠️ 멀티매장 reload 재개 한도 초과 (${reloadCount}/${MAX_STORE_RELOAD}) — 남은 매장 백필 이월` });
+          this._appendRemainingOrdersDeferred(matchingStores, storeResults, '매장전환 reload 재개 한도 초과 → 백필');
+          forcedPartialComplete = true;
+          break;
+        }
+        await this._saveOrdersBatchRestart(opts, matchingStores, reloadCount + 1);
+        Utils.updateProgressModal({ debug: `💾 매장전환 reload 재개 예약 (${reloadCount + 1}/${MAX_STORE_RELOAD}): ${storeName}` });
+      }
+
       const selected = await this._selectStoreInOrdersDropdown(storeName);
+      if (matchingStores.length > 1) {
+        await this._clearOrdersBatchRestartKeys();
+      }
       if (!selected) {
         Utils.updateProgressModal({ debug: `❌ 매장 선택 실패` });
         Utils.updateMultiStoreStoreResult('error', '매장 선택 실패');
@@ -2069,20 +2622,30 @@ ${filename}`;
       if (!this._isDashboardBatchOrders(opts)) {
         Utils.updateProgressModal({ debug: `📅 수동 수집: 현재 날짜 그대로 사용` });
       } else {
-        Utils.updateProgressModal({ debug: `📅 주문일 설정 중 (어제~어제)` });
-        dateSet = await this._setOrdersDateToYesterday();
+        const targetDate = this._resolveBatchTargetDate(opts);
+        Utils.updateProgressModal({ debug: `📅 주문일 설정 중 (${this._batchTargetDateLabel(opts)}~${this._batchTargetDateLabel(opts)})` });
+        dateSet = await this._setOrdersDateToYesterday(targetDate);
         Utils.updateProgressModal({ debug: dateSet ? `✅ 주문일 설정 완료` : `⚠️ 주문일 설정 실패, 기존 날짜로 진행` });
       }
-      await this._randomDelay(300, 500);
+      if (this._isSafeOrdersPacingEnabled()) {
+        await this._randomDelay(1200, 3500);
+      } else {
+        await this._randomDelay(300, 500);
+      }
 
       const prevCount = this._getExpectedOrderCount();
       Utils.updateProgressModal({ debug: `📊 prevCount = ${prevCount}건` });
 
       let searched = false;
-      for (let r = 0; r < 3 && !searched; r++) {
+      for (let r = 0; r < 1 && !searched; r++) {
         Utils.updateProgressModal({ debug: `🔍 조회 버튼 클릭 (${r + 1}차)` });
-        if (r > 0) await this._randomDelay(400, 600);
+        if (r > 0) await this._randomDelay(1500, 4500);
         searched = await this._clickOrdersSearchButton();
+        if (this._hardThrottled) break;
+      }
+      if (this._hardThrottled) {
+        await this._pushOrdersBlockedCurrentStore(storeName, storeResults);
+        continue;
       }
       if (!searched) {
         Utils.updateProgressModal({ debug: `❌ 조회 버튼 클릭 실패, 건너뜀` });
@@ -2098,20 +2661,47 @@ ${filename}`;
       const newCount = this._getExpectedOrderCount();
       Utils.updateProgressModal({ debug: `✅ 데이터 로드 완료 (${newCount}건)` });
 
-      // 0건: 어제 주문 없는 정상 상황 → 체크포인트만 저장하고 다음 매장으로
-      if (newCount === 0) {
-        Utils.updateProgressModal({ debug: `ℹ️ 0건 확인 (어제 주문 없음) — 다음 매장으로` });
+      // 0건: 기준일 주문 없는 정상 상황 → 체크포인트만 저장하고 다음 매장으로
+      if (this._isNormalZeroOrders({ requireNotice: true })) {
+        Utils.updateProgressModal({ debug: `ℹ️ 0건 확인 (기준일 주문 없음) — 다음 매장으로` });
+        Utils.updateMultiStoreStoreResult('success', '0건');
         if (!this._stopFlag) {
           completedStores.push(storeName);
-          await this._saveOrdersCheckpoint({ date: today, completedStores: [...completedStores] });
+          await this._saveOrdersCheckpoint({ date: Utils.getTodayStr(), targetDate: checkpointDate, completedStores: [...completedStores] });
         }
-        storeResults.push({ storeName, completed: !this._stopFlag, status: this._stopFlag ? 'warn' : 'ok', note: '0건' });
+        storeResults.push({ storeName, completed: !this._stopFlag, status: this._stopFlag ? 'warn' : 'ok', zeroOrders: true, note: '0건' });
+        continue;
+      }
+
+      if (this._checkOrdersHardThrottle()) {
+        await this._pushOrdersBlockedCurrentStore(storeName, storeResults);
         continue;
       }
 
       const shopInfo = this._getShopInfo();
       const collected = await this._collectOrdersWithValidation(shopInfo, true, { skipValidation: !dateSet });
+      if (this._hardThrottled) {
+        await this._pushOrdersBlockedCurrentStore(storeName, storeResults);
+        continue;
+      }
       if (!collected) {
+        const r = this._lastOrdersCollectResult || {};
+        const throttled = !this._stopFlag && (
+          r.partialThrottle || r.detailBlocked ||
+          this._hadRecentOrdersTransientError() || this._isOrdersThrottleVisible()
+        );
+        if (throttled) {
+          // Soft throttle is deferred to backfill to avoid same-day retry loops.
+          Utils.updateProgressModal({ debug: `현재 매장 백필 이월 후 다음 매장 진행 - ${r.note || '수집 제한/경고'}` });
+          Utils.updateMultiStoreStoreResult('blocked', '⚠️ 수집 제한/경고 — 백필 이월');
+          storeResults.push({
+            storeName, completed: false, blocked: true, partialThrottle: true,
+            status: 'warn', note: r.note || '수집 제한/경고 → 백필'
+          });
+          this._hardThrottled = false;
+          await this._waitAfterOrdersBlockedStore();
+          continue;
+        }
         Utils.updateMultiStoreStoreResult('error', '수집 결과 없음');
         storeResults.push({ storeName, completed: false, status: this._stopFlag ? 'warn' : 'fail', error: true, note: this._stopFlag ? '중단됨' : '수집 결과 없음' });
         continue;
@@ -2120,34 +2710,48 @@ ${filename}`;
       // 매장 수집 완료 → 체크포인트 갱신
       if (!this._stopFlag) {
         completedStores.push(storeName);
-        await this._saveOrdersCheckpoint({ date: today, completedStores: [...completedStores] });
+        await this._saveOrdersCheckpoint({ date: Utils.getTodayStr(), targetDate: checkpointDate, completedStores: [...completedStores] });
         Utils.updateProgressModal({ debug: `💾 체크포인트 저장 (완료: ${completedStores.length}/${matchingStores.length}개)` });
       }
       storeResults.push({ storeName, completed: !this._stopFlag, status: this._stopFlag ? 'warn' : 'ok', note: this._stopFlag ? '중단됨' : '완료' });
     }
 
+    const hasResultForEveryStore = matchingStores.every(storeName => {
+      const key = this._normalizeStoreName(storeName || '');
+      return storeResults.some(r => this._normalizeStoreName(r.storeName || '') === key);
+    });
+    const allStoresSettled = hasResultForEveryStore && storeResults.every(r => (
+      r.completed || r.blocked || r.hardThrottle || r.partialThrottle || r.error || r.status === 'fail' || r.status === 'warn'
+    ));
+    const allStoresFinishedCleanly = hasResultForEveryStore && storeResults.every(r => (
+      r.completed || r.blocked || r.hardThrottle
+    ));
+
+    if (!allStoresSettled && !this._stopFlag) {
+      Utils.updateProgressModal({ debug: `⏸️ 멀티매장 중간 run 종료 — 완료신호 보류 (완료: ${completedStores.length}/${matchingStores.length})` });
+      return;
+    }
+
     // 모든 매장 완료 → 체크포인트 삭제
-    if (!this._stopFlag) {
+    if (!this._stopFlag && allStoresFinishedCleanly) {
       await this._clearOrdersCheckpoint();
+      await this._clearOrdersBatchResumeState();
+    } else if (forcedPartialComplete || this._stopFlag) {
+      await this._clearOrdersBatchRestartKeys();
     }
 
     Utils.finalizeMultiStoreModal();
 
     // ── runner 대시보드에 완료 신호 ──
-    if (window.top === window.self) {
-      try {
-        chrome.runtime.sendMessage({
-          type: 'MULTISTORE_COMPLETE',
-          payload: {
-            category: 'orders',
-            storeCount: matchingStores.length,
-            completedCount: storeResults.filter(r => r.completed).length,
-            stopped: !!this._stopFlag,
-            storeResults
-          }
-        }).catch(() => {});
-      } catch (_) {}
-    }
+    this._sendOrdersCompletePayload({
+      category: 'orders',
+      storeCount: matchingStores.length,
+      completedCount: storeResults.filter(r => r.completed).length,
+      stopped: !!this._stopFlag,
+      zeroOrders: storeResults.length > 0 && storeResults.every(r => r.zeroOrders),
+      partialThrottle: storeResults.some(r => r.partialThrottle),
+      storeResults
+    });
   },
 
   _loadOrdersCheckpoint() {
@@ -2170,6 +2774,45 @@ ${filename}`;
     });
   },
 
+  _loadOrdersBatchReloadCount() {
+    return new Promise((resolve) => {
+      chrome.storage.local.get(['ce_orders_batch_reload_count'], (r) => {
+        resolve(Number(r.ce_orders_batch_reload_count || 0));
+      });
+    });
+  },
+
+  _saveOrdersBatchRestart(opts, matchingStores, reloadCount) {
+    const today = Utils.getTodayStr();
+    return new Promise((resolve) => {
+      chrome.storage.local.set({
+        ce_orders_restart: { date: today },
+        ce_current_target_stores: Array.isArray(opts.targetStores) ? opts.targetStores : matchingStores,
+        ce_current_target_date: opts.targetDate || '',
+        ce_current_target_date_mode: opts.targetDateMode || 'yesterday',
+        ce_orders_batch_reload_count: reloadCount
+      }, resolve);
+    });
+  },
+
+  _clearOrdersBatchRestartKeys() {
+    return new Promise((resolve) => {
+      chrome.storage.local.remove(['ce_orders_restart', 'ce_orders_batch_reload_count'], resolve);
+    });
+  },
+
+  _clearOrdersBatchResumeState() {
+    return new Promise((resolve) => {
+      chrome.storage.local.remove([
+        'ce_orders_restart',
+        'ce_current_target_stores',
+        'ce_current_target_date',
+        'ce_current_target_date_mode',
+        'ce_orders_batch_reload_count'
+      ], resolve);
+    });
+  },
+
   async _getOrdersDropdownStores() {
     const toggleBtn = document.querySelector('.dropdown-btn.highlight');
     if (!toggleBtn) return [];
@@ -2188,9 +2831,25 @@ ${filename}`;
     return items;
   },
 
+  // storeText 가 현재 표시(selected) 매장과 같으면 true — 재클릭/이동 불필요
+  _isCurrentOrdersStore(storeText) {
+    const curText = document.querySelector('.dropdown-btn.highlight')?.textContent?.trim();
+    if (!curText) return false;
+    const targetKey = this._normalizeStoreName(storeText);
+    const curKey = this._normalizeStoreName(curText);
+    if (!targetKey || !curKey) return false;
+    return curKey === targetKey || curKey.includes(targetKey) || targetKey.includes(curKey);
+  },
+
   async _selectStoreInOrdersDropdown(storeText) {
     const toggleBtn = document.querySelector('.dropdown-btn.highlight');
     if (!toggleBtn) return false;
+
+    // 이미 현재 표시 중인 매장이면 드롭다운을 열지 않고 즉시 성공 처리
+    // (같은 매장 재클릭 → 불필요한 페이지 이동/reload 재개 유발 방지)
+    if (this._isCurrentOrdersStore(storeText)) {
+      return true;
+    }
 
     toggleBtn.click();
 
@@ -2230,6 +2889,9 @@ ${filename}`;
   },
 
   async _clickOrdersSearchButton() {
+    const canSearch = await this._waitBeforeOrdersSearch();
+    if (canSearch === false || this._hardThrottled) return false;
+
     const selectors = [
       'button.button--defaultOutlined',
       'button.css-casqo8',
@@ -2240,7 +2902,9 @@ ${filename}`;
       const btns = document.querySelectorAll(sel);
       for (const btn of btns) {
         if (btn.querySelector('svg') && !btn.disabled && btn.offsetParent !== null) {
+          this._markExistingNoticesStale();
           btn.click();
+          this._lastOrdersSearchAt = Date.now();
           await this._randomDelay(300, 500);
           return true;
         }
@@ -2251,7 +2915,9 @@ ${filename}`;
     for (const btn of document.querySelectorAll('button')) {
       const path = btn.querySelector('svg path');
       if (path && path.getAttribute('d')?.includes('M3.11 3.608') && !btn.disabled && btn.offsetParent !== null) {
+        this._markExistingNoticesStale();
         btn.click();
+        this._lastOrdersSearchAt = Date.now();
         await this._randomDelay(300, 500);
         return true;
       }
@@ -2260,9 +2926,9 @@ ${filename}`;
     return false;
   },
 
-  async _setOrdersDateToYesterday() {
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
+  async _setOrdersDateToYesterday(targetDateObj = null) {
+    const yesterday = targetDateObj ? new Date(targetDateObj) : new Date();
+    if (!targetDateObj) yesterday.setDate(yesterday.getDate() - 1);
     yesterday.setHours(0, 0, 0, 0);
     const ariaLabel = yesterday.toDateString();
     const visibleLabel = `${yesterday.getFullYear()}.${yesterday.getMonth() + 1}.${yesterday.getDate()}`;
@@ -2574,6 +3240,8 @@ ${filename}`;
     let stableCount = 0;
     let lastSeen = -1;
     while (Date.now() - start < timeoutMs) {
+      if (this._hasNoOrdersNotice()) return true;
+      if (this._checkOrdersHardThrottle()) return false;
       const count = this._getExpectedOrderCount();
       const sales = this._getExpectedSalesTotal();
       if (count > 0 || sales > 0) {
@@ -2591,7 +3259,9 @@ ${filename}`;
         await new Promise(r => setTimeout(r, 100));
       }
     }
-    return false;
+    const finalCount = this._getExpectedOrderCount();
+    const finalSales = this._getExpectedSalesTotal();
+    return finalCount === 0 && finalSales === 0 && !this._isOrdersThrottleVisible();
   },
 
   async _waitForOrdersCountChange(prevCount, timeoutMs = 8000) {
@@ -2599,6 +3269,7 @@ ${filename}`;
     const effectiveTimeout = prevCount === 0 ? 3000 : timeoutMs;
     const start = Date.now();
     while (Date.now() - start < effectiveTimeout && !this._stopFlag) {
+      if (this._checkOrdersHardThrottle()) return;
       const cur = this._getExpectedOrderCount();
       if (cur !== prevCount) return;
       await new Promise(r => setTimeout(r, 100));
@@ -2625,28 +3296,58 @@ ${filename}`;
     const iso = new Date().toISOString();
     let pageCount = seed.pageCount || 0;
     let hasError = false;
+    let storeDeadlineExceeded = false;
+    let detailBlockedInStore = false;
+    let reachedEnd = false;
     let emptyPageCount = 0;
+    let lastPage = this._getCurrentPage();
     const collectedOrderIds = seed.collectedOrderIds || new Set();
-    let recoveryCount = 0;
-    const MAX_RECOVERY = 3;
-    const _originalEndDateMs = seed._originalEndDateMs || this._readOrdersDateRange().end;
+    let failureNote = '';
+    const currentRange = this._readOrdersDateRange();
+    const _originalStartDateMs = seed._originalStartDateMs || currentRange.start;
+    const _originalEndDateMs = seed._originalEndDateMs || currentRange.end;
     const _dateRestartCount = seed._dateRestartCount || 0;
+    let storeDeadlineMs = seed._storeDeadlineMs || (Date.now() + this.ORDERS_STORE_BUDGET_MS);
+    let budgetExtensions = seed._budgetExtensions || 0;
+    let lastExtensionIdCount = collectedOrderIds.size;
+    let lastExtendedPage = 0;
     let nextCheckpoint = seed.checkpointEvery > 0
       ? (seed.checkpointFrom || 0) + seed.checkpointEvery
       : 0;
 
-    const tryDateRestart = async (debugMessage, restartRows = allRows) => {
-      Utils.updateProgressModal({ debug: debugMessage });
-      const rr = await this._restartFromErrorDate(restartRows, shopInfo, _originalEndDateMs, _dateRestartCount);
-      if (!rr.restarted) return false;
-      allRows.length = 0;
-      allRows.push(...rr.newRows);
-      hasError = rr.hasError;
-      return true;
-    };
 
     while (!this._stopFlag) {
+      if (this._checkOrdersHardThrottle()) {
+        hasError = true;
+        break;
+      }
+      if (Date.now() > storeDeadlineMs) {
+        if (this._tryExtendStoreBudget({
+          extensions: budgetExtensions,
+          idCount: collectedOrderIds.size,
+          lastExtensionIdCount
+        })) {
+          budgetExtensions++;
+          storeDeadlineMs = Date.now() + this.ORDERS_STORE_BUDGET_EXTENSION_MS;
+          lastExtensionIdCount = collectedOrderIds.size;
+          Utils.updateProgressModal({
+            debug: `⏳ 매장 예산 연장 (${budgetExtensions}/${this.ORDERS_STORE_BUDGET_MAX_EXTENSIONS}) — 진전 있음 | ${this._ordersDiag({ totalRows: allRows.length, ids: collectedOrderIds.size })}`
+          });
+          continue;
+        }
+        storeDeadlineExceeded = true;
+        this._markOrdersTransientError();
+        hasError = true;
+        failureNote = '수집 제한/경고 - 매장 예산 초과';
+        Utils.updateProgressModal({
+          rowCount: allRows.length,
+          message: `매장 예산 초과 - 부분 저장/백필 처리 중...`,
+          debug: `⏱ 매장 예산 초과 — 부분 저장 후 백필 | ${this._ordersDiag({ totalRows: allRows.length, ids: collectedOrderIds.size, ext: `${budgetExtensions}/${this.ORDERS_STORE_BUDGET_MAX_EXTENSIONS}` })}`
+        });
+        break;
+      }
       const currentPage = this._getCurrentPage();
+      lastPage = currentPage;
       pageCount++;
 
       Utils.updateProgressModal({
@@ -2655,28 +3356,101 @@ ${filename}`;
         message: `${currentPage}페이지 수집 중...`
       });
 
-      const { rows: pageData, pageComplete, missingOrderIds, stableTimedOut } = await this._collectCurrentPageData(shopInfo, iso, currentPage);
+      const budgetState = {
+        deadlineMs: storeDeadlineMs,
+        extensions: budgetExtensions,
+        lastExtensionIdCount,
+        lastExtendedPage
+      };
+      const { rows: pageData, pageComplete, missingOrderIds, stableTimedOut, detailBlocked, storeDeadlineExceeded: pageDeadlineExceeded, skippedCount = 0 } = await this._collectCurrentPageData(shopInfo, iso, currentPage, storeDeadlineMs, collectedOrderIds, budgetState);
+      storeDeadlineMs = budgetState.deadlineMs;
+      budgetExtensions = budgetState.extensions;
+      lastExtensionIdCount = budgetState.lastExtensionIdCount;
+      lastExtendedPage = budgetState.lastExtendedPage;
+      if (this._checkOrdersHardThrottle()) {
+        hasError = true;
+        break;
+      }
       const restartRows = pageData.length ? [...allRows, ...pageData] : allRows;
 
-      if (stableTimedOut) {
-        if (!await tryDateRestart(`❌ ${currentPage}페이지 안정화 타임아웃 - 날짜 재시작 시도`, restartRows)) {
-          hasError = true;
-        }
+      const expectedCount = this._getExpectedOrderCount();
+      const expectedSales = this._getExpectedSalesTotal();
+      const pageHadKnownOrders = skippedCount > 0;
+      Utils.updateProgressModal({
+        debug: `페이지 수집 결과 - ${this._ordersDiag({ pageData: pageData.length, skipped: skippedCount, totalRows: allRows.length, ids: collectedOrderIds.size, expectedCount, expectedSales })}`
+      });
+      const isNormalZeroOrders = pageData.length === 0
+        && !pageHadKnownOrders
+        && expectedCount === 0
+        && expectedSales === 0
+        && !this._isOrdersThrottleVisible();
+
+      if (stableTimedOut && pageData.length > 0) {
+        Utils.updateProgressModal({ debug: `⚠️ ${currentPage}페이지 안정화 타임아웃이나 ${pageData.length}행 확인 - 중단 없이 계속 진행` });
+      }
+
+      if (stableTimedOut && pageData.length === 0 && isNormalZeroOrders) {
+        Utils.updateProgressModal({ debug: `ℹ️ ${currentPage}페이지 0건 확인 - 정상 빈 결과` });
+        reachedEnd = true;
         break;
       }
 
-      if (pageData.length === 0) {
+      if (stableTimedOut && pageData.length === 0 && !pageHadKnownOrders) {
+        this._markOrdersTransientError();
+        hasError = true;
+        failureNote = '수집 중 끊김 - 페이지 안정화 실패';
+        Utils.updateProgressModal({ debug: `페이지 안정화 타임아웃 - 재조회 없이 백필 이월` });
+        break;
+      }
+
+      if (detailBlocked || pageDeadlineExceeded) {
+        if (pageData.length > 0) {
+          const newRows = pageData.filter(r => !r.order_id || !collectedOrderIds.has(r.order_id));
+          pageData.forEach(r => {
+            if (r.order_id) collectedOrderIds.add(r.order_id);
+          });
+          if (newRows.length) allRows.push(...newRows);
+        }
+        if (detailBlocked) detailBlockedInStore = true;
+        if (pageDeadlineExceeded) storeDeadlineExceeded = true;
+        this._markOrdersTransientError();
+        hasError = true;
+        failureNote = detailBlocked ? '수집 제한/경고 - 상세패널 차단' : '수집 제한/경고 - 매장 예산 초과';
+        Utils.updateProgressModal({
+          currentPage,
+          rowCount: allRows.length,
+          message: `${currentPage}페이지 부분 수집 저장/백필 처리 중...`
+        });
+        Utils.updateProgressModal({
+          debug: detailBlocked
+            ? `🚫 상세패널 차단 감지 — 부분 저장 후 백필 | ${this._ordersDiag({ pageData: pageData.length, skipped: skippedCount, totalRows: allRows.length, ids: collectedOrderIds.size })}`
+            : `⏱ 매장 예산 초과 — 부분 저장 후 백필 | ${this._ordersDiag({ pageData: pageData.length, skipped: skippedCount, totalRows: allRows.length, ids: collectedOrderIds.size, ext: `${budgetExtensions}/${this.ORDERS_STORE_BUDGET_MAX_EXTENSIONS}` })}`
+        });
+        break;
+      }
+
+      if (pageData.length === 0 && !pageHadKnownOrders) {
         emptyPageCount++;
         Utils.updateProgressModal({ debug: `⚠️ ${currentPage}페이지 빈 페이지 (연속 ${emptyPageCount}번째)` });
+        if (this._isOrdersThrottleVisible() || this._hadRecentOrdersTransientError()) {
+          this._markOrdersTransientError();
+          hasError = true;
+          failureNote = this._isOrdersThrottleVisible() ? '수집 제한/경고 - 조회 제한 감지' : '수집 중 끊김 - 페이지 불안정';
+          break;
+        }
 
         if (emptyPageCount >= 3) {
-          if (!await tryDateRestart(`❌ 연속 3페이지 데이터 없음 - 날짜 재시작 시도`)) {
-            hasError = true;
-          }
+          this._markOrdersTransientError();
+          hasError = true;
+          failureNote = '수집 중 끊김 - 연속 빈 페이지';
+          Utils.updateProgressModal({ debug: '연속 3페이지 데이터 없음 - 재조회 없이 백필 이월' });
           break;
         }
       } else {
         emptyPageCount = 0;
+        if (!this._isOrdersThrottleVisible()) {
+          this._ordersThrottleCount = 0;
+        }
         const newRows = pageData.filter(r => !r.order_id || !collectedOrderIds.has(r.order_id));
         pageData.forEach(r => {
           if (r.order_id) collectedOrderIds.add(r.order_id);
@@ -2702,19 +3476,34 @@ ${filename}`;
       if (this._stopFlag) break;
 
       if (!pageComplete) {
-        Utils.updateProgressModal({ debug: `⚠️ ${currentPage}페이지 미완료 주문: ${missingOrderIds.join(', ')}` });
-        if (recoveryCount >= MAX_RECOVERY || !await tryDateRestart(`❌ ${currentPage}페이지 미완료 - 날짜 재시작 시도`, restartRows)) {
-          hasError = true;
-        }
-        recoveryCount++;
+        this._markOrdersTransientError();
+        hasError = true;
+        failureNote = '수집 중 끊김 - 주문 상세 미완료';
+        Utils.updateProgressModal({ debug: `페이지 미완료 주문: ${missingOrderIds.join(', ')} - 재조회 없이 백필 이월` });
         break;
       }
 
       await this._closeErrorPopups();
 
-      const hasNext = this._clickNextPage();
-      if (!hasNext) {
-        console.log('[쿠팡이츠] 마지막 페이지 도달');
+      const prevFirstOrderId = this._getFirstOrderId();
+      Utils.updateProgressModal({ debug: `다음 페이지 이동 전 - ${this._ordersDiag({ currentPage, prevFirst: prevFirstOrderId || '-', totalRows: allRows.length, ids: collectedOrderIds.size })}` });
+      let nextResult = await this._clickNextOrderPage();
+      if (!nextResult.moved && nextResult.stalled) {
+        await this._closeErrorPopups();
+        await this._randomDelay(800, 1500);
+        nextResult = await this._clickNextOrderPage();
+      }
+      if (!nextResult.moved) {
+        if (nextResult.stalled) {
+          this._markOrdersTransientError();
+          hasError = true;
+          failureNote = '페이지 이동 정체 - 재조회 없이 백필 이월';
+          Utils.updateProgressModal({ debug: `다음 페이지 이동 정체(재시도 실패) - ${this._ordersDiag({ currentPage, totalRows: allRows.length, ids: collectedOrderIds.size })}` });
+        } else {
+          Utils.updateProgressModal({ debug: `다음 페이지 없음/이동 실패 - ${this._ordersDiag({ currentPage, totalRows: allRows.length, ids: collectedOrderIds.size })}` });
+          console.log('[쿠팡이츠] 마지막 페이지 도달');
+          reachedEnd = true;
+        }
         break;
       }
 
@@ -2724,7 +3513,6 @@ ${filename}`;
         message: `${currentPage + 1}페이지 로딩 대기...`
       });
 
-      const prevFirstOrderId = this._getFirstOrderId();
       const loaded = await this._waitForPageLoad(prevFirstOrderId, 20000);
 
       if (!loaded) {
@@ -2733,30 +3521,40 @@ ${filename}`;
         Utils.updateProgressModal({
           currentPage: currentPage + 1,
           rowCount: allRows.length,
-          debug: `⚠️ ${currentPage + 1}페이지 로딩 타임아웃 - 재시도`
+          debug: `⚠️ ${currentPage + 1}페이지 로딩 타임아웃 - 재시도 | ${this._ordersDiag({ prevFirst: prevFirstOrderId || '-', totalRows: allRows.length, ids: collectedOrderIds.size })}`
         });
         await this._randomDelay(800, 1500);
         await this._closeErrorPopups();
 
         const retryLoaded = await this._waitForPageLoad(prevFirstOrderId, 10000);
         if (!retryLoaded) {
-          if (!await tryDateRestart(`❌ ${currentPage + 1}페이지 로딩 타임아웃 - 날짜 재시작 시도`)) {
+          const actualPage = this._getCurrentPage();
+          const visibleFirstOrderId = this._getFirstOrderId();
+          const visibleOrderCount = document.querySelectorAll('.order-search-result-content > li.col-12').length;
+          if (visibleOrderCount > 0 && (actualPage !== currentPage || visibleFirstOrderId !== prevFirstOrderId)) {
+            Utils.updateProgressModal({
+              currentPage: actualPage,
+              rowCount: allRows.length,
+              debug: `⚠️ 페이지 로딩 확인 실패했지만 계속 진행 - ${this._ordersDiag({ actualPage, prevFirst: prevFirstOrderId || '-', visibleFirst: visibleFirstOrderId || '-', visibleOrderCount, totalRows: allRows.length })}`
+            });
+          } else {
+            this._markOrdersTransientError();
             hasError = true;
+            failureNote = '수집 중 끊김 - 페이지 로딩 타임아웃';
+            Utils.updateProgressModal({ debug: `페이지 로딩 타임아웃 - 재조회 없이 백필 이월 | ${this._ordersDiag({ actualPage, prevFirst: prevFirstOrderId || '-', visibleFirst: visibleFirstOrderId || '-', visibleOrderCount, totalRows: allRows.length })}` });
+            break;
           }
-          break;
-        } else {
-          Utils.updateProgressModal({ debug: `✅ ${currentPage + 1}페이지 재시도 성공` });
         }
       }
 
-      if (this._collectSource === 'manual') {
-        await this._randomDelay(1200, 2000);
+      if (this._isSafeOrdersPacingEnabled()) {
+        await this._humanizeManualOrdersAfterPage();
       } else {
         await this._randomDelay(400, 700);
       }
     }
 
-    return { allRows, pageCount, hasError };
+    return { allRows, pageCount, hasError, storeDeadlineExceeded, detailBlocked: detailBlockedInStore, failureNote, resumePage: lastPage, collectedOrderIds, reachedEnd, budgetExtensions };
   },
 
   _parseOrderDateOnly(value, fallbackRange = null) {
@@ -2776,13 +3574,13 @@ ${filename}`;
   },
 
   _getRestartDateFromRows(rows) {
-    let maxDate = null;
+    let minDate = null;
     for (const row of rows || []) {
       const d = this._parseOrderDateOnly(row?.order_date);
       if (!d) continue;
-      if (!maxDate || d.getTime() > maxDate.getTime()) maxDate = d;
+      if (!minDate || d.getTime() < minDate.getTime()) minDate = d;
     }
-    return maxDate;
+    return minDate;
   },
 
   _isOrderRowBeforeDate(row, compareDate) {
@@ -2790,26 +3588,31 @@ ${filename}`;
     return !!d && d.getTime() < compareDate.getTime();
   },
 
-  async _restartFromErrorDate(safeRows, shopInfo, originalEndDateMs, dateRestartCount = 0) {
-    if (this._collectSource !== 'manual') return { restarted: false };
-    if (dateRestartCount >= 1) return { restarted: false };
+  async _restartFromErrorDate(safeRows, shopInfo, originalStartDateMs, originalEndDateMs, dateRestartCount = 0) {
+    if (!this._isSafeOrdersPacingEnabled()) return { restarted: false };
+    if (dateRestartCount >= 3) return { restarted: false };
     if (this._stopFlag) return { restarted: false, stopped: true };
 
     const restartDateObj = this._getRestartDateFromRows(safeRows);
     if (!restartDateObj) return { restarted: false };
 
+    const startDateMs = parseInt(originalStartDateMs, 10);
+    const startDateObj = isNaN(startDateMs) ? restartDateObj : new Date(startDateMs);
     const endDateMs = parseInt(originalEndDateMs, 10);
-    const endDateObj = isNaN(endDateMs) ? new Date() : new Date(endDateMs);
-    endDateObj.setHours(0, 0, 0, 0);
-    const preRows = (safeRows || []).filter(r => this._isOrderRowBeforeDate(r, restartDateObj));
-    const restartLabel = `${restartDateObj.getFullYear()}.${restartDateObj.getMonth() + 1}.${restartDateObj.getDate()}`;
-    const endLabel = `${endDateObj.getFullYear()}.${endDateObj.getMonth() + 1}.${endDateObj.getDate()}`;
+    const originalEndDateObj = isNaN(endDateMs) ? new Date() : new Date(endDateMs);
+    startDateObj.setHours(0, 0, 0, 0);
+    originalEndDateObj.setHours(0, 0, 0, 0);
+    const preRows = safeRows || [];
+    const originalEndLabel = `${originalEndDateObj.getFullYear()}.${originalEndDateObj.getMonth() + 1}.${originalEndDateObj.getDate()}`;
+    const restartStartObj = new Date(Math.max(restartDateObj.getTime(), startDateObj.getTime()));
+    restartStartObj.setHours(0, 0, 0, 0);
+    const restartLabel = `${restartStartObj.getFullYear()}.${restartStartObj.getMonth() + 1}.${restartStartObj.getDate()}`;
 
     Utils.updateProgressModal({
-      debug: `⚠️ 에러 발생 → ${restartLabel} ~ ${endLabel} 날짜 재조회 시작`
+      debug: `⚠️ 에러 발생 → 역순 이어수집 ${restartLabel} ~ ${originalEndLabel} 재조회 시작`
     });
 
-    const ok = await this._setOrdersDateRange(restartDateObj, endDateObj);
+    const ok = await this._setOrdersDateRange(restartStartObj, originalEndDateObj);
     if (!ok || this._stopFlag) return { restarted: false, stopped: this._stopFlag };
 
     const prevCount = this._getExpectedOrderCount();
@@ -2823,6 +3626,7 @@ ${filename}`;
       allRows: preRows,
       collectedOrderIds: new Set(preRows.map(r => r.order_id).filter(Boolean)),
       pageCount: 0,
+      _originalStartDateMs: originalStartDateMs,
       _originalEndDateMs: originalEndDateMs,
       _dateRestartCount: dateRestartCount + 1
     };
@@ -3055,6 +3859,68 @@ ${filename}`;
     return { startMs, endMs };
   },
 
+  async _resumeOrdersRange(remainingStartMs, remainingEndMs, shopInfo, resumeDepth) {
+    const MAX_MANUAL_RESUME = 10;
+    if (resumeDepth >= MAX_MANUAL_RESUME) {
+      Utils.showSuccessModal('이어수집 중단', `자동 이어수집 최대 횟수(${MAX_MANUAL_RESUME}회)에 도달했습니다.`, { status: 'warning' });
+      return false;
+    }
+
+    this._stopFlag = false;
+    await this._applyOrdersDateRange(remainingStartMs, remainingEndMs);
+    const prevCount = this._getExpectedOrderCount();
+    const searched = await this._clickOrdersSearchButton();
+    if (searched) {
+      await this._waitForOrdersCountChange(prevCount, 8000);
+      await this._waitForOrdersDataReady(8000);
+      await this._collectOrdersManualWithCheckpoints(shopInfo, resumeDepth + 1, {
+        start: String(remainingStartMs),
+        end: String(remainingEndMs)
+      });
+    } else {
+      Utils.showSuccessModal('수집 중단', '이어수집 검색 버튼을 찾지 못했습니다.', { status: 'warning' });
+    }
+    return !!searched;
+  },
+
+  async _resumeOrdersCurrentPage(shopInfo, resumeDepth, seed = {}) {
+    const MAX_MANUAL_RESUME = 10;
+    if (resumeDepth >= MAX_MANUAL_RESUME) {
+      Utils.showSuccessModal('이어수집 중단', `자동 이어수집 최대 횟수(${MAX_MANUAL_RESUME}회)에 도달했습니다.`, { status: 'warning' });
+      return false;
+    }
+
+    const waitMs = 90000 + Math.floor(Math.random() * 60001);
+    Utils.updateProgressModal({
+      message: `${seed.resumePage || this._getCurrentPage()}페이지 대기 후 이어수집 준비 중...`,
+      debug: `현재 페이지 이어수집 - ${Math.ceil(waitMs / 1000)}초 대기 | page=${seed.resumePage || this._getCurrentPage()}, rows=${(seed.allRows || []).length}, ids=${seed.collectedOrderIds?.size || 0}`
+    });
+    await new Promise(r => setTimeout(r, waitMs));
+    if (this._stopFlag) return false;
+
+    const resumePage = seed.resumePage || this._getCurrentPage();
+    if (this._getCurrentPage() !== resumePage) {
+      Utils.updateProgressModal({ debug: `현재 페이지 이어수집 - ${resumePage}페이지 복귀 시도(재조회 없음)` });
+      await this._recoverToPage(resumePage, false);
+    }
+
+    const resumeSeed = {
+      allRows: seed.allRows || [],
+      collectedOrderIds: seed.collectedOrderIds || new Set((seed.allRows || []).map(r => r.order_id).filter(Boolean)),
+      pageCount: seed.pageCount || 0,
+      _originalStartDateMs: seed._originalStartDateMs,
+      _originalEndDateMs: seed._originalEndDateMs,
+      _budgetExtensions: 0,
+      _storeDeadlineMs: Date.now() + this.ORDERS_STORE_BUDGET_MS
+    };
+    Utils.updateProgressModal({
+      message: `${resumePage}페이지에서 이어수집 중...`,
+      debug: `현재 페이지 이어수집 시작 - 조회 버튼 클릭 없음 | page=${resumePage}, rows=${resumeSeed.allRows.length}, ids=${resumeSeed.collectedOrderIds.size}`
+    });
+    const result = await this._collectOrdersPages(shopInfo, resumeSeed);
+    return result;
+  },
+
   async _showResumeRangeModal(remainingStartMs, remainingEndMs, shopInfo, originalRange, resumeDepth) {
     const fmtDate = (ms) => {
       const d = new Date(ms);
@@ -3091,20 +3957,7 @@ ${filename}`;
 
       modal.querySelector('#__ce_resume_btn').onclick = async () => {
         overlay.remove();
-        this._stopFlag = false;
-        await this._applyOrdersDateRange(remainingStartMs, remainingEndMs);
-        const prevCount = this._getExpectedOrderCount();
-        const searched = await this._clickOrdersSearchButton();
-        if (searched) {
-          await this._waitForOrdersCountChange(prevCount, 8000);
-          await this._waitForOrdersDataReady(8000);
-          await this._collectOrdersManualWithCheckpoints(shopInfo, resumeDepth + 1, {
-            start: String(remainingStartMs),
-            end: String(remainingEndMs)
-          });
-        } else {
-          Utils.showSuccessModal('수집 중단', '이어수집 검색 버튼을 찾지 못했습니다.', { status: 'warning' });
-        }
+        const searched = await this._resumeOrdersRange(remainingStartMs, remainingEndMs, shopInfo, resumeDepth);
         resolve(!!searched);
       };
     });
@@ -3122,13 +3975,24 @@ ${filename}`;
     const filename = await Utils.downloadCSV(csv, {
       channel: 'coupangeats', purpose: 'orders',
       storeName: shopInfo.store_name, storeId: shopInfo.store_id,
-      dateStr: Utils.getTodayStr()
+      dateStr: this._ordersDownloadDateStr()
     });
     Utils.updateProgressModal({ debug: `💾 저장: ${filename}` });
     return filename;
   },
 
+  _computeOrdersTotals(rows) {
+    const valid = (rows || []).filter(r => r.is_cancelled !== 'Y');
+    const sales = valid.reduce((sum, r) => {
+      const val = parseInt((r['매출액'] || '0').toString().replace(/,/g, ''), 10);
+      return sum + (isNaN(val) ? 0 : val);
+    }, 0);
+    const count = new Set(valid.map(r => r.order_id).filter(Boolean)).size;
+    return { sales, count };
+  },
+
   async _collectOrdersManualWithCheckpoints(shopInfo, _resumeDepth = 0, _activeRange = null) {
+    if (_resumeDepth === 0) this._resumeNoProgressBase = 0;
     const CHECKPOINT_EVERY = 100;
     let partialIndex = 0;
     let lastSavedUniqueCount = 0;
@@ -3144,6 +4008,8 @@ ${filename}`;
     const seed = {
       checkpointEvery: CHECKPOINT_EVERY,
       checkpointFrom: 0,
+      _originalStartDateMs: originalRange.start,
+      _originalEndDateMs: originalRange.end,
       onCheckpoint: async (rows, uniqueCount) => {
         partialIndex++;
         lastSavedUniqueCount = uniqueCount;
@@ -3151,10 +4017,14 @@ ${filename}`;
       },
     };
 
-    const { allRows, reloaded } = await this._collectOrdersPages(shopInfo, seed);
+    const { allRows, pageCount, hasError, reloaded, storeDeadlineExceeded, failureNote, resumePage, collectedOrderIds, reachedEnd } = await this._collectOrdersPages(shopInfo, seed);
     if (reloaded) return false;
 
     if (!allRows.length) {
+      if (hasError || this._hadRecentOrdersTransientError()) {
+        Utils.showSuccessModal('수집 중단', failureNote || '수집 중 끊김 - 빈 결과', { status: 'warning' });
+        return false;
+      }
       Utils.showSuccessModal('데이터 없음', '추출할 주문이 없습니다.', { status: 'error' });
       return false;
     }
@@ -3187,20 +4057,73 @@ ${filename}`;
     const countMatch = expectedCount === 0 || collectedCount === expectedCount;
 
     if (!salesMatch || !countMatch) {
+      const uniqueAllCount = new Set(allRows.map(r => r.order_id).filter(Boolean)).size;
       Utils.updateProgressModal({
-        debug: `⚠️ 수집 검증 불일치 - 주문 ${collectedCount}/${expectedCount || '읽기 실패'}, 매출 ${collectedSales.toLocaleString()}원/${expectedSales ? expectedSales.toLocaleString() + '원' : '읽기 실패'}`
+        debug: `⚠️ 수집 검증 불일치 - 주문 ${collectedCount}/${expectedCount || '읽기 실패'}, 매출 ${collectedSales.toLocaleString()}원/${expectedSales ? expectedSales.toLocaleString() + '원' : '읽기 실패'} | rows=${allRows.length}, unique=${uniqueAllCount}, hasError=${hasError}, failure=${failureNote || '-'}`
       });
+      const hardStop = (hasError || this._hadRecentOrdersTransientError()) && !storeDeadlineExceeded;
+      if (hardStop) {
+        Utils.updateProgressModal({ debug: `검증 불일치 하드중단 - ${this._ordersDiag({ rows: allRows.length, unique: uniqueAllCount, collectedCount, expectedCount: expectedCount || 'fail', failure: failureNote || '-' })}` });
+        Utils.showSuccessModal(
+          '수집 검증 불일치',
+          `저장 완료: ${partialIndex}개 파일<br>주문: ${collectedCount}/${expectedCount || '읽기 실패'}건<br>매출: ${collectedSales.toLocaleString()}원/${expectedSales ? expectedSales.toLocaleString() + '원' : '읽기 실패'}<br>${failureNote || '수집 중 끊김 - 재조회 없이 종료'}`,
+          { status: 'warning' }
+        );
+        return true;
+      }
+      if (storeDeadlineExceeded) {
+        let resumed = await this._resumeOrdersCurrentPage(shopInfo, _resumeDepth + 1, {
+          allRows,
+          collectedOrderIds: collectedOrderIds || new Set(allRows.map(r => r.order_id).filter(Boolean)),
+          pageCount,
+          resumePage,
+          _originalStartDateMs: originalRange.start,
+          _originalEndDateMs: originalRange.end
+        });
+        let depth = _resumeDepth + 1;
+        while (resumed && resumed.storeDeadlineExceeded && !resumed.reachedEnd && !this._stopFlag && depth < 10) {
+          depth++;
+          resumed = await this._resumeOrdersCurrentPage(shopInfo, depth, {
+            allRows: resumed.allRows,
+            collectedOrderIds: resumed.collectedOrderIds,
+            pageCount: resumed.pageCount,
+            resumePage: resumed.resumePage,
+            _originalStartDateMs: originalRange.start,
+            _originalEndDateMs: originalRange.end
+          });
+        }
+        let finalRows = allRows;
+        if (resumed?.allRows?.length) {
+          finalRows = resumed.allRows;
+          partialIndex++;
+          await this._downloadOrdersPartial(resumed.allRows, shopInfo);
+        }
+        const { sales: finalSales, count: finalCount } = this._computeOrdersTotals(finalRows);
+        const finalSalesMatch = expectedSales === 0 || finalSales === expectedSales;
+        const finalCountMatch = expectedCount === 0 || finalCount === expectedCount;
+        if (finalSalesMatch && finalCountMatch) {
+          Utils.showSuccessModal('수집 완료', `총 ${partialIndex}개 파일 저장 완료`, { status: 'ok' });
+        } else {
+          Utils.showSuccessModal(
+            '수집 검증 불일치',
+            `저장 완료: ${partialIndex}개 파일<br>주문: ${finalCount}/${expectedCount || '읽기 실패'}건<br>매출: ${finalSales.toLocaleString()}원/${expectedSales ? expectedSales.toLocaleString() + '원' : '읽기 실패'}`,
+            { status: 'warning' }
+          );
+        }
+        return true;
+      }
       const bounds = this._getOrderDateBoundaries(allRows, originalRange);
-      const remaining = bounds ? this._calcRemainingRange(bounds, originalRange) : null;
-      if (remaining) {
-        await this._showResumeRangeModal(remaining.startMs, remaining.endMs, shopInfo, originalRange, _resumeDepth);
+      const remaining = (!reachedEnd && bounds) ? this._calcRemainingRange(bounds, originalRange) : null;
+      const madeProgress = uniqueAllCount > (this._resumeNoProgressBase || 0);
+      if (remaining && madeProgress) {
+        this._resumeNoProgressBase = uniqueAllCount;
+        const waitMs = 90000 + Math.floor(Math.random() * 60001);
+        Utils.updateProgressModal({ debug: `검증 불일치 - ${Math.ceil(waitMs / 1000)}초 대기 후 남은 구간 이어수집 | remaining=${new Date(remaining.startMs).toLocaleString()}~${new Date(remaining.endMs).toLocaleString()}` });
+        await new Promise(r => setTimeout(r, waitMs));
+        await this._resumeOrdersRange(remaining.startMs, remaining.endMs, shopInfo, _resumeDepth);
         return true;
       }
-      const retryRange = this._normalizeOrdersRange(originalRange);
-      if (retryRange) {
-        await this._showResumeRangeModal(retryRange.startMs, retryRange.endMs, shopInfo, originalRange, _resumeDepth);
-        return true;
-      }
+      Utils.updateProgressModal({ debug: `검증 불일치 - ${reachedEnd ? '페이지 소진' : !madeProgress ? '이전 재개 대비 진전 없음' : '남은 구간 계산 불가'}, 재조회 없이 저장본으로 종료 | ${this._ordersDiag({ rows: allRows.length, unique: uniqueAllCount, collectedCount, expectedCount: expectedCount || 'fail' })}` });
       Utils.showSuccessModal(
         '수집 검증 불일치',
         `저장 완료: ${partialIndex}개 파일<br>주문: ${collectedCount}/${expectedCount || '읽기 실패'}건<br>매출: ${collectedSales.toLocaleString()}원/${expectedSales ? expectedSales.toLocaleString() + '원' : '읽기 실패'}`,
@@ -3214,6 +4137,7 @@ ${filename}`;
   },
 
   async _collectOrdersWithValidation(shopInfo, isMultiStore = false, opts = {}) {
+    this._lastOrdersCollectResult = null;
     if (this._collectSource === 'manual' && !isMultiStore) {
       return await this._collectOrdersManualWithCheckpoints(shopInfo);
     }
@@ -3223,7 +4147,7 @@ ${filename}`;
       Utils.showProgressModal('쿠팡이츠 수집', `${shopInfo.store_name ? shopInfo.store_name + ' ' : ''}첫 페이지 로딩 중...`);
     }
 
-    const MAX_RETRY = 3;
+    const MAX_RETRY = 1;
     // ESC 대비: 마지막으로 수집된 결과 보존
     let lastResult = null;
 
@@ -3242,16 +4166,37 @@ ${filename}`;
         debug: `📊 기대값 - 매출액: ${expectedSales > 0 ? expectedSales.toLocaleString() + '원' : '읽기 실패'} | 주문: ${expectedCount > 0 ? expectedCount + '건' : '읽기 실패'}`
       });
 
-      const { allRows, pageCount, hasError, reloaded } = await this._collectOrdersPages(shopInfo);
+      const { allRows, pageCount, hasError, reloaded, storeDeadlineExceeded, detailBlocked, failureNote, resumePage, reachedEnd, budgetExtensions } = await this._collectOrdersPages(shopInfo);
 
       // F5 새로고침 재개로 넘어감 → 이후 처리는 새 페이지 로드의 _resumeOrdersFromReload 가 담당
       if (reloaded) return false;
+      if (this._checkOrdersHardThrottle()) return false;
 
       if (allRows.length === 0) {
         // ESC로 인해 빈 결과인 경우 이전 결과 사용
         if (this._stopFlag && lastResult) {
           await this._downloadOrdersResult(lastResult.allRows, shopInfo, { ...lastResult.stats, isMultiStore });
           return true;
+        }
+        const normalZeroOrders = !hasError && this._isNormalZeroOrders({ requireNotice: true });
+        if (normalZeroOrders) {
+          if (isMultiStore) {
+            Utils.updateMultiStoreStoreResult('success', '0건');
+          } else {
+            Utils.showSuccessModal('데이터 없음', `${shopInfo.store_name ? shopInfo.store_name + ': ' : ''}추출할 주문이 없습니다.`, { status: 'success' });
+          }
+          return true;
+        }
+        if (hasError || this._hadRecentOrdersTransientError()) {
+          const note = failureNote || '수집 중 끊김 - 빈 결과';
+          this._lastOrdersCollectResult = { completed: false, partial: true, partialThrottle: true, note };
+          Utils.updateProgressModal({ debug: `경고: ${note}` });
+          if (isMultiStore) {
+            Utils.updateMultiStoreStoreResult('warning', '수집 제한/불안정');
+          } else {
+            Utils.showSuccessModal('수집 제한/불안정', `${shopInfo.store_name ? shopInfo.store_name + ': ' : ''}반복 요청 제한 또는 페이지 불안정으로 빈 결과가 반환됐습니다.`, { status: 'warning' });
+          }
+          return false;
         }
         Utils.showSuccessModal('데이터 없음', `${shopInfo.store_name ? shopInfo.store_name + ': ' : ''}추출할 주문이 없습니다.`, { status: 'error' });
         return false;
@@ -3274,34 +4219,74 @@ ${filename}`;
       // 현재 결과 보존 (ESC 대비)
       lastResult = { allRows, stats: { pageCount, hasError, expectedCount, expectedSales, collectedSales, salesMatch, collectedCount, countMatch, attempt } };
 
+      const shouldPartialSave = !this._stopFlag && allRows.length > 0
+        && (hasError || this._hadRecentOrdersTransientError())
+        && (storeDeadlineExceeded || detailBlocked || this._isOrdersThrottleVisible() || this._hadRecentOrdersTransientError());
+      if (shouldPartialSave) {
+        if (this._checkOrdersHardThrottle()) return false;
+        const noteBase = failureNote || (detailBlocked ? '수집 제한/경고 - 상세패널 차단' : storeDeadlineExceeded ? '수집 제한/경고 - 매장 예산 초과' : '수집 제한/경고 - 부분 저장 후 백필');
+        const note = storeDeadlineExceeded
+          ? `${noteBase} (page=${resumePage}, ext=${budgetExtensions}/${this.ORDERS_STORE_BUDGET_MAX_EXTENSIONS})`
+          : noteBase;
+        Utils.updateProgressModal({
+          rowCount: allRows.length,
+          message: `부분 수집 결과 저장 중...`,
+          debug: `부분 저장 시작 - ${note} | rows=${allRows.length}, collected=${collectedCount}/${expectedCount || 'fail'}, sales=${collectedSales}/${expectedSales || 'fail'}`
+        });
+        await this._downloadOrdersResult(allRows, shopInfo, {
+          pageCount, hasError: true, expectedCount, expectedSales, collectedSales, salesMatch,
+          collectedCount, countMatch, attempt, isMultiStore, partial: true
+        });
+        this._lastOrdersCollectResult = { completed: false, partial: true, partialThrottle: true, storeDeadlineExceeded: !!storeDeadlineExceeded, detailBlocked: !!detailBlocked, note };
+        Utils.updateProgressModal({
+          rowCount: allRows.length,
+          message: `부분 저장 완료 - 백필 이월`,
+          debug: `부분 저장 완료 - 백필 이월 | ${note}`
+        });
+        return false;
+      }
+
       // 매출액 일치 OR 최대 재시도 OR ESC → 저장
       // 건수 불일치는 재시도 없이 경고만 표시 (h1-txt와 실제 목록 불일치는 쿠팡 UI 이슈)
-      if (salesMatch || attempt === MAX_RETRY || this._stopFlag) {
+      if ((hasError || this._hadRecentOrdersTransientError()) && !this._stopFlag) {
+        const note = failureNote || '수집 중 끊김 - 재조회 없이 백필';
+        await this._downloadOrdersResult(allRows, shopInfo, {
+          pageCount, hasError: true, expectedCount, expectedSales, collectedSales, salesMatch,
+          collectedCount, countMatch, attempt, isMultiStore, partial: true
+        });
+        this._lastOrdersCollectResult = { completed: false, partial: true, partialThrottle: true, storeDeadlineExceeded: !!storeDeadlineExceeded, detailBlocked: !!detailBlocked, note };
+        return false;
+      }
+
+      if (salesMatch || this._stopFlag) {
         await this._downloadOrdersResult(allRows, shopInfo, {
           pageCount, hasError, expectedCount, expectedSales, collectedSales, salesMatch,
           collectedCount, countMatch, attempt, isMultiStore
         });
+        this._lastOrdersCollectResult = { completed: true, partial: false, note: '완료' };
         return true;
       }
 
       Utils.updateProgressModal({
-        debug: `⚠️ 매출액 불일치 (수집: ${collectedSales.toLocaleString()}원 ≠ 기대: ${expectedSales.toLocaleString()}원) → 재조회 (${attempt}/${MAX_RETRY})`
+        debug: `매출액 불일치 (수집: ${collectedSales.toLocaleString()}원 != 기대: ${expectedSales.toLocaleString()}원) - 재조회 없이 현재 결과 저장`
       });
       if (!countMatch) {
         Utils.updateProgressModal({ debug: `ℹ️ 주문 건수: ${collectedCount}건 vs 기대: ${expectedCount}건 (경고만, 재시도 없음)` });
       }
 
-      const prevCountForRetry = this._getExpectedOrderCount();
-      await this._clickOrdersSearchButton();
-      await this._waitForOrdersCountChange(prevCountForRetry, 8000);
-      await this._waitForOrdersDataReady(8000);
+      await this._downloadOrdersResult(allRows, shopInfo, {
+        pageCount, hasError, expectedCount, expectedSales, collectedSales, salesMatch,
+        collectedCount, countMatch, attempt, isMultiStore
+      });
+      this._lastOrdersCollectResult = { completed: true, partial: false, note: '완료(검증 불일치)' };
+      return true;
     }
     return false;
   },
 
   async _downloadOrdersResult(allRows, shopInfo, stats) {
     const { pageCount, hasError, expectedCount, expectedSales, collectedSales, salesMatch,
-            collectedCount, countMatch, attempt, isMultiStore } = stats;
+            collectedCount, countMatch, attempt, isMultiStore, partial } = stats;
 
     const headers = [
       'collected_at', 'store_id', 'store_name', 'order_date', 'order_id',
@@ -3317,7 +4302,7 @@ ${filename}`;
       purpose: 'orders',
       storeName: shopInfo.store_name,
       storeId: shopInfo.store_id,
-      dateStr: Utils.getTodayStr()
+      dateStr: this._ordersDownloadDateStr()
     });
 
     const uniqueOrders = new Set(allRows.map(r => r.order_id)).size;
@@ -3336,6 +4321,10 @@ ${filename}`;
     }
 
     const cancelledLine = cancelledOrders > 0 ? `\n  - 취소 ${cancelledOrders}건 포함` : '';
+
+    if (partial) {
+      Utils.updateProgressModal({ debug: `✅ 저장 완료(부분): ${filename}` });
+    }
 
     const displayCount = collectedCount ?? uniqueOrders;
     let mismatchLine = '';

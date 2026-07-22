@@ -7,47 +7,86 @@ Sites['baemin'] = {
   match: (url) => url.includes('self.baemin.com'),
   _stopFlag: false,
   
-  async collect() {
+  async collect(opts = {}) {
     this._stopFlag = false;
+    this._batchMode = opts.source === 'batch';
     this._setupEscListener();
-    
+
     const shopInfo = this._getShopInfo();
-    
-    // 메인 페이지에서 수집 시 매장명 확인
-    if (!location.href.includes('/orders/') && 
-        !location.href.includes('/stat/') && 
-        !location.href.includes('/history/')) {
-      
-      const storeName = shopInfo.store_name || '';
-      const isDoridang = storeName.includes('도리당') || storeName.includes('곱도리탕');
-      
-      if (!isDoridang) {
-        const confirmMsg = `⚠️ 매장명 확인\n\n현재 선택된 매장:\n"${storeName}"\n\n도리당/곱도리탕 매장이 아닌 것 같습니다.\n이 매장으로 수집하시겠습니까?`;
-        
-        if (!confirm(confirmMsg)) {
-          console.log('[배민 수집] 사용자가 수집 취소');
-          Utils.showError('수집 취소', '매장을 확인하고 다시 시도해주세요.');
-          this._removeEscListener();
-          return;
+    const expectedStore = opts.expectedStore || '';
+    const expectedStoreId = opts.expectedStoreId || '';
+    let category = 'now';
+    let success = true;
+    let error = '';
+    let result = null;
+
+    try {
+      if (location.href.includes('/orders/history')) category = 'orders';
+      else if (location.href.includes('/stat/marketing/woori-shop-click')) category = 'woori';
+      else if (location.href.includes('/stat/advertisement')) category = 'ad';
+      else if (location.href.includes('/history/change/shop')) category = 'change';
+      else if (location.href.includes('/history/change/ad')) category = 'change';
+
+      // 메인 페이지에서 수집 시 매장명 확인. 배치 모드는 대시보드가 계정을 통제한다.
+      if (!this._batchMode &&
+          !location.href.includes('/orders/') &&
+          !location.href.includes('/stat/') &&
+          !location.href.includes('/history/')) {
+        const storeName = shopInfo.store_name || '';
+        const isDoridang = storeName.includes('도리당') || storeName.includes('곱도리탕');
+
+        if (!isDoridang) {
+          const confirmMsg = `⚠️ 매장명 확인\n\n현재 선택된 매장:\n"${storeName}"\n\n도리당/곱도리탕 매장이 아닌 것 같습니다.\n이 매장으로 수집하시겠습니까?`;
+
+          if (!confirm(confirmMsg)) {
+            console.log('[배민 수집] 사용자가 수집 취소');
+            Utils.showError('수집 취소', '매장을 확인하고 다시 시도해주세요.');
+            throw new Error('사용자가 수집 취소');
+          }
         }
       }
+
+      if (category === 'orders') result = await this._collectOrdersAllPages(shopInfo);
+      else if (category === 'woori') result = await this._collectMarketingData(shopInfo);
+      else if (category === 'ad') result = await this._collectAdvertisementData(shopInfo);
+      else if (location.href.includes('/history/change/ad')) result = await this._collectAdChangeHistory(shopInfo);
+      else if (category === 'change') result = await this._collectChangeHistory(shopInfo);
+      else {
+        const currentInfo = this._getShopInfo();
+        if (this._batchMode && expectedStore && !this._isSameStoreName(currentInfo.store_name, expectedStore) && currentInfo.store_id !== expectedStoreId) {
+          throw new Error(`now content 매장 불일치: 현재=${currentInfo.store_name || '미탐지'}(${currentInfo.store_id || 'id없음'}) / 목표=${expectedStore}(${expectedStoreId || 'id없음'})`);
+        }
+        result = await this._collectMetrics(currentInfo);
+      }
+
+      if (result && result.success === false) {
+        success = false;
+        error = result.error || '수집 실패';
+      }
+    } catch (e) {
+      success = false;
+      error = e?.message || String(e);
+      console.error('[배민 배치 수집] 실패:', e);
+    } finally {
+      this._removeEscListener();
+      if (this._batchMode) {
+        try {
+          chrome.runtime.sendMessage({
+            type: 'BAEMIN_CATEGORY_COMPLETE',
+            payload: {
+              category,
+              success,
+              error,
+              store_id: (result && result.store_id) || shopInfo.store_id || '',
+              store_name: (result && result.store_name) || shopInfo.store_name || '',
+              filename: (result && result.filename) || '',
+              rows: (result && result.rows) || 0
+            }
+          });
+        } catch (_) {}
+      }
+      this._batchMode = false;
     }
-    
-    if (location.href.includes('/orders/history')) {
-      await this._collectOrdersAllPages(shopInfo);
-    } else if (location.href.includes('/stat/marketing/woori-shop-click')) {
-      await this._collectMarketingData(shopInfo);
-    } else if (location.href.includes('/stat/advertisement')) {
-      await this._collectAdvertisementData(shopInfo);
-    } else if (location.href.includes('/history/change/shop')) {
-      await this._collectChangeHistory(shopInfo);
-    } else if (location.href.includes('/history/change/ad')) {
-      await this._collectAdChangeHistory(shopInfo);
-    } else {
-      this._collectMetrics(shopInfo);
-    }
-    
-    this._removeEscListener();
   },
 
   _escHandler: null,
@@ -97,20 +136,61 @@ Sites['baemin'] = {
     return areaMatch ? areaMatch[1] : '';
   },
 
+  _storeKey(name) {
+    return String(name || '')
+      .replace(/\[[^\]]*\]/g, '')
+      .replace(/닭도리탕전문/g, '')
+      .replace(/구로디지털단지점/g, '구로디지털점')
+      .replace(/[\s·ㆍ.,_\-()\[\]]+/g, '')
+      .trim();
+  },
+
+  _isSameStoreName(actual, expected) {
+    const a = this._storeKey(actual);
+    const e = this._storeKey(expected);
+    return !!a && !!e && (a === e || a.includes(e));
+  },
+
+  _parseShopOption(option) {
+    if (!option) return null;
+    const value = option.value || '';
+    let text = (option.textContent || '').replace(/\s+/g, ' ').trim();
+    text = text.replace(/^\[[^\]]+\]\s*/, '').trim();
+    text = text.split('/')[0].trim();
+    text = text.replace(/\s+\d+$/, '').trim();
+    text = text.replace(/^닭도리탕\s*전문\s*/, '').trim();
+    return { store_name: text, store_id: value, needFilter: false };
+  },
+
   _getShopInfo() {
+    const cleanText = value => (value || '').replace(/\s+/g, ' ').trim();
+    const visible = el => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const st = getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+    };
+
+    const nameEl = [...document.querySelectorAll('.ShopSelect-module__b8Mn, .ShopSelect-module__JWCr h3, h3')].find(visible);
+    const infoEl = [...document.querySelectorAll('.ShopSelect-module__j4Qm')].find(visible);
+    const visibleName = cleanText(nameEl?.textContent);
+    const visibleStoreId = infoEl?.textContent.match(/(\d+)/)?.[1] || '';
+    if (visibleName || visibleStoreId) {
+      return { store_name: visibleName, store_id: visibleStoreId, needFilter: false };
+    }
+
+    const pathStoreId = location.pathname.match(/\/shops\/(\d+)/)?.[1] || '';
+    const selectBox = document.querySelector('select.Select-module__a623, select.ShopSelect-module___pC1, .ShopSelect-module__JWCr select');
+    if (selectBox) {
+      const selectedOption = pathStoreId
+        ? [...selectBox.options].find(option => option.value === pathStoreId)
+        : selectBox.options[selectBox.selectedIndex];
+      const parsed = this._parseShopOption(selectedOption);
+      if (parsed?.store_name || parsed?.store_id) return parsed;
+    }
+
     if (location.href.includes('/history/change/shop') || location.href.includes('/history/change/ad')) {
-      const selectBox = document.querySelector('select.Select-module__a623');
-      if (selectBox) {
-        const selectedOption = selectBox.options[selectBox.selectedIndex];
-        if (selectedOption) {
-          const value = selectedOption.value;
-          const text = selectedOption.textContent.trim();
-          const nameMatch = text.match(/\[.*?\]\s*(.+?)\s+\d+$/);
-          const storeName = nameMatch ? nameMatch[1].trim() : text.replace(/\d+$/, '').trim();
-          return { store_name: storeName, store_id: value, needFilter: false };
-        }
-      }
-      return { store_name: '', store_id: '', needFilter: false };
+      return { store_name: '', store_id: pathStoreId, needFilter: false };
     }
     
     if (location.href.includes('/orders/history')) {
@@ -119,17 +199,15 @@ Sites['baemin'] = {
         const firstBadge = filterContainer.querySelector('.Badge_b_r4ax_19agxiso');
         const text = firstBadge?.textContent.trim() || '';
         if (text === '음식배달 가게 전체') {
-          return { store_name: '', store_id: '', needFilter: true };
+          return { store_name: '', store_id: pathStoreId, needFilter: true };
         }
-        return { store_name: text, store_id: '', needFilter: false };
+        return { store_name: text, store_id: pathStoreId, needFilter: false };
       }
     }
-    
-    const nameEl = document.querySelector('.ShopSelect-module__b8Mn, h3');
-    const infoEl = document.querySelector('.ShopSelect-module__j4Qm');
+
     return {
-      store_name: nameEl?.textContent.trim() || '',
-      store_id: infoEl?.textContent.match(/(\d+)/)?.[1] || '',
+      store_name: '',
+      store_id: pathStoreId,
       needFilter: false
     };
   },
@@ -344,7 +422,18 @@ Sites['baemin'] = {
             const optDivs = optionsContainer.querySelectorAll('.DetailInfo-module__n2Ro');
             for (const opt of optDivs) {
               const spans = opt.querySelectorAll('span');
-              const optName = spans[0]?.textContent.trim() || '';
+              let optName = '';
+              const nameSpan = spans[0];
+              if (nameSpan) {
+                if (nameSpan.querySelector('.DetailInfo-module__t8S5')) {
+                  const clone = nameSpan.cloneNode(true);
+                  clone.querySelector('.DetailInfo-module__t8S5')?.remove();
+                  optName = clone.textContent.trim();
+                } else {
+                  optName = nameSpan.textContent.trim();
+                }
+              }
+              if (/^[\d,]+원?$/.test(optName)) optName = menuName;
               
               let optPrice = '';
               const priceSpan = spans[1];
@@ -441,7 +530,7 @@ Sites['baemin'] = {
   async _collectOrdersAllPages(shopInfo) {
     if (shopInfo.needFilter) {
       Utils.showError('가게 필터 필요', '가게 필터를 걸어주세요.');
-      return;
+      return { success: false, error: '가게 필터 필요' };
     }
 
     this._currentShopInfo = shopInfo;
@@ -550,6 +639,7 @@ Sites['baemin'] = {
 ${filename}`;
     
     Utils.showSuccessModal(`주문 내역 수집 완료 ${statusMsg}`, details, { status });
+    return { success: true, filename, rows: allRows.length };
   },
 
   async _collectMarketingData(shopInfo) {
@@ -562,7 +652,7 @@ ${filename}`;
     
     if (!year || !month) {
       Utils.showError('날짜 정보 없음', 'URL에서 월 정보를 찾을 수 없습니다.');
-      return;
+      return { success: false, error: '날짜 정보 없음' };
     }
     
     // StoreRegistry에서 매장명 조회
@@ -572,23 +662,36 @@ ${filename}`;
       console.log(`[마케팅 수집] StoreRegistry에서 조회: ${store_id} → ${store_name}`);
     }
     
-    Utils.showProgress('마케팅 데이터 수집 중...', '전체보기 클릭');
-    
-    const expandBtn = [...document.querySelectorAll('button[data-atelier-component="Button"]')]
-      .find(btn => btn.textContent.includes('전체보기'));
-    
-    if (expandBtn) {
-      expandBtn.click();
-      await this._randomDelay(500, 800);
+    Utils.showProgress('마케팅 데이터 수집 중...', '테이블 로딩 대기');
+
+    let table = null;
+    let rows = [];
+    const waitStart = Date.now();
+    while (Date.now() - waitStart < 45000) {
+      const expandBtn = [...document.querySelectorAll('button[data-atelier-component="Button"], button')]
+        .find(btn => (btn.textContent || '').includes('전체보기'));
+
+      if (expandBtn) {
+        expandBtn.click();
+        await this._randomDelay(500, 800);
+      }
+
+      table = document.querySelector('table[data-atelier-component="Table"]') || document.querySelector('table');
+      rows = table ? [...table.querySelectorAll('tbody tr.Table_b_r4ax_1dwbr4on, tbody tr')] : [];
+      if (table && rows.length > 0) break;
+
+      Utils.showProgress('마케팅 데이터 수집 중...', `테이블 로딩 대기 ${Math.floor((Date.now() - waitStart) / 1000)}초`);
+      await this._randomDelay(800, 1200);
     }
-    
-    const table = document.querySelector('table[data-atelier-component="Table"]');
+
     if (!table) {
       Utils.showError('테이블 없음', '마케팅 데이터 테이블을 찾을 수 없습니다.');
-      return;
+      return { success: false, error: `마케팅 데이터 테이블 없음 (${location.href})` };
     }
-    
-    const rows = table.querySelectorAll('tbody tr.Table_b_r4ax_1dwbr4on');
+    if (!rows.length) {
+      Utils.showSuccess('마케팅 데이터 없음', `우가클 ${yearMonth} 테이블은 비어 있습니다.`);
+      return { success: true, empty: true, rows: 0 };
+    }
     const allRows = [];
     const iso = new Date().toISOString();
     
@@ -625,8 +728,8 @@ ${filename}`;
     }
     
     if (!allRows.length) {
-      Utils.showError('데이터 없음', '수집할 마케팅 데이터가 없습니다.');
-      return;
+      Utils.showSuccess('마케팅 데이터 없음', `우가클 ${yearMonth} 수집 결과가 비어 있습니다.`);
+      return { success: true, empty: true, rows: 0 };
     }
     
     const headers = [
@@ -649,7 +752,10 @@ ${filename}`;
     // 자동 이동
     const confirmMsg = `✅ 마케팅 데이터 수집 완료!\n\n📁 파일: ${filename}\n📊 ${allRows.length}건 수집\n\n⏭️ 주문 내역 페이지로 이동하시겠습니까?`;
     
-    Utils.navigateWithConfirm(nextUrl, confirmMsg);
+    if (!this._batchMode) {
+      await Utils.navigateWithConfirm(nextUrl, confirmMsg);
+    }
+    return { success: true, filename, rows: allRows.length };
   },
 
   async _collectAdvertisementData(shopInfo) {
@@ -661,7 +767,7 @@ ${filename}`;
     
     if (!yearMonth) {
       Utils.showError('날짜 정보 없음', 'URL에서 월 정보를 찾을 수 없습니다.');
-      return;
+      return { success: false, error: '날짜 정보 없음' };
     }
     
     const iso = new Date().toISOString();
@@ -702,7 +808,7 @@ ${filename}`;
     
     if (!rows.length) {
       Utils.showError('데이터 없음', '수집할 광고 성과 데이터가 없습니다.');
-      return;
+      return { success: false, error: '광고 성과 데이터 없음' };
     }
     
     const headers = [
@@ -713,7 +819,7 @@ ${filename}`;
     ];
     
     const csv = Utils.toCSV(headers, rows);
-    const filename = Utils.downloadCSV(csv, {
+    const filename = await Utils.downloadCSV(csv, {
       channel: 'baemin',
       purpose: 'advertisement',
       storeName: shopInfo.store_name,
@@ -722,6 +828,7 @@ ${filename}`;
     });
     
     Utils.showSuccess('광고 성과 수집 완료', `${rows.length}건 → ${filename}`);
+    return { success: true, filename, rows: rows.length };
   },
 
   _extractChartData() {
@@ -1083,7 +1190,7 @@ ${filename}`;
       Utils.showError(`데이터 없음 ${statusMsg}`, 
         `총 ${totalProcessed}개 항목 처리했으나 데이터 수집 실패`
       );
-      return;
+      return { success: false, error: '변경 이력 데이터 없음' };
     }
     
     const headers = [
@@ -1094,7 +1201,7 @@ ${filename}`;
     ];
     
     const csv = Utils.toCSV(headers, allRows);
-    const filename = Utils.downloadCSV(csv, {
+    const filename = await Utils.downloadCSV(csv, {
       channel: 'baemin',
       purpose: 'change_history',
       storeName: shopInfo.store_name,
@@ -1105,8 +1212,10 @@ ${filename}`;
     const status = this._stopFlag ? '(ESC 중단됨)' : '';
     Utils.showSuccess(
       `변경 이력 수집 완료 ${status}`, 
-      `총 ${allRows.length}행 수집 (영업임시중지: ${pauseCount}건, 휴무일: ${holidayCount}건, 운영시간: ${operationTimeCount}건)\n→ ${filename}`
+      `총 ${allRows.length}행 수집 (영업임시중지: ${pauseCount}건, 휴무일: ${holidayCount}건, 운영시간: ${operationTimeCount}건)
+→ ${filename}`
     );
+    return { success: true, filename, rows: allRows.length };
   },
 
   _parseChangeHistoryItem(item, iso, shopInfo, areaName) {
@@ -1503,61 +1612,52 @@ ${filename}`;
 
   async _collectMetrics(shopInfo) {
     const LABELS = ['조리소요시간', '주문접수시간', '최근재주문율', '조리시간준수율', '주문접수율', '최근별점'];
-    let cards = document.querySelectorAll('.WooriShopNowCard-module__rcFf');
-    if (!cards.length) cards = document.querySelectorAll('div[data-atelier-component="Container"]');
-
-    const rows = [];
+    const RATIO = new Set(['조리시간준수율', '주문접수율', '최근재주문율']);
     const iso = new Date().toISOString();
+    const data = {
+      collected_at: iso,
+      store_id: shopInfo.store_id,
+      store_name: shopInfo.store_name,
+      cardIndex: 0,
+      url: location.href,
+      조리소요시간: '', 조리소요시간_순위구분: '', 조리소요시간_순위비율: '',
+      주문접수시간: '', 주문접수시간_순위구분: '', 주문접수시간_순위비율: '',
+      최근재주문율: '', 
+      조리시간준수율: '', 조리시간준수율_순위구분: '', 조리시간준수율_순위비율: '',
+      주문접수율: '', 주문접수율_순위구분: '', 주문접수율_순위비율: '',
+      최근별점: ''
+    };
+    let filledCount = 0;
 
-    cards.forEach((card, idx) => {
-      const data = {
-        collected_at: iso,
-        store_id: shopInfo.store_id,
-        store_name: shopInfo.store_name,
-        cardIndex: idx,
-        url: location.href,
-        조리소요시간: '', 조리소요시간_순위구분: '', 조리소요시간_순위비율: '',
-        주문접수시간: '', 주문접수시간_순위구분: '', 주문접수시간_순위비율: '',
-        최근재주문율: '', 
-        조리시간준수율: '', 조리시간준수율_순위구분: '', 조리시간준수율_순위비율: '',
-        주문접수율: '', 주문접수율_순위구분: '', 주문접수율_순위비율: '',
-        최근별점: ''
-      };
+    const items = document.querySelectorAll('.WooriShopNowItem-module__TKcC');
+    for (const item of items) {
+      const spans = item.querySelectorAll('span');
+      if (spans.length < 2) continue;
 
-      for (const labelEl of card.querySelectorAll('span[data-atelier-component="Typography"]')) {
-        const label = labelEl.textContent.trim();
-        if (!LABELS.includes(label)) continue;
+      const label = spans[0].textContent.trim();
+      if (!LABELS.includes(label)) continue;
 
-        const { value, rank } = this._findValueAndRank(labelEl, LABELS);
-        const num = value?.match(/[\d.]+/)?.[0];
-        const rankMatch = rank?.match(/^(상위|하위)\s*(\d+(?:\.\d+)?)%$/);
+      const rawVal = spans[1].textContent.trim();
+      const rawRank = spans.length > 2 ? spans[2].textContent.trim() : '';
+      const numMatch = rawVal.match(/[\d.]+/);
+      let numStr = numMatch ? numMatch[0] : '';
+      if (numStr && RATIO.has(label)) numStr = String(parseFloat(numStr) / 100);
 
-        if (label === '조리소요시간' || label === '주문접수시간') {
-          data[label] = num || '';
-          if (rankMatch) {
-            data[`${label}_순위구분`] = rankMatch[1];
-            data[`${label}_순위비율`] = (parseFloat(rankMatch[2]) / 100).toString();
-          }
-        } else if (label === '조리시간준수율' || label === '주문접수율') {
-          data[label] = num ? (parseFloat(num) / 100).toString() : '';
-          if (rankMatch) {
-            data[`${label}_순위구분`] = rankMatch[1];
-            data[`${label}_순위비율`] = (parseFloat(rankMatch[2]) / 100).toString();
-          }
-        } else if (label === '최근재주문율') {
-          data[label] = num ? (parseFloat(num) / 100).toString() : '';
-        } else if (label === '최근별점') {
-          data[label] = num || '';
-        }
+      const rankMatch = rawRank.match(/^(상위|하위)\s*([\d.]+)%$/);
+      data[label] = numStr;
+      if (rankMatch) {
+        data[`${label}_순위구분`] = rankMatch[1];
+        data[`${label}_순위비율`] = String(parseFloat(rankMatch[2]) / 100);
       }
-      rows.push(data);
-    });
-
-    if (!rows.length) {
-      Utils.showError('데이터 없음', '수집할 메트릭이 없습니다.');
-      return;
+      if (numStr) filledCount++;
     }
 
+    if (!filledCount) {
+      Utils.showError('데이터 없음', '수집할 메트릭이 없습니다.');
+      return { success: false, error: '메트릭 데이터 없음' };
+    }
+
+    const rows = [data];
     const headers = [
       'collected_at', 'store_id', 'store_name', 'cardIndex', 'url',
       '조리소요시간', '조리소요시간_순위구분', '조리소요시간_순위비율',
@@ -1568,6 +1668,7 @@ ${filename}`;
       '최근별점'
     ];
     const csv = Utils.toCSV(headers, rows);
+    console.log(`[배민 now] 다운로드 시작: ${shopInfo.store_name} (${shopInfo.store_id}) rows=${rows.length}`);
     const filename = await Utils.downloadCSV(csv, {
       channel: 'baemin',
       purpose: 'metrics',
@@ -1575,10 +1676,11 @@ ${filename}`;
       storeId: shopInfo.store_id,
       dateStr: Utils.getTodayStr()
     });
+    console.log(`[배민 now] 다운로드 요청 완료: ${filename}`);
     
     // 매장 정보 저장 (마케팅 페이지에서 사용)
     if (shopInfo.store_id && shopInfo.store_name) {
-      Utils.StoreRegistry.save('baemin', shopInfo.store_id, shopInfo.store_name);
+      await Utils.StoreRegistry.save('baemin', shopInfo.store_id, shopInfo.store_name);
     }
     
     // 다음 페이지 URL
@@ -1587,7 +1689,18 @@ ${filename}`;
     // 자동 이동 확인
     const confirmMsg = `✅ 메트릭 수집 완료!\n\n📁 파일: ${filename}\n📊 ${rows.length}건 수집\n\n⏭️ 마케팅 페이지로 이동하시겠습니까?`;
     
-    Utils.navigateWithConfirm(nextUrl, confirmMsg);
+    if (!this._batchMode) {
+      await Utils.navigateWithConfirm(nextUrl, confirmMsg);
+    } else {
+      console.log('[배민 now] 배치 모드: 마케팅 자동 이동 생략');
+    }
+    return {
+      success: true,
+      filename,
+      rows: rows.length,
+      store_id: shopInfo.store_id,
+      store_name: shopInfo.store_name
+    };
   },
 
   _findValueAndRank(labelSpan, LABELS) {
