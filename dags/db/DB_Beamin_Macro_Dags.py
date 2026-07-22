@@ -95,7 +95,7 @@ _ALERT_EMAILS = [MAIL_CMJ_PM]
 TARGET_STORES = DELIVERY_MANUAL_TEST_STORES  # empty list means all stores
 # None: 전체 수집, "상위": 가나다순 상위 절반, "하위": 가나다순 하위 절반(나머지)
 # ex ) COLLECT_RANGE="상위" → 가나다순 상위 절반만 수집
-COLLECT_RANGE: str | None = None # 상위, 하위, None
+COLLECT_RANGE: str | None = "상위" # 상위, 하위, None
 SCHEDULED_DEFAULT_STABILITY_PROFILE = "safe_daily"
 _MACRO_ROLE_RAW = os.getenv("BAEMIN_MACRO_ROLE")
 _MACRO_ROLE = resolve_macro_role(_MACRO_ROLE_RAW)
