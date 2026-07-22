@@ -24,6 +24,12 @@ def _as_str_df(df: pd.DataFrame) -> pd.DataFrame:
     return df.fillna("").astype(str)
 
 
+def order_ym(series: pd.Series) -> pd.Series:
+    """배민 주문시각에서 주문 월(YYYY-MM)을 추출한다. 파싱 실패는 빈 문자열."""
+    matched = series.fillna("").astype(str).str.extract(r"^\s*(\d{4})\.\s*(\d{1,2})\.")
+    return (matched[0] + "-" + matched[1].str.zfill(2)).fillna("")
+
+
 def read_table(stem_path: Path, columns: list[str] | None = None) -> pd.DataFrame | None:
     """확장자 없는 경로(stem)를 받아 parquet 우선·CSV 폴백으로 읽는다.
 

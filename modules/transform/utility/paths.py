@@ -266,14 +266,38 @@ MART_DB = resolve_mart_db()
 LLM_OUTPUT_DIR = resolve_llm_output_dir()
 DASHBOARD_DB = resolve_dashboard_db()
 COLLECTION_COMPARE_PATH = MART_DB / "collection_compare" / "collection_compare.parquet"
+DELIVERY_COMMISSION_DIR = MART_DB / "delivery_commission"
+DELIVERY_COMMISSION_PATH = DELIVERY_COMMISSION_DIR / "delivery_commission.parquet"
 ITEM_MASTER_CHECKPOINT_DIR = ANALYTICS_DB / "item_master_checkpoints"
 RAW_OKPOS_SALES = resolve_raw_okpos_sales()
 RAW_UNIONPOS_SALES = resolve_raw_unionpos_sales()
-FIN_PRODUCT_CSV_PATH = MART_DB / "fin_product" / "fin_product_grp.csv"
+FIN_PRODUCT_LEGACY_CSV_PATH = MART_DB / "fin_product" / "fin_product_grp.csv"
+FIN_PRODUCT_CSV_PATH = MART_DB / "fin_product" / "fin_product_grp_input.csv"
 FIN_PRODUCT_REVIEW_CSV_PATH = MART_DB / "fin_product" / "fin_product_review.csv"
 FIN_PRODUCT_ALIAS_CSV_PATH = MART_DB / "fin_product" / "fin_product_alias.csv"
 FIN_PRODUCT_MART_CSV_PATH = MART_DB / "fin_product" / "fin_product_mart.csv"
 POSFEED_WHITELIST_CSV_PATH = MART_DB / "fin_product" / "fin_product_posfeed_whitelist.csv"
+FIN_PRODUCT_MAP_CSV_PATH = MART_DB / "fin_product" / "fin_product_map.csv"
+FIN_PRODUCT_MAP_REVIEW_LEGACY_CSV_PATH = MART_DB / "fin_product" / "fin_product_map_review.csv"
+FIN_PRODUCT_MAP_REVIEW_CSV_PATH = MART_DB / "fin_product" / "fin_product_map_review_input.csv"
+FIN_PRODUCT_MAP_RECENTLY_CSV_PATH = MART_DB / "fin_product" / "fin_product_map_recently.csv"
+FIN_PRODUCT_MAP_JOIN_CSV_PATH = MART_DB / "fin_product" / "fin_product_map_join.csv"
+FIN_PRODUCT_MAP_TRAIN_JSON_PATH = MART_DB / "fin_product" / "fin_product_map_train.json"
+FIN_PRODUCT_RULES_JSON_PATH = MART_DB / "fin_product" / "fin_product_rules.json"
+FIN_PRODUCT_RULES_MANUAL_JSON_PATH = MART_DB / "fin_product" / "fin_product_rules_manual.json"
+ORDER_CROSS_DIR = MART_DB / "order_cross_analysis"
+
+
+def existing_fin_product_csv_path() -> Path:
+    return FIN_PRODUCT_CSV_PATH if FIN_PRODUCT_CSV_PATH.exists() else FIN_PRODUCT_LEGACY_CSV_PATH
+
+
+def existing_fin_product_map_review_csv_path() -> Path:
+    return (
+        FIN_PRODUCT_MAP_REVIEW_CSV_PATH
+        if FIN_PRODUCT_MAP_REVIEW_CSV_PATH.exists()
+        else FIN_PRODUCT_MAP_REVIEW_LEGACY_CSV_PATH
+    )
 
 STORE_SALES_TARGET_DIR = ANALYTICS_DB / "store_sales_target"
 STORE_SALES_TARGET_CSV = STORE_SALES_TARGET_DIR / "target.csv"

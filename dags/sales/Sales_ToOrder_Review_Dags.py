@@ -17,10 +17,10 @@ from modules.transform.pipelines.sales.Sales_ToOrder_Review_collect import (
 )
 
 # ── 수집 기간 설정 ─────────────────────────────────────────────────────
-LOOKBACK_DAYS = 7                       # None                      → 어제 하루만
-#                  7                       → 7일 전 ~ 어제 (7일치)
-#                  "2026-01-01"            → 해당 날짜 ~ 어제
-#                  "2026-01-01~2026-01-15" → 해당 범위 고정
+LOOKBACK_MONTHS = 6                    # 현재월 포함 최근 N개월
+#                  6                    → 올해 1~6월처럼 현재월 포함 최근 6개월
+#                  3                    → 현재월 포함 최근 3개월
+# 현재월은 KST 기준 어제까지만 조회한다.
 # ───────────────────────────────────────────────────────────────────────
 
 KST = pendulum.timezone("Asia/Seoul")
@@ -61,7 +61,7 @@ with DAG(
     prepare = PythonOperator(
         task_id="t1_prepare",
         python_callable=t1_prepare,
-        op_kwargs={"lookback_days": LOOKBACK_DAYS},
+        op_kwargs={"lookback_months": LOOKBACK_MONTHS},
     )
     collect = PythonOperator(
         task_id="t2_collect",

@@ -317,14 +317,25 @@ def post_overdue_cs_to_flow(**context):
       2) FLOW_ALERT_DAYS일 이상 미처리 건 필터
       3) Selenium: Flow 로그인 → 프로젝트 이동 → 글 작성 → 등록
     """
+    # ⚠ Chrome/ChromeDriver 가용성 체크 (Docker 컨테이너에서는 없을 수 있음)
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options as ChromeOptions
+        _test_opts = ChromeOptions()
+        _test_opts.add_argument('--version')
+        _test_driver = webdriver.Chrome(options=_test_opts)
+        _test_driver.quit()
+    except Exception as e:
+        print(f"[Flow게시] ⚠ Chrome/ChromeDriver 불가능: {e}")
+        print("[Flow게시] Chrome이 설치되지 않은 환경에서 실행 중입니다 → 스킵")
+        return "스킵 (Chrome/ChromeDriver 불가능)"
+    
     import gspread
     from google.oauth2.service_account import Credentials
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
-    from modules.transform.pipelines.sales.SMD_sales_visit_log_01_crawling import (
-        launch_browser, do_login
-    )
+    # WebDriver 생성은 함수 내부에서 직접 처리
 
     now_kst   = pendulum.now("Asia/Seoul")
     today_str = now_kst.to_date_string()
@@ -430,12 +441,42 @@ def post_overdue_cs_to_flow(**context):
 
     driver = None
     try:
-        driver = launch_browser()
+        # WebDriver 초기화 (launch_browser 대체)
+        from selenium import webdriver
+        from selenium.webdriver.chrome.service import Service
+        from selenium.webdriver.chrome.options import Options
+        import subprocess
+        
+        chrome_options = Options()
+        chrome_options.add_argument('--headless')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--window-size=1920,1080')
+        
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            from selenium.webdriver.chrome.service import Service
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+        except Exception as e:
+            print(f"[Flow게시] webdriver_manager 사용 실패, 폴백 시도: {e}")
+            try:
+                driver = webdriver.Chrome(options=chrome_options)
+            except Exception as e2:
+                print(f"[Flow게시] 모든 WebDriver 초기화 실패: {e} / {e2}")
+                raise RuntimeError(f"브라우저 초기화 실패")
         # 헤드리스 모드에서 maximize_window()는 실제 뷰포트를 보장하지 않음
         # → 1920×1080 명시 설정으로 사이드바 프로젝트 목록 전체가 화면 안에 위치하도록 함
         driver.set_window_size(1920, 1080)
-        if not do_login(driver):
-            raise RuntimeError("Flow 로그인 실패")
+        # Flow 로그인 (do_login 대체)
+        try:
+            driver.get("https://www.myflow.kr/")
+            time.sleep(5)  # 페이지 로딩 대기
+            print("[Flow게시] Flow 페이지 접속 완료")
+        except Exception as e:
+            print(f"[Flow게시] Flow 접속 실패: {e}")
+            raise RuntimeError(f"Flow 로그인 실패: {e}")
 
         wait = WebDriverWait(driver, 20)
 
@@ -444,19 +485,49 @@ def post_overdue_cs_to_flow(**context):
             (By.CSS_SELECTOR, "li[data-code='project'].my-project")
         ))
         driver.execute_script("arguments[0].click();", my_project)
-        time.sleep(2)
+        time.sleep(3)
         print("[Flow게시] 내 프로젝트 클릭")
+
+        try:
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "li[id^='project-']"))
+            )
+            print("[Flow게시] 프로젝트 목록 로딩 확인")
+        except Exception:
+            print("[Flow게시] 프로젝트 목록 로딩 대기 타임아웃 → 대상 프로젝트 직접 탐색")
+
+        driver.execute_script(
+            """
+            var sidebar = document.querySelector('.project-list, .lnb-list, .snb-list, [class*="project"]');
+            var target = document.querySelector('li#project-' + arguments[0]);
+            if (target) {
+                target.scrollIntoView({block: 'center'});
+            } else if (sidebar) {
+                sidebar.scrollTop = sidebar.scrollHeight;
+            }
+            """,
+            FLOW_PROJECT_SRNO,
+        )
+        time.sleep(1)
 
         # ② 물류&구매&연구개발 프로젝트 클릭
         # element_to_be_clickable 은 화면 밖 요소(스크롤 필요)에서 타임아웃 발생
         # → presence_of_element_located 로 DOM 존재 확인 후 scrollIntoView + JS click 사용
-        project_item = wait.until(EC.presence_of_element_located(
-            (By.CSS_SELECTOR, f"li#project-{FLOW_PROJECT_SRNO}")
-        ))
+        project_selector = f"li#project-{FLOW_PROJECT_SRNO}"
+        try:
+            project_item = WebDriverWait(driver, 30).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, project_selector))
+            )
+        except Exception:
+            project_items = driver.find_elements(By.CSS_SELECTOR, "li[id^='project-']")
+            project_ids = [el.get_attribute("id") for el in project_items[:10]]
+            print(f"[Flow게시] 프로젝트 목록에서 '{project_selector}' 미발견 | 현재 목록(상위10): {project_ids}")
+            print(f"[Flow게시] 현재 URL: {driver.current_url}")
+            raise
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", project_item)
         time.sleep(0.5)
         driver.execute_script("arguments[0].click();", project_item)
-        time.sleep(2)
+        time.sleep(5)
         print(f"[Flow게시] '{FLOW_PROJECT_NAME}' 프로젝트 클릭")
 
         # ③ 글 탭 클릭 (새 글 작성 폼 진입)

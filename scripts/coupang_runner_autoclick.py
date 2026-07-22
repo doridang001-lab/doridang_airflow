@@ -1,7 +1,8 @@
-"""Auto click topHalfBtn on Coupang runner.html via Chrome DevTools Protocol."""
+"""Auto click a button on Coupang runner.html via Chrome DevTools Protocol."""
 
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import logging
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 RUNNER_URL_SUFFIX = "/runner.html"
 RUNNER_URL_FALLBACK = "chrome-extension://ocpdgnoaajajnlehamcalfcpholjhfbe/runner.html"
-BUTTON_ID = "topHalfBtn"
+DEFAULT_BUTTON_ID = "topHalfBtn"
 DEBUG_ENDPOINT = "http://127.0.0.1:9222"
 TIMEOUT_SECONDS = 60
 POLL_INTERVAL_SECONDS = 0.5
@@ -50,15 +51,20 @@ def _find_runner_url() -> str:
 
 
 def _ensure_runner_tab() -> str:
+    runner_url = RUNNER_URL_FALLBACK
+    start = time.time()
+    while time.time() - start < 10:
+        tabs = _fetch_tabs()
+        for tab in tabs:
+            url = str(tab.get("url", ""))
+            if url.startswith("chrome-extension://") and url.endswith(RUNNER_URL_SUFFIX):
+                ws_url = tab.get("webSocketDebuggerUrl")
+                if ws_url:
+                    logger.info("existing runner tab found: %s", url)
+                    return ws_url
+        time.sleep(POLL_INTERVAL_SECONDS)
+
     runner_url = _find_runner_url()
-    tabs = _fetch_tabs()
-    for tab in tabs:
-        url = str(tab.get("url", ""))
-        if url.startswith("chrome-extension://") and url.endswith(RUNNER_URL_SUFFIX):
-            ws_url = tab.get("webSocketDebuggerUrl")
-            if ws_url:
-                logger.info("existing runner tab found: %s", url)
-                return ws_url
 
     logger.info("runner tab not found, create one: %s", runner_url)
     encoded = urllib.parse.quote(runner_url, safe="")
@@ -232,12 +238,14 @@ class _RawWebSocket:
             self._sock = None
 
 
-def _evaluate_button_state(ws: _RawWebSocket) -> tuple[bool, bool]:
+def _evaluate_button_state(ws: _RawWebSocket, button_id: str) -> tuple[bool, bool, bool]:
     script = (
         "(()=>{"
-        f"const b=document.querySelector('#{BUTTON_ID}');"
-        "if(!b){return {exists:false,enabled:false};}"
-        "return {exists:true,enabled:!b.disabled};"
+        f"const b=document.querySelector('#{button_id}');"
+        "const stop=document.querySelector('#stopBtn');"
+        "const alreadyRunning=!!(stop && !stop.disabled);"
+        "if(!b){return {exists:false,enabled:false,alreadyRunning};}"
+        "return {exists:true,enabled:!b.disabled,alreadyRunning};"
         "})()"
     )
     result = ws.call(
@@ -254,14 +262,18 @@ def _evaluate_button_state(ws: _RawWebSocket) -> tuple[bool, bool]:
 
     value = (result.get("result") or {}).get("result") or {}
     parsed = value.get("value") or {}
-    return bool(parsed.get("exists")), bool(parsed.get("enabled"))
+    return (
+        bool(parsed.get("exists")),
+        bool(parsed.get("enabled")),
+        bool(parsed.get("alreadyRunning")),
+    )
 
 
-def _click_button(ws: _RawWebSocket) -> None:
+def _click_button(ws: _RawWebSocket, button_id: str) -> None:
     result = ws.call(
         "Runtime.evaluate",
         {
-            "expression": f"(()=>{{document.getElementById('{BUTTON_ID}').click(); return true;}})()",
+            "expression": f"(()=>{{document.getElementById('{button_id}').click(); return true;}})()",
             "returnByValue": True,
         },
         timeout=5.0,
@@ -270,34 +282,49 @@ def _click_button(ws: _RawWebSocket) -> None:
         raise RuntimeError(f"button click failed: {result['error']}")
 
 
-def run_autoclick() -> int:
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Auto click a button on Coupang runner.html")
+    parser.add_argument(
+        "--button-id",
+        default=DEFAULT_BUTTON_ID,
+        help=f"runner.html button id to click (default: {DEFAULT_BUTTON_ID})",
+    )
+    return parser.parse_args()
+
+
+def run_autoclick(button_id: str = DEFAULT_BUTTON_ID) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     ws_url = _ensure_runner_tab()
     logger.info("connected runner tab: %s", ws_url)
+    logger.info("target button id: %s", button_id)
 
     ws = _RawWebSocket(ws_url)
     try:
         ws.call("Runtime.enable")
         start = time.time()
         while time.time() - start < TIMEOUT_SECONDS:
-            exists, enabled = _evaluate_button_state(ws)
+            exists, enabled, already_running = _evaluate_button_state(ws, button_id)
             if not exists:
-                logger.info("topHalfBtn not found yet, waiting")
+                logger.info("%s not found yet, waiting", button_id)
+            elif already_running:
+                logger.info("runner batch is already running; treating autoclick as successful")
+                return 0
             elif enabled:
-                logger.info("topHalfBtn is enabled. clicking")
-                _click_button(ws)
-                logger.info("clicked topHalfBtn")
+                logger.info("%s is enabled. clicking", button_id)
+                _click_button(ws, button_id)
+                logger.info("clicked %s", button_id)
                 return 0
             else:
-                logger.info("topHalfBtn exists but disabled")
+                logger.info("%s exists but disabled", button_id)
             time.sleep(POLL_INTERVAL_SECONDS)
     finally:
         ws.close()
 
-    logger.error("timeout waiting topHalfBtn enabled for %ss", TIMEOUT_SECONDS)
+    logger.error("timeout waiting %s enabled for %ss", button_id, TIMEOUT_SECONDS)
     return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(run_autoclick())
+    args = _parse_args()
+    raise SystemExit(run_autoclick(button_id=args.button_id))

@@ -8,6 +8,8 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
+from modules.transform.utility.mail_recipients import MAIL_CMJ_PM, apply_manager_mail_variables, resolve_mail_recipients
+
 
 # ============================================================
 # 📧 알림 대상 필터링 함수
@@ -146,6 +148,7 @@ def filter_alerts(
             for encoding in ['utf-8-sig', 'utf-8', 'cp949']:
                 try:
                     employee_df = pd.read_csv(employee_path, encoding=encoding)
+                    employee_df = apply_manager_mail_variables(employee_df)
                     print(f"[담당자 업데이트] sales_employee.csv 로드: {len(employee_df):,}건 ({encoding})")
                     break
                 except UnicodeDecodeError:
@@ -1679,14 +1682,11 @@ def send_alert_email(**context):
     def get_recipients(manager_email=None):
         """이메일 수신자 결정"""
         if TEST_MODE:
-            return TEST_RECIPIENTS if TEST_RECIPIENTS else ["a17019@kakao.com"]
+            return resolve_mail_recipients(TEST_RECIPIENTS or [MAIL_CMJ_PM])
         else:
-            recipients = []
-            if manager_email and pd.notna(manager_email) and manager_email.strip():
-                recipients.append(manager_email)
             if DEV_CC_IN_PROD:
-                recipients.insert(0, "a17019@kakao.com")
-            return recipients
+                return resolve_mail_recipients(MAIL_CMJ_PM, manager_email)
+            return resolve_mail_recipients(manager_email)
     
     ti = context['task_instance']
     
@@ -1751,6 +1751,7 @@ def send_alert_email(**context):
         return "email 컬럼 없음"
     
     # 담당자별 그룹핑 (email이 없거나 공백이어도 포함)
+    alert_df = apply_manager_mail_variables(alert_df)
     alert_df['email_for_group'] = alert_df['email'].fillna('미배정').replace('', '미배정')
     managers = alert_df.groupby(['담당자', 'email_for_group'])
     
@@ -2309,7 +2310,7 @@ def send_alert_email(**context):
                     <!-- 푸터 -->
                     <tr>
                         <td style="padding: 20px 30px; text-align: center; border-top: 1px solid #eee;">
-                            <p style="margin: 0; font-size: 12px; color: #7f8c8d;">이 이메일은 자동 발송되었습니다 | 문의: a17019@kakao.com</p>
+                            <p style="margin: 0; font-size: 12px; color: #7f8c8d;">이 이메일은 자동 발송되었습니다 | 문의: {MAIL_CMJ_PM}</p>
                         </td>
                     </tr>
                     

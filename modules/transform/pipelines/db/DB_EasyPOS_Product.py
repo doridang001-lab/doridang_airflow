@@ -17,7 +17,8 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from playwright.sync_api import sync_playwright, Frame, Page
+from playwright.sync_api import sync_playwright, Frame, Page, TimeoutError as PlaywrightTimeoutError
+from playwright._impl._errors import TargetClosedError
 
 from modules.load.load_onedrive import onedrive_csv_save
 from modules.transform.utility.paths import ANALYTICS_DB, TEMP_DIR
@@ -62,6 +63,113 @@ _PRODUCT_MENU_SELECTORS = [
     "xpath=//*[contains(@id,'divLeftMenu') or contains(@id,'divLeftMainList') or contains(@id,'grdLeft')]//*[normalize-space(.)='상품조회']",
     "xpath=//*[normalize-space(.)='상품조회']",
 ]
+
+
+def _is_clickable_handle(handle) -> bool:
+    if handle is None:
+        return False
+    try:
+        if hasattr(handle, "is_visible") and not handle.is_visible():
+            return False
+    except Exception:
+        return False
+    try:
+        return handle.bounding_box() is not None
+    except Exception:
+        return False
+
+
+def _find_first_clickable_selector(mf: Frame, selectors: list[str]):
+    for selector in selectors:
+        try:
+            for el in mf.query_selector_all(selector):
+                if _is_clickable_handle(el):
+                    return el, selector
+        except Exception:
+            continue
+    return None, None
+
+
+def _navigate_product_by_menu_url(page: Page, target_needles: list[str]) -> bool:
+    """Nexacro 메뉴 데이터셋에서 상품 화면 URL을 찾아 childframe에 직접 로드."""
+    mf = _get_main_frame(page)
+    result = mf.evaluate(
+        """(needles) => {
+            try {
+                var form = window.application.mainframe.childframe.form;
+                var rows = [];
+
+                function pushRow(source, idx, nm, url, id) {
+                    nm = nm || '';
+                    url = url || '';
+                    if (!nm && !url) return;
+                    rows.push({source: source, i: idx, nm: String(nm), url: String(url), id: id || ''});
+                }
+
+                ['dsLeftMenuParnas', 'dsLeftMenuParnas00', 'dsLeftMenuSample', 'dsTopMenu'].forEach(function(dsName) {
+                    var ds = form[dsName];
+                    if (!ds || ds.rowcount === undefined) return;
+                    var rowCount = ds.rowcount || 0;
+                    for (var i = 0; i < rowCount; i++) {
+                        var nm = ds.getColumn(i, 'MENU_NAME') || ds.getColumn(i, 'MENU_NM') || ds.getColumn(i, 'MENU_NM_KOR') || '';
+                        var url = ds.getColumn(i, 'SMART_MENU_URL') || ds.getColumn(i, 'PROGRAM_PATH') || ds.getColumn(i, 'MENU_URL') || '';
+                        var id = ds.getColumn(i, 'MENU_ID') || ds.getColumn(i, 'PROGRAM_ID') || '';
+                        pushRow(dsName, i, nm, url, id);
+                    }
+                });
+
+                var grd = form.divLeftMenu && form.divLeftMenu.divLeftMainList && form.divLeftMenu.divLeftMainList.grdLeft;
+                if (grd && typeof form.gfnGetMenuUrl === 'function') {
+                    var rowCount = 100;
+                    try {
+                        var ds = null;
+                        if (grd._datasets && grd._datasets.length > 0) ds = grd._datasets[0];
+                        else if (typeof grd.getBindDataset === 'function') ds = grd.getBindDataset();
+                        if (ds && ds.rowcount) rowCount = ds.rowcount;
+                    } catch(e) {}
+                    for (var j = 0; j < rowCount; j++) {
+                        try {
+                            pushRow('gfnGetMenuUrl', j, form.gfnGetMenuName(j), form.gfnGetMenuUrl(j), form.gfnGetMenuId(j));
+                        } catch(e) { break; }
+                    }
+                }
+
+                var candidates = rows.filter(function(row) {
+                    return needles.some(function(n) { return row.nm.indexOf(n) >= 0; }) && row.url;
+                });
+                candidates.sort(function(a, b) {
+                    function score(row) {
+                        if (row.nm.indexOf('상품조회') >= 0) return 0;
+                        if (row.nm.indexOf('상품 등록') >= 0 || row.nm.indexOf('상품등록') >= 0) return 1;
+                        return 2;
+                    }
+                    return score(a) - score(b);
+                });
+
+                if (candidates.length === 0) {
+                    return {ok: false, reason: 'target menu url not found', sample: rows.slice(0, 30)};
+                }
+
+                var target = candidates[0];
+                var cf = window.application.mainframe.childframe;
+                if (typeof cf.set_formurl !== 'function') {
+                    return {ok: false, reason: 'childframe.set_formurl not function', target: target, candidates: candidates.slice(0, 10)};
+                }
+                cf.set_formurl(target.url);
+                return {ok: true, target: target, candidates: candidates.slice(0, 10)};
+            } catch(e) {
+                return {ok: false, reason: e.toString()};
+            }
+        }""",
+        target_needles,
+    )
+    logger.info("EasyPOS 상품 메뉴 URL 직접 진입 결과: %s", result)
+    if not isinstance(result, dict) or not result.get("ok"):
+        return False
+    time.sleep(3.0)
+    mf = _get_main_frame(page)
+    btn, _ = _find_first_clickable_selector(mf, _BTN_SEARCH_SELECTORS + _BTN_EXCEL_SELECTORS)
+    return btn is not None
 
 
 def _cleanup_download_dir(download_dir: Path) -> None:
@@ -143,21 +251,33 @@ def _navigate_to_product_search(page: Page, mf: Frame, *, _reload_retry: bool = 
                 uniq.append(t)
         return uniq[:limit]
 
-    def _click_first_row_containing(needles: list[str], *, double: bool = False, label: str = "") -> bool:
+    def _click_first_row_containing(
+        needles: list[str],
+        *,
+        double: bool = False,
+        label: str = "",
+        exact: bool = False,
+        exclude: list[str] | None = None,
+    ) -> bool:
         mf2 = _get_main_frame(page)
         for el in mf2.query_selector_all("[id*='grdLeft_body_gridrow_']"):
             txt = (el.inner_text() or "").strip().replace("\n", " ")
             if not txt:
                 continue
-            if any(n in txt for n in needles):
+            if exclude and any(n in txt for n in exclude):
+                continue
+            matched = txt in needles if exact else any(n in txt for n in needles)
+            if matched:
                 box = el.bounding_box()
                 if box:
                     cx = box["x"] + box["width"] / 2
                     cy = box["y"] + box["height"] / 2
-                    page.mouse.click(cx, cy)
                     if double:
+                        page.mouse.dblclick(cx, cy)
                         time.sleep(0.2)
-                        page.mouse.click(cx, cy, click_count=2)
+                        page.keyboard.press("Enter")
+                    else:
+                        page.mouse.click(cx, cy)
                     logger.info("%s 클릭 @ (%.0f, %.0f) txt=%r", label or "메뉴", cx, cy, txt)
                     return True
                 try:
@@ -180,12 +300,20 @@ def _navigate_to_product_search(page: Page, mf: Frame, *, _reload_retry: bool = 
             _click_first_row_containing(expand_needles, double=False, label="상품관리")
             time.sleep(0.8)
 
-            if _click_first_row_containing(target_needles, double=True, label="상품조회"):
+            if _click_first_row_containing(
+                target_needles,
+                double=True,
+                label="상품조회",
+                exact=True,
+                exclude=["상품등록", "상품 등록"],
+            ):
                 time.sleep(2.0)
                 mf = _get_main_frame(page)
-                b, _ = _find_first_selector(mf, _BTN_SEARCH_SELECTORS)
-                e, _ = _find_first_selector(mf, _BTN_EXCEL_SELECTORS)
+                b, _ = _find_first_clickable_selector(mf, _BTN_SEARCH_SELECTORS)
+                e, _ = _find_first_clickable_selector(mf, _BTN_EXCEL_SELECTORS)
                 if b is not None or e is not None:
+                    return _get_main_frame(page)
+                if _navigate_product_by_menu_url(page, target_needles):
                     return _get_main_frame(page)
                 try:
                     mf.wait_for_selector("[id*='btnCommSearch'],[id*='btnCommExcel']", timeout=WAIT_TIMEOUT)
@@ -298,77 +426,89 @@ def download_easypos_product(**context) -> str:
     _cleanup_download_dir(download_dir)
 
     with sync_playwright() as p:
-        try:
-            browser = launch_chromium(
-                p,
-                headless=HEADLESS_MODE,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-        except Exception as e:
-            # 컨테이너/업그레이드 등으로 playwright 브라우저가 누락된 경우 자동 설치 시도
-            msg = str(e)
-            if "Executable doesn't exist" in msg or "playwright install" in msg:
-                _ensure_playwright_chromium_installed()
-                browser = launch_chromium(p, headless=HEADLESS_MODE)
-            else:
-                raise
-
-        bctx = browser.new_context(
-            accept_downloads=True,
-            locale="ko-KR",
-            timezone_id="Asia/Seoul",
-        )
-        _add_nexacro_init_script(bctx)
-
-        page = bctx.new_page()
-        try:
-            mf = _login(page)
-            mf = _navigate_to_product_search(page, mf)
-
-            # 조회
-            search_btn, search_sel = _find_first_selector(mf, _BTN_SEARCH_SELECTORS)
-            if search_btn is None:
-                _debug_dump(page, "easypos_product_search_btn_not_found")
-                raise RuntimeError("상품조회 화면에서 '조회' 버튼을 찾지 못했습니다.")
-
-            _click_handle(page, search_btn, f"조회({search_sel})", prefer_mouse=True)
-            time.sleep(2.5)
-
-            # 엑셀 다운로드
-            mf = _get_main_frame(page)
-            excel_btn, excel_sel = _find_first_selector(mf, _BTN_EXCEL_SELECTORS)
-            if excel_btn is None:
-                _debug_dump(page, "easypos_product_excel_btn_not_found")
-                raise RuntimeError("상품조회 화면에서 '엑셀' 버튼을 찾지 못했습니다.")
-
-            with page.expect_download(timeout=120_000) as dl_info:
-                _click_handle(page, excel_btn, f"엑셀({excel_sel})", prefer_mouse=True)
-            download = dl_info.value
-
-            tmp_xlsx = download_dir / f"easypos_product_{snapshot_date}.xlsx"
-            download.save_as(str(tmp_xlsx))
-
-            context["ti"].xcom_push(key="downloaded_path", value=str(tmp_xlsx))
-            logger.info("EasyPOS 상품조회 다운로드 완료: %s", tmp_xlsx)
-            return f"다운로드 완료: {tmp_xlsx}"
-        finally:
+        def _open_browser():
             try:
-                browser.close()
-            except Exception:
-                pass
+                _browser = launch_chromium(
+                    p,
+                    headless=HEADLESS_MODE,
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+            except Exception as e:
+                # 컨테이너/업그레이드 등으로 playwright 브라우저가 누락된 경우 자동 설치 시도
+                msg = str(e)
+                if "Executable doesn't exist" in msg or "playwright install" in msg:
+                    _ensure_playwright_chromium_installed()
+                    _browser = launch_chromium(
+                        p,
+                        headless=HEADLESS_MODE,
+                        args=["--disable-blink-features=AutomationControlled"],
+                    )
+                else:
+                    raise
+
+            _bctx = _browser.new_context(
+                accept_downloads=True,
+                locale="ko-KR",
+                timezone_id="Asia/Seoul",
+            )
+            _add_nexacro_init_script(_bctx)
+            return _browser, _bctx, _bctx.new_page()
+
+        browser = None
+        last_err: Exception | None = None
+        for attempt in range(1, 4):
+            browser, bctx, page = _open_browser()
+            try:
+                mf = _login(page)
+                mf = _navigate_to_product_search(page, mf)
+
+                # 조회
+                search_btn, search_sel = _find_first_clickable_selector(mf, _BTN_SEARCH_SELECTORS)
+                if search_btn is None:
+                    _debug_dump(page, f"easypos_product_search_btn_not_found_attempt_{attempt}")
+                    raise RuntimeError("상품조회 화면에서 '조회' 버튼을 찾지 못했습니다.")
+
+                _click_handle(page, search_btn, f"조회({search_sel})", prefer_mouse=True)
+                time.sleep(2.5)
+
+                # 엑셀 다운로드
+                mf = _get_main_frame(page)
+                excel_btn, excel_sel = _find_first_clickable_selector(mf, _BTN_EXCEL_SELECTORS)
+                if excel_btn is None:
+                    _debug_dump(page, f"easypos_product_excel_btn_not_found_attempt_{attempt}")
+                    raise RuntimeError("상품조회 화면에서 '엑셀' 버튼을 찾지 못했습니다.")
+
+                with page.expect_download(timeout=120_000) as dl_info:
+                    _click_handle(page, excel_btn, f"엑셀({excel_sel})", prefer_mouse=True)
+                download = dl_info.value
+
+                tmp_xlsx = download_dir / f"easypos_product_{snapshot_date}.xlsx"
+                download.save_as(str(tmp_xlsx))
+
+                context["ti"].xcom_push(key="downloaded_path", value=str(tmp_xlsx))
+                logger.info("EasyPOS 상품조회 다운로드 완료: %s", tmp_xlsx)
+                return f"다운로드 완료: {tmp_xlsx}"
+            except (TargetClosedError, PlaywrightTimeoutError, RuntimeError) as e:
+                last_err = e
+                if attempt >= 3:
+                    raise
+                logger.warning("EasyPOS 상품조회 다운로드 실패(attempt=%d/3) → 브라우저 재시작: %s", attempt, e)
+                time.sleep(5)
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("EasyPOS 상품조회 다운로드 실패")
 
 
 def save_easypos_product(**context) -> str:
     """다운로드된 상품조회 엑셀을 덮어쓰기 방식으로 저장(엑셀 1개 파일만)."""
     snapshot_date = (context.get("ds") or "").strip() or datetime.now().strftime("%Y-%m-%d")
     downloaded_path = context["ti"].xcom_pull(task_ids="download_easypos_product", key="downloaded_path")
-    if not downloaded_path:
-        raise ValueError("download_easypos_product의 XCom(downloaded_path)이 비어있습니다.")
-
-    src = Path(str(downloaded_path))
-    if not src.exists():
-        raise FileNotFoundError(f"다운로드 파일이 없습니다: {src}")
-
     # 요청사항: 엑셀 1개만 저장 (덮어쓰기)
     # - 기본: ANALYTICS_DB/easypos_product/상품조회.xlsx
     # - override: EASYPOS_PRODUCT_XLSX_PATH (절대경로)
@@ -378,6 +518,20 @@ def save_easypos_product(**context) -> str:
     else:
         base_dir = ANALYTICS_DB / "easypos_product"
         dest_xlsx = base_dir / "상품조회.xlsx"
+
+    if not downloaded_path:
+        if dest_xlsx.exists() and dest_xlsx.stat().st_size > 0:
+            logger.warning(
+                "download_easypos_product XCom이 없어 기존 상품조회.xlsx를 유지합니다: %s",
+                dest_xlsx,
+            )
+            context["ti"].xcom_push(key="dest_xlsx", value=str(dest_xlsx))
+            return f"기존 상품조회.xlsx 유지 | date={snapshot_date} | xlsx={dest_xlsx}"
+        raise ValueError("download_easypos_product의 XCom(downloaded_path)이 비어있습니다.")
+
+    src = Path(str(downloaded_path))
+    if not src.exists():
+        raise FileNotFoundError(f"다운로드 파일이 없습니다: {src}")
 
     # OneDrive/Excel 잠금이 간헐적으로 발생하므로, 저장 자체에서 짧게 재시도한다.
     last_err: Exception | None = None

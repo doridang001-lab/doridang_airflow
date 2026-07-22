@@ -16,6 +16,69 @@ from selenium.webdriver.chrome.service import Service
 logger = logging.getLogger(__name__)
 
 
+def _resolve_chrome_temp_root() -> Path | None:
+    """Return a Chrome/UC temp root that does not grow Docker's writable layer."""
+    explicit = os.getenv("AIRFLOW_CHROME_TMP_DIR") or os.getenv("CHROME_TMP_DIR")
+    candidates = [explicit] if explicit else []
+    if os.getenv("AIRFLOW_HOME") or os.getenv("IS_DOCKER"):
+        candidates.extend(
+            [
+                "/opt/airflow/download/chrome_tmp",
+                "/opt/airflow/Local_DB/temp/chrome_tmp",
+            ]
+        )
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return path.resolve()
+        except Exception as err:
+            logger.warning("Chrome temp root 생성 실패(무시): %s (path=%s)", err, path)
+    return None
+
+
+def _cleanup_stale_chrome_temp(root: Path, max_age_sec: int = 6 * 60 * 60) -> None:
+    """Remove stale Chrome temp directories left by crashed crawler sessions."""
+    now = time.time()
+    prefixes = (
+        "chrome_",
+        "org.chromium.Chromium.scoped_dir.",
+        "playwright-",
+        "puppeteer_",
+        "scoped_dir",
+    )
+    for child in root.iterdir():
+        try:
+            if not child.is_dir():
+                continue
+            if not child.name.startswith(prefixes):
+                continue
+            if now - child.stat().st_mtime < max_age_sec:
+                continue
+            shutil.rmtree(child, ignore_errors=True)
+        except Exception:
+            continue
+
+
+def configure_chrome_temp_root(log_fn: Callable[[str], None] | None = None) -> str | None:
+    """Force Chrome/UC temp files onto a bind-mounted path before launching Chrome."""
+    root = _resolve_chrome_temp_root()
+    if root is None:
+        return None
+
+    root_str = str(root)
+    os.environ["TMPDIR"] = root_str
+    os.environ["TMP"] = root_str
+    os.environ["TEMP"] = root_str
+    tempfile.tempdir = root_str
+    _cleanup_stale_chrome_temp(root)
+    _emit_uc_log(log_fn, f"Chrome temp root 고정: {root_str}")
+    return root_str
+
+
 @contextmanager
 def _uc_launch_lock(timeout_sec: int = 180):
     """Serialize UC driver patch/launch across Airflow task processes."""
@@ -233,12 +296,40 @@ def _is_network_launch_error(msg: str) -> bool:
     )
 
 
+def _is_cached_driver_launch_error(msg: str) -> bool:
+    """Cached UC driver can become unusable after Chrome/container updates."""
+    normalized = msg.lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "session not created",
+            "cannot connect to chrome",
+            "chrome not reachable",
+            "disconnected",
+        )
+    )
+
+
+def _remove_cached_uc_driver(data_dir: str | None, log_fn: Callable[[str], None] | None = None) -> None:
+    if not data_dir:
+        return
+    driver_bin = Path(data_dir) / "undetected_chromedriver"
+    if not driver_bin.exists():
+        return
+    try:
+        driver_bin.unlink()
+        _emit_uc_log(log_fn, f"UC cached driver 삭제: {driver_bin}")
+    except Exception as err:
+        _emit_uc_log(log_fn, f"UC cached driver 삭제 실패(무시): {err}")
+
+
 def _launch_standard_chrome(
     *,
     options,
     chrome_binary: str | None,
     detected_version: int | None,
     log_fn: Callable[[str], None] | None = None,
+    command_timeout_sec: int = 30,
 ):
     chromedriver_binary = _resolve_chromedriver_binary()
     if not chromedriver_binary:
@@ -251,7 +342,7 @@ def _launch_standard_chrome(
     )
     service = Service(executable_path=chromedriver_binary)
     driver = webdriver.Chrome(service=service, options=options)
-    _apply_failfast_client(driver, log_fn=log_fn)
+    _apply_failfast_client(driver, timeout_sec=command_timeout_sec, log_fn=log_fn)
     return driver
 
 
@@ -261,7 +352,9 @@ def launch_uc_chrome(
     chrome_bin: str | None = None,
     log_fn: Callable[[str], None] | None = None,
     prefer_standard: bool = False,
+    command_timeout_sec: int = 30,
 ):
+    configure_chrome_temp_root(log_fn=log_fn)
     chrome_binary = _resolve_chrome_binary(chrome_bin)
     detected_version = _detect_chrome_major_version(chrome_binary)
 
@@ -277,6 +370,7 @@ def launch_uc_chrome(
             chrome_binary=chrome_binary,
             detected_version=detected_version,
             log_fn=log_fn,
+            command_timeout_sec=command_timeout_sec,
         )
 
     data_dir = configure_uc_data_path()
@@ -304,7 +398,7 @@ def launch_uc_chrome(
         try:
             with _uc_launch_lock():
                 driver = uc.Chrome(**kwargs)
-            _apply_failfast_client(driver, log_fn=log_fn)
+            _apply_failfast_client(driver, timeout_sec=command_timeout_sec, log_fn=log_fn)
             return driver
         except Exception as exc:
             last_exc = exc
@@ -335,28 +429,29 @@ def launch_uc_chrome(
             try:
                 with _uc_launch_lock():
                     driver = uc.Chrome(options=options, version_main=retry_version)
-                _apply_failfast_client(driver, log_fn=log_fn)
+                _apply_failfast_client(driver, timeout_sec=command_timeout_sec, log_fn=log_fn)
                 return driver
             except Exception:
                 pass
 
-        # RemoteDisconnected / ProtocolError: 바이너리 오염 → 삭제 후 재시도(재다운로드)
-        if "RemoteDisconnected" in err_str or "Connection aborted" in err_str:
-            _emit_uc_log(log_fn, "RemoteDisconnected: UC driver binary 강제 삭제 후 재시도")
-            if data_dir:
-                driver_bin = Path(data_dir) / "undetected_chromedriver"
-                if driver_bin.exists():
-                    try:
-                        driver_bin.unlink()
-                    except Exception:
-                        pass
+        # Cached UC driver corruption/staleness → remove it and let UC choose a fresh launch path.
+        if (
+            "driver_executable_path" in kwargs
+            and (
+                "RemoteDisconnected" in err_str
+                or "Connection aborted" in err_str
+                or _is_cached_driver_launch_error(err_str)
+            )
+        ):
+            _emit_uc_log(log_fn, "UC cached driver launch 실패: 캐시 삭제 후 재시도")
+            _remove_cached_uc_driver(data_dir, log_fn)
             configure_uc_data_path()
             # 캐시 삭제 후 재다운로드해야 하므로 driver_executable_path 제거
             retry_kwargs = {k: v for k, v in kwargs.items() if k != "driver_executable_path"}
             try:
                 with _uc_launch_lock():
                     driver = uc.Chrome(**retry_kwargs)
-                _apply_failfast_client(driver, log_fn=log_fn)
+                _apply_failfast_client(driver, timeout_sec=command_timeout_sec, log_fn=log_fn)
                 return driver
             except Exception:
                 pass
@@ -374,6 +469,7 @@ def launch_uc_chrome(
                 chrome_binary=chrome_binary,
                 detected_version=detected_version,
                 log_fn=log_fn,
+                command_timeout_sec=command_timeout_sec,
             )
         except Exception as fallback_exc:
             _emit_uc_log(log_fn, f"standard chromedriver fallback failed: {fallback_exc}")

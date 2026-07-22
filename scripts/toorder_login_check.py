@@ -28,8 +28,9 @@ with sync_playwright() as p:
     print("페이지 로드 완료. URL:", page.url)
 
     # isCompany 없이 시도 (일반회원)
+    from modules.transform.utility.account import get_pw
     page.fill('input[name="id"]', "doridang15")
-    page.fill('input[name="password"]', "ehfl5233!")
+    page.fill('input[name="password"]', get_pw("toorder", "doridang15"))
     print("입력 완료 (isCompany 체크 안 함)")
 
     page.click('button[type="submit"]')

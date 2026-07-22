@@ -238,6 +238,16 @@ def _expected_brands_by_store(store_info_per_account: list) -> dict[str, set[str
     return expected
 
 
+def _collected_store_names(store_info_per_account: list) -> set[str]:
+    """이번 DAG 실행에서 실제 수집 대상으로 전달된 매장명 집합."""
+    return {
+        str(store_info.get("store") or "").strip()
+        for item in (store_info_per_account or [])
+        for store_info in item.get("stores", []) or []
+        if str(store_info.get("store") or "").strip()
+    }
+
+
 def _inspect_brand_coverage(
     target_date: str,
     store_names: set[str],
@@ -337,18 +347,28 @@ def _recollect_stores(
     account_list: list,
     target_date: str,
     store_names: set,
-) -> None:
+) -> set[str]:
     """지정된 매장들에 대해서만 배민 주문내역을 재수집한다 (전 브랜드).
 
     store_info_per_account 내 각 항목의 stores 중
     store["store"] 이 store_names에 포함된 것만 재수집한다.
     """
     pw_map = {a["account_id"]: a["password"] for a in account_list}
+    attempted: set[str] = set()
+    seen_targets: set[tuple[str, str]] = set()
 
     for item in store_info_per_account:
         account_id = item["account_id"]
         all_stores = item.get("stores", [])
-        target_stores = [s for s in all_stores if s.get("store") in store_names]
+        target_stores = []
+        for store in all_stores:
+            store_name = str(store.get("store") or "").strip()
+            store_id = str(store.get("store_id") or store_name).strip()
+            key = (account_id, store_id)
+            if store_name not in store_names or key in seen_targets:
+                continue
+            seen_targets.add(key)
+            target_stores.append(store)
         if not target_stores:
             continue
         password = pw_map.get(account_id)
@@ -360,10 +380,33 @@ def _recollect_stores(
             account_id,
             [s["store"] for s in target_stores],
         )
+        attempted.update(str(s.get("store") or "").strip() for s in target_stores if s.get("store"))
         try:
             collect_orders_for_account(account_id, password, target_stores, target_date=target_date)
         except Exception as exc:
             logger.error("재수집 실패 [%s]: %s", account_id, exc, exc_info=True)
+    return attempted
+
+
+def _recollectable_store_names(
+    store_info_per_account: list,
+    account_list: list,
+    store_names: set,
+) -> set[str]:
+    """비밀번호가 있어 실제 재수집을 시도할 수 있는 매장명만 반환한다."""
+    pw_map = {a["account_id"]: a["password"] for a in account_list}
+    recollectable: set[str] = set()
+
+    for item in store_info_per_account:
+        account_id = item["account_id"]
+        if not pw_map.get(account_id):
+            continue
+        for store in item.get("stores", []):
+            store_name = str(store.get("store") or "").strip()
+            if store_name in store_names:
+                recollectable.add(store_name)
+
+    return recollectable
 
 
 # 이전 전체 재수집 함수 (호환성 유지)
@@ -416,6 +459,7 @@ def validate_toorder_orders(
         "store_results": {},
         "mismatched_stores": [],
         "missing_brand_stores": [],
+        "source_mismatch_stores": [],
         "retried_stores": [],
         "matched": False,
         "compared_count": 0,
@@ -431,14 +475,10 @@ def validate_toorder_orders(
 
     # 2. 비교 범위 = 이번 실행에서 실제 수집한 매장 ∩ ToOrder 매장
     #    (수집 대상이 아닌 매장을 배민=0과 비교해 허위 불일치/불필요 재수집하는 것을 방지)
-    collected_stores = {
-        s.get("store")
-        for item in (store_info_per_account or [])
-        for s in item.get("stores", [])
-        if s.get("store")
-    }
+    collected_stores = _collected_store_names(store_info_per_account)
     baemin_has_data = {store for store, amount in baemin_by_store.items() if amount > 0}
-    compare_stores = set(toorder_by_store) & (collected_stores | baemin_has_data)
+    compare_scope = collected_stores or baemin_has_data
+    compare_stores = set(toorder_by_store) & compare_scope
     expected_brands = _expected_brands_by_store(store_info_per_account)
     brand_coverage = _inspect_brand_coverage(target_date, compare_stores, expected_brands)
     result["compared_count"] = len(compare_stores)
@@ -462,6 +502,7 @@ def validate_toorder_orders(
 
     mismatched_first: list[str] = []
     missing_brand_stores: list[str] = []
+    source_mismatch_stores: list[str] = []
     toorder_gap_stores: list[str] = []          # ToOrder 계정 연결 끊김 의심 매장
     for store in sorted(compare_stores):
         coverage = brand_coverage.get(store, {})
@@ -507,12 +548,22 @@ def validate_toorder_orders(
                     coverage.get("missing_brands", []),
                     coverage.get("stale_brands", []),
                 )
+            elif t > 0 and b > 0:
+                source_mismatch_stores.append(store)
+                logger.warning(
+                    "원천 금액 차이로 분류, 자동 재수집 제외: %s ToOrder=%d / 배민=%d (차이=%d)",
+                    store,
+                    t,
+                    b,
+                    t - b,
+                )
             logger.warning("불일치: %s ToOrder=%d / 배민=%d (차이=%d)", store, t, b, t - b)
         else:
             logger.info("일치: %s %d원", store, t)
 
     result["toorder_gap_stores"] = toorder_gap_stores
     result["missing_brand_stores"] = sorted(set(missing_brand_stores))
+    result["source_mismatch_stores"] = sorted(set(source_mismatch_stores))
 
     # 3. 전부 일치 → 종료
     if not mismatched_first:
@@ -520,11 +571,40 @@ def validate_toorder_orders(
         return result
 
     # 4. 불일치 매장 → 삭제 → 재수집
-    logger.warning("불일치 %d개 매장 재수집: %s", len(mismatched_first), mismatched_first)
-    result["retried_stores"] = mismatched_first
+    # 이번 실행의 수집 대상이 아닌 매장은 삭제하지 않는다. 삭제 후 재수집 대상에서
+    # 빠지면 기존 정상 배민 금액이 0으로 보이는 허위 불일치가 발생한다.
+    retry_candidates = [
+        store for store in mismatched_first
+        if (not collected_stores or store in collected_stores)
+        and store not in source_mismatch_stores
+    ]
+    source_mismatch_set = set(source_mismatch_stores)
+    skipped_retry = sorted(set(mismatched_first) - set(retry_candidates) - source_mismatch_set)
+    if skipped_retry:
+        logger.warning("재수집 범위 밖 불일치 매장 보존: %s", skipped_retry)
+    if source_mismatch_stores:
+        logger.warning("원천 금액 차이 매장 재수집 제외: %s", sorted(source_mismatch_set))
 
-    _delete_orders_for_stores(target_date, mismatched_first)
-    _recollect_stores(store_info_per_account, account_list, target_date, set(mismatched_first))
+    attempted_retry: set[str] = set()
+    if retry_candidates:
+        retry_candidate_set = set(retry_candidates)
+        eligible_retry = sorted(
+            _recollectable_store_names(store_info_per_account, account_list, retry_candidate_set)
+        )
+        blocked_retry = sorted(retry_candidate_set - set(eligible_retry))
+        if blocked_retry:
+            logger.warning("재수집 계정/비밀번호 없음, 기존 orders 보존: %s", blocked_retry)
+
+        logger.warning("불일치 %d개 매장 재수집: %s", len(eligible_retry), eligible_retry)
+        result["retried_stores"] = eligible_retry
+
+        if eligible_retry:
+            _delete_orders_for_stores(target_date, eligible_retry)
+            attempted_retry = _recollect_stores(
+                store_info_per_account, account_list, target_date, set(eligible_retry)
+            )
+    else:
+        result["retried_stores"] = []
 
     # 5. 재비교
     baemin_after = _baemin_orders_by_store(target_date)
@@ -545,7 +625,10 @@ def validate_toorder_orders(
     mismatched_final: list[str] = []
     for store in mismatched_first:
         t = toorder_by_store[store]
-        b = baemin_after.get(store, 0)
+        if store in retry_candidates and (not attempted_retry or store in attempted_retry):
+            b = baemin_after.get(store, 0)
+        else:
+            b = baemin_by_store.get(store, 0)
         matched = t == b
         coverage = brand_coverage_after.get(store, {})
         result["store_results"][store] = {
@@ -562,9 +645,15 @@ def validate_toorder_orders(
             mismatched_final.append(store)
             if coverage.get("issue_type"):
                 missing_brand_stores.append(store)
-            logger.warning("재수집 후 불일치: %s ToOrder=%d / 배민=%d", store, t, b)
+            if store in attempted_retry:
+                logger.warning("재수집 후 불일치: %s ToOrder=%d / 배민=%d", store, t, b)
+            else:
+                logger.warning("원천 금액 차이 유지: %s ToOrder=%d / 배민=%d", store, t, b)
         else:
-            logger.info("재수집 후 일치: %s %d원", store, t)
+            if store in attempted_retry:
+                logger.info("재수집 후 일치: %s %d원", store, t)
+            else:
+                logger.info("일치 유지: %s %d원", store, t)
 
     result["mismatched_stores"] = mismatched_final
     result["missing_brand_stores"] = sorted(set(missing_brand_stores))

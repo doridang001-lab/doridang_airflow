@@ -16,6 +16,8 @@ from modules.extract.croling_beamin import (
     launch_browser,
     login_baemin,
     logout_baemin,
+    is_on_main_dashboard,
+    navigate_to_store_now,
     select_store_by_id,
     wait_for_metrics_data,
     wait_for_page,
@@ -47,7 +49,7 @@ def collect_now_stats(account_list: list[dict]) -> str:
 
             from urllib.parse import urlparse as _urlparse
 
-            if _urlparse(driver.current_url).hostname != "self.baemin.com":
+            if not is_on_main_dashboard(driver.current_url):
                 try:
                     driver.set_page_load_timeout(45)
                     driver.get("https://self.baemin.com/")
@@ -120,6 +122,8 @@ def collect_now_stats(account_list: list[dict]) -> str:
                 )
                 stats["brand"] = store_info["brand"]
                 stats["store"] = store_info["store"]
+                stats["collection_status"] = "ok"
+                stats["collection_note"] = "metric_values"
 
                 saved = _save_metrics_csv(stats, store_info["brand"], store_info["store"])
                 logger.info(
@@ -190,6 +194,35 @@ def _save_metrics_csv(stats: dict, brand: str, store: str) -> Path:
     return out_path
 
 
+def _collect_stats_or_empty(driver, store_info: dict, account_id: str) -> dict:
+    try:
+        return collect_single_store_stats(driver, store_info["store_id"], account_id)
+    except Exception as exc:
+        logger.info("NOW 빈값 stats 생성 중 DOM 읽기 실패(빈값 저장 계속): %s", exc)
+        return {
+            "account_id": account_id,
+            "store_id": store_info["store_id"],
+            "platform": "baemin",
+            "collected_at": pendulum.now(KST).to_iso8601_string(),
+        }
+
+
+def _is_recoverable_driver_error(exc: Exception) -> bool:
+    text = str(exc)
+    return any(
+        marker in text
+        for marker in (
+            "Connection refused",
+            "Max retries",
+            "Read timed out",
+            "ReadTimeoutError",
+            "invalid session",
+            "chrome not reachable",
+            "tab crashed",
+        )
+    )
+
+
 def collect_now_for_driver(driver, account_id: str, store_list: list[dict]) -> None:
     """이미 로그인된 driver로 now 지표를 수집한다 (login/logout 없음).
 
@@ -197,15 +230,13 @@ def collect_now_for_driver(driver, account_id: str, store_list: list[dict]) -> N
     """
     for store_info in store_list:
         try:
-            logger.info("매장 선택 시도: %s", store_info)
-            if not select_store_by_id(driver, store_info["store_id"]):
-                logger.warning("매장 선택 실패: %s", store_info)
-                raise RuntimeError(f"store selection failed: {store_info['store_id']}")
-
-            logger.info("매장 데이터 로드 대기: %s", store_info["store"])
-            if not wait_for_metrics_data(driver, timeout=90):
-                logger.warning("매장 데이터 로드 타임아웃: %s", store_info["store"])
-                raise RuntimeError(f"metrics load timeout: {store_info['store_id']}")
+            logger.info("매장 선택 시도(URL 이동): %s", store_info)
+            # URL 직접 이동(+F5)으로 매장 전환 및 NOW 지표 로드까지 한 번에 처리한다.
+            # 멀티매장 계정에서 드롭다운 전환이 되돌아가는 문제를 우회한다.
+            state = navigate_to_store_now(driver, store_info["store_id"], return_state=True)
+            if state.get("status") not in ("loaded", "no_data"):
+                logger.info("NOW 렌더/데이터 로드 실패: %s / state=%s", store_info, state)
+                raise RuntimeError(f"NOW render/metrics failed: {store_info['store_id']} / {state}")
 
             try:
                 dom_info = driver.execute_script(r"""
@@ -223,23 +254,32 @@ def collect_now_for_driver(driver, account_id: str, store_list: list[dict]) -> N
             except Exception:
                 pass
 
-            stats = collect_single_store_stats(
-                driver, store_info["store_id"], account_id
-            )
+            stats = _collect_stats_or_empty(driver, store_info, account_id)
             stats["brand"] = store_info["brand"]
             stats["store"] = store_info["store"]
+            stats["collection_status"] = "no_data" if state.get("status") == "no_data" else "ok"
+            stats["collection_note"] = state.get("reason", "")
 
             saved = _save_metrics_csv(stats, store_info["brand"], store_info["store"])
-            logger.info(
-                "수집 완료: brand=%s store=%s -> %s",
-                store_info["brand"],
-                store_info["store"],
-                saved,
-            )
+            if state.get("status") == "no_data":
+                logger.info(
+                    "NOW 데이터없음(정상): brand=%s store=%s reason=%s -> %s",
+                    store_info["brand"],
+                    store_info["store"],
+                    state.get("reason", ""),
+                    saved,
+                )
+            else:
+                logger.info(
+                    "수집 완료: brand=%s store=%s -> %s",
+                    store_info["brand"],
+                    store_info["store"],
+                    saved,
+                )
 
         except Exception as e:
-            # Connection refused / Max retries = Chrome OOM 크래시 → 상위로 전파
-            if "Connection refused" in str(e) or "Max retries" in str(e):
-                logger.warning("Chrome 세션 종료, now 수집 중단: %s", e)
+            # Selenium/renderer timeout은 세션 복구 또는 Retry DAG가 처리할 수 있게 상위로 전파한다.
+            if _is_recoverable_driver_error(e):
+                logger.info("Chrome 세션 종료, now 수집 중단: %s", e)
                 raise
-            logger.warning("매장 now 수집 실패 (건너뜀): %s / %s", store_info["store"], e)
+            logger.info("매장 now 수집 실패 (건너뜀): %s / %s", store_info["store"], e)

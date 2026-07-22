@@ -1,9 +1,10 @@
 """
 ToOrder datedetail monthly recollection DAG.
 
-- Default: recollect 2025-07-01 through yesterday in KST by month spans.
+- Default: recollect previous month start through yesterday in KST by month spans.
 - conf ``month``: collect that month only, for example {"month": "2025-07"}.
 - conf ``sale_date_from`` and ``sale_date_to``: collect the inclusive range.
+- conf ``backfill``: recollect 2025-07-01 through yesterday in KST.
 """
 
 from datetime import datetime, timedelta
@@ -30,9 +31,12 @@ def resolve_dates(**context) -> str:
     month = conf.get("month")
     sale_date_from = conf.get("sale_date_from")
     sale_date_to = conf.get("sale_date_to")
+    backfill = conf.get("backfill")
 
     if month and (sale_date_from or sale_date_to):
         raise ValueError("month and sale_date_from/sale_date_to cannot be used together.")
+    if backfill and (month or sale_date_from or sale_date_to):
+        raise ValueError("backfill cannot be used with month or sale_date_from/sale_date_to.")
 
     if month:
         start = datetime.strptime(f"{month}-01", "%Y-%m-%d")
@@ -49,9 +53,13 @@ def resolve_dates(**context) -> str:
             raise ValueError(f"sale_date_from({sale_date_from}) is after sale_date_to({sale_date_to}).")
         date_from = sale_date_from
         date_to = sale_date_to
-    else:
+    elif backfill:
         date_from = DEFAULT_DATE_FROM
         date_to = pendulum.now("Asia/Seoul").subtract(days=1).format("YYYY-MM-DD")
+    else:
+        today = pendulum.now("Asia/Seoul")
+        date_from = today.start_of("month").subtract(months=1).format("YYYY-MM-DD")
+        date_to = today.subtract(days=1).format("YYYY-MM-DD")
 
     context["ti"].xcom_push(key="date_from", value=date_from)
     context["ti"].xcom_push(key="date_to", value=date_to)

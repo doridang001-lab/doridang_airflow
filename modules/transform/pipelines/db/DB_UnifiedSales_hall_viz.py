@@ -19,7 +19,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from modules.transform.pipelines.db.DB_UnifiedSales_common import UNIFIED_ROOT, _unified_daily_path
+from modules.transform.pipelines.db.DB_UnifiedSales_common import UNIFIED_ROOT, _unified_daily_path, iter_unified_sales_files
 from modules.transform.utility.paths import MART_DB
 
 logger = logging.getLogger(__name__)
@@ -155,7 +155,7 @@ def run_lookback_hall_viz(days: int = 7) -> str:
 
 def backfill_hall_viz() -> str:
     """UNIFIED_ROOT의 모든 unified_sales_*.parquet 기준으로 hall_viz를 재생성(overwrite)."""
-    files = sorted(UNIFIED_ROOT.glob("unified_sales_*.parquet")) if UNIFIED_ROOT.exists() else []
+    files = iter_unified_sales_files()
     if not files:
         msg = f"hall_viz backfill 스킵 (unified_sales parquet 없음) | {UNIFIED_ROOT}"
         logger.warning(msg)

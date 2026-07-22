@@ -2,13 +2,9 @@
 
 import logging
 
-import pandas as pd
-
-from modules.transform.utility.paths import ONEDRIVE_DB
+from modules.transform.utility.account import load_automation_account_df
 
 logger = logging.getLogger(__name__)
-
-CSV_PATH = ONEDRIVE_DB / "sales_employee.csv"
 
 
 def load_accounts(target_stores: list[str], exact: bool = False) -> list[dict]:
@@ -18,23 +14,20 @@ def load_accounts(target_stores: list[str], exact: bool = False) -> list[dict]:
     target_stores가 비어 있으면 전 매장 반환.
     exact=True 이면 매장명 완전 일치(isin), False 이면 부분 문자열 매칭.
     """
-    df = pd.read_csv(CSV_PATH)
-    df = df[df["플랫폼"] == "배달의 민족"].copy()
-
-    if target_stores:
-        if exact:
-            df = df[df["매장명"].isin(target_stores)]
-        else:
-            pattern = "|".join(target_stores)
-            df = df[df["매장명"].str.contains(pattern, na=False)]
+    df = load_automation_account_df(
+        platform="배달의 민족",
+        target_stores=target_stores,
+        exact=exact,
+    )
 
     accounts = [
         {
-            "account_id": str(r["계정ID"]),
-            "password":   str(r["계정PW"]),
-            "store_name": str(r["매장명"]),
+            "account_id": str(r["계정ID"]).strip(),
+            "password":   str(r["계정PW"]).strip(),
+            "store_name": str(r["매장명"]).strip(),
         }
         for _, r in df.iterrows()
+        if str(r.get("계정ID", "")).strip() and str(r.get("계정PW", "")).strip()
     ]
     logger.info("계정 로드: %d개 %s", len(accounts), [a["store_name"] for a in accounts])
     return accounts

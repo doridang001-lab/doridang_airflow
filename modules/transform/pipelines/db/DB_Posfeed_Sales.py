@@ -26,7 +26,7 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 
 from airflow.exceptions import AirflowSkipException
 
-from modules.transform.utility.paths import DOWN_DIR, ANALYTICS_DB
+from modules.transform.utility.paths import DOWN_DIR, ANALYTICS_DB, TEMP_DIR
 from modules.transform.utility.selenium_uc import configure_uc_data_path
 from modules.transform.utility.store_normalize import normalize as _normalize_store_series
 from modules.load.load_onedrive import onedrive_csv_save
@@ -37,11 +37,24 @@ logger = logging.getLogger(__name__)
 def _kst_now() -> datetime:
     return datetime.now(ZoneInfo("Asia/Seoul")).replace(tzinfo=None)
 
+
+def _get_airflow_variable(key: str) -> str:
+    try:
+        from airflow.models import Variable
+
+        return (Variable.get(key, default_var=None) or "").strip()
+    except Exception:
+        return ""
+
+
+def _resolve_secret(key: str, default: str) -> str:
+    return (os.getenv(key) or _get_airflow_variable(key) or default).strip()
+
 # ============================================================
 # 상수 - 계정 / URL
 # ============================================================
-POSFEED_ID  = "siw2222@naver.com"
-POSFEED_PW  = "ehfl8877!!"
+POSFEED_ID  = _resolve_secret("POSFEED_ID", "siw2222@naver.com")
+POSFEED_PW  = _resolve_secret("POSFEED_PW", "ehfl8877!!")
 LOGIN_URL   = "https://admin.posfeed.co.kr/#/login?redirect=%2Fdashboard"
 ORDER_URL   = "https://admin.posfeed.co.kr/#/order/list"
 
@@ -236,9 +249,72 @@ def _login(driver: uc.Chrome, wait: WebDriverWait) -> None:
     pw_input.send_keys(Keys.RETURN)  # Vue SPA: submit() 대신 Enter
 
     # 로그인 성공 = URL 해시가 /login 에서 벗어날 때까지 대기
-    wait.until(lambda d: "#/login" not in d.current_url)
+    try:
+        wait.until(lambda d: "#/login" not in d.current_url)
+    except TimeoutException as exc:
+        current_url = getattr(driver, "current_url", "")
+        debug_path = _save_posfeed_login_debug(driver, "login_failed")
+        input_state = _posfeed_login_input_state(driver)
+        raise TimeoutException(
+            "Posfeed 로그인 실패: 로그인 페이지에서 벗어나지 못했습니다. "
+            f"account={POSFEED_ID!r}, current_url={current_url!r}, "
+            f"input_state={input_state}, debug={debug_path or 'unavailable'}"
+        ) from exc
     time.sleep(2)
     logger.info(f"Posfeed 로그인 완료 | URL: {driver.current_url}")
+
+
+def _posfeed_login_input_state(driver: uc.Chrome) -> dict:
+    """로그인 실패 진단용 입력 상태. 비밀번호 원문은 남기지 않는다."""
+    try:
+        return driver.execute_script(
+            """
+            const id = document.querySelector('input[name="username"], input[type="text"], input[type="email"]');
+            const pw = document.querySelector('input[name="password"], input[type="password"]');
+            const errorSelectors = [
+                '.el-message', '.el-message__content', '.el-form-item__error',
+                '.error', '.alert', '[role="alert"]', '.toast-message'
+            ];
+            const errors = [];
+            for (const selector of errorSelectors) {
+                for (const el of document.querySelectorAll(selector)) {
+                    const text = (el.innerText || el.textContent || '').trim();
+                    if (text) errors.push(text);
+                }
+            }
+            return {
+                title: document.title || '',
+                id_len: id && id.value ? id.value.length : 0,
+                pw_len: pw && pw.value ? pw.value.length : 0,
+                error_texts: errors.slice(0, 10),
+                inputs: Array.from(document.querySelectorAll('input')).map(el => ({
+                    id: el.id || '',
+                    name: el.name || '',
+                    type: el.type || ''
+                })).slice(0, 10)
+            };
+            """
+        )
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _save_posfeed_login_debug(driver: uc.Chrome, tag: str) -> str | None:
+    """Posfeed 로그인 실패 디버그 파일을 temp 경로에 저장한다."""
+    try:
+        debug_dir = TEMP_DIR / "posfeed_login_debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = debug_dir / f"{tag}_{ts}"
+        png = base.with_suffix(".png")
+        html = base.with_suffix(".html")
+        driver.save_screenshot(str(png))
+        html.write_text(driver.page_source or "", encoding="utf-8", errors="replace")
+        logger.error("Posfeed 로그인 실패 디버그 저장: %s", png)
+        return str(png)
+    except Exception as exc:
+        logger.warning("Posfeed 로그인 실패 디버그 저장 실패: %s", exc)
+        return None
 
 
 def _read_panel_ym(panel) -> tuple[int, int] | tuple[None, None]:
@@ -627,6 +703,30 @@ def download_posfeed_excel(collect_mode: str = None, **context) -> str:
     raise last_exc
 
 
+def _read_order_excel_file(src: Path) -> pd.DataFrame:
+    """Posfeed 다운로드 파일을 실제 포맷에 맞춰 DataFrame으로 읽는다."""
+    with open(str(src), "rb") as _f:
+        _magic = _f.read(8)
+
+    if _magic[:4] == b'\xd0\xcf\x11\xe0':
+        df = pd.read_excel(str(src), dtype=str, engine="xlrd")
+        logger.info("엑셀 파일 엔진: xlrd (xls)")
+    elif _magic[:4] == b'PK\x03\x04':
+        df = pd.read_excel(str(src), dtype=str, engine="openpyxl")
+        logger.info("엑셀 파일 엔진: openpyxl (xlsx)")
+    elif _magic[:5] in (b'<?xml', b'<html', b'<HTML') or _magic.lstrip()[:1] == b'<':
+        logger.warning("HTML 형식 파일 감지 - HTML 테이블로 파싱 시도")
+        dfs = pd.read_html(str(src), encoding="utf-8")
+        df = dfs[0].astype(str)
+    else:
+        logger.warning(f"파일 매직 바이트 미확인({_magic[:8].hex()}) - openpyxl로 시도")
+        try:
+            df = pd.read_excel(str(src), dtype=str, engine="openpyxl")
+        except Exception:
+            df = pd.read_excel(str(src), dtype=str, engine="xlrd")
+    return df
+
+
 def move_to_storage(**context) -> str:
     """다운로드된 엑셀 → UTF-8 CSV 변환 후 DOWN_DIR/ 에 저장 (OneDrive 업로드 전 처리용)"""
     from datetime import timedelta
@@ -647,31 +747,7 @@ def move_to_storage(**context) -> str:
     yesterday = (_kst_now() - timedelta(days=1)).strftime("%Y-%m-%d")
     today = _kst_now().strftime("%Y%m%d")
 
-    # 엑셀 읽기 → 등록날짜 컬럼 추가 → UTF-8 CSV 저장
-    # 파일 매직 바이트로 실제 포맷 판별 후 적절한 엔진 선택
-    with open(str(src), "rb") as _f:
-        _magic = _f.read(8)
-
-    if _magic[:4] == b'\xd0\xcf\x11\xe0':
-        # OLE2 복합 문서 형식 (xls)
-        df = pd.read_excel(str(src), dtype=str, engine="xlrd")
-        logger.info("엑셀 파일 엔진: xlrd (xls)")
-    elif _magic[:4] == b'PK\x03\x04':
-        # ZIP 기반 (xlsx)
-        df = pd.read_excel(str(src), dtype=str, engine="openpyxl")
-        logger.info("엑셀 파일 엔진: openpyxl (xlsx)")
-    elif _magic[:5] in (b'<?xml', b'<html', b'<HTML') or _magic.lstrip()[:1] == b'<':
-        # HTML 테이블로 내려온 경우
-        logger.warning("HTML 형식 파일 감지 - HTML 테이블로 파싱 시도")
-        dfs = pd.read_html(str(src), encoding="utf-8")
-        df = dfs[0].astype(str)
-    else:
-        # 최후 시도: openpyxl → xlrd 순으로 fallback
-        logger.warning(f"파일 매직 바이트 미확인({_magic[:8].hex()}) - openpyxl로 시도")
-        try:
-            df = pd.read_excel(str(src), dtype=str, engine="openpyxl")
-        except Exception:
-            df = pd.read_excel(str(src), dtype=str, engine="xlrd")
+    df = _read_order_excel_file(src)
     df["등록날짜"] = yesterday
     dest = dest_dir / f"{src.stem}_{today}.csv"
     df.to_csv(str(dest), index=False, encoding="utf-8-sig")  # BOM 포함 → Excel 한글 깨짐 방지
@@ -682,6 +758,58 @@ def move_to_storage(**context) -> str:
     logger.info(result)
     context['ti'].xcom_push(key='saved_file_path', value=str(dest))
     return result
+
+
+def collect_posfeed_today(**context) -> str:
+    """Today DAG용 Posfeed 주문 수집: 조회 날짜와 등록날짜를 sale_date로 맞춘다."""
+    ti = context.get("ti")
+    sale_date = ti.xcom_pull(task_ids="resolve_today", key="sale_date") if ti else None
+    if not sale_date:
+        conf = (getattr(context.get("dag_run"), "conf", None) or {})
+        sale_date = conf.get("sale_date")
+    if not sale_date:
+        sale_date = _kst_now().strftime("%Y-%m-%d")
+
+    target_date = datetime.strptime(str(sale_date), "%Y-%m-%d")
+    download_dir = DOWN_DIR
+    download_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Posfeed today 수집 시작: %s | 다운로드 경로: %s", sale_date, download_dir)
+
+    MAX_ATTEMPTS = 5
+    last_exc: Exception = RuntimeError("collect_posfeed_today 시도 0회")
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        driver, wait = _restart_driver_with_download(download_dir)
+        logger.info("CDP 다운로드 경로 설정: %s (today 시도 %d/%d)", download_dir, attempt, MAX_ATTEMPTS)
+        try:
+            _login(driver, wait)
+            download_start = time.time()
+            _click_download(driver, wait, target_date=target_date)
+            downloaded_file = _wait_for_downloaded_file(download_dir, min_mtime=download_start)
+
+            df = _read_order_excel_file(downloaded_file)
+            df["등록날짜"] = str(sale_date)
+            dest = download_dir / f"{downloaded_file.stem}_{target_date.strftime('%Y%m%d')}_today.csv"
+            df.to_csv(str(dest), index=False, encoding="utf-8-sig")
+            downloaded_file.unlink()
+
+            if ti:
+                ti.xcom_push(key="downloaded_file_path", value=str(downloaded_file))
+                ti.xcom_push(key="saved_file_path", value=str(dest))
+            result = f"✅ Today 저장 완료: {dest.name} | 행수: {len(df):,} | 등록날짜: {sale_date}"
+            logger.info(result)
+            return result
+        except (TimeoutException, WebDriverException, Exception) as e:
+            last_exc = e
+            logger.warning("Today 다운로드 시도 %d/%d 실패: %s — Chrome 재시작", attempt, MAX_ATTEMPTS, e)
+        finally:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            _kill_chrome_processes()
+            logger.info("WebDriver 종료 (today 시도 %d)", attempt)
+
+    raise last_exc
 
 
 # ============================================================

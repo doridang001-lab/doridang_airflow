@@ -5,7 +5,7 @@
 1. 8개 플랫폼 raw 정책 CSV 로드 → 플랫폼별 최신 policy_date 1건 필터링
 2. 기존 통합 CSV와 비교하여 신규/변경 정책 감지
 3. 통합 CSV 저장 (전체 컬럼)
-4. 신규/변경 정책 있을 시 HTML 이메일 알림 (a17019@kakao.com)
+4. 신규/변경 정책 있을 시 HTML 이메일 알림
 5. Flow 하위업무 자동 게시 (https://flow.team/l/QdNBw)
 6. 실행 로그 기록
 

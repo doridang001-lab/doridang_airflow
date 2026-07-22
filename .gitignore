@@ -94,6 +94,9 @@ pnpm-debug.log*
 # Sensitive data
 *.json
 !requirements.json
+!harness/registry.json
+!phases/
+!phases/**/*.json
 config/*.json
 
 # Downloaded/temporary files

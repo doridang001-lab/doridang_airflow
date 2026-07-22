@@ -1,12 +1,13 @@
-﻿"""
-WSL?먯꽌 ?ㅽ뻾:
-nohup python /mnt/c/airflow/watch_heal_queue.py >> /tmp/heal_watch.log 2>&1 &
+"""
+WSL 실행 예:
+python /mnt/c/airflow/watch_heal_queue.py >> /tmp/codex_autoheal_queue.log 2>&1
 """
 
 import hashlib
 import json
 import logging
 import os
+import signal
 import shlex
 import subprocess
 import time
@@ -35,10 +36,15 @@ _load_dotenv(Path("/mnt/c/airflow/.env"))
 
 QUEUE_PATH = Path(os.getenv("HEAL_QUEUE_PATH", "/mnt/c/airflow/logs/heal_queue.jsonl"))
 TASK_STATE_PATH = Path(os.getenv("HEAL_TASK_STATE_PATH", "/mnt/c/airflow/logs/heal_task_state.json"))
+HEARTBEAT_PATH = Path(
+    os.getenv("AUTOHEAL_HEARTBEAT_PATH", str(QUEUE_PATH.parent / "autoheal_heartbeat.json"))
+)
 POLL_INTERVAL = int(os.getenv("HEAL_QUEUE_POLL_INTERVAL", "60"))
 CODEX_COMMAND = os.getenv("CODEX_COMMAND", "codex")
 CODEX_MODEL = os.getenv("CODEX_MODEL", "codex-spark")
-CODEX_WORKDIR = os.getenv("CODEX_WORKDIR", "/mnt/c/airflow")
+AIRFLOW_RUNTIME_WORKDIR = os.getenv("AIRFLOW_RUNTIME_WORKDIR", "/mnt/c/airflow")
+AUTOHEAL_WORKTREE = os.getenv("CODEX_AUTOHEAL_WORKTREE", "/mnt/c/tmp/airflow-autoheal")
+CODEX_WORKDIR = os.getenv("CODEX_WORKDIR", AUTOHEAL_WORKTREE)
 CODEX_EXTRA_ARGS = os.getenv("CODEX_EXTRA_ARGS", "")
 CODEX_TIMEOUT_SECONDS = int(os.getenv("CODEX_TIMEOUT_SECONDS", "1800"))
 AIRFLOW_API_URL = os.getenv("AIRFLOW_API_URL", "http://localhost:8080/api/v1").rstrip("/")
@@ -46,6 +52,7 @@ AIRFLOW_USERNAME = os.getenv("AIRFLOW_USERNAME", "airflow")
 AIRFLOW_PASSWORD = os.getenv("AIRFLOW_PASSWORD", "airflow")
 
 os.environ["HEAL_QUEUE_PATH"] = str(QUEUE_PATH)
+os.environ["AUTOHEAL_HEARTBEAT_PATH"] = str(HEARTBEAT_PATH)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -53,7 +60,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 _BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 _CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 _TELEGRAM_CREDS_LOADED = False
-_AUTO_EDIT_CLASSES = {"code_error"}
+_AUTO_EDIT_CLASSES = {"code_error", "allocator_error", "transient", "unknown"}
 
 try:
     from modules.transform.utility.notifier import classify_failure
@@ -62,6 +69,8 @@ except Exception:
         lowered = (text or "").lower()
         if any(token in lowered for token in ("[content_types].xml", "badzipfile", "invalid xlsx", "xlsx required parts missing")):
             return "data_file_error"
+        if any(token in lowered for token in ("상품 슬롯 초과", "slot overflow", "manual_item_block_size", "item_id 배정 실패")):
+            return "allocator_error"
         if any(token in lowered for token in ("syntaxerror", "nameerror", "modulenotfounderror", "importerror")):
             return "code_error"
         if any(token in lowered for token in ("timeout", "selenium", "webdriver", "connection", "chrome", "crash")):
@@ -182,6 +191,36 @@ def _load_queue_rows() -> list[tuple[str, object]]:
     return rows
 
 
+def _pending_queue_count() -> int:
+    return sum(
+        1
+        for kind, row in _load_queue_rows()
+        if kind == "json" and isinstance(row, dict) and row.get("claimed_by") is None
+    )
+
+
+def _write_heartbeat(last_result: str = "running", last_error: str = "") -> None:
+    try:
+        HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "pid": os.getpid(),
+            "queue_path": str(QUEUE_PATH),
+            "task_state_path": str(TASK_STATE_PATH),
+            "code_workdir": CODEX_WORKDIR,
+            "runtime_workdir": AIRFLOW_RUNTIME_WORKDIR,
+            "pending_count": _pending_queue_count(),
+            "last_result": last_result,
+            "last_error": last_error[:500],
+        }
+        tmp_path = HEARTBEAT_PATH.with_suffix(HEARTBEAT_PATH.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        tmp_path.replace(HEARTBEAT_PATH)
+    except Exception as e:
+        logger.warning("heartbeat write failed: %s", e)
+
+
 def _write_queue_rows(rows: list[tuple[str, object]]) -> None:
     QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = QUEUE_PATH.with_suffix(QUEUE_PATH.suffix + ".tmp")
@@ -244,6 +283,7 @@ def send_telegram(text: str) -> None:
 def _read_first_unclaimed() -> dict | None:
     if not QUEUE_PATH.exists():
         return None
+    candidates: list[dict] = []
     with QUEUE_PATH.open("r", encoding="utf-8") as f:
         for line in f:
             if not line.strip():
@@ -254,8 +294,15 @@ def _read_first_unclaimed() -> dict | None:
                 logger.warning("heal_queue JSON parse error: %s", line[:200])
                 continue
             if entry.get("claimed_by") is None:
-                return entry
-    return None
+                candidates.append(entry)
+    if not candidates:
+        return None
+    return max(candidates, key=_queue_entry_sort_key)
+
+
+def _queue_entry_sort_key(entry: dict) -> tuple[int, str]:
+    kind_priority = 1 if entry.get("kind") == "task_failure" else 0
+    return kind_priority, str(entry.get("ts") or "")
 
 
 def _codex_args(prompt: str) -> list[str]:
@@ -269,13 +316,55 @@ def _codex_args(prompt: str) -> list[str]:
 def _run_codex(prompt: str) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["CODEX_WORKDIR"] = CODEX_WORKDIR
-    return subprocess.run(
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kwargs["start_new_session"] = True
+
+    started = time.monotonic()
+    proc = subprocess.Popen(
         _codex_args(prompt),
-        check=False,
-        timeout=CODEX_TIMEOUT_SECONDS,
         cwd=CODEX_WORKDIR,
         env=env,
+        **kwargs,
     )
+    while True:
+        returncode = proc.poll()
+        if returncode is not None:
+            return subprocess.CompletedProcess(proc.args, returncode)
+
+        elapsed = time.monotonic() - started
+        if elapsed > CODEX_TIMEOUT_SECONDS:
+            _terminate_process_tree(proc)
+            raise subprocess.TimeoutExpired(proc.args, CODEX_TIMEOUT_SECONDS)
+
+        _write_heartbeat("codex_running")
+        time.sleep(min(POLL_INTERVAL, 30))
+
+
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    try:
+        if os.name == "nt":
+            proc.terminate()
+        else:
+            os.killpg(proc.pid, signal.SIGTERM)
+    except Exception as e:
+        logger.warning("Codex terminate failed: %s", e)
+
+    try:
+        proc.wait(timeout=10)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    try:
+        if os.name == "nt":
+            proc.kill()
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception as e:
+        logger.warning("Codex kill failed: %s", e)
 
 
 def _build_import_signature(entry: dict) -> str:
@@ -362,9 +451,11 @@ def _classify_task_entry(entry: dict, log_text: str) -> str:
     combined = "\n".join([str(entry.get("error") or ""), log_text or ""])
     detected = classify_failure(combined)
     queued = entry.get("failure_class")
-    if detected == "data_file_error":
+    if detected in {"data_file_error", "allocator_error", "code_error"}:
         return detected
-    if queued in {"transient", "data_or_account"}:
+    if queued == "data_or_account":
+        return queued
+    if queued == "transient" and detected == "unknown":
         return queued
     return detected
 
@@ -402,6 +493,11 @@ def _build_prompt(entry: dict, log_text: str) -> str:
             "- Codex auto-heal은 Airflow DAG import/task 실패 복구만 담당합니다.\n"
             "- Telegram/Claude 루프 파일은 해당 오류의 직접 원인이 아니면 수정하지 마세요.\n"
             "- 사용자의 일반 질문이나 보고서 작성은 Claude 루프 담당으로 남겨두세요.\n\n"
+            "Workspace rules:\n"
+            f"- Runtime source is {AIRFLOW_RUNTIME_WORKDIR}.\n"
+            f"- Codex auto-heal workspace is {CODEX_WORKDIR}.\n"
+            "- Do not edit the runtime source by default; inspect, patch, and verify only in the auto-heal workspace.\n"
+            "- If runtime deployment is needed, report changed files and validation results for manual approval.\n\n"
             f"dag_id={entry.get('dag_id', '<unknown>')}\n"
             f"filename={entry.get('filename', '<unknown>')}\n"
             f"filepath={entry.get('filepath', '<unknown>')}\n"
@@ -428,15 +524,21 @@ def _build_prompt(entry: dict, log_text: str) -> str:
         "- Codex auto-heal은 Airflow DAG import/task 실패 복구만 담당합니다.\n"
         "- Telegram/Claude 루프 파일은 해당 오류의 직접 원인이 아니면 수정하지 마세요.\n"
         "- 사용자의 일반 질문이나 보고서 작성은 Claude 루프 담당으로 남겨두세요.\n\n"
+        "Workspace rules:\n"
+        f"- Runtime source is {AIRFLOW_RUNTIME_WORKDIR}.\n"
+        f"- Codex auto-heal workspace is {CODEX_WORKDIR}.\n"
+        "- Do not edit the runtime source by default; inspect, patch, and verify only in the auto-heal workspace.\n"
+        "- If runtime deployment is needed, report changed files and validation results for manual approval.\n\n"
         f"dag_id={entry['dag_id']}\n"
         f"task_id={entry['task_id']}\n"
         f"run_id={entry['run_id']}\n"
         f"try_number={entry['try_number']}\n"
+        f"failure_class={entry.get('failure_class', '')}\n"
         f"error={entry.get('error', '')}\n\n"
         f"--- log ---\n{log_text}\n\n"
         "필수 지시:\n"
-        "1. 원인을 먼저 파악하세요.\n"
-        "2. 필요한 경우에만 최소 수정하세요.\n"
+        "1. 원인을 먼저 파악하세요. unknown/transient/allocator_error도 조사 대상입니다.\n"
+        "2. 코드/설계 문제면 최소 수정하고, 데이터/계정/권한 문제면 수정하지 말고 수동조치 사유를 보고하세요.\n"
         "3. modules.transform.utility.airflow_api.trigger_dag(dag_id) 재실행이 적절한지 판단하세요.\n"
         "4. modules.transform.utility.notifier.send_telegram()으로 아래 형식의 한글 보고를 보내세요.\n\n"
         "[자동복구 결과]\n"
@@ -502,7 +604,17 @@ def _send_import_start_notification(entry: dict) -> None:
 def process_once() -> bool:
     entry = _read_first_unclaimed()
     if not entry:
+        logger.info("heal_queue idle: pending=0")
         return False
+
+    logger.info(
+        "heal_queue pending entry: kind=%s dag_id=%s task_id=%s run_id=%s failure_class=%s",
+        entry.get("kind"),
+        entry.get("dag_id"),
+        entry.get("task_id"),
+        entry.get("run_id"),
+        entry.get("failure_class"),
+    )
 
     if entry.get("kind") == "import_error":
         signature = entry.get("signature") or _build_import_signature(entry)
@@ -542,10 +654,12 @@ def process_once() -> bool:
     task_id = entry.get("task_id")
     try_number = entry.get("try_number")
     if not all([dag_id, run_id, task_id, try_number]):
-        logger.warning("heal_queue ?꾩닔 ?꾨뱶 ?꾨씫: %s", entry)
+        logger.warning("heal_queue 필수 필드 누락: %s", entry)
         return False
 
     log_text = get_task_log(dag_id, run_id, task_id, try_number)
+    if not log_text:
+        logger.warning("task log lookup returned empty: dag_id=%s task_id=%s run_id=%s", dag_id, task_id, run_id)
     failure_class = _classify_task_entry(entry, log_text)
     entry["failure_class"] = failure_class
     signature = _task_signature(entry, log_text)
@@ -583,9 +697,9 @@ def process_once() -> bool:
             task_id,
             "autoheal-skip",
             try_number=try_number,
-            updates={"failure_class": failure_class, "skip_reason": "not_code_error", "signature": signature},
+            updates={"failure_class": failure_class, "skip_reason": "manual_only", "signature": signature},
         ):
-            _send_skip_notification(entry, failure_class, "not_code_error")
+            _send_skip_notification(entry, failure_class, "manual_only")
             return True
         return False
 
@@ -645,14 +759,23 @@ def process_once() -> bool:
 
 def main() -> None:
     logger.info("watch_heal_queue start: %s", QUEUE_PATH)
+    logger.info("AUTOHEAL_HEARTBEAT_PATH=%s", HEARTBEAT_PATH)
+    logger.info("AIRFLOW_RUNTIME_WORKDIR=%s", AIRFLOW_RUNTIME_WORKDIR)
     logger.info("CODEX_WORKDIR=%s", CODEX_WORKDIR)
     logger.info("CODEX_TIMEOUT_SECONDS=%s", CODEX_TIMEOUT_SECONDS)
     logger.info("started_at=%s", datetime.now(timezone.utc).isoformat())
+    _write_heartbeat("started")
     while True:
+        last_result = "idle"
+        last_error = ""
         try:
-            process_once()
+            processed = process_once()
+            last_result = "processed" if processed else "idle"
         except Exception as e:
-            logger.exception("heal_queue 泥섎━ ?ㅽ뙣: %s", e)
+            last_result = "error"
+            last_error = str(e)
+            logger.exception("heal_queue 처리 실패: %s", e)
+        _write_heartbeat(last_result, last_error)
         time.sleep(POLL_INTERVAL)
 
 

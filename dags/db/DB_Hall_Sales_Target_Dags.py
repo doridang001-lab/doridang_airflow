@@ -22,6 +22,7 @@ from modules.transform.pipelines.db.DB_Hall_Sales_Excel import (
     build_weekly_report_excel,
 )
 from modules.transform.pipelines.db.DB_Hall_Daily_Excel import build_daily_tracking_excel
+from modules.transform.pipelines.db.DB_Hall_Daily_Excel import build_daily_tracking_csv
 # 목표치 계산은 airflow 비의존 헬퍼로 분리 (로컬 Windows 스크립트와 공유)
 from modules.transform.pipelines.db.DB_Hall_Sales_Target_config import build_targets
 from modules.transform.utility.notifier import on_failure_callback
@@ -72,10 +73,20 @@ with DAG(
         },
     )
 
+    t_daily_csv = PythonOperator(
+        task_id="build_daily_tracking_csv",
+        python_callable=build_daily_tracking_csv,
+        op_kwargs={
+            "monthly_targets":           MONTHLY_TARGETS,
+            "marketing_monthly_targets": MARKETING_MONTHLY_TARGETS,
+            "daily_target":              DAILY_TRACKING_TARGET,
+        },
+    )
+
     t_llm_log = PythonOperator(
         task_id="append_weekly_ai_log",
         python_callable=append_weekly_ai_log,
     )
 
-    t_csv >> [t_excel, t_daily_excel]
+    t_csv >> [t_excel, t_daily_excel, t_daily_csv]
     t_excel >> t_llm_log

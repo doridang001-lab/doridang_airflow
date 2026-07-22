@@ -3,8 +3,8 @@
 
 처리 흐름:
 1) OKPOS + EASYPOS 상품조회.xlsx 로드 및 정규화
-2) fin_product_grp.csv와 비교 → 신규/변경 상품 감지
-3) LLM(Ollama)으로 수동분류 + is_main_candidate 분류
+2) fin_product_grp_input.csv와 비교 → 신규/변경 상품 감지
+3) LLM(Ollama)으로 검수 후보 분류 + is_main_candidate 분류
 4) CSV에 신규 행 append (llm_check=Y)
 5) 이메일 알림 발송
 """
@@ -25,10 +25,36 @@ from modules.transform.utility.paths import (
     FIN_PRODUCT_REVIEW_CSV_PATH,
     FIN_PRODUCT_ALIAS_CSV_PATH,
     FIN_PRODUCT_MART_CSV_PATH,
+    FIN_PRODUCT_MAP_CSV_PATH,
+    FIN_PRODUCT_MAP_REVIEW_CSV_PATH,
+    RAW_OKPOS_SALES,
+    existing_fin_product_csv_path,
 )
+from modules.transform.utility.qwen_client import query_qwen_json
 from modules.transform.utility.mailer import send_email
+from modules.transform.utility.mail_recipients import MAIL_CMJ_PM
+from modules.transform.pipelines.db.DB_FinProduct_Rules import (
+    build_rules_from_manual,
+    classify_by_rules,
+    load_rules,
+    reconcile,
+    rules_to_prompt_block,
+)
+from modules.transform.pipelines.db.DB_ItemIdAllocator import (
+    SOURCE_ITEM_BASE,
+    allocate_manual_item_ids,
+    canonical_source,
+    ensure_allocator_columns,
+    item_block_size,
+    normalize_item_key,
+    validate_fin_product_codes,
+)
 
 logger = logging.getLogger(__name__)
+
+_MAP_APPROVED = {"1", "1.0", "y", "yes", "true", "approved", "승인", "완료", "검수완료"}
+_MAP_DUP_LABEL_COL = "중복_수동분류"
+_MAP_ENRICHMENT_COLS = ["source", "item_id", _MAP_DUP_LABEL_COL, "표준상품명", "수동분류_edit", "대표메뉴", "검수유무"]
 
 
 def _safe_replace(src: Path, dst: Path) -> None:
@@ -38,15 +64,80 @@ def _safe_replace(src: Path, dst: Path) -> None:
     except (PermissionError, OSError):
         dst.write_bytes(src.read_bytes())
 
+
+def _load_representative_menu_lookup() -> dict[tuple[str, str], str]:
+    if not FIN_PRODUCT_MAP_CSV_PATH.exists():
+        return {}
+    try:
+        df = pd.read_csv(FIN_PRODUCT_MAP_CSV_PATH, dtype=str, encoding="utf-8-sig").fillna("")
+    except Exception as e:
+        logger.warning("fin_product_map.csv 대표메뉴 로드 실패: %s", e)
+        return {}
+
+    for col in ("source", "item_id", "대표메뉴"):
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str).str.strip()
+    df["source"] = df["source"].map(canonical_source)
+    df = df[(df["source"] != "") & (df["item_id"] != "") & (df["대표메뉴"] != "")]
+    if df.empty:
+        return {}
+    deduped = df.drop_duplicates(subset=["source", "item_id"], keep="last")
+    return {
+        (row["source"], row["item_id"]): row["대표메뉴"]
+        for row in deduped[["source", "item_id", "대표메뉴"]].to_dict("records")
+    }
+
+
+def _load_map_enrichment_df() -> pd.DataFrame:
+    """fin_product_map_review_input.csv에서 검수 완료된 분석용 표준명/분류만 로드."""
+    empty = pd.DataFrame(columns=_MAP_ENRICHMENT_COLS)
+    if not FIN_PRODUCT_MAP_REVIEW_CSV_PATH.exists():
+        return empty
+
+    try:
+        df = pd.read_csv(FIN_PRODUCT_MAP_REVIEW_CSV_PATH, dtype=str, encoding="utf-8-sig").fillna("")
+    except Exception as e:
+        logger.warning("fin_product_map_review_input.csv 로드 실패, 표준명 합침 생략: %s", e)
+        return empty
+
+    required_cols = (
+        "source",
+        "item_id",
+        "표준_메뉴명_edit",
+        "수동분류_edit",
+        _MAP_DUP_LABEL_COL,
+        "검수유무",
+    )
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = ""
+
+    df["source"] = df["source"].astype(str).str.strip()
+    df["item_id"] = df["item_id"].astype(str).str.strip()
+    df["표준상품명"] = df["표준_메뉴명_edit"].astype(str).str.strip()
+    df["수동분류_edit"] = df["수동분류_edit"].astype(str).str.strip()
+    df[_MAP_DUP_LABEL_COL] = df[_MAP_DUP_LABEL_COL].astype(str).str.strip().str.upper().replace({"": "N"})
+    df["검수유무"] = df["검수유무"].astype(str).str.strip()
+    approved = df["검수유무"].str.lower().isin(_MAP_APPROVED)
+    df = df[approved & (df["source"] != "") & (df["item_id"] != "") & (df["표준상품명"] != "")].copy()
+    if df.empty:
+        return empty
+
+    representative_menu = _load_representative_menu_lookup()
+    df["대표메뉴"] = [
+        representative_menu.get((source, item_id), "")
+        for source, item_id in zip(df["source"], df["item_id"])
+    ]
+    for col in ["표준상품명", "수동분류_edit", "대표메뉴", "검수유무"]:
+        df[col] = df[col].replace("", pd.NA)
+    return df.drop_duplicates(subset=["source", "item_id"], keep="last")[_MAP_ENRICHMENT_COLS]
+
 OKPOS_PRODUCT_XLSX = ANALYTICS_DB / "okpos_product" / "상품조회.xlsx"
 EASYPOS_PRODUCT_XLSX = ANALYTICS_DB / "easypos_product" / "상품조회.xlsx"
 SOURCE_CODE = "okpos"
 EASYPOS_SOURCE_CODE = "easypos"
-ALERT_EMAIL = "a17019@kakao.com"
-
-# LLM 설정 - gpt-oss:20b 우선, 실패 시 qwen2.5:7b 폴백
-_GPT_MODEL_CANDIDATES = ["gpt-oss:20b", "gpt-oss:latest", "gpt-oss", "qwen2.5:7b", "qwen2.5:latest"]
-_OLLAMA_HOST = "http://host.docker.internal:11434"
+ALERT_EMAIL = MAIL_CMJ_PM
 
 # OKPOS xlsx 컬럼 인덱스 → 표준 컬럼명 매핑
 _XLSX_COL_IDX = {
@@ -59,6 +150,7 @@ _XLSX_COL_IDX = {
 
 # OKPOS 대메뉴 필터 - 도리당/나홀로 포함 행만 처리
 _OKPOS_DAEGROUP_KEYWORDS = ["도리당", "나홀로"]
+_BRAND_STORE_DAEGROUP_RE = re.compile(r"^\s*(도리당|나홀로)\s+(.+점)\s*$")
 
 # EASYPOS xlsx 컬럼명 → 표준 컬럼명 매핑
 _EASYPOS_COL_MAP = {
@@ -69,7 +161,9 @@ _EASYPOS_COL_MAP = {
     "판매단가": "판매가",
 }
 
-_CLASSIFY_LABELS = ["메인", "1인", "사이드", "기타"]
+_CLASSIFY_LABELS = ["메인", "1인", "사이드", "기타", "주류", "음료", "토핑", "옵션", "세트", "리뷰"]
+_MAP_FEW_SHOT_SOURCES = {"okpos", "posfeed"}
+_FEW_SHOT_PER_LABEL = 8
 _CHANGE_KEYS = ["대메뉴", "중메뉴", "상품명"]
 
 _XCOM_OKPOS = "okpos_df_json"
@@ -82,6 +176,159 @@ _REVIEW_APPROVE_COL = "approve"  # Y/N/blank
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+def _split_brand_store_daemenu(value: object) -> tuple[str, str, str]:
+    text = str(value or "").strip()
+    if not text:
+        return "", "", ""
+    match = _BRAND_STORE_DAEGROUP_RE.match(text)
+    if match:
+        brand = match.group(1)
+        return brand, brand, match.group(2).strip()
+    return text, "", ""
+
+
+def _normalize_daemenu(value: object) -> str:
+    return _split_brand_store_daemenu(value)[0]
+
+
+def _normalize_daemenu_series(series: pd.Series) -> pd.Series:
+    return series.fillna("").map(_normalize_daemenu)
+
+
+def _fill_brand_store_from_daemenu(df: pd.DataFrame) -> pd.DataFrame:
+    if "대메뉴" not in df.columns:
+        return df
+    split = df["대메뉴"].fillna("").map(_split_brand_store_daemenu)
+    df["대메뉴"] = split.map(lambda x: x[0])
+    if "brand" not in df.columns:
+        df["brand"] = ""
+    if "store" not in df.columns:
+        df["store"] = ""
+    brand = split.map(lambda x: x[1])
+    store = split.map(lambda x: x[2])
+    brand_blank = df["brand"].fillna("").astype(str).str.strip().eq("")
+    store_blank = df["store"].fillna("").astype(str).str.strip().eq("")
+    df.loc[brand_blank & brand.ne(""), "brand"] = brand[brand_blank & brand.ne("")]
+    df.loc[store_blank & store.ne(""), "store"] = store[store_blank & store.ne("")]
+    return df
+
+
+def _okpos_store_from_path(path: Path) -> str:
+    for part in path.parts:
+        if part.startswith("store="):
+            return part.split("=", 1)[1].strip()
+    return ""
+
+
+def _normalize_okpos_product_code(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    numeric = pd.to_numeric(pd.Series([text]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return text
+    return str(int(numeric))
+
+
+def _load_okpos_product_code_store_map() -> dict[str, set[str]]:
+    """OKPOS 매출 원천에서 원본 상품코드별 실제 판매 매장 목록을 만든다."""
+    brand_root = RAW_OKPOS_SALES / "brand=도리당"
+    result: dict[str, set[str]] = {}
+    if not brand_root.exists():
+        logger.warning("OKPOS 원천 매출 경로 없음: %s", brand_root)
+        return result
+
+    code_candidates = ("상품코드", "item_id", "상품번호", "상품ID")
+    for path in sorted(brand_root.glob("store=*/ym=*/okpos_order_item.csv")):
+        store = _okpos_store_from_path(path)
+        if not store:
+            continue
+        try:
+            df = pd.read_csv(path, dtype=str).fillna("")
+        except Exception as e:
+            logger.warning("OKPOS 상품코드-매장 매핑 로드 실패: %s | %s", path, e)
+            continue
+
+        code_col = next((col for col in code_candidates if col in df.columns), "")
+        if not code_col:
+            logger.warning("OKPOS order_item 상품코드 컬럼 없음: %s | columns=%s", path, list(df.columns))
+            continue
+
+        codes = df[code_col].map(_normalize_okpos_product_code)
+        for code in codes[codes != ""].drop_duplicates():
+            result.setdefault(code, set()).add(store)
+    return result
+
+
+def _expand_okpos_rows_by_sales_store(df: pd.DataFrame) -> pd.DataFrame:
+    """상품조회에서 매장이 빈 OKPOS 행을 실제 매출 원천의 매장별 행으로 확장한다."""
+    if df.empty or "source" not in df.columns or "상품코드" not in df.columns:
+        return df
+
+    result = df.copy()
+    for col in ("brand", "store", "상품코드"):
+        if col not in result.columns:
+            result[col] = ""
+        result[col] = result[col].fillna("").astype(str).str.strip()
+
+    source_s = result["source"].fillna("").astype(str).str.strip().str.lower()
+    blank_store = source_s.eq(SOURCE_CODE) & result["store"].eq("")
+    if not blank_store.any():
+        return result
+
+    code_to_stores = _load_okpos_product_code_store_map()
+    expanded_rows: list[pd.Series] = []
+    existing_keys = {
+        (
+            SOURCE_CODE,
+            str(row.get("brand", "")).strip(),
+            str(row.get("store", "")).strip(),
+            _normalize_okpos_product_code(row.get("상품코드", "")),
+        )
+        for _, row in result[~blank_store].iterrows()
+        if str(row.get("store", "")).strip()
+    }
+    dropped = 0
+    for _, row in result[blank_store].iterrows():
+        code = _normalize_okpos_product_code(row.get("상품코드", ""))
+        stores = sorted(code_to_stores.get(code, set()))
+        if not stores:
+            dropped += 1
+            continue
+        for store in stores:
+            new_row = row.copy()
+            if not str(new_row.get("brand", "")).strip():
+                new_row["brand"] = "도리당"
+            new_row["store"] = store
+            key = (SOURCE_CODE, str(new_row.get("brand", "")).strip(), store, code)
+            if key in existing_keys:
+                continue
+            existing_keys.add(key)
+            expanded_rows.append(new_row)
+
+    kept = result[~blank_store].copy()
+    if expanded_rows:
+        kept = pd.concat([kept, pd.DataFrame(expanded_rows, columns=result.columns)], ignore_index=True)
+    if dropped:
+        logger.warning("OKPOS 상품조회 매장 미확인 행 제외: %d건", dropped)
+    logger.info(
+        "OKPOS 상품조회 빈 매장 행 확장: blank=%d expanded=%d dropped=%d",
+        int(blank_store.sum()),
+        len(expanded_rows),
+        dropped,
+    )
+    return kept.reset_index(drop=True)
+
+
+def _normalize_launch_date(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    ts = pd.to_datetime(text, errors="coerce")
+    if pd.isna(ts):
+        return text
+    return ts.strftime("%Y-%m-%d")
 
 def _load_alias_map() -> dict[str, str]:
     """fin_product_alias.csv 로드 → {alias: canonical}."""
@@ -189,7 +436,7 @@ def _load_review_file() -> pd.DataFrame:
 
 
 def _pending_latest(df_master: pd.DataFrame) -> pd.DataFrame:
-    """fin_product_grp.csv에서 llm_check=Y인 미확정 상품을 코드별 최신 1행으로 추출."""
+    """fin_product_grp_input.csv에서 llm_check=Y인 미확정 상품을 코드별 최신 1행으로 추출."""
     if df_master.empty:
         return pd.DataFrame()
     if "상품코드" not in df_master.columns:
@@ -241,6 +488,7 @@ def _read_xlsx() -> pd.DataFrame:
 
     result["source"] = SOURCE_CODE
     result["상품코드"] = result["상품코드"].str.strip()
+    result = _fill_brand_store_from_daemenu(result)
     result["판매단가"] = pd.to_numeric(result["판매단가"], errors="coerce").fillna(0).astype(int)
     result["구분"] = result["구분"].fillna("").astype(str).str.strip()
     result["구분"] = result["구분"].replace({"": "홀"})
@@ -267,6 +515,8 @@ def _read_easypos_xlsx() -> pd.DataFrame:
         result[std_col] = df_raw[src_col]
 
     result["source"] = EASYPOS_SOURCE_CODE
+    result["brand"] = "도리당"
+    result["store"] = "송파점"
     result["상품코드"] = result["상품코드"].str.strip()
     # 상품코드 정규화: "000001" → "1" (마스터 CSV의 수동 입력 포맷과 일치)
     result["상품코드"] = result["상품코드"].apply(
@@ -290,12 +540,16 @@ def _mark_is_latest(df: pd.DataFrame) -> pd.DataFrame:
         df["source"] = ""
     _grp_keys = ["source", "상품코드"]
     df["is_latest"] = "N"
+    valid_code = df["상품코드"].fillna("").astype(str).str.strip() != ""
+    work = df[valid_code]
+    if work.empty:
+        return df
     if "updated_at" in df.columns:
         # ISO 형식(YYYY-MM-DD 또는 YYYY-MM-DD HH:MM:SS)은 문자열 사전순 = 시간순
         # → datetime 파싱 없이 문자열로 비교 (혼합 날짜/datetime 형식 파싱 오류 방지)
-        ts_str = df["updated_at"].fillna("").astype(str).str.strip()
+        ts_str = work["updated_at"].fillna("").astype(str).str.strip()
         latest_idx = (
-            df.assign(_ts=ts_str, _pos=range(len(df)))
+            work.assign(_ts=ts_str, _pos=range(len(work)))
             .sort_values(["_ts", "_pos"])
             .groupby(_grp_keys)
             .tail(1)
@@ -303,17 +557,19 @@ def _mark_is_latest(df: pd.DataFrame) -> pd.DataFrame:
         )
         df.loc[latest_idx, "is_latest"] = "Y"
     else:
-        df.loc[df.groupby(_grp_keys).tail(1).index, "is_latest"] = "Y"
+        df.loc[work.groupby(_grp_keys).tail(1).index, "is_latest"] = "Y"
     return df
 
 
 def _read_master() -> pd.DataFrame:
-    """fin_product_grp.csv 로드. 없으면 빈 DataFrame."""
-    if not FIN_PRODUCT_CSV_PATH.exists():
-        return pd.DataFrame(columns=["source", "구분", "대메뉴", "중메뉴", "상품코드", "상품명",
-                                     "판매단가", "수동분류", "is_main_candidate", "llm_check",
-                                     "exclude_check", "updated_at", "is_latest"])
-    df = pd.read_csv(FIN_PRODUCT_CSV_PATH, dtype=str).fillna("")
+    """fin_product_grp_input.csv 로드. 없으면 기존 fin_product_grp.csv를 읽는다."""
+    source_path = existing_fin_product_csv_path()
+    if not source_path.exists():
+        return ensure_allocator_columns(pd.DataFrame(columns=["source", "구분", "대메뉴", "중메뉴", "상품코드", "상품명",
+                                     "판매단가", "is_main_candidate", "llm_check",
+                                     "exclude_check", "updated_at", "is_latest"]))
+    df = pd.read_csv(source_path, dtype=str).fillna("")
+    df = ensure_allocator_columns(df)
 
     # Backward compatibility: 신규 컬럼이 뒤늦게 추가될 수 있음
     if "exclude_check" not in df.columns:
@@ -327,8 +583,8 @@ def _read_master() -> pd.DataFrame:
     # 표준_메뉴명 컬럼은 더 이상 사용하지 않음(과거 파일 호환을 위해 존재할 수는 있으나 파이프라인에서는 제거)
     if "표준_메뉴명" in df.columns:
         df = df.drop(columns=["표준_메뉴명"], errors="ignore")
-    if "중복_수동분류" not in df.columns:
-        df["중복_수동분류"] = "N"
+    if "중복_수동분류" in df.columns:
+        df = df.drop(columns=["중복_수동분류"], errors="ignore")
 
     # Normalize flags
     df["exclude_check"] = df["exclude_check"].fillna("").astype(str).str.strip().str.upper().replace({"": "N"})
@@ -342,41 +598,203 @@ def _read_master() -> pd.DataFrame:
     return df
 
 
-def _build_few_shot(master: pd.DataFrame) -> str:
-    """확정된 분류(llm_check=N) 기준 카테고리별 예시 3개씩 추출."""
-    confirmed = master[master.get("llm_check", pd.Series(["N"] * len(master))) != "Y"] if "llm_check" in master.columns else master
+def _apply_scoped_product_codes(df: pd.DataFrame) -> pd.DataFrame:
+    """상품조회 원본 코드를 매장 스코프 숫자 상품코드로 변환한다."""
+    if df.empty:
+        return ensure_allocator_columns(df)
+    result = ensure_allocator_columns(df.copy())
+    for col in ("source", "brand", "store", "상품코드", "상품명", "판매단가"):
+        if col not in result.columns:
+            result[col] = ""
+        result[col] = result[col].fillna("").astype(str).str.strip()
+    result["상품코드"] = allocate_manual_item_ids(
+        result[["source", "brand", "store", "상품코드", "상품명", "판매단가"]]
+        .rename(columns={"상품코드": "item_id", "상품명": "item_name", "판매단가": "unit_price"}),
+        persist=False,
+    )
+    result["item_key"] = result["상품명"].map(normalize_item_key)
+    for idx in result.index:
+        source = canonical_source(result.at[idx, "source"])
+        base = SOURCE_ITEM_BASE.get(source)
+        if base is None:
+            continue
+        try:
+            offset = int(str(result.at[idx, "상품코드"]).strip()) - base
+        except ValueError:
+            continue
+        if offset < 0:
+            continue
+        block_size = item_block_size(source)
+        result.at[idx, "store_seq"] = str(offset // block_size)
+        result.at[idx, "item_seq"] = str(offset % block_size)
+    return result
+
+
+def _fill_allocator_identity_from_code(item: dict) -> dict:
+    out = dict(item)
+    source = canonical_source(out.get("source", SOURCE_CODE))
+    base = SOURCE_ITEM_BASE.get(source)
+    code = str(out.get("상품코드", "")).strip()
+    if base is None or not code:
+        return out
+    try:
+        offset = int(code) - base
+    except ValueError:
+        return out
+    if offset < 0:
+        return out
+    block_size = item_block_size(source)
+    out["store_seq"] = str(offset // block_size)
+    out["item_seq"] = str(offset % block_size)
+    item_key = str(out.get("item_key", "")).strip()
+    if not item_key:
+        out["item_key"] = normalize_item_key(out.get("상품명", out.get("item_name", "")))
+    return out
+
+
+def _review_few_shot_rows() -> pd.DataFrame:
+    if not FIN_PRODUCT_MAP_REVIEW_CSV_PATH.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(FIN_PRODUCT_MAP_REVIEW_CSV_PATH, dtype=str, encoding="utf-8-sig").fillna("")
+    except Exception as exc:
+        logger.warning("fin_product_map_review_input.csv few-shot 로드 실패: %s", exc)
+        return pd.DataFrame()
+
+    required = ("source", "item_name", "표준_메뉴명_edit", "수동분류_edit", "대표메뉴", "검수유무")
+    for col in required:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str).str.strip()
+
+    approved = df["검수유무"].str.lower().isin(_MAP_APPROVED)
+    source_ok = df["source"].map(canonical_source).isin(_MAP_FEW_SHOT_SOURCES)
+    label_ok = df["수동분류_edit"].isin(_CLASSIFY_LABELS)
+    name_ok = df["item_name"].ne("")
+    out = df[approved & source_ok & label_ok & name_ok].copy()
+    if out.empty:
+        return out
+
+    out["_source_rank"] = out["source"].map(canonical_source).map({"okpos": 0, "posfeed": 1}).fillna(9)
+    out["_name_len"] = out["item_name"].str.len()
+    return (
+        out.sort_values(["수동분류_edit", "_source_rank", "_name_len", "item_name"])
+        .drop_duplicates(subset=["수동분류_edit", "item_name"], keep="first")
+        .reset_index(drop=True)
+    )
+
+
+def _master_few_shot_rows(master: pd.DataFrame) -> pd.DataFrame:
+    if master.empty or "수동분류" not in master.columns:
+        return pd.DataFrame()
+    confirmed = master[master.get("llm_check", pd.Series(["N"] * len(master), index=master.index)) != "Y"].copy()
     if "exclude_check" in confirmed.columns:
         confirmed = confirmed[confirmed["exclude_check"].fillna("").astype(str).str.strip().str.upper() != "Y"]
-    lines = []
-    for label in _CLASSIFY_LABELS:
-        samples = confirmed[confirmed["수동분류"] == label].head(3)
-        for _, row in samples.iterrows():
-            lines.append(f'  상품명="{row["상품명"]}", 중메뉴="{row["중메뉴"]}", 대메뉴="{row["대메뉴"]}" → 수동분류="{label}"')
+    if confirmed.empty:
+        return pd.DataFrame()
+    for col in ("상품명", "중메뉴", "대메뉴", "수동분류"):
+        if col not in confirmed.columns:
+            confirmed[col] = ""
+        confirmed[col] = confirmed[col].fillna("").astype(str).str.strip()
+    return confirmed[confirmed["수동분류"].isin(_CLASSIFY_LABELS) & confirmed["상품명"].ne("")]
+
+
+def _available_rules(master: pd.DataFrame | None = None) -> list[dict]:
+    rules = load_rules()
+    if rules or master is None or master.empty:
+        return rules
+    source = master.copy()
+    for col in ("상품명", "수동분류", "llm_check", "classified_by", "검수사유"):
+        if col not in source.columns:
+            source[col] = ""
+        source[col] = source[col].fillna("").astype(str).str.strip()
+    source = source[
+        (source["상품명"] != "")
+        & source["수동분류"].isin(_CLASSIFY_LABELS)
+        & (source["llm_check"].str.upper() != "Y")
+        & (~source["classified_by"].str.lower().isin({"rule", "llm", "rule+llm"}))
+        & (~source["classified_by"].str.startswith("rule/llm_conflict"))
+        & (~source["검수사유"].str.contains("충돌|미입력|확인|불일치", regex=True, na=False))
+    ]
+    return build_rules_from_manual(source)
+
+
+def _build_few_shot(master: pd.DataFrame, rules: list[dict] | None = None) -> str:
+    """검수 완료된 map review와 확정 master 기준으로 LLM 분류 예시를 만든다."""
+    lines: list[str] = []
+    rule_block = rules_to_prompt_block(rules or [])
+    if rule_block != "(자동 키워드 규칙 없음)":
+        lines.extend(["자동 키워드 규칙:", rule_block, "검수 완료 예시:"])
+    review_rows = _review_few_shot_rows()
+    if not review_rows.empty:
+        for label in _CLASSIFY_LABELS:
+            samples = review_rows[review_rows["수동분류_edit"] == label].head(_FEW_SHOT_PER_LABEL)
+            for _, row in samples.iterrows():
+                standard = row.get("표준_메뉴명_edit", "")
+                main = row.get("대표메뉴", "")
+                detail = []
+                if standard:
+                    detail.append(f'표준명="{standard}"')
+                if main:
+                    detail.append(f'대표메뉴="{main}"')
+                detail_text = ", " + ", ".join(detail) if detail else ""
+                lines.append(f'  상품명="{row["item_name"]}"{detail_text} → 수동분류="{label}"')
+
+    master_rows = _master_few_shot_rows(master)
+    if not master_rows.empty:
+        existing_names = {line.split('상품명="', 1)[1].split('"', 1)[0] for line in lines if '상품명="' in line}
+        for label in _CLASSIFY_LABELS:
+            current_count = sum(f'수동분류="{label}"' in line for line in lines)
+            if current_count >= _FEW_SHOT_PER_LABEL:
+                continue
+            samples = master_rows[master_rows["수동분류"] == label].head(_FEW_SHOT_PER_LABEL - current_count)
+            for _, row in samples.iterrows():
+                name = str(row.get("상품명", "")).strip()
+                if not name or name in existing_names:
+                    continue
+                existing_names.add(name)
+                lines.append(
+                    f'  상품명="{name}", 중메뉴="{row.get("중메뉴", "")}", '
+                    f'대메뉴="{row.get("대메뉴", "")}" → 수동분류="{label}"'
+                )
+
     return "\n".join(lines) if lines else "  (예시 없음)"
 
 
-def _get_gpt_client():
-    """gpt-oss:20b 우선으로 Ollama 클라이언트와 모델명 반환."""
-    import ollama
-    client = ollama.Client(host=_OLLAMA_HOST)
-    model_names = [m["model"] for m in client.list().get("models", [])]
-    for candidate in _GPT_MODEL_CANDIDATES:
-        if any(candidate in m for m in model_names):
-            logger.info("LLM 모델 선택: %s", candidate)
-            return client, candidate
-    raise RuntimeError(f"사용 가능한 LLM 모델 없음. 설치 목록: {model_names}")
+def _rule_based_classification(item: dict) -> dict | None:
+    rules = item.pop("_rules", None)
+    rule_result = classify_by_rules(item, rules or load_rules())
+    if not rule_result:
+        return None
+    label = rule_result.get("수동분류", "기타")
+    return {
+        **rule_result,
+        "수동분류": label,
+        "is_main_candidate": "Y" if label == "메인" else "N",
+        "llm_error": False,
+    }
 
 
-def _classify_one(item: dict, few_shot: str) -> dict:
+def _format_won(value: object) -> str:
+    numeric = pd.to_numeric(pd.Series([str(value or "").replace(",", "").strip()]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return str(value or "").strip()
+    return f"{int(numeric):,}"
+
+
+def _classify_one(item: dict, few_shot: str, rules: list[dict] | None = None) -> dict:
     """gpt-oss:20b로 단일 항목 분류. 실패 시 폴백값 반환."""
-    try:
-        import json as _json
-        client, model = _get_gpt_client()
+    rule_item = dict(item)
+    rule_item["_rules"] = rules or []
+    rule_result = _rule_based_classification(rule_item)
 
+    try:
         system_prompt = (
             "당신은 F&B 상품 분류 전문가입니다. 반드시 JSON만 응답하세요.\n"
             f"수동분류 카테고리: {', '.join(_CLASSIFY_LABELS)}\n"
-            "확정된 기존 분류 예시 (학습 데이터):\n"
+            "아래 자동 키워드 규칙과 검수 완료 예시를 최우선으로 참고하되, 상품 문맥과 다르면 더 적절한 분류를 선택하세요.\n"
+            "is_main_candidate는 수동분류가 메인일 때만 Y, 그 외에는 N으로 응답하세요.\n"
+            "확정된 기존 분류 기준 (학습 데이터):\n"
             f"{few_shot}\n\n"
             '응답 형식: {"수동분류": "메인", "is_main_candidate": "Y"}'
         )
@@ -384,22 +802,9 @@ def _classify_one(item: dict, few_shot: str) -> dict:
             f'대메뉴: {item["대메뉴"]}, 중메뉴: {item["중메뉴"]}, '
             f'상품명: {item["상품명"]}, 판매단가: {item["판매단가"]}'
         )
-        response = client.chat(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            stream=False,
-        )
-        raw = response.get("message", {}).get("content", "")
-
-        # JSON 블록 추출
-        if "```json" in raw:
-            raw = raw.split("```json")[1].split("```")[0].strip()
-        elif "```" in raw:
-            raw = raw.split("```")[1].split("```")[0].strip()
-        result = _json.loads(raw.strip())
+        result = query_qwen_json(prompt, system_prompt=system_prompt)
+        if result.get("parse_error"):
+            raise ValueError(result.get("parse_error"))
 
         분류 = result.get("수동분류", "기타")
         if 분류 not in _CLASSIFY_LABELS:
@@ -407,12 +812,37 @@ def _classify_one(item: dict, few_shot: str) -> dict:
         is_main = result.get("is_main_candidate", "N")
         if is_main not in ("Y", "N"):
             is_main = "Y" if 분류 == "메인" else "N"
+        if 분류 != "메인":
+            is_main = "N"
 
-        return {"수동분류": 분류, "is_main_candidate": is_main, "llm_error": False}
+        llm_result = {"수동분류": 분류, "is_main_candidate": is_main, "llm_error": False}
 
     except Exception as e:
         logger.warning("LLM 분류 실패 (%s): %s", item.get("상품명"), e)
-        return {"수동분류": "기타", "is_main_candidate": "N", "llm_error": True}
+        if rule_result is not None:
+            resolved = reconcile(rule_result, {})
+            label = resolved.get("수동분류", "기타")
+            return {
+                "수동분류": label,
+                "is_main_candidate": "Y" if label == "메인" else "N",
+                "llm_error": True,
+                "classified_by": resolved.get("classified_by", "rule"),
+                "검수사유": resolved.get("검수사유", ""),
+            }
+        return {"수동분류": "기타", "is_main_candidate": "N", "llm_error": True, "classified_by": "llm"}
+
+    resolved = reconcile(rule_result, llm_result)
+    label = resolved.get("수동분류", llm_result["수동분류"])
+    is_main = resolved.get("is_main_candidate") or ("Y" if label == "메인" else "N")
+    if label != "메인":
+        is_main = "N"
+    return {
+        "수동분류": label,
+        "is_main_candidate": is_main,
+        "llm_error": llm_result.get("llm_error", False),
+        "classified_by": resolved.get("classified_by", "llm"),
+        "검수사유": resolved.get("검수사유", ""),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -432,12 +862,6 @@ def _read_xlsx() -> pd.DataFrame:
     df_raw = df_raw.fillna("")
     df_raw.columns = [str(c).strip() for c in df_raw.columns]
 
-    dae_col = next(name for name, idx in _XLSX_COL_IDX.items() if idx == 0)
-    jung_col = next(name for name, idx in _XLSX_COL_IDX.items() if idx == 1)
-    code_col = next(name for name, idx in _XLSX_COL_IDX.items() if idx == 3)
-    name_col = next(name for name, idx in _XLSX_COL_IDX.items() if idx == 4)
-    price_col = next(name for name, idx in _XLSX_COL_IDX.items() if idx == 9)
-
     if df_raw.shape[1] <= max(_XLSX_COL_IDX.values()):
         raise ValueError(
             f"OKPOS product xlsx has fewer columns than expected: "
@@ -448,24 +872,25 @@ def _read_xlsx() -> pd.DataFrame:
     for name, idx in _XLSX_COL_IDX.items():
         result[name] = df_raw.iloc[:, idx]
 
-    if "援щ텇" in df_raw.columns:
-        result["援щ텇"] = df_raw["援щ텇"]
-    elif "遺꾨쪟" in df_raw.columns:
-        result["援щ텇"] = df_raw["遺꾨쪟"]
+    if "구분" in df_raw.columns:
+        result["구분"] = df_raw["구분"]
+    elif "분류" in df_raw.columns:
+        result["구분"] = df_raw["분류"]
     else:
-        result["援щ텇"] = ""
+        result["구분"] = ""
 
     result["source"] = SOURCE_CODE
-    result[code_col] = result[code_col].astype(str).str.strip()
-    result[price_col] = pd.to_numeric(result[price_col], errors="coerce").fillna(0).astype(int)
-    result["援щ텇"] = result["援щ텇"].fillna("").astype(str).str.strip()
-    result["援щ텇"] = result["援щ텇"].replace({"": "?"})
+    result["상품코드"] = result["상품코드"].astype(str).str.strip()
+    result = _fill_brand_store_from_daemenu(result)
+    result["판매단가"] = pd.to_numeric(result["판매단가"], errors="coerce").fillna(0).astype(int)
+    result["구분"] = result["구분"].fillna("").astype(str).str.strip()
+    result["구분"] = result["구분"].replace({"": "홀"})
 
-    result = result[result[code_col] != ""]
+    result = result[result["상품코드"] != ""]
 
     pat = "|".join(_OKPOS_DAEGROUP_KEYWORDS)
-    mask_brand = result[dae_col].astype(str).str.contains(pat, na=False)
-    mask_delivery = result["援щ텇"].astype(str).str.contains("諛곕떖", na=False)
+    mask_brand = result["대메뉴"].astype(str).str.contains(pat, na=False)
+    mask_delivery = result["구분"].astype(str).str.contains("배달", na=False)
     result = result[mask_brand | mask_delivery]
     return result.reset_index(drop=True)
 
@@ -477,6 +902,7 @@ def load_okpos_product_xlsx(**context) -> str:
 
     alias_map = _load_alias_map()
     df_okpos = _read_xlsx()
+    df_okpos = _expand_okpos_rows_by_sales_store(df_okpos)
     if "상품명" in df_okpos.columns:
         norm = df_okpos["상품명"].apply(lambda x: _normalize_product_name(x, alias_map))
         # 표준_메뉴명 컬럼은 제거(상품명에 표준명을 반영)
@@ -509,6 +935,8 @@ def load_okpos_product_xlsx(**context) -> str:
             before = len(df)
             df = df[df["구분"].isin(allowed)].reset_index(drop=True)
             logger.info("구분 필터 적용: %s | %d -> %d", sorted(allowed), before, len(df))
+
+    df = _apply_scoped_product_codes(df)
 
     context["ti"].xcom_push(key=_XCOM_OKPOS, value=df.to_json(orient="records", force_ascii=False))
     logger.info("전체 상품 로드 완료: %d건", len(df))
@@ -601,7 +1029,8 @@ def classify_with_llm(enable_llm: bool = True, **context) -> str:
         context["ti"].xcom_push(key=_XCOM_CLASSIFIED, value=json.dumps(classified, ensure_ascii=False))
         return f"LLM OFF - 분류 스킵: {len(classified)}건"
 
-    few_shot = _build_few_shot(df_master)
+    rules = _available_rules(df_master)
+    few_shot = _build_few_shot(df_master, rules=rules)
     reused_cnt, llm_cnt = 0, 0
 
     classified = []
@@ -620,9 +1049,25 @@ def classify_with_llm(enable_llm: bool = True, **context) -> str:
             logger.info("[%s] %s → 확정분류 재사용: %s", item.get("_change_type"), item.get("상품명"), prev)
             reused_cnt += 1
         else:
-            result = _classify_one(item, few_shot)
+            result = _classify_one(item, few_shot, rules=rules)
             item.update(result)
-            logger.info("[%s] %s → LLM: %s", item.get("_change_type"), item.get("상품명"), result["수동분류"])
+            if result.get("검수사유"):
+                logger.info(
+                    "[%s] %s → %s: %s | %s",
+                    item.get("_change_type"),
+                    item.get("상품명"),
+                    result.get("classified_by", "llm"),
+                    result["수동분류"],
+                    result["검수사유"],
+                )
+            else:
+                logger.info(
+                    "[%s] %s → %s: %s",
+                    item.get("_change_type"),
+                    item.get("상품명"),
+                    result.get("classified_by", "llm"),
+                    result["수동분류"],
+                )
             llm_cnt += 1
         classified.append(item)
 
@@ -631,7 +1076,7 @@ def classify_with_llm(enable_llm: bool = True, **context) -> str:
 
 
 def update_product_master(**context) -> str:
-    """분류된 신규/변경 항목을 fin_product_grp.csv에 append."""
+    """분류된 신규/변경 항목을 fin_product_grp_input.csv에 append."""
     classified_json = context["ti"].xcom_pull(task_ids="classify_with_llm", key=_XCOM_CLASSIFIED)
     classified = json.loads(classified_json)
 
@@ -650,7 +1095,11 @@ def update_product_master(**context) -> str:
 
     new_rows = []
     for item in classified:
+        item = _fill_allocator_identity_from_code(item)
         code = str(item.get("상품코드", "")).strip()
+        if not code:
+            logger.warning("상품코드 빈 신규/변경 항목 저장 스킵: %s", item.get("상품명", ""))
+            continue
         exclude_check = exclude_map.get(code, "N") if item.get("_change_type") != "신규" else "N"
         # 확정 분류 재사용 → 검토 불필요(N), LLM 새 분류(신규/미확정변경) → 검토 필요(Y)
         reused = item.get("_reused_confirmed", False)
@@ -660,7 +1109,7 @@ def update_product_master(**context) -> str:
             "구분": item.get("구분", "홀"),
             "대메뉴": item.get("대메뉴", ""),
             "중메뉴": item.get("중메뉴", ""),
-            "상품코드": item.get("상품코드", ""),
+            "상품코드": code,
             "상품명": item.get("상품명", ""),
             "판매단가": item.get("판매단가", 0),
             "수동분류": item.get("수동분류", "기타"),
@@ -669,12 +1118,19 @@ def update_product_master(**context) -> str:
             "exclude_check": exclude_check,
             _REVIEW_APPROVE_COL: "",
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "중복_수동분류": "N",
+            "brand": item.get("brand", ""),
+            "store": item.get("store", ""),
+            "launch_date": _normalize_launch_date(item.get("launch_date", "")),
+            "store_seq": item.get("store_seq", ""),
+            "item_seq": item.get("item_seq", ""),
+            "item_key": item.get("item_key", ""),
         })
 
     df_append = pd.DataFrame(new_rows)
     df_out = pd.concat([df_master, df_append], ignore_index=True)
+    df_out = ensure_allocator_columns(df_out)
     df_out = _mark_is_latest(df_out)
+    validate_fin_product_codes(df_out, allow_legacy_blank=True)
 
     FIN_PRODUCT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
@@ -733,7 +1189,7 @@ def send_alert_email(**context) -> str:
             f"<td style='padding:6px 10px;'>{item.get('중메뉴','')}</td>"
             f"<td style='padding:6px 10px;'>{item.get('상품코드','')}</td>"
             f"<td style='padding:6px 10px;'>{item.get('상품명','')}</td>"
-            f"<td style='padding:6px 10px;'>{item.get('판매단가',0):,}원</td>"
+            f"<td style='padding:6px 10px;'>{_format_won(item.get('판매단가',0))}원</td>"
             f"<td style='padding:6px 10px;'>{item.get('수동분류','')}{error_mark}{review_mark}</td>"
             f"<td style='padding:6px 10px;text-align:center;'>{item.get('is_main_candidate','N')}</td>"
             f"</tr>"
@@ -753,7 +1209,7 @@ def send_alert_email(**context) -> str:
     html = f"""
 <html><body style="font-family:sans-serif;color:#333;">
 <h2 style="color:#1565C0;">📦 상품 마스터 업데이트 감지</h2>
-<p>신규 <b>{신규_cnt}건</b> · 변경 <b>{변경_cnt}건</b> 이 감지되어 LLM 분류 후 <code>fin_product_grp.csv</code>에 추가됐습니다 (신규는 <code>llm_check=Y</code>).</p>
+<p>신규 <b>{신규_cnt}건</b> · 변경 <b>{변경_cnt}건</b> 이 감지되어 LLM 분류 후 <code>fin_product_grp_input.csv</code>에 추가됐습니다 (신규는 <code>llm_check=Y</code>).</p>
 {warning_html}
 <table border="0" cellspacing="0" cellpadding="0"
   style="border-collapse:collapse;width:100%;margin-top:16px;font-size:14px;">
@@ -774,8 +1230,8 @@ def send_alert_email(**context) -> str:
   </tbody>
 </table>
 <p style="margin-top:20px;font-size:13px;color:#777;">
-  ✅ <code>fin_product_grp.csv</code>에서 <code>llm_check=Y</code>인 행을 찾아 <code>approve</code> 컬럼에 <b>Y</b>를 입력 후 저장하면 다음 DAG 실행 시 자동으로 <code>llm_check=N</code> 확정행이 append됩니다.<br>
-  ❌ 분류가 틀리면 같은 행의 <code>수동분류</code>/<code>is_main_candidate</code>도 함께 수정하세요.<br>
+  ✅ <code>fin_product_grp_input.csv</code>에서 <code>llm_check=Y</code>인 행을 찾아 <code>approve</code> 컬럼에 <b>Y</b>를 입력 후 저장하면 다음 DAG 실행 시 자동으로 <code>llm_check=N</code> 확정행이 append됩니다.<br>
+  ❌ 대표메뉴 후보가 틀리면 같은 행의 <code>is_main_candidate</code>를 수정하세요.<br>
   📄 마스터 파일: <code>{FIN_PRODUCT_CSV_PATH}</code>
 </p>
 </body></html>
@@ -798,13 +1254,13 @@ def send_alert_email(**context) -> str:
 
 
 def apply_review_approvals(**context) -> str:
-    """fin_product_grp.csv에서 approve=Y, llm_check=Y인 상품을 llm_check=N 확정행으로 append."""
-    if not FIN_PRODUCT_CSV_PATH.exists():
-        return "fin_product_grp.csv 없음 - 스킵"
+    """fin_product_grp_input.csv에서 approve=Y, llm_check=Y인 상품을 llm_check=N 확정행으로 append."""
+    if not existing_fin_product_csv_path().exists():
+        return "fin_product_grp_input.csv 없음 - 스킵"
 
     master = _read_master()
     if master.empty:
-        return "fin_product_grp.csv 비어있음 - 스킵"
+        return "fin_product_grp_input.csv 비어있음 - 스킵"
 
     for col in ("llm_check", _REVIEW_APPROVE_COL, "is_latest", "상품코드"):
         if col not in master.columns:
@@ -840,7 +1296,9 @@ def apply_review_approvals(**context) -> str:
 
     df_append = pd.DataFrame(rows)
     out = pd.concat([master_copy, df_append], ignore_index=True)
+    out = ensure_allocator_columns(out)
     out = _mark_is_latest(out)
+    validate_fin_product_codes(out, allow_legacy_blank=True)
 
     FIN_PRODUCT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
@@ -857,16 +1315,143 @@ def apply_review_approvals(**context) -> str:
     return f"approve 확정 {len(df_append)}건 (llm_check=N append)"
 
 
+def classify_pending_master(
+    limit: int | None = 1000,
+    since: str | None = None,
+    sources: list[str] | None = None,
+    enable_llm: bool = True,
+    dry_run: bool = False,
+) -> str:
+    """수동분류가 비어 있는 최신 상품 마스터 행을 source 무관하게 LLM 초안 분류한다."""
+    df = _read_master()
+    if df.empty:
+        return "fin_product_grp_input.csv 비어있음 - 스킵"
+
+    for col in (
+        "수동분류",
+        "is_latest",
+        "상품명",
+        "updated_at",
+        "source",
+        "대메뉴",
+        "중메뉴",
+        "판매단가",
+        "is_main_candidate",
+        "llm_check",
+    ):
+        if col not in df.columns:
+            df[col] = ""
+
+    lab = df["수동분류"].fillna("").astype(str).str.strip()
+    latest = df["is_latest"].fillna("").astype(str).str.strip().str.upper() == "Y"
+    name_ok = df["상품명"].fillna("").astype(str).str.strip() != ""
+    mask = (lab == "") & latest & name_ok
+
+    if since:
+        mask &= df["updated_at"].fillna("").astype(str).str[:10] >= since
+    if sources:
+        source_set = {str(source).strip().lower() for source in sources}
+        mask &= df["source"].fillna("").astype(str).str.strip().str.lower().isin(source_set)
+
+    targets = df.loc[mask].copy()
+    total = len(targets)
+    if total == 0:
+        return f"pending 분류: 대상 0건, 분류 0건, 실패 0건 (limit={limit}, since={since})"
+
+    if not enable_llm:
+        return f"LLM OFF - pending 분류 스킵: 대상 {total}건 (limit={limit}, since={since})"
+
+    targets["_updated_at_ts"] = pd.to_datetime(targets["updated_at"], errors="coerce").fillna(pd.Timestamp.min)
+    targets = targets.sort_values("_updated_at_ts", ascending=False)
+    if limit is not None:
+        targets = targets.head(limit)
+    targets = targets.drop(columns=["_updated_at_ts"], errors="ignore")
+
+    rules = _available_rules(df)
+    few_shot = _build_few_shot(df, rules=rules)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    done = 0
+    fail = 0
+
+    for idx, row in targets.iterrows():
+        item = row.to_dict()
+        try:
+            result = _classify_one(item, few_shot, rules=rules)
+            label = result.get("수동분류", "기타")
+            if label not in _CLASSIFY_LABELS:
+                label = "기타"
+            is_main = result.get("is_main_candidate", "N")
+            if is_main not in ("Y", "N"):
+                is_main = "Y" if label == "메인" else "N"
+            if label != "메인":
+                is_main = "N"
+            df.at[idx, "수동분류"] = label
+            df.at[idx, "is_main_candidate"] = is_main
+            df.at[idx, "llm_check"] = "Y"
+            df.at[idx, "updated_at"] = now
+            if result.get("llm_error"):
+                fail += 1
+            else:
+                done += 1
+            if result.get("검수사유"):
+                logger.info(
+                    "pending 분류: %s → %s (%s) | %s",
+                    item.get("상품명"),
+                    label,
+                    result.get("classified_by", "llm"),
+                    result["검수사유"],
+                )
+        except Exception as exc:
+            fail += 1
+            logger.warning("pending 분류 실패 (%s): %s", item.get("상품명"), exc)
+
+    processed = done + fail
+    if dry_run:
+        return f"pending 분류 dry-run: 대상 {total}건, 분류 {done}건, 실패 {fail}건 (limit={limit}, since={since})"
+
+    df = ensure_allocator_columns(df)
+    df = _mark_is_latest(df)
+    validate_fin_product_codes(df, allow_legacy_blank=True)
+
+    label_counts = (
+        df.loc[targets.index, "수동분류"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .value_counts()
+        .to_dict()
+    )
+    logger.info("pending 분류 라벨 분포(%d건 처리): %s", processed, label_counts)
+
+    FIN_PRODUCT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    backup = FIN_PRODUCT_CSV_PATH.with_name(
+        f"fin_product_grp_input.backup_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    )
+    backup.write_bytes(FIN_PRODUCT_CSV_PATH.read_bytes())
+
+    tmp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
+    try:
+        df.to_csv(tmp, index=False, encoding="utf-8-sig")
+        _safe_replace(tmp, FIN_PRODUCT_CSV_PATH)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    return f"pending 분류: 대상 {total}건, 분류 {done}건, 실패 {fail}건 (limit={limit}, since={since})"
+
+
 def finalize_unionpos_pending(enable_llm: bool = True, **context) -> str:
-    """fin_product_grp.csv에 누적된 unionpos 신규(=llm_check=Y) 상품을 LLM으로 분류하고 확정행(llm_check=N)으로 append."""
+    """fin_product_grp_input.csv에 누적된 unionpos 신규(=llm_check=Y) 상품을 LLM으로 분류하고 확정행(llm_check=N)으로 append."""
     if not enable_llm:
         return "LLM OFF - unionpos pending 확정 스킵"
     df_master = _read_master()
     if df_master.empty:
-        return "fin_product_grp.csv 비어있음 - 스킵"
+        return "fin_product_grp_input.csv 비어있음 - 스킵"
 
     if "source" not in df_master.columns or "llm_check" not in df_master.columns:
-        return "fin_product_grp.csv 컬럼 부족(source/llm_check) - 스킵"
+        return "fin_product_grp_input.csv 컬럼 부족(source/llm_check) - 스킵"
 
     df = df_master.copy()
     df["source"] = df["source"].fillna("").astype(str).str.strip().str.lower()
@@ -886,12 +1471,13 @@ def finalize_unionpos_pending(enable_llm: bool = True, **context) -> str:
     )
     pending = pending.drop(columns=["_updated_at_ts"], errors="ignore")
 
-    few_shot = _build_few_shot(df_master)
+    rules = _available_rules(df_master)
+    few_shot = _build_few_shot(df_master, rules=rules)
 
     rows = []
     for _, row in pending.iterrows():
         item = row.to_dict()
-        result = _classify_one(item, few_shot)
+        result = _classify_one(item, few_shot, rules=rules)
 
         out = row.to_dict()
         out["수동분류"] = result.get("수동분류", out.get("수동분류", "기타"))
@@ -905,7 +1491,9 @@ def finalize_unionpos_pending(enable_llm: bool = True, **context) -> str:
 
     df_append = pd.DataFrame(rows)
     df_out = pd.concat([df_master, df_append], ignore_index=True)
+    df_out = ensure_allocator_columns(df_out)
     df_out = _mark_is_latest(df_out)
+    validate_fin_product_codes(df_out, allow_legacy_blank=True)
 
     FIN_PRODUCT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
@@ -923,113 +1511,61 @@ def finalize_unionpos_pending(enable_llm: bool = True, **context) -> str:
 
 
 def build_fin_product_mart(**context) -> str:
-    """fin_product_grp.csv → fin_product_mart.csv 생성.
+    """fin_product_grp_input.csv → fin_product_mart.csv 생성.
 
-    - 컬럼: source, 상품코드, 수동분류 (중복 제거)
-    - 동일 source+상품코드에 수동분류가 2가지 이상이면 이메일 알림 발송.
+    - 컬럼: source, 상품코드 기준 상품 목록
+    - 분석용 표준명/분류는 fin_product_map_review_input.csv에서 합친다.
     """
     master = _read_master()
     if master.empty:
-        logger.warning("fin_product_grp.csv 비어있음 - 마트 생성 스킵")
+        logger.warning("fin_product_grp_input.csv 비어있음 - 마트 생성 스킵")
         return "스킵: 원천 데이터 없음"
 
-    # is_latest=Y이고 수동분류가 있는 행만 사용
+    # is_latest=Y인 행만 사용
     df = master.copy()
     if "is_latest" in df.columns:
         df = df[df["is_latest"].astype(str).str.upper() == "Y"]
-    if "수동분류" in df.columns:
-        df = df[df["수동분류"].notna() & (df["수동분류"].astype(str).str.strip() != "")]
 
     if df.empty:
-        logger.warning("is_latest=Y + 수동분류 있는 행 없음")
+        logger.warning("is_latest=Y 행 없음")
         return "스킵: 해당 행 없음"
 
     df["source"] = df["source"].astype(str).str.strip()
     df["상품코드"] = df["상품코드"].astype(str).str.strip()
-    df["수동분류"] = df["수동분류"].astype(str).str.strip()
 
-    # 중복 감지: is_latest 필터 없이 llm_check=N 확정 전체 이력 기준
-    # (같은 source+상품코드에 두 개의 확정 분류가 이력에 존재하는 케이스 감지)
-    confirmed_all = master.copy()
-    confirmed_all["source"] = confirmed_all["source"].astype(str).str.strip()
-    confirmed_all["상품코드"] = confirmed_all["상품코드"].astype(str).str.strip()
-    confirmed_all["수동분류"] = confirmed_all["수동분류"].astype(str).str.strip()
-    if "llm_check" in confirmed_all.columns:
-        confirmed_all = confirmed_all[
-            confirmed_all["llm_check"].fillna("").astype(str).str.upper() == "N"
-        ]
-    confirmed_all = confirmed_all[confirmed_all["수동분류"] != ""]
+    # 마트 생성: source+상품코드 기준 중복 제거.
+    # 분석용 분류는 검수 완료된 fin_product_map_review_input.csv의 수동분류_edit만 사용한다.
+    key_cols = ["source", "상품코드"]
+    extra_src_cols = ["상품명", "exclude_check"]
+    for col in extra_src_cols:
+        if col not in df.columns:
+            df[col] = ""
 
-    conflict_df = (
-        confirmed_all.groupby(["source", "상품코드"])["수동분류"]
-        .nunique()
-        .reset_index(name="분류_종류수")
-    )
-    conflicts = conflict_df[conflict_df["분류_종류수"] > 1]
-
-    if not conflicts.empty:
-        detail_rows = []
-        for _, row in conflicts.iterrows():
-            labels = (
-                confirmed_all[
-                    (confirmed_all["source"] == row["source"]) & (confirmed_all["상품코드"] == row["상품코드"])
-                ]["수동분류"]
-                .unique()
-                .tolist()
-            )
-            detail_rows.append(
-                f"  {row['source']} {row['상품코드']} → {', '.join(labels)}"
-            )
-        conflict_body = (
-            "아래 상품코드에 수동분류가 2가지 이상 지정되어 있습니다.\n"
-            "fin_product_grp.csv에서 직접 수정 후 DAG를 재실행해주세요.\n\n"
-            + "\n".join(detail_rows)
-        )
-        logger.warning("수동분류 충돌 %d건:\n%s", len(conflicts), conflict_body)
-        try:
-            from modules.transform.utility.mailer import send_email, text_to_html
-            send_email(
-                subject=f"[fin_product_mart] 수동분류 충돌 {len(conflicts)}건 수정 필요",
-                html_content=text_to_html(conflict_body),
-                to_emails=[ALERT_EMAIL],
-            )
-        except Exception as e:
-            logger.error("충돌 알림 발송 실패: %s", e)
-
-    conflict_keys = set(
-        zip(conflicts["source"].astype(str), conflicts["상품코드"].astype(str))
-    ) if not conflicts.empty else set()
-
-    # fin_product_grp.csv에 중복_수동분류 플래그 write-back
-    if FIN_PRODUCT_CSV_PATH.exists():
-        full_master = _read_master()
-        full_master["_key"] = list(
-            zip(full_master["source"].astype(str), full_master["상품코드"].astype(str))
-        )
-        full_master["중복_수동분류"] = full_master["_key"].apply(
-            lambda k: "Y" if k in conflict_keys else "N"
-        )
-        full_master = full_master.drop(columns=["_key"])
-        tmp_grp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
-        try:
-            full_master.to_csv(tmp_grp, index=False, encoding="utf-8-sig")
-            _safe_replace(tmp_grp, FIN_PRODUCT_CSV_PATH)
-        finally:
-            try:
-                tmp_grp.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    # 마트 생성: source+상품코드 기준 중복 제거 (수동분류 충돌 시 첫 번째 값 유지)
-    df["중복_수동분류"] = df.apply(
-        lambda r: "Y" if (str(r["source"]), str(r["상품코드"])) in conflict_keys else "N", axis=1
-    )
     mart = (
-        df[["source", "상품코드", "수동분류", "중복_수동분류"]]
+        df[key_cols + extra_src_cols]
         .drop_duplicates(subset=["source", "상품코드"], keep="first")
         .sort_values(["source", "상품코드"])
         .reset_index(drop=True)
     )
+    try:
+        enrichment = _load_map_enrichment_df()
+        mart = mart.merge(
+            enrichment.rename(columns={"item_id": "상품코드"}),
+            on=["source", "상품코드"],
+            how="left",
+        )
+        for col in [_MAP_DUP_LABEL_COL, "표준상품명", "수동분류_edit", "대표메뉴", "검수유무"]:
+            if col not in mart.columns:
+                mart[col] = pd.NA
+        matched = int((mart["표준상품명"].astype(str).str.strip() != "").sum())
+        logger.info("mart review 표준명/분류 합침: %d/%d행 매칭", matched, len(mart))
+    except Exception as e:
+        logger.warning("표준명 합침 실패, mart 기본 컬럼만 생성: %s", e)
+        for col in [_MAP_DUP_LABEL_COL, "표준상품명", "수동분류_edit", "대표메뉴", "검수유무"]:
+            mart[col] = pd.NA
+    mart = mart[
+        key_cols + [_MAP_DUP_LABEL_COL, "상품명", "표준상품명", "수동분류_edit", "대표메뉴", "검수유무", "exclude_check"]
+    ]
 
     FIN_PRODUCT_MART_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = FIN_PRODUCT_MART_CSV_PATH.with_suffix(".tmp")
@@ -1042,6 +1578,5 @@ def build_fin_product_mart(**context) -> str:
         except Exception:
             pass
 
-    conflict_msg = f", 충돌 {len(conflicts)}건 알림" if not conflicts.empty else ""
-    logger.info("fin_product_mart.csv 저장: %d행%s", len(mart), conflict_msg)
-    return f"마트 생성: {len(mart)}행{conflict_msg}"
+    logger.info("fin_product_mart.csv 저장: %d행", len(mart))
+    return f"마트 생성: {len(mart)}행"

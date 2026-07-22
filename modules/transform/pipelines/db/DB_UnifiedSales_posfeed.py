@@ -14,14 +14,19 @@ unified_sales - Posfeed 채널 전용 모듈.
 - 주문상태 '배달완료' → 정상, 그 외('취소') → 취소
 """
 
-import hashlib
 import logging
 from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 
-from modules.transform.utility.paths import ANALYTICS_DB
+from modules.transform.utility.mail_recipients import MAIL_CMJ_PM
+from modules.transform.utility.paths import (
+    ANALYTICS_DB,
+    FIN_PRODUCT_CSV_PATH,
+    POSFEED_WHITELIST_CSV_PATH,
+    existing_fin_product_csv_path,
+)
 from modules.transform.utility.store_normalize import (
     normalize as _normalize_store_names,
     strip_brand as _strip_brand,
@@ -38,7 +43,11 @@ from modules.transform.pipelines.db.DB_UnifiedSales_common import (
     _normalize_time,
     _save_unified_daily,
     _to_int_series,
+    _kst_today_str,
+    iter_unified_sales_files,
 )
+from modules.transform.pipelines.db.DB_FinProduct import _safe_replace
+from modules.transform.pipelines.db.DB_ItemIdAllocator import MANUAL_SOURCE_BASE, allocate_manual_item_ids, item_block_size
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +57,8 @@ POSFEED_SOURCE = "posfeed"
 EXCLUSION_LOG_BASE = ANALYTICS_DB / "posfeed_exclusion_log"
 # Posfeed 제외 항목 중 '도리' 포함 알림은 유지하고, 자동으로 Y로 보정합니다.
 _ENABLE_POSFEED_DORI_EXCLUSION_ALERT = True
-# 주문상태 → 정상 처리할 완료 상태 (포장주문도 '배달완료'로 기록됨)
-_COMPLETE_STATUSES = {"배달완료"}
+# 주문상태 → 정상 처리할 완료 상태
+_COMPLETE_STATUSES = {"배달완료", "접수", "완료"}
 
 # 주문경로 → platform 정규화 (배민1 → 배달의민족 통일)
 _PLATFORM_MAP = {
@@ -161,7 +170,13 @@ def _load_items_for_ym(ym: str) -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
 
-def _transform_df(orders: pd.DataFrame, items: pd.DataFrame, date_str: str) -> pd.DataFrame:
+def _transform_df(
+    orders: pd.DataFrame,
+    items: pd.DataFrame,
+    date_str: str,
+    *,
+    persist_item_ids: bool = True,
+) -> pd.DataFrame:
     """posfeed orders + items → unified_sales 스키마 변환."""
     if orders.empty:
         return pd.DataFrame(columns=UNIFIED_COLUMNS)
@@ -243,6 +258,31 @@ def _transform_df(orders: pd.DataFrame, items: pd.DataFrame, date_str: str) -> p
     dfs["단품가격"] = pd.to_numeric(dfs["단품가격"], errors="coerce").fillna(0).astype(int)
     dfs["수량"] = pd.to_numeric(dfs["수량"], errors="coerce").fillna(0).astype(int)
 
+    # 숫자만으로 된 '+' 옵션(가격 캐리어)을 본품에 합산 후 제거.
+    # 프로모션 메뉴는 본품 단가가 0이고 실제 가격이 "'+ 16900" 같은 옵션명에
+    # 실려오는 경우가 있어, 그대로 두면 "16900"이 별도 상품으로 등록되고
+    # 최고가라서 주문의 대표메뉴까지 가로챈다.
+    _raw_name = dfs["상품명"].fillna("").astype(str).str.strip()
+    _is_option = _raw_name.str.startswith("'+")
+    _is_numeric_option = _is_option & _raw_name.str.lstrip("'+ ").str.match(r"^\d+$")
+    if _is_numeric_option.any():
+        _main_mask = ~_is_option & (_raw_name != "배달비")
+        _main_rows = dfs[_main_mask].sort_values("단품가격", ascending=False)
+        _main_idx_by_order = _main_rows.groupby("주문 코드").apply(lambda g: g.index[0])
+        for opt_idx in dfs.index[_is_numeric_option]:
+            order_code = dfs.at[opt_idx, "주문 코드"]
+            if order_code in _main_idx_by_order.index:
+                main_idx = _main_idx_by_order.loc[order_code]
+                dfs.at[main_idx, "단품가격"] += dfs.at[opt_idx, "단품가격"]
+                dfs.at[main_idx, "합계"] += dfs.at[opt_idx, "합계"]
+            else:
+                logger.warning(
+                    "숫자 옵션 상품 본품 매칭 실패, 옵션 유지: 주문코드=%s 상품명=%s",
+                    order_code, dfs.at[opt_idx, "상품명"],
+                )
+                _is_numeric_option.at[opt_idx] = False
+        dfs = dfs[~_is_numeric_option].copy()
+
     # 아이템 비율 배분: sum(합계) != 포스피드_매출이면 비율로 total_price 산정
     order_total = dfs.groupby("주문 코드")["합계"].transform("sum")
     order_posfeed = dfs.groupby("주문 코드")["포스피드_매출"].transform("first").astype(int)
@@ -309,9 +349,10 @@ def _transform_df(orders: pd.DataFrame, items: pd.DataFrame, date_str: str) -> p
     # item_seq: order 내 순번
     dfs["item_seq"] = dfs.groupby("order_id").cumcount().add(1).astype(int).astype(str)
 
-    # item_id: 상품명 md5 해시
-    dfs["item_id"] = dfs["item_name"].map(
-        lambda s: hashlib.md5(s.encode()).hexdigest() if s else ""
+    # item_id: source+brand+store+item_name 기준 매장별 숫자 코드
+    dfs["item_id"] = allocate_manual_item_ids(
+        dfs[["source", "brand", "store", "item_name", "unit_price"]],
+        persist=persist_item_ids,
     )
 
     # "홀_" 접두어 아이템이 있는 주문: order_id 전체를 홀 테이블로 재분류
@@ -324,7 +365,7 @@ def _transform_df(orders: pd.DataFrame, items: pd.DataFrame, date_str: str) -> p
     dfs.loc[_hall_mask, "platform"] = "홀"
     dfs.loc[_hall_mask, "order_type"] = "홀_테이블"
 
-    # 블랙리스트 필터: is_valid=N 항목 제거 (brand·item_name 할당 후, menu_name 계산 전)
+    # 블랙리스트 필터: grp exclude_check=Y 항목 제거 (brand·item_name 할당 후, menu_name 계산 전)
     _bl_before = dfs.copy()
     dfs = _apply_posfeed_blacklist(dfs)
     _bl_excluded = _bl_before.loc[~_bl_before.index.isin(dfs.index)]
@@ -357,51 +398,60 @@ def _transform_df(orders: pd.DataFrame, items: pd.DataFrame, date_str: str) -> p
 
 def _save_exclusion_log(excluded: pd.DataFrame, date_str: str, menu_map: dict) -> None:
     """블랙리스트로 제외된 행을 월별 CSV에 누적 저장 (append+dedup)."""
-    ym = date_str[:7]
-    log_dir = EXCLUSION_LOG_BASE / f"ym={ym}"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "exclusion_log.csv"
+    try:
+        ym = date_str[:7]
+        log_dir = EXCLUSION_LOG_BASE / f"ym={ym}"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "exclusion_log.csv"
 
-    exc = excluded.copy()
-    exc["menu_name"] = (
-        exc["order_id"].map(menu_map)
-        .fillna(exc["메뉴명"].fillna("").astype(str) if "메뉴명" in exc.columns else "")
-    )
+        exc = excluded.copy()
+        exc["menu_name"] = (
+            exc["order_id"].map(menu_map)
+            .fillna(exc["메뉴명"].fillna("").astype(str) if "메뉴명" in exc.columns else "")
+        )
 
-    cols = ["sale_date", "brand", "store", "menu_name", "item_name", "qty", "unit_price", "total_price"]
-    save_df = exc[[c for c in cols if c in exc.columns]].copy()
+        cols = ["sale_date", "brand", "store", "menu_name", "item_name", "qty", "unit_price", "total_price"]
+        save_df = exc[[c for c in cols if c in exc.columns]].copy()
 
-    if log_path.exists():
-        existing = pd.read_csv(str(log_path), dtype=str, encoding="utf-8-sig")
-        save_df = pd.concat([existing, save_df], ignore_index=True).drop_duplicates()
+        # 메뉴/상품명 개행이 누적 CSV 구조를 깨지 않도록 저장 직전에 정화한다.
+        for col in ("menu_name", "item_name"):
+            if col in save_df.columns:
+                save_df[col] = save_df[col].astype(str).str.replace(r"[\r\n]+", " ", regex=True)
 
-    save_df.to_csv(str(log_path), index=False, encoding="utf-8-sig")
+        if log_path.exists():
+            try:
+                existing = pd.read_csv(
+                    str(log_path),
+                    dtype=str,
+                    encoding="utf-8-sig",
+                    on_bad_lines="skip",
+                )
+                save_df = pd.concat([existing, save_df], ignore_index=True).drop_duplicates()
+            except Exception as exc_read:
+                logger.warning("exclusion_log 읽기 실패, 신규 행만 저장: %s | %s", log_path, exc_read)
+
+        save_df.to_csv(str(log_path), index=False, encoding="utf-8-sig")
+    except Exception as exc:
+        logger.warning("exclusion_log 저장 실패, 메인 적재 계속: %s", exc)
 
 
 def _auto_fix_dori_whitelist(doridori_df: pd.DataFrame) -> tuple[int, int]:
-    """도리(item_name에 '도리' 포함) 항목을 whitelist에서 Y로 자동 보정.
+    """도리(item_name에 '도리' 포함) 항목을 grp에서 유지(N)로 자동 보정.
 
-    - 기존 fin_product_posfeed_whitelist.csv에서 일치하는 normalized item_name이 N이면 Y로 변경
-    - 항목이 존재하지 않으면 새 Y 행을 추가
-    - review_needed는 자동 보정된 항목에 대해 N으로 설정
+    - 기존 fin_product_grp_input.csv posfeed 행에서 일치하는 normalized 상품명의 exclude_check가 Y이면 N으로 변경
+    - 항목이 존재하지 않으면 exclude_check=N posfeed 행을 추가
     """
-    from modules.transform.utility.paths import POSFEED_WHITELIST_CSV_PATH
-
-    if POSFEED_WHITELIST_CSV_PATH.exists():
-        try:
-            wl_df = pd.read_csv(POSFEED_WHITELIST_CSV_PATH, dtype=str).fillna("")
-        except Exception as exc:
-            logger.warning("도리 자동 보정용 whitelist 로드 실패: %s", exc)
-            return 0, 0
-    else:
-        wl_df = pd.DataFrame(columns=_WHITELIST_COLUMNS)
-
-    if not {"item_name", "is_valid"}.issubset(wl_df.columns):
-        logger.warning("도리 자동 보정 실패: whitelist CSV에 필수 컬럼 없음")
+    try:
+        master = _read_fin_product_grp()
+    except Exception as exc:
+        logger.warning("도리 자동 보정용 grp 로드 실패: %s", exc)
         return 0, 0
 
-    wl_df = wl_df.reindex(columns=_WHITELIST_COLUMNS, fill_value="")
-    wl_df["_norm_item"] = wl_df["item_name"].fillna("").astype(str).map(_normalize_item_key)
+    if not {"source", "상품명", "exclude_check"}.issubset(master.columns):
+        logger.warning("도리 자동 보정 실패: grp CSV에 필수 컬럼 없음")
+        return 0, 0
+
+    master["_norm_item"] = master["상품명"].fillna("").astype(str).map(_normalize_item_key)
 
     dori_examples: dict[str, str] = {}
     for item_name in doridori_df["item_name"].fillna("").astype(str):
@@ -412,40 +462,26 @@ def _auto_fix_dori_whitelist(doridori_df: pd.DataFrame) -> tuple[int, int]:
     if not dori_examples:
         return 0, 0
 
+    posfeed_mask = _posfeed_master_mask(master)
     fixed_count = 0
-    for idx, row in wl_df.iterrows():
-        if row["_norm_item"] in dori_examples and row["is_valid"].strip().upper() == "N":
-            wl_df.at[idx, "is_valid"] = "Y"
-            wl_df.at[idx, "review_needed"] = "N"
-            wl_df.at[idx, "classified_by"] = "auto_dori_fix"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for idx, row in master[posfeed_mask].iterrows():
+        if row["_norm_item"] in dori_examples and str(row["exclude_check"]).strip().upper() == "Y":
+            master.at[idx, "exclude_check"] = "N"
+            master.at[idx, "updated_at"] = now
+            if "llm_check" in master.columns:
+                master.at[idx, "llm_check"] = "N"
             fixed_count += 1
 
     added_count = 0
-    existing_norms = set(wl_df["_norm_item"].dropna().astype(str))
+    existing_norms = set(master.loc[posfeed_mask, "_norm_item"].dropna().astype(str))
     for norm, example_name in dori_examples.items():
         if norm not in existing_norms:
-            wl_df = pd.concat(
-                [
-                    wl_df,
-                    pd.DataFrame([
-                        {
-                            "item_name": example_name,
-                            "is_valid": "Y",
-                            "store": "",
-                            "review_needed": "N",
-                            "classified_by": "auto_dori_fix",
-                            "_norm_item": norm,
-                        }
-                    ])
-                ],
-                ignore_index=True,
-            )
-            added_count += 1
+            logger.warning("도리 자동 보정 신규 행 스킵(매장별 item_id 없음): %s", example_name)
 
     if fixed_count or added_count:
-        wl_df = wl_df.drop(columns=["_norm_item"])
-        wl_df = wl_df.drop_duplicates(subset=["item_name", "store"], keep="first")
-        wl_df.to_csv(POSFEED_WHITELIST_CSV_PATH, index=False, encoding="utf-8-sig")
+        master = master.drop(columns=["_norm_item"], errors="ignore")
+        _save_fin_product_grp(master)
 
     return fixed_count, added_count
 
@@ -496,12 +532,13 @@ def report_posfeed_exclusions(**context) -> str:
                     added_count,
                 )
 
-            # whitelist 재조회 — 이미 is_valid=Y로 수정된 항목은 알림에서 제외
+            # grp 재조회 — 이미 exclude_check=N으로 수정된 항목은 알림에서 제외
             try:
-                from modules.transform.utility.paths import POSFEED_WHITELIST_CSV_PATH
-                wl = pd.read_csv(POSFEED_WHITELIST_CSV_PATH, dtype=str).fillna("")
-                wl["_norm"] = wl["item_name"].astype(str).map(_normalize_item_key)
-                still_n = set(wl.loc[wl["is_valid"].str.upper() == "N", "_norm"])
+                master = _read_fin_product_grp()
+                master["_norm"] = master["상품명"].astype(str).map(_normalize_item_key)
+                posfeed_mask = _posfeed_master_mask(master)
+                exclude_mask = master["exclude_check"].fillna("").astype(str).str.strip().str.upper() == "Y"
+                still_n = set(master.loc[posfeed_mask & exclude_mask, "_norm"])
                 still_blocked_df = doridori_df[
                     doridori_df["item_name"].astype(str).map(_normalize_item_key).isin(still_n)
                 ]
@@ -534,7 +571,7 @@ def report_posfeed_exclusions(**context) -> str:
                     send_email(
                         subject=f"[도리당] Posfeed 제외 항목 검토 필요 - '도리' 포함 ({ym}, {len(still_blocked_df)}건){subject_suffix}",
                         html_content=html,
-                        to_emails="a17019@kakao.com",
+                        to_emails=MAIL_CMJ_PM,
                     )
                     logger.info("[exclusion alert] '도리' 포함 %d건 알림 발송 (ym=%s)%s", len(still_blocked_df), ym, subject_suffix)
                 except Exception as exc:
@@ -572,23 +609,34 @@ def report_posfeed_exclusions(**context) -> str:
     return " | ".join(results) if results else "exclusion report: 제외 데이터 없음"
 
 
-def run_posfeed(date_str: str, overwrite: bool = False) -> str:
+def run_posfeed(
+    date_str: str,
+    overwrite: bool = False,
+    *,
+    persist_item_ids: bool = True,
+    stores: list[str] | None = None,
+) -> str:
     ym = date_str[:7]
     orders = _load_orders_for_ym(ym)
     items = _load_items_for_ym(ym)
     if orders.empty:
         raise FileNotFoundError(f"posfeed orders 없음: {date_str}")
-    df = _transform_df(orders, items, date_str)
+    df = _transform_df(orders, items, date_str, persist_item_ids=persist_item_ids)
     if df.empty:
         return f"SKIP: posfeed {date_str} 해당일 데이터 없음"
-    saved = _save_unified_daily(df, date_str, overwrite=overwrite)
+    store_scope = {str(store).strip() for store in (stores or []) if str(store).strip()}
+    if store_scope:
+        df = df[df["store"].fillna("").astype(str).str.strip().isin(store_scope)].copy()
+        if df.empty:
+            return f"SKIP: posfeed {date_str} 대상 매장 데이터 없음 | stores={sorted(store_scope)}"
+    saved = _save_unified_daily(df, date_str, overwrite=overwrite, replace_stores=stores)
     return f"posfeed {date_str}: {saved}행 저장"
 
 
 def run_lookback_posfeed(days: int = 7) -> str:
     total = 0
-    today = datetime.now()
-    for i in range(days):
+    today = datetime.strptime(_kst_today_str(), "%Y-%m-%d")
+    for i in range(1, days + 1):
         d = (today - timedelta(days=i)).strftime("%Y-%m-%d")
         try:
             result = run_posfeed(d)
@@ -636,21 +684,37 @@ def _recalculate_order_meta(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def sync_posfeed_blacklist() -> str:
-    """블랙리스트(is_valid=N)를 기존 unified_sales_*.parquet에 소급 적용.
+def _unified_paths_for_dates(date_strs: list[str]) -> list:
+    paths = []
+    for date_str in date_strs:
+        try:
+            ymd = datetime.strptime(str(date_str), "%Y-%m-%d").strftime("%y%m%d")
+        except Exception:
+            logger.warning("posfeed blacklist 날짜 형식 무시: %s", date_str)
+            continue
+        path = UNIFIED_ROOT / f"unified_sales_{ymd}.parquet"
+        if path.exists():
+            paths.append(path)
+        else:
+            logger.info("posfeed blacklist 대상 파일 없음: %s", path)
+    return sorted(set(paths))
+
+
+def sync_posfeed_blacklist(target_dates: list[str] | None = None) -> str:
+    """grp 블랙리스트(exclude_check=Y)를 기존 unified_sales_*.parquet에 소급 적용.
 
     처리 흐름:
-    1. fin_product_posfeed_whitelist.csv에서 N 항목 로드
-    2. unified_sales_*.parquet 전체 스캔
+    1. fin_product_grp_input.csv에서 source=posfeed & exclude_check=Y 항목 로드
+    2. target_dates가 있으면 해당 일자만, 없으면 unified_sales_*.parquet 전체 스캔
     3. source=posfeed & item_name ∈ 블랙리스트인 행 제거
     4. 영향받은 order_id의 menu_name/order_cnt/item_seq/_pk 재계산
     5. 변경된 parquet만 덮어쓰기
     """
     blacklist = _load_posfeed_blacklist()
     if not blacklist:
-        return "블랙리스트 없음 (fin_product_posfeed_whitelist.csv 미존재 또는 N 항목 없음) — 스킵"
+        return "블랙리스트 없음 (fin_product_grp_input.csv posfeed exclude_check=Y 항목 없음) — 스킵"
 
-    files = sorted(UNIFIED_ROOT.glob("unified_sales_*.parquet"))
+    files = _unified_paths_for_dates(target_dates) if target_dates else iter_unified_sales_files()
     if not files:
         return "unified_sales parquet 없음 — 스킵"
 
@@ -734,7 +798,184 @@ _BRAND_DESC = {
     "나홀로": "도리당의 서브브랜드, 1인 닭도리탕 전문점 (1인 고객 타겟)",
 }
 
-_WHITELIST_COLUMNS = ["item_name", "is_valid", "store", "review_needed", "classified_by"]
+_FIN_PRODUCT_REQUIRED_COLUMNS = [
+    "source",
+    "구분",
+    "대메뉴",
+    "중메뉴",
+    "상품코드",
+    "상품명",
+    "판매단가",
+    "수동분류",
+    "is_main_candidate",
+    "llm_check",
+    "exclude_check",
+    "updated_at",
+    "is_latest",
+]
+
+
+def _read_fin_product_grp() -> pd.DataFrame:
+    source_path = existing_fin_product_csv_path()
+    if source_path.exists():
+        df = pd.read_csv(source_path, dtype=str, encoding="utf-8-sig").fillna("")
+    else:
+        df = pd.DataFrame(columns=_FIN_PRODUCT_REQUIRED_COLUMNS)
+    for col in _FIN_PRODUCT_REQUIRED_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    return df
+
+
+def _save_fin_product_grp(df: pd.DataFrame) -> None:
+    FIN_PRODUCT_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = FIN_PRODUCT_CSV_PATH.with_suffix(".tmp")
+    try:
+        df.to_csv(tmp, index=False, encoding="utf-8-sig")
+        _safe_replace(tmp, FIN_PRODUCT_CSV_PATH)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _posfeed_master_mask(df: pd.DataFrame) -> pd.Series:
+    return df["source"].fillna("").astype(str).str.strip().str.lower() == "posfeed"
+
+
+def _make_posfeed_master_row(
+    columns: list[str],
+    item_name: str,
+    exclude_check: str,
+    updated_at: str,
+    unit_price: int | str = "",
+) -> dict[str, str]:
+    row = {col: "" for col in columns}
+    row.update({
+        "source": "posfeed",
+        "구분": "배달",
+        "상품코드": "",
+        "상품명": item_name,
+        "판매단가": unit_price,
+        "llm_check": "N",
+        "exclude_check": exclude_check,
+        "updated_at": updated_at,
+    })
+    if "is_main_candidate" in row:
+        row["is_main_candidate"] = "N"
+    if "is_latest" in row:
+        row["is_latest"] = "Y"
+    if "중복_수동분류" in row:
+        row["중복_수동분류"] = "N"
+    return row
+
+
+def _build_posfeed_latest_price_map() -> dict[str, int]:
+    """posfeed 상세 원천에서 상품명별 최신 관측 단품가격 맵을 만든다."""
+    files = sorted(RAW_POSFEED_DETAIL.glob("brand=*/store=*/ym=*/posfeed_order_item.csv"))
+    if not files:
+        return {}
+
+    parts = []
+    for file_pos, path in enumerate(files):
+        try:
+            header = pd.read_csv(path, encoding="utf-8-sig", dtype=str, nrows=0)
+            usecols = [c for c in ("상품명", "단품가격", "order_date", "ym") if c in header.columns]
+            if "상품명" not in usecols or "단품가격" not in usecols:
+                continue
+            df = pd.read_csv(path, encoding="utf-8-sig", dtype=str, usecols=usecols).fillna("")
+        except Exception as e:
+            logger.warning("posfeed 단가 원천 로드 실패, 스킵: %s | %s", path, e)
+            continue
+
+        df["_item_key"] = df["상품명"].astype(str).map(lambda v: _normalize_item_key(v.strip()))
+        df["_unit_price"] = _to_int_series(df["단품가격"])
+        df["_file_pos"] = file_pos
+        df["_row_pos"] = range(len(df))
+        if "order_date" not in df.columns:
+            df["order_date"] = ""
+        if "ym" not in df.columns:
+            df["ym"] = ""
+        df["_observed_at"] = pd.to_datetime(
+            df["order_date"].astype(str).str.strip().where(
+                df["order_date"].astype(str).str.strip() != "",
+                df["ym"].astype(str).str.strip() + "-01",
+            ),
+            errors="coerce",
+        )
+        df = df[df["_item_key"] != ""].copy()
+        if not df.empty:
+            parts.append(df[["_item_key", "_unit_price", "_observed_at", "_file_pos", "_row_pos"]])
+
+    if not parts:
+        return {}
+
+    all_prices = pd.concat(parts, ignore_index=True)
+    latest = (
+        all_prices.sort_values(["_observed_at", "_file_pos", "_row_pos"], na_position="first")
+        .groupby("_item_key", as_index=False)
+        .last()
+    )
+    return latest.set_index("_item_key")["_unit_price"].astype(int).to_dict()
+
+
+def _fill_posfeed_master_prices(
+    master: pd.DataFrame,
+    price_map: dict[str, int],
+    *,
+    blank_only: bool = True,
+) -> tuple[pd.DataFrame, int]:
+    """fin_product_grp의 posfeed 판매단가를 상품명 정규화키 기준으로 채운다."""
+    if master.empty or not price_map:
+        return master, 0
+    if "판매단가" not in master.columns:
+        master["판매단가"] = ""
+    if "상품명" not in master.columns or "source" not in master.columns:
+        return master, 0
+
+    out = master.copy()
+    posfeed_mask = _posfeed_master_mask(out)
+    item_key = out["상품명"].fillna("").astype(str).map(lambda v: _normalize_item_key(v.strip()))
+    mapped = item_key.map(price_map)
+    target_mask = posfeed_mask & mapped.notna()
+    if blank_only:
+        current = out["판매단가"].fillna("").astype(str).str.strip()
+        target_mask &= current.eq("")
+
+    update_count = int(target_mask.sum())
+    if update_count:
+        out.loc[target_mask, "판매단가"] = mapped.loc[target_mask].astype(int).astype(str)
+    return out, update_count
+
+
+def backfill_posfeed_product_prices(dry_run: bool = False) -> str:
+    """기존 fin_product_grp_input.csv posfeed 행의 빈 판매단가를 최신 관측 단가로 채운다."""
+    master = _read_fin_product_grp()
+    price_map = _build_posfeed_latest_price_map()
+    if not price_map:
+        return "posfeed 단가 원천 없음 - 스킵"
+
+    out, update_count = _fill_posfeed_master_prices(master, price_map, blank_only=True)
+    if update_count == 0:
+        return "posfeed 판매단가 백필 대상 없음"
+    if dry_run:
+        return f"dry_run: posfeed 판매단가 {update_count}행 백필 예정"
+
+    _save_fin_product_grp(out)
+    return f"posfeed 판매단가 {update_count}행 백필"
+
+
+def _posfeed_llm_examples(master: pd.DataFrame) -> list[dict]:
+    pf = master[_posfeed_master_mask(master)].copy()
+    examples = []
+    for _, row in pf.iterrows():
+        item_name = str(row.get("상품명", "")).strip()
+        if not item_name:
+            continue
+        is_valid = "N" if str(row.get("exclude_check", "")).strip().upper() == "Y" else "Y"
+        examples.append({"item_name": item_name, "is_valid": is_valid})
+    return examples
 
 
 def _classify_item_with_llm(
@@ -773,122 +1014,180 @@ def _classify_item_with_llm(
         return "N"
 
 
-def generate_posfeed_whitelist_draft() -> str:
-    """기존 unified_sales parquet에서 posfeed item_name 목록을 추출해 draft CSV 생성.
+def _load_legacy_posfeed_decisions() -> dict[str, str]:
+    """구 whitelist의 item_key별 최종 판단을 exclude_check 값으로 변환한다."""
+    if not POSFEED_WHITELIST_CSV_PATH.exists():
+        return {}
+    try:
+        df = pd.read_csv(POSFEED_WHITELIST_CSV_PATH, dtype=str, encoding="utf-8-sig").fillna("")
+    except Exception as exc:
+        logger.warning("legacy posfeed whitelist 로드 실패: %s", exc)
+        return {}
+    if not {"item_name", "is_valid"}.issubset(df.columns):
+        logger.warning("legacy posfeed whitelist 컬럼 오류 (필요: item_name, is_valid)")
+        return {}
 
-    - 신규 item_name: Ollama로 브랜드 맥락 자동 분류(Y/N), review_needed=Y
-    - 기존 항목: is_valid 유지, review_needed/classified_by 컬럼 마이그레이션
-    - 구버전 CSV(brand/store_name 컬럼) 자동 마이그레이션
-    """
-    from modules.transform.utility.paths import POSFEED_WHITELIST_CSV_PATH
+    decisions: dict[str, str] = {}
+    # N을 우선한다. 같은 item_key가 Y/N 모두 있으면 제외를 유지한다.
+    for _, row in df.iterrows():
+        key = _normalize_item_key(str(row.get("item_name", "")).strip())
+        if not key:
+            continue
+        is_valid = str(row.get("is_valid", "")).strip().upper()
+        if is_valid == "N":
+            decisions[key] = "Y"
+        elif is_valid == "Y" and key not in decisions:
+            decisions[key] = "N"
+    return decisions
 
-    files = sorted(UNIFIED_ROOT.glob("unified_sales_*.parquet"))
+
+def generate_posfeed_whitelist_draft(
+    enable_llm: bool = False,
+    max_llm_candidates: int = 50,
+) -> str:
+    """기존 unified_sales parquet에서 신규 posfeed item_name을 찾아 fin_product_grp_input.csv에 추가."""
+    if not enable_llm:
+        return "posfeed whitelist LLM 비활성화 — 스킵"
+
+    files = _unified_paths_for_dates(target_dates) if target_dates else iter_unified_sales_files()
     if not files:
         return "unified_sales parquet 없음 — 스킵"
 
-    # parquet 스캔: item_name + brand 수집
-    norm_items: set[str] = set()
-    item_brands: dict[str, set[str]] = {}
+    # parquet 스캔: item_key 판단은 전역으로, item_id는 매장별로 유지한다.
+    norm_items: set[tuple[str, str, str]] = set()
+    item_brands: dict[tuple[str, str, str], set[str]] = {}
+    global_item_brands: dict[str, set[str]] = {}
     for path in files:
         try:
-            df = pd.read_parquet(path, columns=["source", "item_name", "brand"])
+            df = pd.read_parquet(path, columns=["source", "item_name", "brand", "store"])
         except Exception as e:
             logger.warning("parquet 로드 실패, 스킵: %s | %s", path, e)
             continue
         pf = df[df["source"].fillna("").astype(str).str.strip().str.lower() == "posfeed"]
-        for _, row in pf[["item_name", "brand"]].dropna(subset=["item_name"]).iterrows():
+        for _, row in pf[["item_name", "brand", "store"]].dropna(subset=["item_name"]).iterrows():
             norm = _normalize_item_key(str(row["item_name"]).strip())
             if not norm:
                 continue
-            norm_items.add(norm)
             brand = str(row.get("brand", "")).strip()
+            store = str(row.get("store", "")).strip()
+            key = (brand, store, norm)
+            norm_items.add(key)
             if brand:
-                item_brands.setdefault(norm, set()).add(brand)
+                item_brands.setdefault(key, set()).add(brand)
+                global_item_brands.setdefault(norm, set()).add(brand)
 
     if not norm_items:
         return "posfeed 데이터 없음"
 
-    # 기존 CSV 로드
-    existing_df: pd.DataFrame | None = None
-    existing_items: set[str] = set()
-    POSFEED_WHITELIST_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        master = _read_fin_product_grp()
+    except Exception as e:
+        logger.warning("fin_product_grp_input.csv 로드 실패: %s", e)
+        return f"fin_product_grp_input.csv 로드 실패 — {e}"
 
-    if POSFEED_WHITELIST_CSV_PATH.exists():
-        try:
-            existing_df = pd.read_csv(POSFEED_WHITELIST_CSV_PATH, dtype=str).fillna("")
-            # 구버전 CSV(brand/store_name 컬럼) 마이그레이션
-            if "brand" in existing_df.columns or "store_name" in existing_df.columns:
-                logger.info("구버전 whitelist CSV 감지 → 마이그레이션")
-                existing_df["item_name"] = existing_df["item_name"].fillna("").astype(str).str.strip().map(_normalize_item_key)
-                existing_df["_sort"] = existing_df["is_valid"].str.strip().str.upper().map({"N": 0, "Y": 1}).fillna(1)
-                existing_df = (
-                    existing_df.sort_values("_sort")
-                    .drop_duplicates(subset=["item_name"], keep="first")
-                    .drop(columns=[c for c in ("brand", "store_name", "_sort") if c in existing_df.columns])
-                )
-                if "store" not in existing_df.columns:
-                    existing_df["store"] = existing_df.pop("note") if "note" in existing_df.columns else ""
-                existing_df = (
-                    existing_df[existing_df["item_name"].str.strip() != ""]
-                    .reset_index(drop=True)
-                )
-                logger.info("구버전 마이그레이션 완료: %d행", len(existing_df))
-            # note→store 마이그레이션
-            elif "note" in existing_df.columns and "store" not in existing_df.columns:
-                logger.info("whitelist CSV note→store 마이그레이션")
-                existing_df = existing_df.rename(columns={"note": "store"})
+    posfeed_mask = _posfeed_master_mask(master)
+    for col in ("brand", "store", "item_key"):
+        if col not in master.columns:
+            master[col] = ""
+    legacy_decisions = _load_legacy_posfeed_decisions()
+    existing_items = set()
+    master_decisions: dict[str, str] = {}
+    for _, row in master.loc[posfeed_mask].iterrows():
+        norm = str(row.get("item_key", "")).strip() or _normalize_item_key(str(row.get("상품명", "")).strip())
+        if norm:
+            existing_items.add((str(row.get("brand", "")).strip(), str(row.get("store", "")).strip(), norm))
+            exclude_check = str(row.get("exclude_check", "")).strip().upper()
+            llm_check = str(row.get("llm_check", "")).strip().upper()
+            if exclude_check == "Y":
+                master_decisions[norm] = "Y"
+            elif exclude_check == "N" and norm not in master_decisions:
+                if legacy_decisions.get(norm) == "Y" and llm_check == "Y":
+                    continue
+                master_decisions[norm] = "N"
+    known_decisions = {**legacy_decisions, **master_decisions}
+    examples = _posfeed_llm_examples(master)
+    price_map = _build_posfeed_latest_price_map()
 
-            # review_needed / classified_by 컬럼 마이그레이션
-            if "review_needed" not in existing_df.columns:
-                existing_df["review_needed"] = "N"
-            if "classified_by" not in existing_df.columns:
-                existing_df["classified_by"] = "human"
+    candidates = [
+        (brand, store, norm)
+        for brand, store, norm in sorted(norm_items)
+        if (brand, store, norm) not in existing_items
+    ]
+    candidate_norms = sorted({norm for _, _, norm in candidates})
+    unknown_norms = [norm for norm in candidate_norms if norm not in known_decisions]
+    logger.info(
+        "posfeed whitelist 후보 | parquet_keys=%d store_item_candidates=%d known=%d unknown_llm=%d",
+        len(norm_items),
+        len(candidates),
+        len(candidate_norms) - len(unknown_norms),
+        len(unknown_norms),
+    )
+    if len(unknown_norms) > max_llm_candidates:
+        return (
+            "posfeed whitelist LLM 후보 과다 - 스킵 | "
+            f"unknown={len(unknown_norms)} max={max_llm_candidates} "
+            "conf['posfeed_whitelist_llm'] 실행 전 상품테이블/구 whitelist 병합 필요"
+        )
 
-            existing_df = existing_df.reindex(columns=_WHITELIST_COLUMNS, fill_value="")
-            existing_df.to_csv(POSFEED_WHITELIST_CSV_PATH, index=False, encoding="utf-8-sig")
-
-            existing_items = {
-                str(r["item_name"]).strip()
-                for _, r in existing_df.iterrows()
-                if str(r["item_name"]).strip()
-            }
-        except Exception as e:
-            logger.warning("기존 CSV 로드 실패, 신규 생성으로 진행: %s", e)
-            existing_df = None
-
-    # 신규 아이템: LLM 자동 분류
-    new_rows = []
-    for norm in sorted(norm_items):
-        if norm in existing_items:
-            continue
-        brands = item_brands.get(norm, set())
-        ex = existing_df.to_dict("records") if existing_df is not None else None
-        is_valid = _classify_item_with_llm(norm, brands, examples=ex)
-        classified_by = "auto_llm"
-        new_rows.append({
-            "item_name": norm,
-            "is_valid": is_valid,
-            "store": "",
-            "review_needed": "Y",
-            "classified_by": classified_by,
-        })
+    llm_decisions: dict[str, str] = {}
+    for norm in unknown_norms:
+        brands = global_item_brands.get(norm, set())
+        is_valid = _classify_item_with_llm(norm, brands, examples=examples)
+        llm_decisions[norm] = "Y" if is_valid == "N" else "N"
         logger.info("LLM 분류: %s → %s (브랜드: %s)", norm, is_valid, brands)
 
+    decisions = {**known_decisions, **llm_decisions}
+
+    # 신규 매장별 item_id 행 생성. 분류 판단은 전역 item_key 결정을 재사용한다.
+    new_rows = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    code_series = allocate_manual_item_ids(pd.DataFrame([
+        {
+            "source": "posfeed",
+            "brand": brand,
+            "store": store,
+            "item_name": norm,
+            "unit_price": price_map.get(norm, ""),
+        }
+        for brand, store, norm in candidates
+    ]), persist=False) if candidates else pd.Series(dtype=str)
+
+    for pos, (brand, store, norm) in enumerate(candidates):
+        exclude_check = decisions.get(norm, "Y")
+        unit_price = price_map.get(norm, "")
+        code = str(code_series.iloc[pos])
+        row = _make_posfeed_master_row(list(master.columns), norm, exclude_check, now, unit_price)
+        offset = int(code) - MANUAL_SOURCE_BASE["posfeed"]
+        block_size = item_block_size("posfeed")
+        row.update({
+            "brand": brand,
+            "store": store,
+            "item_key": norm,
+            "store_seq": str(offset // block_size),
+            "item_seq": str(offset % block_size),
+            "상품코드": code,
+        })
+        new_rows.append(row)
+        logger.info(
+            "posfeed master 신규: %s/%s/%s → exclude_check=%s",
+            brand,
+            store,
+            norm,
+            exclude_check,
+        )
+
+    if new_rows:
+        new_df = pd.DataFrame(new_rows, columns=master.columns)
+        combined = pd.concat([master, new_df], ignore_index=True)
+    else:
+        combined = master.copy()
+    combined, price_update_count = _fill_posfeed_master_prices(combined, price_map, blank_only=True)
+    if not new_rows and price_update_count == 0:
+        return f"신규 항목 없음 (기존 grp에 모두 포함됨) | {FIN_PRODUCT_CSV_PATH}"
+    _save_fin_product_grp(combined)
+
     if not new_rows:
-        return f"신규 항목 없음 (기존 CSV에 모두 포함됨) | {POSFEED_WHITELIST_CSV_PATH}"
-
-    new_df = pd.DataFrame(new_rows, columns=_WHITELIST_COLUMNS)
-
-    combined = pd.concat([existing_df, new_df], ignore_index=True) if existing_df is not None else new_df
-    combined["_sort"] = combined["is_valid"].str.strip().str.upper().map({"N": 0, "Y": 1}).fillna(1)
-    combined = (
-        combined.sort_values("_sort")
-        .drop_duplicates(subset=["item_name", "store"], keep="first")
-        .drop(columns=["_sort"])
-        .sort_values(["item_name", "store"])
-        .reset_index(drop=True)
-    )
-    combined.to_csv(POSFEED_WHITELIST_CSV_PATH, index=False, encoding="utf-8-sig")
+        return f"신규 항목 없음, posfeed 판매단가 {price_update_count}행 백필 | {FIN_PRODUCT_CSV_PATH}"
 
     # 이메일: LLM 분류 결과 표 (Y=초록, N=빨강)
     try:
@@ -896,10 +1195,12 @@ def generate_posfeed_whitelist_draft() -> str:
 
         table_rows = "".join(
             "<tr>"
-            f"<td style='padding:6px 12px;border-bottom:1px solid #eee;'>{r['item_name']}</td>"
+            f"<td style='padding:6px 12px;border-bottom:1px solid #eee;'>{r['상품명']}</td>"
             f"<td style='padding:6px 12px;border-bottom:1px solid #eee;text-align:center;"
-            f"color:{'#27ae60' if r['is_valid']=='Y' else '#c0392b'};font-weight:bold;'>{r['is_valid']}</td>"
-            f"<td style='padding:6px 12px;border-bottom:1px solid #eee;color:#888;font-size:12px;'>{','.join(sorted(item_brands.get(r['item_name'],set())))}</td>"
+            f"color:{'#27ae60' if r['exclude_check']=='N' else '#c0392b'};font-weight:bold;'>"
+            f"{'Y' if r['exclude_check']=='N' else 'N'}</td>"
+            f"<td style='padding:6px 12px;border-bottom:1px solid #eee;color:#888;font-size:12px;'>"
+            f"{r.get('brand', '')}/{r.get('store', '')}</td>"
             "</tr>"
             for r in new_rows
         )
@@ -907,7 +1208,7 @@ def generate_posfeed_whitelist_draft() -> str:
 <body style="font-family:'Malgun Gothic',Arial,sans-serif;margin:24px;background:#f4f6f8;">
 <div style="max-width:800px;margin:auto;background:#fff;border-radius:8px;padding:24px;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
   <h2 style="margin-top:0;color:#2c3e50;border-bottom:2px solid #2c3e50;padding-bottom:8px;">[도리당] Posfeed 신규 상품 LLM 자동 분류</h2>
-  <p style="color:#555;">신규 item_name <b>{len(new_rows)}개</b>를 LLM이 자동 분류했습니다. <b>review_needed=Y</b> 항목을 검토해 주세요.</p>
+  <p style="color:#555;">신규 item_name <b>{len(new_rows)}개</b>를 LLM이 자동 분류해 fin_product_grp_input.csv에 추가했습니다.</p>
   <table style="border-collapse:collapse;width:100%;">
     <thead><tr>
       <th style="background:#2c3e50;color:#fff;padding:8px 12px;text-align:left;">item_name</th>
@@ -917,28 +1218,28 @@ def generate_posfeed_whitelist_draft() -> str:
     <tbody>{table_rows}</tbody>
   </table>
   <p style="margin-top:16px;">
-    <a href="{POSFEED_WHITELIST_CSV_PATH.as_uri()}"
+    <a href="{FIN_PRODUCT_CSV_PATH.as_uri()}"
        style="display:inline-block;padding:8px 16px;background:#2c3e50;color:#fff;border-radius:4px;text-decoration:none;font-size:13px;">
       📂 CSV 파일 열기
     </a>
-    <span style="color:#999;font-size:11px;margin-left:10px;">{POSFEED_WHITELIST_CSV_PATH}</span>
+    <span style="color:#999;font-size:11px;margin-left:10px;">{FIN_PRODUCT_CSV_PATH}</span>
   </p>
 </div></body></html>"""
 
         send_email(
             subject=f"[도리당] Posfeed 신규 상품 {len(new_rows)}개 LLM 자동 분류 완료",
             html_content=html,
-            to_emails="a17019@kakao.com",
+            to_emails=MAIL_CMJ_PM,
         )
         logger.info("신규 상품 알림 발송 완료: %d개", len(new_rows))
     except Exception as e:
         logger.warning("신규 상품 알림 발송 실패: %s", e)
 
-    approved = sum(1 for r in new_rows if r["is_valid"] == "Y")
+    approved = sum(1 for r in new_rows if r["exclude_check"] == "N")
     rejected = len(new_rows) - approved
     return (
         f"draft 생성 완료 | 신규 {len(new_rows)}개 (LLM: Y={approved}/N={rejected}) | "
-        f"총 {len(combined)}개 항목 | {POSFEED_WHITELIST_CSV_PATH}"
+        f"총 {len(combined)}개 항목 | {FIN_PRODUCT_CSV_PATH}"
     )
 
 

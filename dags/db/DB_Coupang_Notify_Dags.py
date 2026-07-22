@@ -10,7 +10,7 @@ conf 예시:
     ...
   ],
   "collected_at": "2026-06-05T13:08:15.000Z",
-  "notify_email": "a17019@kakao.com"
+  "notify_email": "a17019@doridang.com"
 }
 """
 
@@ -23,10 +23,11 @@ from airflow.operators.python import PythonOperator
 
 from modules.transform.utility.mailer import send_email
 from modules.transform.utility.notifier import on_failure_callback
+from modules.transform.utility.mail_recipients import MAIL_CMJ_PM
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_NOTIFY_EMAIL = "a17019@kakao.com"
+DEFAULT_NOTIFY_EMAIL = MAIL_CMJ_PM
 
 
 def _send_failure_email(**context):

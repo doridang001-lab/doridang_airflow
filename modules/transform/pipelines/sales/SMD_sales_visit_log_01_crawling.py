@@ -78,7 +78,6 @@ def get_output_dir():
         # Airflow 환경에서는 LOCAL_DB/업로드_temp 사용
         try:
             import sys
-            from pathlib import Path
             # modules 경로 추가
             sys.path.insert(0, str(Path(__file__).parent.parent.parent))
             return Path("/opt/airflow/download/업로드_temp")
@@ -327,14 +326,25 @@ def do_login(driver) -> bool:
         login_btn = driver.find_element(By.CSS_SELECTOR, "a#normalLoginButton")
         driver.execute_script("arguments[0].click();", login_btn)
         log(f"  ✓ 로그인 버튼 클릭")
-        
-        time.sleep(5.0)
-        
+
+        wait = WebDriverWait(driver, int(os.getenv("FLOW_LOGIN_SUCCESS_TIMEOUT", "150")))
+        try:
+            wait.until(
+                lambda d: (
+                    "signin" not in d.current_url.lower()
+                    or bool(d.find_elements(By.CSS_SELECTOR, "input#topSearchKeywordBox"))
+                )
+            )
+        except TimeoutException:
+            current_url = driver.current_url
+            title = driver.title
+            log(f"  ❌ 로그인 대기 타임아웃 | url={current_url} | title={title}")
+            return False
+
         current_url = driver.current_url
         if "signin" not in current_url.lower():
             log(f"  ✅ 로그인 성공!")
-            
-            wait = WebDriverWait(driver, 15)
+
             try:
                 search_box = wait.until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "input#topSearchKeywordBox"))

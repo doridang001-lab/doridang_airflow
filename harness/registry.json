@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "ignore": ["dags/**/__init__.py"],
+  "groups": [
+    {"id": "db", "patterns": ["dags/db/*.py"], "guidance": ["dags/CLAUDE.md", "dags/db/AGENTS.md"], "harness_docs": []},
+    {"id": "sales", "patterns": ["dags/sales/*.py"], "guidance": ["dags/CLAUDE.md", "dags/sales/AGENTS.md"], "harness_docs": []},
+    {"id": "strategy", "patterns": ["dags/strategy/*.py"], "guidance": ["dags/CLAUDE.md", "dags/strategy/AGENTS.md"], "harness_docs": []},
+    {"id": "etl", "patterns": ["dags/etl/*.py"], "guidance": ["dags/CLAUDE.md"], "harness_docs": []},
+    {"id": "private", "patterns": ["dags/private/*.py"], "guidance": ["dags/CLAUDE.md"], "harness_docs": []}
+  ],
+  "overrides": [
+    {"dag": "dags/db/DB_Beamin_Macro_Dags.py", "harness_docs": ["baemin_macro"]},
+    {"dag": "dags/db/DB_Beamin_Macro_Dags_Retry.py", "harness_docs": ["baemin_macro"]},
+    {"dag": "dags/db/DB_Beamin_Macro_Pc2_Dags.py", "harness_docs": ["baemin_macro"]},
+    {"dag": "dags/db/DB_CoupangMacro_Load_Dags.py", "harness_docs": ["coupang_macro"]},
+    {"dag": "dags/db/DB_Coupang_Notify_Dags.py", "harness_docs": ["coupang_macro"]},
+    {"dag": "dags/sales/Sales_CoupangEats_CMG_Partition_Dags.py", "harness_docs": ["coupang_macro"]},
+    {"dag": "dags/db/DB_FinProduct_Dags.py", "harness_docs": ["fin_product"]},
+    {"dag": "dags/db/DB_FinProduct_Map_Dags.py", "harness_docs": ["fin_product"]},
+    {"dag": "dags/db/DB_UnifiedSales_Dags.py", "harness_docs": ["unified_sales_grp"]}
+  ]
+}

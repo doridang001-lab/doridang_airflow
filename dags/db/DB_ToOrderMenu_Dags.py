@@ -29,12 +29,12 @@ from modules.extract.crawling_toorder_sales_report import generate_date_range
 from modules.transform.utility.paths import ANALYTICS_DB, DOWN_DIR
 from modules.transform.utility.schedule import DB_TOORDER_MENU_TIME
 from modules.transform.utility.notifier import on_failure_callback
+from modules.transform.utility.account import get_default_account
 
 logger = logging.getLogger(__name__)
 
 
-TOORDER_ID = "doridang15"
-TOORDER_PW = os.getenv("TOORDER_PW", "ehfl5233!")
+TOORDER_ID, TOORDER_PW = get_default_account("toorder")
 
 # ============================================================
 # 사용법

@@ -21,6 +21,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 from modules.transform.utility.selenium_uc import configure_uc_data_path
+from modules.transform.utility.mail_recipients import MAIL_CMJ_PM
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ _CALENDAR_FALLBACK_URLS = [
     "https://flow.team/main.act?calendar",
 ]
 _HEADLESS           = os.getenv("AIRFLOW_HOME") is not None
-_BRIEFING_RECIPIENT = "a17019@kakao.com"
+_BRIEFING_RECIPIENT = MAIL_CMJ_PM
 _CALENDAR_NOTIFY_ENABLED = os.getenv("FLOW_CALENDAR_NOTIFY_ENABLED", "1").strip() not in {"0", "false", "False", "no", "NO"}
 _CALENDAR_NOTIFY_TARGET_NAME = os.getenv("FLOW_CALENDAR_NOTIFY_TARGET_NAME", "조민준").strip() or "조민준"
 _BRIEFING_INCLUDE_KPI_SECTION = os.getenv("FLOW_BRIEFING_INCLUDE_KPI_SECTION", "0").strip() not in {"0", "false", "False", "no", "NO"}

@@ -38,12 +38,13 @@ from modules.transform.ai_daily_collection_integrator import (
 from modules.transform.utility.paths import ANALYTICS_DB, DOWN_DIR
 from modules.transform.utility.mailer import send_email
 from modules.transform.utility.notifier import on_failure_callback
+from modules.transform.utility.account import get_default_account
+from modules.transform.utility.mail_recipients import MAIL_CMJ_PM, MAIL_OH_NAYOUNG
 
 
 DAG_ID = "DB_Sales_Alert_01_Score_AI_Daily_Collection"
 
-TOORDER_ID = os.getenv("TOORDER_ID", "doridang15")
-TOORDER_PW = os.getenv("TOORDER_PW", "ehfl5233!")
+TOORDER_ID, TOORDER_PW = get_default_account("toorder")
 
 DEST_DIR = ANALYTICS_DB / "ai_daily_collection"
 DOWNLOAD_DIR = DOWN_DIR / "toorder_sales_report_date"
@@ -52,7 +53,7 @@ DAILY_SUMMARY_CSV = DEST_DIR / "종합보고서_일별매출보고서_일별합�
 
 logger = logging.getLogger(__name__)
 
-ALERT_TO_EMAILS = ["a17019@kakao.com", "bulu1017@kakao.com"] # 이메일 수신자 리스트 (조민준 pm, 오나영 차장)
+ALERT_TO_EMAILS = [MAIL_CMJ_PM, MAIL_OH_NAYOUNG]
 POWERBI_DASHBOARD_URL = "https://app.powerbi.com/groups/me/reports/07a40f9d-e54a-40db-9b5e-6a2648206cab/a640e3550e57c3103a85?experience=power-bi"
 FINAL_CLEANUP_TARGETS = [
     Path(r"E:\down\종합보고서_일별매출보고서_260513_raw.xlsx"),

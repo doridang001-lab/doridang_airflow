@@ -17,14 +17,18 @@ from modules.transform.utility.paths import (
     COUPANG_ORDERS_DB,
     MART_DB,
 )
+from modules.transform.pipelines.db.DB_UnifiedSales_common import (
+    DELIVERY_PLATFORM_FAMILIES,
+    filter_manual_delivery_sources_for_test_stores,
+)
 from modules.transform.utility.store_normalize import normalize_for_join
 
 logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
 
 PLATFORM_GROUPS = {
-    "배달의민족": {"배달의민족", "배민1", "배민 포장", "배민 사장"},
-    "쿠팡이츠": {"쿠팡이츠", "쿠팡 포장"},
+    "배달의민족": set(DELIVERY_PLATFORM_FAMILIES["배민수동"]),
+    "쿠팡이츠": set(DELIVERY_PLATFORM_FAMILIES["쿠팡수동"]),
 }
 PLATFORM_TO_GROUP = {
     platform: group
@@ -93,13 +97,16 @@ def load_toorder() -> pd.DataFrame:
 
 def load_unified() -> pd.DataFrame:
     root = MART_DB / "unified_sales_grp"
-    files = sorted(root.glob("unified_sales_*.parquet")) if root.exists() else []
+    files = sorted(
+        path for path in root.glob("unified_sales_*.parquet") if ".bak_" not in path.name
+    ) if root.exists() else []
     if not files:
         logger.warning("unified_sales parquet 없음: %s", root)
         return _empty_long()
-    df = _read_parquet_parts(files, ["sale_date", "store", "platform", "total_price"])
+    df = _read_parquet_parts(files, ["sale_date", "store", "platform", "source", "total_price"])
     if df.empty:
         return _empty_long()
+    df = filter_manual_delivery_sources_for_test_stores(df)
     return _normalize_grouped(df, "sale_date", "store", "platform", "total_price")
 
 

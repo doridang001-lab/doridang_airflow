@@ -47,6 +47,28 @@ D_DOWN_DIR=e:/d_down
 ONEDRIVE_ROOT=c:/Users/hong/OneDrive - 주식회사 도리당
 ```
 
+배민 매크로를 두 PC에서 나눠 수집하면 각 PC의 `.env`에 역할을 하나만 지정합니다.
+
+```env
+# 중앙 PC(상위 절반 수집 및 Upload DAG 실행)
+BAEMIN_MACRO_ROLE=top
+
+# 두 번째 PC(하위 절반 수집, 위 설정 대신 사용)
+BAEMIN_MACRO_ROLE=bottom
+```
+
+역할값은 `top` 또는 `bottom`을 권장합니다. 역할을 바꾼 뒤에는 Airflow 컨테이너를
+재생성하고 scheduler와 worker에 값이 전달됐는지 확인합니다.
+
+```powershell
+docker compose up -d
+docker compose exec airflow-scheduler printenv BAEMIN_MACRO_ROLE
+docker compose exec airflow-worker printenv BAEMIN_MACRO_ROLE
+```
+
+두 PC 모두 `DB_Beamin_Macro_Dags`를 실행하지만,
+`DB_Beamin_Macro_Upload_Dags`는 중앙 PC에서만 활성화합니다.
+
 ## 4. 로컬 폴더 만들기
 기본값을 그대로 쓸 경우 아래 폴더가 있어야 합니다.
 

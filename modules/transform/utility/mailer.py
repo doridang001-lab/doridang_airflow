@@ -5,6 +5,8 @@ Airflow SMTP Connection을 통해 HTML 메일과 inline image를 함께 전송�
 
 import logging
 
+from modules.transform.utility.mail_recipients import resolve_mail_recipients
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,7 +54,11 @@ def send_email(
     smtp_password = connection.password
     from_email = connection.extra_dejson.get("from_email") or smtp_user
 
-    to_list = [to_emails] if isinstance(to_emails, str) else list(to_emails)
+    to_list = resolve_mail_recipients(to_emails)
+    if not to_list:
+        logger.warning("메일 수신자 없음 - 발송 스킵: 제목=%s", subject)
+        return "메일 수신자 없음 - 발송 스킵"
+
     attachments = list(attachments or [])
     inline_images = list(inline_images or [])
 

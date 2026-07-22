@@ -4,13 +4,15 @@ unified_sales - OKPOS 채널 전용 모듈.
 
 import hashlib
 import logging
+import os
 from datetime import datetime
 from functools import lru_cache
 
 import pandas as pd
 
-from modules.transform.utility.paths import FIN_PRODUCT_CSV_PATH, RAW_OKPOS_SALES
+from modules.transform.utility.paths import FIN_PRODUCT_CSV_PATH, RAW_OKPOS_SALES, existing_fin_product_csv_path
 from modules.transform.pipelines.db.DB_UnifiedSales_common import (
+    DELIVERY_PLATFORM_FAMILIES,
     UNIFIED_COLUMNS,
     _apply_fin_item_name,
     _make_unified_pk,
@@ -22,12 +24,16 @@ from modules.transform.pipelines.db.DB_UnifiedSales_common import (
     _strip_and_coalesce_columns,
     _to_int_series,
 )
+from modules.transform.pipelines.db.DB_ItemIdAllocator import OKPOS_ADJUSTMENT_ITEM_ID, allocate_manual_item_ids
+from modules.transform.pipelines.db.DB_OKPOS_Sales import _sum_csv_amount_for_date
 
 logger = logging.getLogger(__name__)
 
 OKPOS_BRAND_ROOT = RAW_OKPOS_SALES / "brand=도리당"
+_GATE_ALERT_RECENT_DAYS = int(os.getenv("OKPOS_GATE_ALERT_RECENT_DAYS", "2") or "2")
 BAEMIN_MANUAL_STORES = {"해운대중동점", "법흥리점", "송파삼전점"}
 BAEMIN_PLATFORM = "배달의민족"
+BAEMIN_PLATFORMS = DELIVERY_PLATFORM_FAMILIES["배민수동"]
 
 # 도리당 OKPOS "상품 미매칭" 알림은 운영상 불필요하여 기본 비활성화.
 # (필요 시 수신자 이메일을 지정하면 다시 활성화됨)
@@ -98,7 +104,7 @@ def _dedup_okpos_df_by_stable_key(df: pd.DataFrame, kind: str) -> pd.DataFrame:
 @lru_cache(maxsize=1)
 def _load_fin_product() -> pd.DataFrame:
     try:
-        df = pd.read_csv(FIN_PRODUCT_CSV_PATH, dtype=str)
+        df = pd.read_csv(existing_fin_product_csv_path(), dtype=str)
         df["상품코드"] = df["상품코드"].fillna("").str.strip()
         df["is_main_candidate"] = df["is_main_candidate"].fillna("N").str.strip().str.upper()
         if "exclude_check" not in df.columns:
@@ -141,7 +147,7 @@ def _build_unmatched_report(codes: set[str]) -> str:
 
     lines: list[str] = []
     if not_registered:
-        lines.append(f"■ 미등록 상품 ({len(not_registered)}건) — fin_product_grp.csv 추가 필요")
+        lines.append(f"■ 미등록 상품 ({len(not_registered)}건) — fin_product_grp_input.csv 추가 필요")
         for c in not_registered:
             lines.append(f"  · {c}")
     if excluded:
@@ -602,7 +608,7 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
     merged["platform"] = (merged[channel_col].fillna("").astype(str).str.strip() if channel_col else "")
     baemin_manual_mask = (
         merged["store"].fillna("").astype(str).str.strip().isin(BAEMIN_MANUAL_STORES)
-        & merged["platform"].fillna("").astype(str).str.strip().eq(BAEMIN_PLATFORM)
+        & merged["platform"].fillna("").astype(str).str.strip().isin(BAEMIN_PLATFORMS)
     )
     if baemin_manual_mask.any():
         logger.info(
@@ -698,6 +704,14 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
 
     merged["item_id"] = merged["상품코드"].fillna("").astype(str)
     merged["item_name"] = merged["상품명"].fillna("").astype(str)
+    missing_item_name = merged["item_name"].astype(str).str.strip().eq("")
+    if missing_item_name.any() and "menu_name" in merged.columns:
+        menu_fallback = merged["menu_name"].fillna("").astype(str).str.strip()
+        merged.loc[missing_item_name & menu_fallback.ne(""), "item_name"] = menu_fallback
+    missing_item_name = merged["item_name"].astype(str).str.strip().eq("")
+    if missing_item_name.any():
+        merged.loc[missing_item_name, "item_id"] = OKPOS_ADJUSTMENT_ITEM_ID
+        merged.loc[missing_item_name, "item_name"] = "정산차액(OKPOS)"
 
     qty_col = "수량_y" if "수량_y" in merged.columns else "수량"
     qty_source = merged[qty_col] if qty_col in merged.columns else pd.Series(0, index=merged.index)
@@ -756,7 +770,7 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
     # - 실제 아이템 행을 변경하지 않고, 영수증(_order_key)별 차액을 1개 조정 행으로 별도 기록한다.
     #
     # 조정 행 규칙:
-    # - item_id: "__OKPOS_ADJ__"
+    # - item_id: OKPOS_ADJUSTMENT_ITEM_ID
     # - item_name: "정산차액(OKPOS)"
     # - qty: "1"
     # - unit_price: total_price와 동일(차액)
@@ -801,7 +815,7 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
                     row = rep.loc[ok].copy()
                     next_seq = int(seq_max.get(ok, 0) or 0) + 1
                     row["item_seq"] = str(next_seq)
-                    row["item_id"] = "__OKPOS_ADJ__"
+                    row["item_id"] = OKPOS_ADJUSTMENT_ITEM_ID
                     row["item_name"] = "정산차액(OKPOS)"
                     row["menu_name"] = row.get("menu_name", "")
                     row["qty"] = "1"
@@ -830,12 +844,272 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
         if _col in merged.columns and merged[_col].dtype == object:
             merged[_col] = merged[_col].fillna("").astype(str)
 
-    # item_id(상품코드) 기준으로 item_name을 fin 상품명으로 정합(LEFT JOIN 100% 목표)
+    merged["item_id"] = allocate_manual_item_ids(
+        merged[["source", "brand", "store", "item_id", "item_name", "unit_price"]],
+        persist=True,
+    )
+
+    # scoped item_id 기준으로 item_name을 fin 상품명으로 정합
     merged = _apply_fin_item_name(merged)
     return merged[UNIFIED_COLUMNS]
 
 
-def run_okpos(date_str: str, overwrite: bool = False) -> str:
+def _send_okpos_daily_gate_alert(message: str) -> None:
+    try:
+        from modules.transform.utility.notifier import send_telegram
+
+        send_telegram(message)
+    except Exception as e:
+        logger.warning("OKPOS daily 교차검증 텔레그램 발송 실패(무시): %s", e)
+
+
+def _send_okpos_daily_gate_alert_summary(alerts: list[dict], date_str: str) -> None:
+    if not alerts:
+        return
+
+    max_lines = int(os.getenv("OKPOS_GATE_ALERT_MAX_LINES", "20") or "20")
+    lines = [
+        f"[OKPOS daily 교차검증] 알림 {len(alerts)}건",
+        f"date={date_str}",
+    ]
+    for alert in alerts[:max_lines]:
+        lines.append(
+            "{store} | {reason} | daily={daily_net} | order={order_total} | diff={diff} | strict_gate={strict_gate}".format(
+                store=alert.get("store", ""),
+                reason=alert.get("reason", ""),
+                daily_net=alert.get("daily_net", ""),
+                order_total=alert.get("order_total", ""),
+                diff=alert.get("diff", ""),
+                strict_gate=alert.get("strict_gate", ""),
+            )
+        )
+    if len(alerts) > max_lines:
+        lines.append(f"...외 {len(alerts) - max_lines}건")
+    message = "\n".join(lines)
+    logger.warning(message.replace("\n", " | "))
+    _send_okpos_daily_gate_alert(message)
+
+
+def _okpos_daily_gate_late_hours() -> set[int]:
+    raw = os.getenv("OKPOS_DAILY_GATE_LATE_HOURS", "21,22,23,0,1")
+    hours: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            hour = int(part)
+        except ValueError:
+            continue
+        if 0 <= hour <= 23:
+            hours.add(hour)
+    return hours
+
+
+def _okpos_late_hour_total(group: pd.DataFrame) -> int:
+    if "order_time" not in group.columns or "total_price" not in group.columns:
+        return 0
+    late_hours = _okpos_daily_gate_late_hours()
+    if not late_hours:
+        return 0
+    hour = pd.to_numeric(
+        group["order_time"].fillna("").astype(str).str.extract(r"^(\d{1,2})", expand=False),
+        errors="coerce",
+    )
+    mask = hour.isin(late_hours)
+    if not bool(mask.any()):
+        return 0
+    return int(pd.to_numeric(group.loc[mask, "total_price"], errors="coerce").fillna(0).sum())
+
+
+def _kst_today():
+    from zoneinfo import ZoneInfo
+
+    return datetime.now(ZoneInfo("Asia/Seoul")).date()
+
+
+def _should_send_gate_alert(store_short: str, date_str: str, fingerprint: str) -> bool:
+    try:
+        sale_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except Exception as e:
+        logger.warning("gate alert 날짜 파싱 실패(발송 허용): %s | %s", date_str, e)
+        return True
+
+    if (_kst_today() - sale_date).days > _GATE_ALERT_RECENT_DAYS:
+        return False
+
+    marker = OKPOS_BRAND_ROOT / f"store={store_short}" / f"ym={date_str[:7]}" / ".gate_alert__okpos.txt"
+    try:
+        seen = set()
+        if marker.exists():
+            for line in marker.read_text(encoding="utf-8").splitlines():
+                parts = line.split("\t")
+                if len(parts) > 1:
+                    seen.add(parts[1])
+        if fingerprint in seen:
+            return False
+
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().isoformat(timespec="seconds")
+        with marker.open("a", encoding="utf-8") as f:
+            f.write(f"{date_str}\t{fingerprint}\t{ts}\n")
+        return True
+    except Exception as e:
+        logger.warning("gate alert 스로틀 마커 처리 실패(발송 허용): %s | %s | %s", date_str, store_short, e)
+        return True
+
+
+def _okpos_daily_gate(df: pd.DataFrame, date_str: str) -> pd.DataFrame:
+    """daily 실매출이 있는데 order/item 합계가 0인 OKPOS 적재를 차단한다."""
+    if df.empty or "store" not in df.columns or "total_price" not in df.columns:
+        return df
+
+    tol = int(os.getenv("OKPOS_DAILY_VALIDATE_TOLERANCE", "0") or "0")
+    strict_gate = os.getenv("OKPOS_UNIFIED_STRICT_GATE", "").strip() == "1"
+    keep = pd.Series(True, index=df.index)
+    pending_alerts: list[dict] = []
+
+    for store, group in df.groupby("store", dropna=False):
+        store_short = str(store or "").strip()
+        if not store_short:
+            logger.warning("OKPOS daily 교차검증 스킵: store 빈값 | %s", date_str)
+            continue
+
+        daily_csv = OKPOS_BRAND_ROOT / f"store={store_short}" / f"ym={date_str[:7]}" / "okpos_daily.csv"
+        daily_net, reason = _sum_csv_amount_for_date(daily_csv, date_str, "실매출액")
+        order_total = int(pd.to_numeric(group["total_price"], errors="coerce").fillna(0).sum())
+
+        if reason is not None:
+            logger.info(
+                "OKPOS daily 교차검증 미적용: %s | %s | daily=%s reason=%s order_total=%s",
+                date_str,
+                store_short,
+                daily_net,
+                reason,
+                order_total,
+            )
+            continue
+
+        if daily_net == 0:
+            if abs(order_total) <= tol:
+                alert_reason = "daily_zero_order_zero"
+                msg = (
+                    "[OKPOS daily 교차검증] UnifiedSales 0원 적재 제외\n"
+                    f"date={date_str}\nstore={store_short}\n"
+                    f"daily_net={daily_net}\norder_total={order_total}\nreason={alert_reason}"
+                )
+                logger.info(msg.replace("\n", " | "))
+                fp = hashlib.md5(f"{date_str}|{store_short}|{daily_net}|{order_total}|{alert_reason}".encode()).hexdigest()
+                if _should_send_gate_alert(store_short, date_str, fp):
+                    pending_alerts.append({
+                        "store": store_short,
+                        "reason": alert_reason,
+                        "daily_net": daily_net,
+                        "order_total": order_total,
+                        "diff": int(order_total) - int(daily_net),
+                        "strict_gate": int(strict_gate),
+                    })
+                else:
+                    logger.info("gate alert 스로틀 스킵: %s | %s | reason=%s", date_str, store_short, alert_reason)
+                keep.loc[group.index] = False
+            else:
+                logger.info(
+                    "OKPOS daily 0원이나 order/item 비영이라 적재 유지: %s | %s | daily=%s order=%s",
+                    date_str,
+                    store_short,
+                    daily_net,
+                    order_total,
+                )
+            continue
+
+        diff = order_total - int(daily_net)
+        if abs(order_total) <= tol:
+            alert_reason = "order_total_zero"
+            msg = (
+                "[OKPOS daily 교차검증] UnifiedSales 적재 제외\n"
+                f"date={date_str}\nstore={store_short}\n"
+                f"daily_net={daily_net}\norder_total={order_total}\nreason={alert_reason}"
+            )
+            logger.info(msg.replace("\n", " | "))
+            fp = hashlib.md5(f"{date_str}|{store_short}|{daily_net}|{order_total}|{alert_reason}".encode()).hexdigest()
+            if _should_send_gate_alert(store_short, date_str, fp):
+                pending_alerts.append({
+                    "store": store_short,
+                    "reason": alert_reason,
+                    "daily_net": daily_net,
+                    "order_total": order_total,
+                    "diff": int(order_total) - int(daily_net),
+                    "strict_gate": int(strict_gate),
+                })
+            else:
+                logger.info("gate alert 스로틀 스킵: %s | %s | reason=%s", date_str, store_short, alert_reason)
+            keep.loc[group.index] = False
+        elif abs(diff) <= tol:
+            logger.info(
+                "OKPOS daily 교차검증 PASS: %s | %s | daily=%s order=%s",
+                date_str,
+                store_short,
+                daily_net,
+                order_total,
+            )
+        else:
+            msg = (
+                "[OKPOS daily 교차검증] daily/order mismatch\n"
+                f"date={date_str}\nstore={store_short}\n"
+                f"daily_net={daily_net}\norder_total={order_total}\ndiff={diff}\n"
+                f"strict_gate={int(strict_gate)}"
+            )
+            alert_reason = "mismatch"
+            late_total = _okpos_late_hour_total(group)
+            if diff > 0 and abs(diff - late_total) <= tol:
+                logger.info(
+                    "OKPOS daily 교차검증 PASS(late-hour diff): %s | %s | daily=%s order=%s diff=%s late_total=%s late_hours=%s",
+                    date_str,
+                    store_short,
+                    daily_net,
+                    order_total,
+                    diff,
+                    late_total,
+                    sorted(_okpos_daily_gate_late_hours()),
+                )
+                continue
+            # order+receipt 병합값이 신뢰 소스. daily 종합매출 페이지는 정산 지연으로
+            # 익일까지 과소보고될 수 있으므로 diff>0(order>daily)는 알림을 억제한다.
+            trust_order = os.getenv("OKPOS_DAILY_TRUST_ORDER", "1").strip() != "0"
+            if trust_order and diff > 0:
+                logger.info(
+                    "OKPOS daily 교차검증 PASS(order 신뢰, daily 정산지연 과소보고): %s | %s | daily=%s order=%s diff=%s",
+                    date_str,
+                    store_short,
+                    daily_net,
+                    order_total,
+                    diff,
+                )
+                continue
+            logger.info(msg.replace("\n", " | "))
+            fp = hashlib.md5(f"{date_str}|{store_short}|{daily_net}|{order_total}|{alert_reason}".encode()).hexdigest()
+            if _should_send_gate_alert(store_short, date_str, fp):
+                pending_alerts.append({
+                    "store": store_short,
+                    "reason": alert_reason,
+                    "daily_net": daily_net,
+                    "order_total": order_total,
+                    "diff": diff,
+                    "strict_gate": int(strict_gate),
+                })
+            else:
+                logger.info("gate alert 스로틀 스킵: %s | %s | reason=%s", date_str, store_short, alert_reason)
+            if strict_gate:
+                keep.loc[group.index] = False
+
+    _send_okpos_daily_gate_alert_summary(pending_alerts, date_str)
+    dropped = int((~keep).sum())
+    if dropped:
+        logger.warning("OKPOS daily 교차검증 제외: %s | rows=%d", date_str, dropped)
+    return df[keep].reset_index(drop=True)
+
+
+def run_okpos(date_str: str, overwrite: bool = False, stores: list[str] | None = None) -> str:
     """특정 날짜 OKPOS order+order_item → unified_sales 저장.
 
     overwrite=True: 기존 데이터 교체 (정정용).
@@ -848,7 +1122,15 @@ def run_okpos(date_str: str, overwrite: bool = False) -> str:
     df = _transform_okpos_df(order_df, item_df)
     if df.empty:
         return f"스킵 (데이터 없음 | {date_str})"
-    saved = _save_unified_daily(df, date_str, overwrite=overwrite)
+    df = _okpos_daily_gate(df, date_str)
+    if df.empty:
+        return f"스킵 (daily 교차검증 후 전량 제외 | {date_str})"
+    store_scope = {str(store).strip() for store in (stores or []) if str(store).strip()}
+    if store_scope:
+        df = df[df["store"].fillna("").astype(str).str.strip().isin(store_scope)].copy()
+        if df.empty:
+            return f"스킵 (okpos 대상 매장 데이터 없음 | {date_str} | stores={sorted(store_scope)})"
+    saved = _save_unified_daily(df, date_str, overwrite=overwrite, replace_stores=stores)
     _flush_unmatched_alert()
     result = f"unified_sales(okpos) 저장 | {date_str} | {saved}행"
     logger.info(result)
@@ -856,7 +1138,7 @@ def run_okpos(date_str: str, overwrite: bool = False) -> str:
 
 
 def run_lookback_okpos(days: int = 7) -> str:
-    """최근 N일 okpos 누락분 보충 (append-only, 월별 캐시).
+    """최근 N일 okpos를 원천 기준으로 재생성한다.
 
     같은 달 날짜를 반복 처리해도 월간 CSV는 1회만 로드.
     """
@@ -881,12 +1163,16 @@ def run_lookback_okpos(days: int = 7) -> str:
         df = _transform_okpos_df(order_df, item_df)
         if df.empty:
             continue
-        saved = _save_unified_daily(df, date_str)
+        df = _okpos_daily_gate(df, date_str)
+        if df.empty:
+            logger.warning("lookback okpos %s | daily 교차검증 후 전량 제외", date_str)
+            continue
+        saved = _save_unified_daily(df, date_str, overwrite=True)
         total_saved += saved
         if saved:
-            logger.info("lookback okpos %s | 신규 %d행", date_str, saved)
+            logger.info("lookback okpos %s | 교체 %d행", date_str, saved)
     _flush_unmatched_alert()
-    result = f"unified_sales(okpos) lookback({days}일) | 신규 {total_saved}행"
+    result = f"unified_sales(okpos) lookback({days}일) | 교체 {total_saved}행"
     logger.info(result)
     return result
 
@@ -908,6 +1194,8 @@ def backfill_okpos() -> str:
         try:
             order_df, item_df = _load_okpos_by_date(date_str)
             df = _transform_okpos_df(order_df, item_df)
+            if not df.empty:
+                df = _okpos_daily_gate(df, date_str)
             if not df.empty:
                 _save_unified_daily(df, date_str)
                 total += 1

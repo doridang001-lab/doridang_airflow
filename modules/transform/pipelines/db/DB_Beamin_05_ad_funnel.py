@@ -623,6 +623,7 @@ def _collect_ad_funnel_for_driver_impl(
 
     try:
         driver.set_page_load_timeout(45)
+        driver.set_script_timeout(60)
         driver.get(_AD_URL_TEMPLATE.format(store_id=store_id))
 
         if not wait_for_page(driver, _FILTER_BTN_CSS, timeout=30):
@@ -631,6 +632,8 @@ def _collect_ad_funnel_for_driver_impl(
 
         return _collect_ad_funnel_metrics(driver, store_id, brand, store, target_date)
     except Exception as exc:
+        if is_driver_crash_error(exc):
+            raise
         logger.warning("Ad funnel collection failed (%s): %s", store, exc)
         return False
 # ---------------------------------------------------------------------------
@@ -686,26 +689,40 @@ def collect_ad_funnel_for_account(
         logger.info("Ad funnel collection start: %s (%s) / %s", store, store_id, target_date)
 
         succeeded = False
-        for attempt in range(2):
+        max_attempts = 3
+        for attempt in range(max_attempts):
             driver = None
             try:
                 driver = launch_browser(account_id)
 
                 if not login_baemin(driver, account_id, password):
-                    logger.warning("Login failed: %s / %s", account_id, store)
-                    break
+                    logger.warning(
+                        "Login failed: %s / %s attempt=%d/%d",
+                        account_id,
+                        store,
+                        attempt + 1,
+                        max_attempts,
+                    )
+                    continue
 
-                driver.set_page_load_timeout(45)
-                driver.get(_AD_URL_TEMPLATE.format(store_id=store_id))
+                driver.set_page_load_timeout(75)
+                try:
+                    driver.get(_AD_URL_TEMPLATE.format(store_id=store_id))
+                except TimeoutException as exc:
+                    logger.info("Ad funnel page load delayed, continuing with DOM wait: %s / %s", store, exc)
+                    try:
+                        driver.execute_script("window.stop();")
+                    except Exception:
+                        pass
 
                 if not wait_for_page(driver, _FILTER_BTN_CSS, timeout=30):
                     logger.warning("Ad funnel page failed to load, skipping: %s", store)
-                    if attempt == 0:
+                    if attempt < max_attempts - 1:
                         continue
                     break
 
                 if not _collect_ad_funnel_metrics(driver, store_id, brand, store, target_date):
-                    if attempt == 0:
+                    if attempt < max_attempts - 1:
                         logger.warning("Metric extraction failed, retrying browser: %s", store)
                         continue
                     logger.warning("Metric extraction failed after retry, skipping: %s", store)
@@ -723,7 +740,7 @@ def collect_ad_funnel_for_account(
                     except Exception:
                         pass
 
-            if attempt == 0:
+            if attempt < max_attempts - 1:
                 time.sleep(random.uniform(3.0, 5.0))
 
         if not succeeded:

@@ -2,7 +2,6 @@ import logging
 import random
 import re
 import time
-import uuid
 from datetime import timedelta
 from pathlib import Path
 
@@ -13,18 +12,20 @@ from airflow.operators.python import PythonOperator
 from airflow.utils.trigger_rule import TriggerRule
 
 from modules.transform.pipelines.db.DB_Beamin_retry import (
+    build_next_retry_conf,
     retry_needed,
     retry_collect_from_conf,
     sanitize_retry_payload,
     validate_retry_ad_funnel,
     validate_retry_toorder,
 )
+from modules.transform.pipelines.db.DB_Beamin_Macro_upload import build_final_notification_message
 from modules.transform.utility.notifier import send_telegram
 
 logger = logging.getLogger(__name__)
 dag_id = Path(__file__).stem
 KST = pendulum.timezone("Asia/Seoul")
-MAX_ATTEMPTS = 10
+MAX_ATTEMPTS = 3
 
 
 def _conf(context) -> dict:
@@ -34,6 +35,26 @@ def _conf(context) -> dict:
 
 def _safe_run_id_part(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.~-]+", "_", str(value or "manual")).strip("_")[:120]
+
+
+def _store_id_check_summary(payload: dict) -> str:
+    total = 0
+    missing: list[str] = []
+    for item in payload.get("store_info_per_account") or []:
+        account_id = str(item.get("account_id") or "?")
+        for store in item.get("stores") or []:
+            total += 1
+            store_id = str((store or {}).get("store_id") or "").strip()
+            if not store_id:
+                store_name = f"{store.get('brand', '')} {store.get('store', '')}".strip()
+                missing.append(f"{account_id}/{store_name or '?'}")
+
+    if total == 0:
+        return "store_id 확인: 대상 없음"
+    if missing:
+        sample = ", ".join(missing[:10])
+        return f"store_id 확인: {total - len(missing)}/{total}개 확인, 누락 {len(missing)}개 ({sample})"
+    return f"store_id 확인: {total}/{total}개 확인"
 
 
 def load_failed_and_accounts(**context) -> str:
@@ -74,14 +95,25 @@ def retry_collect(**context) -> str:
         logger.info("Retry DAG 종료 대상: conf에 실패 대상 없음")
         return payload["retry_result"]
 
-    wait_sec = random.uniform(180, 900)
+    wait_override = conf.get("retry_wait_sec")
+    wait_sec = float(wait_override) if wait_override is not None else random.uniform(180, 900)
     logger.info("재시도 전 랜덤 대기: %.0f초 (%.1f분)", wait_sec, wait_sec / 60)
-    time.sleep(wait_sec)
+    if wait_sec > 0:
+        time.sleep(wait_sec)
 
     payload = sanitize_retry_payload(retry_collect_from_conf(conf))
+    store_id_summary = _store_id_check_summary(payload)
+    if "누락" in store_id_summary:
+        logger.warning(store_id_summary)
+    else:
+        logger.info(store_id_summary)
+
+    retry_result = str(payload.get("retry_result") or "재시도 완료")
+    retry_result = f"{retry_result}\n{store_id_summary}"
+    payload["retry_result"] = retry_result
     context["ti"].xcom_push(key="retry_payload", value=payload)
-    context["ti"].xcom_push(key="retry_result", value=payload.get("retry_result", ""))
-    return str(payload.get("retry_result") or "재시도 완료")
+    context["ti"].xcom_push(key="retry_result", value=retry_result)
+    return retry_result
 
 
 def validate_toorder(**context) -> str:
@@ -159,51 +191,110 @@ def notify_and_trigger_next(**context) -> str:
     attempt = int(ti.xcom_pull(task_ids="load_failed_and_accounts", key="attempt") or conf.get("attempt", 1))
     target_date = ti.xcom_pull(task_ids="load_failed_and_accounts", key="target_date") or conf.get("target_date")
     max_attempts = int(conf.get("max_attempts", MAX_ATTEMPTS))
+    notification_context = conf.get("notification_context") or {
+        "source_dag_id": conf.get("source_dag_id") or dag_id,
+        "source_run_id": conf.get("source_run_id") or context.get("run_id") or "?",
+        "target_date": target_date,
+        "total_accounts": len(set(conf.get("failed_account_ids") or [])),
+        "orders": {},
+        "ad_funnel": {},
+        "toorder": {},
+        "residual_failed": {},
+        "hard_failures": [],
+    }
     retry_result = ti.xcom_pull(task_ids="retry_collect", key="retry_result") or ""
     retry_payload = ti.xcom_pull(task_ids="retry_collect", key="retry_payload")
     if not retry_payload:
-        msg = f"[배민 Retry {attempt}/{max_attempts}회] {target_date}\nRetry 종료: retry_payload 없음"
+        msg = build_final_notification_message(
+            notification_context,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            hard_failure="retry_collect: retry_payload 없음",
+        )
         logger.warning(msg)
         send_telegram(msg)
-        return msg
+        raise RuntimeError(msg)
 
     toorder_result = ti.xcom_pull(task_ids="validate_toorder", key="toorder_result")
     ad_funnel_result = ti.xcom_pull(task_ids="validate_ad_funnel", key="ad_funnel_result") or {}
-    needs_next = (
-        True
-        if toorder_result is None
-        else retry_needed(toorder_result, ad_funnel_result, None)
-    )
+    residual_failed = retry_payload.get("residual_failed") or {}
+    needs_next = retry_needed(toorder_result, ad_funnel_result, residual_failed)
+    dag_run = context.get("dag_run")
+    hard_failures = []
+    if dag_run and hasattr(dag_run, "get_task_instances"):
+        hard_failures = [
+            task.task_id
+            for task in dag_run.get_task_instances()
+            if task.task_id != "notify_and_trigger_next"
+            and getattr(task, "state", None) in {"failed", "upstream_failed"}
+        ]
+
+    def send_final(*, hard_failure: str | None = None) -> str:
+        failure_text = hard_failure
+        if hard_failures:
+            failure_text = ", ".join(sorted(set(hard_failures)))
+        message = build_final_notification_message(
+            notification_context,
+            final_toorder_result=toorder_result,
+            final_ad_funnel_result=ad_funnel_result,
+            residual_failed=residual_failed,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            hard_failure=failure_text,
+        )
+        send_telegram(message)
+        return message
 
     toorder_result = toorder_result or {}
     mismatched = toorder_result.get("mismatched_stores") or []
     gaps = toorder_result.get("toorder_gap_stores") or []
     still_ads = ad_funnel_result.get("still_empty") or []
+    residual_count = sum(len(residual_failed.get(key) or []) for key in ("accounts", "stores", "orders", "ads"))
     summary_lines = [
         f"[배민 Retry {attempt}/{max_attempts}회] {target_date}",
         retry_result,
-        f"ToOrder 불일치={len(mismatched)} / ToOrder 갭={len(gaps)} / ad 잔존={len(still_ads)}",
+        f"잔여실패={residual_count} / ToOrder 불일치={len(mismatched)} / ToOrder 갭={len(gaps)} / ad 잔존={len(still_ads)}",
     ]
     summary = "\n".join(line for line in summary_lines if line)
 
     if not needs_next:
-        msg = f"{summary}\nRetry 종료: 추가 재시도 불필요"
+        msg = send_final()
         logger.info(msg)
-        send_telegram(msg)
         return msg
 
     if attempt >= max_attempts:
-        msg = f"[배민 Retry 최종실패] {max_attempts}회 재시도 후에도 누락 잔존\n{summary}"
+        msg = send_final()
         logger.warning(msg)
-        send_telegram(msg)
         return msg
 
-    next_conf = dict(conf)
-    next_conf["attempt"] = attempt + 1
-    next_conf["max_attempts"] = max_attempts
+    next_conf = build_next_retry_conf(
+        previous_conf=conf,
+        retry_payload=retry_payload,
+        toorder_result=toorder_result,
+        ad_funnel_result=ad_funnel_result,
+        attempt=attempt + 1,
+        max_attempts=max_attempts,
+    )
+    residual_accounts = residual_failed.get("accounts") or []
+    residual_account_ids = [
+        str(account.get("account_id") or "").strip()
+        for account in residual_accounts
+        if str(account.get("account_id") or "").strip()
+    ]
+    if residual_account_ids:
+        next_conf["failed_account_ids"] = sorted(set((next_conf.get("failed_account_ids") or []) + residual_account_ids))
+        next_conf["failed_accounts_ids_only"] = sorted(set((next_conf.get("failed_accounts_ids_only") or []) + residual_account_ids))
+    next_target_count = sum(
+        len(next_conf.get(key) or [])
+        for key in ("failed_account_ids", "failed_stores", "failed_orders", "failed_ads")
+    )
+    if next_target_count == 0:
+        msg = send_final()
+        logger.info(msg)
+        return msg
 
-    parent = _safe_run_id_part(str(context.get("run_id") or "manual"))
-    run_id = f"retry__{str(target_date).replace('-', '')}__attempt_{attempt + 1}__{parent}__{uuid.uuid4().hex[:8]}"
+    root = _safe_run_id_part(str(conf.get("source_run_id") or context.get("run_id") or "manual"))
+    run_id = f"retry__{str(target_date).replace('-', '')}__attempt_{attempt + 1}__{root}"
     from airflow.api.common.trigger_dag import trigger_dag
 
     try:
@@ -211,9 +302,15 @@ def notify_and_trigger_next(**context) -> str:
     except DagRunAlreadyExists:
         logger.info("다음 Retry DAG run 이미 존재: %s", run_id)
 
-    msg = f"{summary}\nRetry DAG attempt {attempt + 1} 트리거: {run_id}"
+    msg = (
+        f"{summary}\n"
+        f"다음 재시도 대상: accounts={len(next_conf.get('failed_account_ids') or [])}, "
+        f"stores={len(next_conf.get('failed_stores') or [])}, "
+        f"orders={len(next_conf.get('failed_orders') or [])}, "
+        f"ads={len(next_conf.get('failed_ads') or [])}\n"
+        f"Retry DAG attempt {attempt + 1} 트리거: {run_id}"
+    )
     logger.info(msg)
-    send_telegram(msg)
     return msg
 
 
@@ -240,6 +337,7 @@ with DAG(
     t2 = PythonOperator(
         task_id="retry_collect",
         python_callable=retry_collect,
+        pool="selenium_pool",
         execution_timeout=timedelta(minutes=180),
     )
 

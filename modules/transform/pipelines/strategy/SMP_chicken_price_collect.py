@@ -13,6 +13,7 @@
 """
 
 import logging
+import math
 import os
 import re
 from datetime import datetime
@@ -26,14 +27,119 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from modules.transform.utility.mailer import send_email
+from modules.transform.utility.mail_recipients import MAIL_CEO, MAIL_CMJ_PM, MAIL_SIM_SUNGJUN_1, MAIL_SIM_SUNGJUN_2
 from modules.transform.utility.paths import CHICKEN_PRICE_CSV_PATH
 
 logger = logging.getLogger(__name__)
 
-
 # ============================================================
 # 내부 유틸
 # ============================================================
+
+def _valid_positive_int(value) -> int | None:
+    """가격/평균 표시용 숫자 검증."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number) or number <= 0:
+        return None
+    return int(number)
+
+
+def _prepare_price_history(df: pd.DataFrame) -> pd.DataFrame:
+    """CSV 누적 이력에서 성공한 유효 가격만 남기고 일자 중복을 제거한다."""
+    if df.empty:
+        return df.copy()
+
+    history = df.copy()
+    if "source_site" not in history.columns or "base_date" not in history.columns or "price_today" not in history.columns:
+        return pd.DataFrame(columns=list(history.columns) + ["_base_date_dt", "_collected_at_dt"])
+
+    history["price_today"] = pd.to_numeric(history["price_today"], errors="coerce")
+    history["_base_date_dt"] = pd.to_datetime(history["base_date"], errors="coerce")
+    if "collected_at" in history.columns:
+        history["_collected_at_dt"] = pd.to_datetime(history["collected_at"], errors="coerce")
+    else:
+        history["_collected_at_dt"] = pd.NaT
+
+    valid = (
+        history["source_site"].notna()
+        & history["source_site"].astype(str).str.strip().ne("")
+        & history["_base_date_dt"].notna()
+        & history["price_today"].notna()
+        & history["price_today"].gt(0)
+    )
+    if "success" in history.columns:
+        valid &= history["success"].fillna(False).astype(str).str.lower().isin({"true", "1"})
+
+    history = history.loc[valid].copy()
+    if history.empty:
+        return history
+
+    history = history.sort_values(["source_site", "_base_date_dt", "_collected_at_dt"])
+    return history.drop_duplicates(subset=["source_site", "_base_date_dt"], keep="last")
+
+
+def _calculate_moving_averages(price_history: pd.DataFrame) -> dict:
+    """정제된 이력 기준으로 사이트별 이동평균을 계산한다."""
+    ma_info: dict = {}
+    if price_history.empty:
+        return ma_info
+
+    for site in price_history["source_site"].dropna().unique():
+        site_df = price_history[price_history["source_site"] == site].sort_values("_base_date_dt")
+        ma_info[site] = {}
+        for window in (20, 60, 120):
+            value = None
+            if len(site_df) >= window:
+                value = site_df["price_today"].rolling(window=window, min_periods=window).mean().iloc[-1]
+            ma_info[site][f"ma{window}"] = value if _valid_positive_int(value) is not None else None
+    return ma_info
+
+
+def _lookup_prev_month_price(price_history: pd.DataFrame, site: str, base_date: str) -> int | None:
+    """같은 사이트의 전월 동일일 또는 그 이전 가장 가까운 가격을 찾는다."""
+    if price_history.empty or not site or not base_date:
+        return None
+
+    base_dt = pd.to_datetime(base_date, errors="coerce")
+    if pd.isna(base_dt):
+        return None
+
+    target_dt = base_dt - pd.DateOffset(months=1)
+    site_df = price_history[price_history["source_site"] == site].sort_values("_base_date_dt")
+    if site_df.empty:
+        return None
+
+    exact = site_df[site_df["_base_date_dt"].eq(target_dt)]
+    if not exact.empty:
+        return _valid_positive_int(exact.iloc[-1]["price_today"])
+
+    prior = site_df[site_df["_base_date_dt"].le(target_dt)]
+    if prior.empty:
+        return None
+    return _valid_positive_int(prior.iloc[-1]["price_today"])
+
+
+def _enrich_prev_month_from_history(results: list, price_history: pd.DataFrame) -> list:
+    """원본 전월값이 없는 성공 결과에만 CSV 이력 기반 전월값을 채운다."""
+    enriched = []
+    for row in results:
+        item = dict(row)
+        if item.get("success") and _valid_positive_int(item.get("price_prev_month")) is None:
+            fallback = _lookup_prev_month_price(
+                price_history=price_history,
+                site=str(item.get("source_site") or ""),
+                base_date=str(item.get("base_date") or ""),
+            )
+            if fallback is not None:
+                item["price_prev_month"] = fallback
+                item["price_prev_month_source"] = "history_csv"
+        enriched.append(item)
+    return enriched
 
 def _build_session(retries: int = 3, backoff_factor: float = 1.0) -> requests.Session:
     """retry 설정이 적용된 requests.Session 반환"""
@@ -608,22 +714,11 @@ def save_results(**context) -> None:
 
 def _build_email_html(results: list, ma_info: dict, base_date: str, any_failure: bool) -> str:
     """육계 시세 일일 알림 HTML 이메일 생성"""
-    import math
-
     status_color = "#e74c3c" if any_failure else "#27ae60"
     status_text = "일부 실패" if any_failure else "정상"
 
     def _valid_price(v) -> int | None:
-        """None / NaN / 0 이하 → None, 그 외 → int 변환"""
-        if v is None:
-            return None
-        try:
-            f = float(v)
-            if math.isnan(f) or f <= 0:
-                return None
-            return int(f)
-        except (TypeError, ValueError):
-            return None
+        return _valid_positive_int(v)
 
     def delta_html(delta: int | None) -> str:
         if delta is None:
@@ -694,12 +789,10 @@ def _build_email_html(results: list, ma_info: dict, base_date: str, any_failure:
     if primary_site in ma_info:
         ma = ma_info[primary_site]
         ma_rows = ""
-        if ma.get("ma20") is not None:
-            ma_rows += f'<tr><td style="color:#555;padding:4px 0;font-size:13px;">20일 평균</td><td style="text-align:right;font-size:13px;color:#2c3e50;">{ma["ma20"]:,.0f}원</td></tr>'
-        if ma.get("ma60") is not None:
-            ma_rows += f'<tr><td style="color:#555;padding:4px 0;font-size:13px;">60일 평균</td><td style="text-align:right;font-size:13px;color:#2c3e50;">{ma["ma60"]:,.0f}원</td></tr>'
-        if ma.get("ma120") is not None:
-            ma_rows += f'<tr><td style="color:#555;padding:4px 0;font-size:13px;">120일 평균</td><td style="text-align:right;font-size:13px;color:#2c3e50;">{ma["ma120"]:,.0f}원</td></tr>'
+        for window in (20, 60, 120):
+            ma_value = _valid_price(ma.get(f"ma{window}"))
+            if ma_value is not None:
+                ma_rows += f'<tr><td style="color:#555;padding:4px 0;font-size:13px;">{window}일 평균</td><td style="text-align:right;font-size:13px;color:#2c3e50;">{ma_value:,}원</td></tr>'
         if ma_rows:
             ma_section = f"""
             <div style="background:#f8f9fa;border-radius:6px;padding:14px 18px;margin-bottom:16px;">
@@ -728,7 +821,7 @@ def _build_email_html(results: list, ma_info: dict, base_date: str, any_failure:
 
     <!-- Status Footer -->
     <div style="border-top:1px solid #eee;padding:12px 18px;display:flex;justify-content:space-between;align-items:center;background:#fafafa;">
-      <span style="font-size:12px;color:#aaa;">문제 시 조민준 PM에게 문의(a17019@doridang.com)</span>
+      <span style="font-size:12px;color:#aaa;">문제 시 조민준 PM에게 문의({MAIL_CMJ_PM})</span>
       <span style="font-size:13px;font-weight:bold;color:{status_color};">{'✅' if not any_failure else '⚠️'} 수집상태: {status_text}</span>
     </div>
 
@@ -757,19 +850,14 @@ def send_notification(**context) -> None:
     except Exception:
         email_on_failure = False
 
-    # 이동평균 계산
+    # 누적 이력 기반 보강/이동평균 계산
+    price_history = pd.DataFrame()
     ma_info: dict = {}
     if CHICKEN_PRICE_CSV_PATH.exists():
         df_csv = pd.read_csv(CHICKEN_PRICE_CSV_PATH, encoding="utf-8-sig")
-        df_csv["price_today"] = pd.to_numeric(df_csv["price_today"], errors="coerce")
-        df_csv["base_date"] = pd.to_datetime(df_csv["base_date"], errors="coerce")
-
-        for site in df_csv["source_site"].unique():
-            site_df = df_csv[df_csv["source_site"] == site].sort_values("base_date")
-            ma20 = site_df["price_today"].rolling(20).mean().iloc[-1] if len(site_df) >= 20 else None
-            ma60 = site_df["price_today"].rolling(60).mean().iloc[-1] if len(site_df) >= 60 else None
-            ma120 = site_df["price_today"].rolling(120).mean().iloc[-1] if len(site_df) >= 120 else None
-            ma_info[site] = {"ma20": ma20, "ma60": ma60, "ma120": ma120}
+        price_history = _prepare_price_history(df_csv)
+        ma_info = _calculate_moving_averages(price_history)
+        results = _enrich_prev_month_from_history(results, price_history)
 
     # 기준일자 (첫 번째 성공 결과 기준)
     base_date = next(
@@ -782,8 +870,8 @@ def send_notification(**context) -> None:
     subject_prefix = "⚠️" if any_failure else "🐔"
     subject = f"{subject_prefix} [大 계육시세] {base_date}"
 
-    pm_emails = ["a17019@kakao.com"]
-    all_emails = ["a17019@kakao.com", "siw22222@kakao.com", "simjeong01@kakao.com", "simjeong00@kakao.com"]
+    pm_emails = [MAIL_CMJ_PM]
+    all_emails = [MAIL_CMJ_PM, MAIL_CEO, MAIL_SIM_SUNGJUN_1, MAIL_SIM_SUNGJUN_2]
     to_emails = all_emails if email_on_failure else pm_emails
 
     send_email(

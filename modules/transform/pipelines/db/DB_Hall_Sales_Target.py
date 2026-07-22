@@ -24,6 +24,7 @@ import pandas as pd
 from airflow.exceptions import AirflowException
 
 from modules.transform.utility.paths import MART_DB
+from modules.transform.pipelines.db.DB_UnifiedSales_common import iter_unified_sales_files
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,7 @@ def classify_hall_time_slots(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _load_hall_df() -> pd.DataFrame:
-    files = sorted(UNIFIED_ROOT.glob("unified_sales_*.parquet"))
+    files = iter_unified_sales_files()
     if not files:
         raise FileNotFoundError(f"unified_sales parquet 없음: {UNIFIED_ROOT}")
 

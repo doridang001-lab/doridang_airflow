@@ -16,6 +16,7 @@ import pandas as pd
 import pendulum
 
 from modules.transform.utility.paths import LOCAL_DB
+from modules.transform.utility.mail_recipients import apply_manager_mail_variables, resolve_mail_recipients
 
 
 def _normalize_store_name(name: str) -> str:
@@ -64,6 +65,7 @@ def _load_employee_mapping() -> pd.DataFrame:
 
     emp["_store_key"] = emp["매장명"].astype(str).map(_normalize_store_name)
     emp = emp[emp["_store_key"].ne("")]
+    emp = apply_manager_mail_variables(emp)
     emp = emp.drop_duplicates(subset=["_store_key"], keep="first")
     return emp[["_store_key", "담당자", "email"]]
 
@@ -103,6 +105,7 @@ def filter_voc_alerts(output_xcom_key: str = "voc_alert_targets", **context):
             alert_df["_store_key"] = alert_df["매장명"].astype(str).map(_normalize_store_name)
             alert_df = alert_df.merge(mapping, how="left", on="_store_key")
             alert_df.drop(columns=["_store_key"], inplace=True, errors="ignore")
+            alert_df = apply_manager_mail_variables(alert_df)
 
     out_dir = LOCAL_DB / "영업관리부_DB"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -139,7 +142,8 @@ def send_voc_alert_email(
 
     recipients = []
     if "email" in df.columns:
-        recipients = [e for e in df["email"].fillna("").astype(str).str.strip().unique().tolist() if e]
+        df = apply_manager_mail_variables(df)
+        recipients = resolve_mail_recipients(df["email"].fillna("").astype(str).str.strip().unique().tolist())
 
     if not recipients:
         return "발송 스킵 (수신자 이메일 없음)"

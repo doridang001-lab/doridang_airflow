@@ -71,10 +71,17 @@ class _FakeDagRun:
 
 
 class _FakeTI:
-    def __init__(self, returns: dict, failed: dict | None = None, validation: list | None = None):
+    def __init__(
+        self,
+        returns: dict,
+        failed: dict | None = None,
+        validation: list | None = None,
+        residual_failed: dict | None = None,
+    ):
         self._returns = returns
         self._failed = failed or {}
         self._validation = validation or []
+        self._residual_failed = residual_failed
         self.run_id = "manual__test"
         self.execution_date = pendulum.datetime(2026, 6, 6, 10, 25, tz="Asia/Seoul")
 
@@ -83,12 +90,19 @@ class _FakeTI:
             return self._failed
         if task_ids == "collect_all" and key == "validation":
             return self._validation
+        if task_ids == "retry_failed" and key == "residual_failed":
+            return self._residual_failed
         if key == "return_value":
             return self._returns.get(task_ids)
         return None
 
 
-def _build_context(returns: dict, failed: dict | None = None, validation: list | None = None):
+def _build_context(
+    returns: dict,
+    failed: dict | None = None,
+    validation: list | None = None,
+    residual_failed: dict | None = None,
+):
     task_ids = (
         "load_accounts",
         "collect_all",
@@ -100,7 +114,7 @@ def _build_context(returns: dict, failed: dict | None = None, validation: list |
     )
     tasks = [_FakeTaskInstance(task_id) for task_id in task_ids]
     dag_run = _FakeDagRun(tasks)
-    ti = _FakeTI(returns, failed=failed, validation=validation)
+    ti = _FakeTI(returns, failed=failed, validation=validation, residual_failed=residual_failed)
     return {"ti": ti, "dag_run": dag_run, "logical_date": ti.execution_date}
 
 
@@ -125,13 +139,14 @@ def test_notify_task_id_and_all_done_trigger_are_wired():
 
     assert notify_ids == ["notify_collection_result"]
     assert "trigger_rule=TriggerRule.ALL_DONE" in source
-    assert ">> t7" in source
+    assert "t1 >> t2 >> t3 >> t4 >> t5" in source
 
 
-def test_notify_delivery_and_problem_sections_are_present():
+def test_collection_task_logs_and_emails_but_does_not_send_telegram():
     source = DAG_SOURCE.read_text(encoding="utf-8")
 
-    assert "send_telegram(body)" in source
+    assert "send_telegram(" not in source
+    assert "on_failure_callback_no_telegram" in source
     assert "_send_alert(subject=subject, body=body" in source
     assert "html_content=html_body" in source
     assert "[복구된 경고]" in source
@@ -153,6 +168,7 @@ def test_notify_treats_toorder_missing_and_recovered_warnings_as_success():
     context = _build_context(
         returns,
         failed={"accounts": [], "stores": ["a", "b", "c"], "orders": [], "ads": []},
+        residual_failed={"accounts": [], "stores": [], "orders": [], "ads": []},
     )
 
     def fake_extract(task_instance, max_lines=8):
@@ -171,8 +187,12 @@ def test_notify_treats_toorder_missing_and_recovered_warnings_as_success():
     assert "[문제 로그]" not in body
     assert "[복구된 경고]" in body
     assert "dashboard not ready" in body
+    assert "원본 수집 실패 신호" in body
+    assert "최종 잔여 실패 accounts=0, stores=0, orders=0, ads=0" in body
     assert should_email is False
     assert "복구된 경고" in html_body
+    assert "원본 수집 실패 신호" in html_body
+    assert "최종 잔여 실패" in html_body
 
 
 def test_notify_keeps_partial_success_for_unrecovered_problem():
@@ -186,7 +206,11 @@ def test_notify_keeps_partial_success_for_unrecovered_problem():
         "validate_ad_funnel": "ad_funnel 빈값 검증: 총 3매장 / 빈값 0건 / 재수집 후 잔존 0건",
         "validate_toorder": "토더 교차검증[2026-06-05]: 비교 3개 매장 / 불일치 1개",
     }
-    context = _build_context(returns)
+    context = _build_context(
+        returns,
+        failed={"accounts": [], "stores": ["a"], "orders": [], "ads": []},
+        residual_failed={"accounts": [], "stores": ["a"], "orders": [], "ads": []},
+    )
 
     def fake_extract(task_instance, max_lines=8):
         if task_instance.task_id == "collect_all":

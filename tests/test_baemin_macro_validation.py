@@ -9,7 +9,7 @@ from modules.transform.utility.store_normalize import lookup_store_key
 DORIDANG = "\uB3C4\uB9AC\uB2F9"
 NAHOLLO = "\uB098\uD640\uB85C"
 SAMSUNG = "\uC0BC\uC1A1\uC810"
-DAG_SOURCE = Path(__file__).resolve().parents[1] / "dags" / "db" / "DB_Beamin_Macro_Dags.py"
+UPLOAD_DAG_SOURCE = Path(__file__).resolve().parents[1] / "dags" / "db" / "DB_Beamin_Macro_Upload_Dags.py"
 
 
 def test_filter_store_list_for_request_keeps_sister_brand_options():
@@ -109,7 +109,7 @@ def test_validate_toorder_orders_flags_missing_sister_brand(monkeypatch):
         lambda target_date: next(baemin_calls),
     )
     monkeypatch.setattr(macro_validate, "_delete_orders_for_stores", lambda *args, **kwargs: 0)
-    monkeypatch.setattr(macro_validate, "_recollect_stores", lambda *args, **kwargs: None)
+    monkeypatch.setattr(macro_validate, "_recollect_stores", lambda *args, **kwargs: set())
     monkeypatch.setattr(
         macro_validate,
         "_inspect_brand_coverage",
@@ -146,8 +146,69 @@ def test_validate_toorder_orders_flags_missing_sister_brand(monkeypatch):
     assert result["store_results"][SAMSUNG]["missing_brands"] == [NAHOLLO]
 
 
+def test_validate_toorder_orders_limits_compare_to_collected_stores(monkeypatch):
+    other_store = "\uB3D9\uB450\uCC9C\uC9C0\uD589\uC810"
+    deleted_stores = []
+    recollected_stores = []
+
+    monkeypatch.setattr(
+        macro_validate,
+        "_toorder_baemin_by_store",
+        lambda target_date: {SAMSUNG: 100000, other_store: 1047700},
+    )
+    monkeypatch.setattr(
+        macro_validate,
+        "_baemin_orders_by_store",
+        lambda target_date: {SAMSUNG: 100000, other_store: 956400},
+    )
+
+    def fake_delete(target_date, store_names):
+        deleted_stores.extend(store_names)
+        return 0
+
+    def fake_recollect(store_info_per_account, account_list, target_date, store_names):
+        recollected_stores.extend(store_names)
+        return set(store_names)
+
+    monkeypatch.setattr(macro_validate, "_delete_orders_for_stores", fake_delete)
+    monkeypatch.setattr(macro_validate, "_recollect_stores", fake_recollect)
+    monkeypatch.setattr(
+        macro_validate,
+        "_inspect_brand_coverage",
+        lambda target_date, store_names, expected_brands=None: {
+            store: {
+                "expected_brands": [DORIDANG],
+                "existing_brands": [DORIDANG],
+                "active_brands": [DORIDANG],
+                "missing_brands": [],
+                "stale_brands": [],
+                "issue_type": None,
+            }
+            for store in store_names
+        },
+    )
+
+    result = macro_validate.validate_toorder_orders(
+        account_list=[{"account_id": "acct", "password": "pw"}],
+        store_info_per_account=[
+            {
+                "account_id": "acct",
+                "stores": [{"brand": DORIDANG, "store": SAMSUNG, "store_id": "1"}],
+            }
+        ],
+        target_date="2026-06-28",
+    )
+
+    assert result["matched"] is True
+    assert result["compared_count"] == 1
+    assert set(result["store_results"]) == {SAMSUNG}
+    assert other_store not in result["store_results"]
+    assert deleted_stores == []
+    assert recollected_stores == []
+
+
 def test_manual_precheck_task_is_wired_before_load_accounts():
-    source = DAG_SOURCE.read_text(encoding="utf-8")
+    source = UPLOAD_DAG_SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(source)
     task_ids = []
     for node in ast.walk(tree):
@@ -160,4 +221,4 @@ def test_manual_precheck_task_is_wired_before_load_accounts():
                 task_ids.append(kw.value.value)
 
     assert "precheck_manual_baemin_orders" in task_ids
-    assert "t_dash >> t0 >> t1 >> t2" in source
+    assert "t_ingest >> t_precheck" in source
