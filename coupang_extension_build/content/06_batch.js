@@ -28,10 +28,10 @@
     site.__batchWrapped = true;
     const origCollect = site.collect.bind(site);
 
-    site.collect = async function () {
+    site.collect = async function (opts = {}) {
       let collectError = null;
       try {
-        await origCollect();
+        await origCollect(opts);
       } catch (e) {
         collectError = e;
         console.error('[Batch] collect() 오류:', e);

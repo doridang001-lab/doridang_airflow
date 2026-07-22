@@ -42,7 +42,6 @@ from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
-import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -415,6 +414,7 @@ def _attach_to_real_chrome(account_id: str):
 
 
 def launch_browser(account_id: str):
+    import undetected_chromedriver as uc
     # ── attach 모드: 환경변수가 있으면 실제(호스트) 크롬에 붙어서 사용 ──
     attached = _attach_to_real_chrome(account_id)
     if attached is not None:

@@ -34,6 +34,11 @@ filename = os.path.basename(__file__)
 logger = logging.getLogger(__name__)
 
 
+def _toorder_voc_01_execution_date(dt, **context):
+    target = pendulum.instance(dt).in_timezone("Asia/Seoul")
+    return target.replace(hour=7, minute=30, second=0, microsecond=0).in_timezone("UTC")
+
+
 def _on_task_failure(context):
     try:
         ti = context.get("ti") or context.get("task_instance")
@@ -119,8 +124,9 @@ with DAG(
         external_task_id='move_voc_files',
         allowed_states=['success'],
         failed_states=['failed', 'skipped'],
-        mode='poke',
-        timeout=3600,
+        execution_date_fn=_toorder_voc_01_execution_date,
+        mode='reschedule',
+        timeout=7200,
         poke_interval=60,
     )
 
@@ -195,7 +201,8 @@ with DAG(
     load_voc_df_task >> review_summary_task
     load_voc_upload_temp_df_task >> [store_summary_task, topic_summary_task]
 
-    # 媛??꾩쿂由???媛??낅줈??    store_summary_task >> upload_store_task
+    # 媛??꾩쿂由???媛??낅줈??
+    store_summary_task >> upload_store_task
     topic_summary_task >> upload_topic_task
     review_summary_task >> upload_review_task
 

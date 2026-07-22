@@ -37,7 +37,7 @@ dag_id = Path(__file__).stem
 
 _ALERT_EMAILS = [MAIL_CMJ_PM]
 
-LOOKBACK_DAYS = 30
+LOOKBACK_DAYS = 2
 
 
 def _latest_toorder_review_execution_date(dt, **context):
@@ -68,7 +68,9 @@ def _latest_toorder_review_execution_date(dt, **context):
         latest_execution_date = row[0]
         # DB 실행 기준으로 너무 오래된 완료 건은 무시한다.
         now = pendulum.now("Asia/Seoul")
-        if latest_execution_date >= dt - timedelta(hours=12) and latest_execution_date <= now:
+        # DB_UnifiedReview는 당일 08:28 이전 실행되므로 최근 1일 이내 성공을 통해 수집을 이어받는다.
+        # 최신 성공 실행이 1일 이내면 해당 실행 날짜를 사용한다.
+        if latest_execution_date >= dt - timedelta(days=1) and latest_execution_date <= now:
             logger.info(
                 "[sensor] Sales_ToOrder_Review_Dags.t4_validate 최신 성공 시각: %s",
                 latest_execution_date,

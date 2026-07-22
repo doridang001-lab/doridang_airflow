@@ -1,5 +1,7 @@
 # strategy pipeline
 
+Root `C:\airflow\AGENTS.md` is the source of truth.
+
 먼저 @C:\airflow\modules\transform\CLAUDE.md
 DAG 연결은 @C:\airflow\dags\strategy\AGENTS.md
 

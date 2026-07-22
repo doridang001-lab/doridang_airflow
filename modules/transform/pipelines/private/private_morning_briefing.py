@@ -10,13 +10,19 @@ import time
 import html
 import logging
 import subprocess
+import json
+import socket
+import urllib.request
+import urllib.parse
 from pathlib import Path
 
 import pendulum
 import undetected_chromedriver as uc
+import websocket
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import Select
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -39,12 +45,47 @@ _CALENDAR_FALLBACK_URLS = [
     "https://flow.team/calendar.act",
     "https://flow.team/main.act?calendar",
 ]
+_NOTION_CALENDAR_URL_TEMPLATE = os.getenv(
+    "NOTION_CALENDAR_URL_TEMPLATE",
+    "https://calendar.notion.so/{year}/{month}",
+)
+_NOTION_CHROME_DEBUGGER = os.getenv("NOTION_CHROME_DEBUGGER", "").strip()
+if not _NOTION_CHROME_DEBUGGER and os.getenv("AIRFLOW_HOME"):
+    _copang_debugger = os.getenv("COUPANG_CHROME_DEBUGGER", "").strip()
+    if _copang_debugger:
+        host_part = _copang_debugger.split(":", 1)[0].strip()
+        if host_part:
+            _NOTION_CHROME_DEBUGGER = f"{host_part}:9223"
+        else:
+            _NOTION_CHROME_DEBUGGER = "host.docker.internal:9223"
+    else:
+        _NOTION_CHROME_DEBUGGER = "host.docker.internal:9223"
+_NOTION_BROWSER_ATTACH_ONLY = os.getenv(
+    "NOTION_BROWSER_ATTACH_ONLY",
+    "1" if os.getenv("AIRFLOW_HOME") else "0",
+).strip() not in {"0", "false", "False", "no", "NO"}
+_NOTION_CLOSE_EXTRA_TABS = os.getenv("NOTION_CLOSE_EXTRA_TABS", "1").strip() not in {"0", "false", "False", "no", "NO"}
+_NOTION_EMAIL       = os.getenv("NOTION_EMAIL", "").strip()
+_NOTION_PASSWORD    = os.getenv("NOTION_PASSWORD", "")
 _HEADLESS           = os.getenv("AIRFLOW_HOME") is not None
 _BRIEFING_RECIPIENT = MAIL_CMJ_PM
 _CALENDAR_NOTIFY_ENABLED = os.getenv("FLOW_CALENDAR_NOTIFY_ENABLED", "1").strip() not in {"0", "false", "False", "no", "NO"}
 _CALENDAR_NOTIFY_TARGET_NAME = os.getenv("FLOW_CALENDAR_NOTIFY_TARGET_NAME", "조민준").strip() or "조민준"
 _BRIEFING_INCLUDE_KPI_SECTION = os.getenv("FLOW_BRIEFING_INCLUDE_KPI_SECTION", "0").strip() not in {"0", "false", "False", "no", "NO"}
 _CALENDAR_ALL_DAY_LABEL = "\uc885\uc77c"
+_NOTION_INCOMPLETE_STATUS_LABELS = ("진행중", "진행 중", "피드백", "결제중", "확인요청", "확인 요청", "시작전", "시작 전")
+_NOTION_DONE_STATUS_LABELS = ("완료", "종료", "보류", "취소")
+_NOTION_STATUSLESS_EXCLUDE_PATTERNS = ("[물티슈]", "[물티수]")
+_NOTION_STATUSLESS_WORK_PREFIXES = ("[로드맵/", "[프로젝트/", "[노션/", "[TF]")
+
+
+def _notion_calendar_profile_dir() -> str:
+    configured = os.getenv("NOTION_CALENDAR_PROFILE_DIR", "").strip()
+    if configured:
+        return str(Path(configured).expanduser().resolve())
+    if os.getenv("AIRFLOW_HOME"):
+        return str(Path(os.getenv("AIRFLOW_HOME", "/opt/airflow")) / "chrome_profiles" / "notion_calendar")
+    return str((Path.cwd() / "chrome_profiles" / "notion_calendar").resolve())
 
 _FLOW_SEARCH_QUERY = """
 ---
@@ -145,7 +186,218 @@ def _get_chrome_version() -> int | None:
     return None
 
 
+def _debugger_candidates(debugger_address: str) -> list[str]:
+    raw = (debugger_address or "").strip()
+    if not raw:
+        return []
+    candidates = [raw]
+    host, sep, port = raw.partition(":")
+    if sep and host in {"127.0.0.1", "localhost", "host.docker.internal"} and os.getenv("AIRFLOW_HOME"):
+        resolved = []
+        for alias in ["host.docker.internal", "gateway.docker.internal"]:
+            try:
+                resolved.append(f"{socket.gethostbyname(alias)}:{port}")
+            except Exception:
+                pass
+        named = [f"host.docker.internal:{port}", f"gateway.docker.internal:{port}"]
+        candidates = resolved + named + candidates
+    seen = set()
+    return [c for c in candidates if not (c in seen or seen.add(c))]
+
+
+def _read_debugger_json(debugger_address: str, path: str):
+    last_error = None
+    for candidate in _debugger_candidates(debugger_address):
+        url = f"http://{candidate}{path}"
+        host, _, port = candidate.partition(":")
+        headers = {}
+        if host not in {"127.0.0.1", "localhost"}:
+            headers["Host"] = f"127.0.0.1:{port or '9223'}"
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            return candidate, payload
+        except Exception as e:
+            last_error = e
+    raise RuntimeError(f"Notion Calendar debugger 연결 실패: {last_error}")
+
+
+class _CdpElement:
+    def __init__(self, text: str = ""):
+        self.text = text
+
+
+class _CdpSwitchTo:
+    def __init__(self, driver):
+        self._driver = driver
+
+    def window(self, _handle):
+        return None
+
+
+class _CdpDriver:
+    def __init__(self, debugger_address: str):
+        self.debugger_address, _ = _read_debugger_json(debugger_address, "/json/version")
+        _, targets = _read_debugger_json(debugger_address, "/json/list")
+        pages = [t for t in targets if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
+        if not pages:
+            raise RuntimeError("Notion Calendar CDP page target 없음")
+        target = next((p for p in pages if "calendar.notion.so" in (p.get("url") or "")), pages[0])
+        ws_url = target["webSocketDebuggerUrl"]
+        parsed = urllib.parse.urlparse(ws_url)
+        ws_host = self.debugger_address.split(":", 1)[0]
+        ws_port = self.debugger_address.split(":", 1)[1] if ":" in self.debugger_address else str(parsed.port or 9223)
+        self._ws_url = urllib.parse.urlunparse(parsed._replace(netloc=f"{ws_host}:{ws_port}"))
+        self._ws = websocket.create_connection(self._ws_url, timeout=10)
+        self._seq = 0
+        self.current_window_handle = target.get("id", "cdp")
+        self.window_handles = [self.current_window_handle]
+        self.switch_to = _CdpSwitchTo(self)
+        self._cmd("Runtime.enable")
+        self._cmd("Page.enable")
+
+    def _cmd(self, method: str, params: dict | None = None):
+        self._seq += 1
+        msg_id = self._seq
+        self._ws.send(json.dumps({"id": msg_id, "method": method, "params": params or {}}))
+        while True:
+            raw = json.loads(self._ws.recv())
+            if raw.get("id") != msg_id:
+                continue
+            if raw.get("error"):
+                raise RuntimeError(raw["error"])
+            return raw.get("result", {})
+
+    def get(self, url: str) -> None:
+        self._cmd("Page.navigate", {"url": url})
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            try:
+                state = self.execute_script("return document.readyState")
+                if state in {"interactive", "complete"}:
+                    return
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+    def execute_script(self, script: str, *args):
+        expression = (
+            "(function(){"
+            + script
+            + "\n}).apply(null, "
+            + json.dumps(list(args), ensure_ascii=False)
+            + ")"
+        )
+        result = self._cmd(
+            "Runtime.evaluate",
+            {
+                "expression": expression,
+                "awaitPromise": True,
+                "returnByValue": True,
+                "timeout": 30000,
+            },
+        )
+        remote = result.get("result", {})
+        if "value" in remote:
+            return remote["value"]
+        return None
+
+    @property
+    def current_url(self) -> str:
+        try:
+            return self.execute_script("return window.location.href") or ""
+        except Exception:
+            return ""
+
+    def find_element(self, by=None, value=None):
+        if by == By.TAG_NAME and value == "body":
+            return _CdpElement(self.execute_script("return document.body ? document.body.innerText : ''") or "")
+        raise RuntimeError(f"CDP find_element 미지원: {by}={value}")
+
+    def close(self):
+        return None
+
+    def quit(self):
+        try:
+            self._ws.close()
+        except Exception:
+            pass
+
+    def set_page_load_timeout(self, _timeout: int):
+        return None
+
+
+def _attach_to_notion_chrome():
+    if not _NOTION_CHROME_DEBUGGER:
+        if _NOTION_BROWSER_ATTACH_ONLY:
+            raise RuntimeError("NOTION_CHROME_DEBUGGER 미설정: 컨테이너 내부 Chrome 실행을 차단했습니다")
+        logger.info("NOTION_CHROME_DEBUGGER 미설정: Notion Calendar 수집을 컨테이너 Chrome으로 진행")
+        return None
+
+    logger.info("Notion Calendar 호스트 Chrome attach 시도 (debuggerAddress=%s)", _NOTION_CHROME_DEBUGGER)
+    service = None
+    is_edge = False
+    try:
+        debugger_address, version_info = _read_debugger_json(_NOTION_CHROME_DEBUGGER, "/json/version")
+        browser_version = version_info.get("Browser", "")
+        is_edge = "edg/" in browser_version.lower() or "edge/" in browser_version.lower()
+        match = re.search(r"/(\d+)\.", browser_version)
+        if match and not is_edge:
+            version_main = int(match.group(1))
+            patcher = uc.Patcher(force=True, version_main=version_main)
+            patcher.auto()
+            service = Service(executable_path=patcher.executable_path)
+            logger.info("호스트 Chrome attach용 chromedriver 준비 완료 (version_main=%s)", version_main)
+    except Exception as e:
+        logger.info("호스트 Chrome 버전 감지/드라이버 준비 실패, Selenium 기본 드라이버로 시도: %r", e)
+        debugger_address = _NOTION_CHROME_DEBUGGER
+
+    if is_edge:
+        if os.getenv("AIRFLOW_HOME"):
+            driver = _CdpDriver(_NOTION_CHROME_DEBUGGER)
+            setattr(driver, "_notion_attached_chrome", True)
+            logger.info("Notion Calendar 호스트 Edge CDP attach 성공")
+            return driver
+        options = webdriver.EdgeOptions()
+        options.add_experimental_option("debuggerAddress", debugger_address)
+        driver = webdriver.Edge(options=options)
+    else:
+        options = webdriver.ChromeOptions()
+        options.add_experimental_option("debuggerAddress", debugger_address)
+        driver = webdriver.Chrome(service=service, options=options) if service else webdriver.Chrome(options=options)
+    setattr(driver, "_notion_attached_chrome", True)
+    try:
+        driver.set_page_load_timeout(60)
+    except Exception:
+        pass
+    logger.info("Notion Calendar 호스트 Chrome attach 성공")
+    return driver
+
+
+def _quit_browser(driver) -> None:
+    if not driver:
+        return
+    if getattr(driver, "_notion_attached_chrome", False):
+        logger.info("호스트 Chrome attach 모드: 브라우저 창 유지")
+        return
+    try:
+        driver.quit()
+    except Exception:
+        pass
+
+
 def _launch_browser():
+    try:
+        attached = _attach_to_notion_chrome()
+        if attached is not None:
+            return attached
+    except Exception:
+        if _NOTION_BROWSER_ATTACH_ONLY:
+            logger.exception("호스트 브라우저 attach 실패: 컨테이너 내부 Chrome 실행을 차단합니다")
+            raise
+        logger.exception("호스트 브라우저 attach 실패: 컨테이너 내부 Chrome으로 fallback 합니다")
+
     logger.info("브라우저 실행 (headless=%s)", _HEADLESS)
 
     def _opts():
@@ -153,6 +405,9 @@ def _launch_browser():
         chrome_bin = _resolve_chrome_bin()
         if chrome_bin:
             options.binary_location = chrome_bin
+        profile_dir = _notion_calendar_profile_dir()
+        Path(profile_dir).mkdir(parents=True, exist_ok=True)
+        options.add_argument(f"--user-data-dir={profile_dir}")
         if _HEADLESS:
             # some sites detect/deny "new" headless; prefer the more compatible flag
             options.add_argument("--headless")
@@ -349,7 +604,11 @@ def _dedupe_calendar_events(events: list[dict]) -> list[dict]:
         if not key[1] or key in seen:
             continue
         seen.add(key)
-        deduped.append({"time": key[0], "title": key[1], "attending": bool(ev.get("attending", True))})
+        item = {"time": key[0], "title": key[1], "attending": bool(ev.get("attending", True))}
+        status = _normalize_calendar_text(ev.get("status"))
+        if status:
+            item["status"] = status
+        deduped.append(item)
     deduped.sort(key=_calendar_sort_key)
     return deduped
 
@@ -368,6 +627,26 @@ def _build_calendar_event(time_text: str | None, title_text: str | None, attendi
         "title": _normalize_calendar_text(title_text),
         "attending": bool(attending),
     }
+
+
+def _normalize_notion_status(text: str | None) -> str:
+    compact = re.sub(r"\s+", "", text or "")
+    for status in _NOTION_INCOMPLETE_STATUS_LABELS + _NOTION_DONE_STATUS_LABELS:
+        if re.sub(r"\s+", "", status) in compact:
+            return status
+    return ""
+
+
+def _should_keep_notion_calendar_event(event: dict) -> bool:
+    title = event.get("title") or ""
+    status = _normalize_notion_status(event.get("status") or "")
+    if event.get("attending") is False:
+        return False
+    if any(pattern in title for pattern in _NOTION_STATUSLESS_EXCLUDE_PATTERNS):
+        return False
+    if status:
+        return status not in _NOTION_DONE_STATUS_LABELS
+    return any(prefix in title for prefix in _NOTION_STATUSLESS_WORK_PREFIXES)
 
 
 def _read_visible_calendar_events(driver, date_str: str) -> list[dict]:
@@ -689,74 +968,559 @@ def _collect_calendar_events_for_day(driver, date_str: str, target_name: str) ->
     return _dedupe_calendar_events(accepted)
 
 
+def _notion_calendar_url_for(date_str: str) -> str:
+    dt = pendulum.parse(date_str)
+    return _NOTION_CALENDAR_URL_TEMPLATE.format(year=dt.year, month=dt.month, day=dt.day, date=date_str)
+
+
+def _set_input_value(driver, el, value: str) -> None:
+    try:
+        el.clear()
+    except Exception:
+        pass
+    driver.execute_script(
+        """
+        arguments[0].focus();
+        arguments[0].value = arguments[1];
+        arguments[0].dispatchEvent(new Event('input', {bubbles:true}));
+        arguments[0].dispatchEvent(new Event('change', {bubbles:true}));
+        """,
+        el,
+        value,
+    )
+
+
+def _click_notion_button_by_text(driver, patterns: list[str]) -> bool:
+    pattern_lowers = [p.lower() for p in patterns]
+    buttons = driver.find_elements(By.CSS_SELECTOR, "button, [role='button'], input[type='submit']")
+    for btn in buttons:
+        try:
+            text = ((btn.text or "") + " " + (btn.get_attribute("value") or "")).strip().lower()
+            if not text or not any(p in text for p in pattern_lowers):
+                continue
+            driver.execute_script("arguments[0].click();", btn)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _notion_calendar_has_events_or_grid(driver) -> bool:
+    try:
+        return bool(
+            driver.execute_script(
+                """
+                return !!(
+                  document.querySelector('[data-event-chip-key]') ||
+                  document.querySelector('[data-date], time[datetime], [aria-label*="202"]')
+                );
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def _maybe_login_notion_calendar(driver) -> None:
+    if _notion_calendar_has_events_or_grid(driver):
+        return
+
+    cur = (getattr(driver, "current_url", "") or "").lower()
+    body_text = ""
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+    except Exception:
+        pass
+    login_hint = any(s in cur for s in ["login", "signin", "notion.so"]) or any(
+        s in body_text for s in ["log in", "login", "sign in", "이메일", "로그인"]
+    )
+    if not login_hint:
+        return
+    if not _NOTION_EMAIL or not _NOTION_PASSWORD:
+        logger.info("Notion Calendar 로그인 화면 감지, NOTION_EMAIL/NOTION_PASSWORD 미설정으로 자동 로그인 생략")
+        return
+
+    logger.info("Notion Calendar 자동 로그인 시도")
+    wait = WebDriverWait(driver, 20)
+    email_selectors = [
+        "input[type='email']",
+        "input[name='email']",
+        "input[placeholder*='Email']",
+        "input[placeholder*='email']",
+        "input[autocomplete='username']",
+    ]
+    password_selectors = [
+        "input[type='password']",
+        "input[name='password']",
+        "input[autocomplete='current-password']",
+    ]
+
+    email_el = None
+    for sel in email_selectors:
+        try:
+            email_el = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
+            break
+        except Exception:
+            pass
+    if email_el:
+        _set_input_value(driver, email_el, _NOTION_EMAIL)
+        _click_notion_button_by_text(driver, ["continue", "log in", "login", "sign in", "로그인", "계속"])
+        time.sleep(2.0)
+
+    password_el = None
+    for sel in password_selectors:
+        try:
+            password_el = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
+            break
+        except Exception:
+            pass
+    if password_el:
+        _set_input_value(driver, password_el, _NOTION_PASSWORD)
+        if not _click_notion_button_by_text(driver, ["continue", "log in", "login", "sign in", "로그인", "계속"]):
+            try:
+                password_el.send_keys(Keys.ENTER)
+            except Exception:
+                pass
+        time.sleep(5.0)
+
+
+def _wait_for_notion_calendar(driver, timeout_sec: int = 45) -> None:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        _maybe_login_notion_calendar(driver)
+        if _notion_calendar_has_events_or_grid(driver):
+            return
+        time.sleep(1.0)
+    raise TimeoutError("Notion Calendar 화면 로딩 타임아웃")
+
+
+def _close_extra_browser_tabs(driver) -> None:
+    if not _NOTION_CLOSE_EXTRA_TABS:
+        return
+    try:
+        keep = driver.current_window_handle
+        for handle in list(driver.window_handles):
+            if handle == keep:
+                continue
+            try:
+                driver.switch_to.window(handle)
+                driver.close()
+            except Exception:
+                pass
+        driver.switch_to.window(keep)
+    except Exception as e:
+        logger.info("추가 브라우저 탭 정리 실패(무시): %r", e)
+
+
+def _open_notion_calendar_date(driver, date_str: str) -> bool:
+    day = str(int(date_str[-2:]))
+    try:
+        return bool(
+            driver.execute_script(
+                """
+                return (function(day) {
+                  function normalizeText(text) { return (text || '').replace(/\\s+/g, ' ').trim(); }
+                  var buttons = Array.prototype.slice.call(document.querySelectorAll('button'));
+                  for (var i = 0; i < buttons.length; i++) {
+                    if (normalizeText(buttons[i].textContent || buttons[i].innerText || '') !== day) continue;
+                    try { buttons[i].scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
+                    try {
+                      buttons[i].dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+                      return true;
+                    } catch (e2) {
+                      try { buttons[i].click(); return true; } catch (e3) {}
+                    }
+                  }
+                  return false;
+                })(arguments[0]);
+                """,
+                day,
+            )
+        )
+    except Exception as e:
+        logger.info("Notion Calendar 날짜 클릭 실패(%s): %r", date_str, e)
+        return False
+
+
+def _click_notion_today_button(driver) -> bool:
+    try:
+        return bool(
+            driver.execute_script(
+                """
+                return (function() {
+                  function normalizeText(text) { return (text || '').replace(/\\s+/g, ' ').trim(); }
+                  var buttons = Array.prototype.slice.call(document.querySelectorAll('button'));
+                  for (var i = 0; i < buttons.length; i++) {
+                    if (normalizeText(buttons[i].textContent || buttons[i].innerText || '') !== '오늘') continue;
+                    try { buttons[i].scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
+                    try {
+                      buttons[i].dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+                      return true;
+                    } catch (e2) {
+                      try { buttons[i].click(); return true; } catch (e3) {}
+                    }
+                  }
+                  return false;
+                })();
+                """
+            )
+        )
+    except Exception as e:
+        logger.info("Notion Calendar 오늘 버튼 클릭 실패: %r", e)
+        return False
+
+
+def _close_notion_calendar_detail(driver) -> None:
+    try:
+        driver.execute_script(
+            """
+            document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape', code:'Escape', bubbles:true}));
+            document.body.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape', code:'Escape', bubbles:true}));
+            """
+        )
+    except Exception:
+        pass
+    time.sleep(0.2)
+
+
+def _click_notion_calendar_chip(driver, chip_idx: str | None) -> bool:
+    if not chip_idx:
+        return False
+    try:
+        return bool(
+            driver.execute_script(
+                """
+                return (function(chipIdx) {
+                  var el = document.querySelector('[data-codex-calendar-chip-idx="' + chipIdx + '"]');
+                  if (!el) return false;
+                  try { el.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
+                  try {
+                    el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+                    return true;
+                  } catch (e2) {
+                    try { el.click(); return true; } catch (e3) {}
+                  }
+                  return false;
+                })(arguments[0]);
+                """,
+                str(chip_idx),
+            )
+        )
+    except Exception:
+        return False
+
+
+def _read_notion_calendar_detail_status(driver, chip_idx: str | None, title: str) -> str:
+    if not chip_idx:
+        return ""
+    if not _click_notion_calendar_chip(driver, chip_idx):
+        return ""
+
+    labels = _NOTION_INCOMPLETE_STATUS_LABELS + _NOTION_DONE_STATUS_LABELS
+    compact_labels = [(label, re.sub(r"\s+", "", label)) for label in labels]
+    deadline = time.time() + 5
+    status = ""
+    try:
+        while time.time() < deadline:
+            time.sleep(0.3)
+            text = driver.execute_script(
+                """
+                return (function() {
+                  function visible(el) {
+                    if (!el) return false;
+                    var rect = el.getBoundingClientRect();
+                    var style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                  }
+                  var selectors = [
+                    '[role="dialog"]',
+                    '[aria-modal="true"]',
+                    '[data-overlay]',
+                    '[data-testid*="peek"]',
+                    '[class*="modal"]',
+                    '[class*="peek"]'
+                  ];
+                  var chunks = [];
+                  selectors.forEach(function(sel) {
+                    Array.prototype.slice.call(document.querySelectorAll(sel)).forEach(function(el) {
+                      if (visible(el)) chunks.push(el.innerText || el.textContent || '');
+                    });
+                  });
+                  return chunks.join('\\n');
+                })();
+                """
+            ) or ""
+            if not text.strip():
+                continue
+            compact_text = re.sub(r"\s+", "", text)
+            if title and re.sub(r"\s+", "", title) not in compact_text and time.time() < deadline:
+                continue
+            for label, compact_label in compact_labels:
+                if compact_label and compact_label in compact_text:
+                    status = label
+                    return status
+        return ""
+    finally:
+        _close_notion_calendar_detail(driver)
+
+
+def _read_notion_calendar_events_for_day(driver, date_str: str) -> list[dict]:
+    raw = driver.execute_script(
+        """
+        return (function(dateStr, allDayLabel) {
+          function normalizeText(text) { return (text || '').replace(/\\s+/g, ' ').trim(); }
+          function ownText(el) {
+            var out = [];
+            Array.prototype.slice.call(el.childNodes || []).forEach(function(node) {
+              if (node.nodeType === Node.TEXT_NODE) out.push(node.textContent || '');
+            });
+            return normalizeText(out.join(' '));
+          }
+          function isVisible(el) {
+            if (!el) return false;
+            var rect = el.getBoundingClientRect();
+            var style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+          }
+          function area(rect) { return Math.max(0, rect.width) * Math.max(0, rect.height); }
+          function containsRect(outer, inner) {
+            return outer.left <= inner.left + 1 && outer.right >= inner.right - 1 &&
+                   outer.top <= inner.top + 1 && outer.bottom >= inner.bottom - 1;
+          }
+          function intersectsColumn(column, rect) {
+            if (!column || !rect) return false;
+            var overlapX = Math.min(column.right, rect.right) - Math.max(column.left, rect.left);
+            var overlapY = Math.min(column.bottom, rect.bottom) - Math.max(column.top, rect.top);
+            return overlapX > 1 && overlapY > 1;
+          }
+          function titleFromChip(chip) {
+            var clone = chip.cloneNode(true);
+            Array.prototype.slice.call(clone.querySelectorAll('svg, [data-resize]')).forEach(function(el) { el.remove(); });
+            return normalizeText(clone.textContent || chip.textContent || '');
+          }
+          function statusFromChip(chip) {
+            var labels = ['진행중', '진행 중', '피드백', '결제중', '확인요청', '확인 요청', '시작전', '시작 전', '완료', '종료', '보류', '취소'];
+            var cur = chip;
+            for (var depth = 0; cur && depth < 5; depth++, cur = cur.parentElement) {
+              var text = normalizeText(cur.textContent || '');
+              for (var i = 0; i < labels.length; i++) {
+                if (text.indexOf(labels[i]) >= 0) return labels[i];
+              }
+            }
+            return '';
+          }
+          function isCompletedChip(chip) {
+            return !!chip.querySelector('path[fill-rule="evenodd"][clip-rule="evenodd"]');
+          }
+          function hasWorkPrefix(text) {
+            var prefixes = ['[로드맵/', '[프로젝트/', '[노션/', '[TF]'];
+            for (var i = 0; i < prefixes.length; i++) {
+              if (text.indexOf(prefixes[i]) >= 0) return true;
+            }
+            return false;
+          }
+          function workMarkerCount(text) {
+            var prefixes = ['[로드맵/', '[프로젝트/', '[노션/', '[TF]'];
+            var count = 0;
+            for (var i = 0; i < prefixes.length; i++) {
+              var idx = -1;
+              while ((idx = text.indexOf(prefixes[i], idx + 1)) >= 0) count++;
+            }
+            return count;
+          }
+          function timeFromChip(chip) {
+            var aria = normalizeText(chip.getAttribute('aria-label') || chip.getAttribute('title') || '');
+            var m = aria.match(/\\b([01]?\\d|2[0-3]):[0-5]\\d\\b/);
+            return m ? m[0] : allDayLabel;
+          }
+          function directDateContainers() {
+            var selectors = [
+              '[data-date="' + dateStr + '"]',
+              '[datetime="' + dateStr + '"]',
+              '[aria-label*="' + dateStr + '"]'
+            ];
+            var out = [];
+            selectors.forEach(function(sel) {
+              Array.prototype.slice.call(document.querySelectorAll(sel)).forEach(function(el) {
+                var cur = el;
+                for (var depth = 0; cur && depth < 8; depth++, cur = cur.parentElement) {
+                  if (!isVisible(cur)) continue;
+                  if (cur.querySelector && cur.querySelector('[data-event-chip-key]')) out.push(cur);
+                }
+              });
+            });
+            return out;
+          }
+          function fallbackDateContainers() {
+            var day = String(parseInt(dateStr.slice(8, 10), 10));
+            var labels = Array.prototype.slice.call(document.querySelectorAll('div, span, button, time'))
+              .filter(function(el) { return isVisible(el) && ownText(el) === day; });
+            var out = [];
+            labels.forEach(function(label) {
+              var cur = label.parentElement;
+              var best = null;
+              var bestArea = Infinity;
+              for (var depth = 0; cur && depth < 10; depth++, cur = cur.parentElement) {
+                if (!isVisible(cur) || !cur.querySelector || !cur.querySelector('[data-event-chip-key]')) continue;
+                var rect = cur.getBoundingClientRect();
+                var a = area(rect);
+                if (rect.width >= 80 && rect.height >= 50 && a < bestArea) {
+                  best = cur;
+                  bestArea = a;
+                }
+              }
+              if (best) out.push(best);
+            });
+            return out;
+          }
+          function uniqueElements(elements) {
+            var seen = new Set();
+            return elements.filter(function(el) {
+              if (seen.has(el)) return false;
+              seen.add(el);
+              return true;
+            });
+          }
+          function mainDateColumnRects() {
+            var day = String(parseInt(dateStr.slice(8, 10), 10));
+            var labels = Array.prototype.slice.call(document.querySelectorAll('div, span, button, time'))
+              .filter(function(el) { return isVisible(el) && (ownText(el) === day || normalizeText(el.textContent || '') === day); });
+            var out = [];
+            labels.forEach(function(label) {
+              var cur = label.parentElement;
+              for (var depth = 0; cur && depth < 8; depth++, cur = cur.parentElement) {
+                if (!isVisible(cur)) continue;
+                var rect = cur.getBoundingClientRect();
+                if (rect.width >= 40 && rect.height >= 70 && rect.top > -120 && rect.top < (window.innerHeight + 300)) {
+                  out.push(cur);
+                  break;
+                }
+              }
+            });
+            return uniqueElements(out).map(function(el) { return el.getBoundingClientRect(); });
+          }
+
+          var containers = uniqueElements(directDateContainers());
+          if (!containers.length) containers = uniqueElements(fallbackDateContainers());
+
+          var chips = [];
+          var chipSeq = 0;
+          function addChip(chip) {
+            if (!chip || chip.getAttribute('data-codex-calendar-chip-idx')) return;
+            chipSeq += 1;
+            chip.setAttribute('data-codex-calendar-chip-idx', String(chipSeq));
+            chips.push(chip);
+          }
+          containers.forEach(function(container) {
+            Array.prototype.slice.call(container.querySelectorAll('[data-event-chip-key]')).forEach(function(chip) {
+              if (!isVisible(chip)) return;
+              var chipRect = chip.getBoundingClientRect();
+              var containerRect = container.getBoundingClientRect();
+              if (containsRect(containerRect, chipRect)) addChip(chip);
+            });
+          });
+          var columnRects = mainDateColumnRects();
+          columnRects.forEach(function(columnRect) {
+            Array.prototype.slice.call(document.querySelectorAll('div')).forEach(function(chip) {
+              if (!isVisible(chip)) return;
+              if ((chip.className || '').toString().indexOf('sc-1axd7p-4') < 0) return;
+              var title = titleFromChip(chip);
+              if (!title || title.length < 3) return;
+              var chipRect = chip.getBoundingClientRect();
+              if (chipRect.height < 10 || chipRect.height > 80) return;
+              if (!intersectsColumn(columnRect, chipRect)) return;
+              addChip(chip);
+            });
+          });
+          columnRects.forEach(function(columnRect) {
+            Array.prototype.slice.call(document.querySelectorAll('div, span, button, a')).forEach(function(chip) {
+              if (!isVisible(chip)) return;
+              var title = titleFromChip(chip);
+              if (!title || title.length < 8) return;
+              if (!hasWorkPrefix(title) && title.indexOf(']') < 0) return;
+              if (workMarkerCount(title) !== 1) return;
+              var chipRect = chip.getBoundingClientRect();
+              if (chipRect.width < 30 || chipRect.height < 12) return;
+              if (!intersectsColumn(columnRect, chipRect)) return;
+              var text = title;
+              if (!hasWorkPrefix(text) && text.indexOf('[') !== 0) return;
+              addChip(chip);
+            });
+          });
+          Array.prototype.slice.call(document.querySelectorAll('div, span, button, a')).forEach(function(chip) {
+            if (!isVisible(chip)) return;
+            var title = titleFromChip(chip);
+            if (!title || title.length < 8 || !hasWorkPrefix(title)) return;
+            if (workMarkerCount(title) !== 1) return;
+            var chipRect = chip.getBoundingClientRect();
+            if (chipRect.width < 80 || chipRect.height < 12 || chipRect.height > 120) return;
+            if (chipRect.top < 0 || chipRect.top > window.innerHeight + 120) return;
+            addChip(chip);
+          });
+
+          return uniqueElements(chips).map(function(chip) {
+            return {
+              chip_idx: chip.getAttribute('data-codex-calendar-chip-idx') || '',
+              time: timeFromChip(chip),
+              title: titleFromChip(chip),
+              status: statusFromChip(chip),
+              attending: !isCompletedChip(chip),
+            };
+          }).filter(function(ev) { return !!ev.title; });
+        })(arguments[0], arguments[1]);
+        """,
+        date_str,
+        _CALENDAR_ALL_DAY_LABEL,
+    ) or []
+    events = []
+    for ev in raw:
+        item = _build_calendar_event(ev.get("time"), ev.get("title"), ev.get("attending", True))
+        item["status"] = _normalize_calendar_text(ev.get("status"))
+        detail_status = _read_notion_calendar_detail_status(driver, ev.get("chip_idx"), item["title"])
+        if detail_status:
+            item["status"] = detail_status
+        if _should_keep_notion_calendar_event(item):
+            events.append(item)
+    return events
+
+
 def _collect_calendar(driver, target_date: str) -> dict[str, list[dict]]:
     try:
         today_str = target_date
         tomorrow_str = pendulum.parse(target_date).add(days=1).to_date_string()
         target_dates = [today_str, tomorrow_str]
 
-        _ensure_team_calendar_access(driver)
+        verified_events = {}
+        loaded_months: set[str] = set()
+        for date_str in target_dates:
+            month_key = date_str[:7]
+            if month_key not in loaded_months:
+                url = _notion_calendar_url_for(date_str)
+                logger.info("Notion Calendar 이동: %s", url)
+                driver.get(url)
+                _close_extra_browser_tabs(driver)
+                _wait_for_notion_calendar(driver)
+                time.sleep(1.5)
+                if date_str == today_str and _click_notion_today_button(driver):
+                    time.sleep(1.0)
+                loaded_months.add(month_key)
+            if _open_notion_calendar_date(driver, date_str):
+                time.sleep(1.5)
+            verified_events[date_str] = _dedupe_calendar_events(_read_notion_calendar_events_for_day(driver, date_str))
 
-        def _goto_calendar():
-            driver.get(_DASHBOARD_URL)
-            time.sleep(2)
-            cal_links = driver.find_elements(By.XPATH, "//a[contains(text(), '캘린더')]")
-            if cal_links:
-                driver.execute_script("arguments[0].click();", cal_links[0])
-                time.sleep(2)
-            else:
-                driver.get(_CALENDAR_URL)
-
-        _goto_calendar()
-
-        cur = (getattr(driver, "current_url", "") or "").lower()
-        if "corpsignin.act" in cur or "signin" in cur:
-            for url in [_CALENDAR_URL, *_CALENDAR_FALLBACK_URLS]:
-                try:
-                    driver.get(url)
-                    time.sleep(2)
-                    cur2 = (getattr(driver, "current_url", "") or "").lower()
-                    if "corpsignin.act" in cur2 or "signin" in cur2:
-                        continue
-                    break
-                except Exception:
-                    pass
-
-        wait = WebDriverWait(driver, 30)
-        wait.until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, f".fc-day-top[data-date='{today_str}'], td[data-date='{today_str}']"))
-        )
-        try:
-            select_el = wait.until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "#calendarSelectBoxItem select.select-box"))
-            )
-            current_value = (select_el.get_attribute("value") or "").strip()
-            if current_value != "weekView":
-                Select(select_el).select_by_value("weekView")
-                time.sleep(2.0)
-        except Exception as e:
-            logger.info("캘린더 주간뷰 전환 실패, 현재 뷰로 진행: %r", e)
-
-        wait.until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, f".fc-day-header[data-date='{today_str}'], .fc-time-grid-container, a.fc-time-grid-event")
-            )
-        )
-        time.sleep(1.5)
-
-        verified_events = {
-            date_str: _collect_calendar_events_for_day(driver, date_str, _CALENDAR_NOTIFY_TARGET_NAME)
-            for date_str in target_dates
-        }
         result = {
             "today": verified_events.get(today_str, []),
             "tomorrow": verified_events.get(tomorrow_str, []),
         }
-        logger.info("캘린더 수집 완료 (today=%d, tomorrow=%d)", len(result["today"]), len(result["tomorrow"]))
+        logger.info("Notion Calendar 수집 완료 (today=%d, tomorrow=%d)", len(result["today"]), len(result["tomorrow"]))
         return result
 
     except Exception as e:
-        logger.warning("캘린더 수집 실패: %r (url=%s)", e, getattr(driver, "current_url", ""))
+        try:
+            current_url = getattr(driver, "current_url", "")
+        except Exception:
+            current_url = ""
+        logger.warning("Notion Calendar 수집 실패: %r (url=%s)", e, current_url)
         return {"today": [], "tomorrow": []}
 
 
@@ -1113,6 +1877,7 @@ def _build_briefing_html(
     kpi_url = (kpi_ai or {}).get("url", "")
     flow_text = ((flow_ai or {}).get("text") or "").strip()
     kpi_text = ((kpi_ai or {}).get("text") or "").strip()
+    calendar_url = _notion_calendar_url_for(run_date)
     if isinstance(calendar_events, dict):
         today_events = _dedupe_calendar_events(calendar_events.get("today") or [])
         tomorrow_events = _dedupe_calendar_events(calendar_events.get("tomorrow") or [])
@@ -1144,9 +1909,9 @@ def _build_briefing_html(
   <a href="{html.escape(_DASHBOARD_URL, quote=True)}" target="_blank" rel="noopener noreferrer"
      style="display:inline-block;background:#111827;color:#fff;text-decoration:none;padding:8px 12px;border-radius:6px;font-size:12px;margin-right:8px;">
      Flow 대시보드 열기</a>
-  <a href="{html.escape(_CALENDAR_URL, quote=True)}" target="_blank" rel="noopener noreferrer"
+  <a href="{html.escape(calendar_url, quote=True)}" target="_blank" rel="noopener noreferrer"
      style="display:inline-block;background:#374151;color:#fff;text-decoration:none;padding:8px 12px;border-radius:6px;font-size:12px;">
-     Flow 캘린더 열기</a>
+     Notion Calendar 열기</a>
 </div>"""
         if flow_text:
             section_a += f"""
@@ -1270,10 +2035,7 @@ def run_briefing(**context):
             driver = _launch_browser()
             if _do_login(driver):
                 break
-            try:
-                driver.quit()
-            except Exception:
-                pass
+            _quit_browser(driver)
             driver = None
             logger.warning("Flow 로그인 재시도 (%d/2)", attempt)
             time.sleep(2.0)
@@ -1290,10 +2052,7 @@ def run_briefing(**context):
         result["error"] = str(e)
     finally:
         if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+            _quit_browser(driver)
             logger.info("브라우저 종료")
 
     return result

@@ -10,7 +10,7 @@ DAG에서 사용하는 cron 표현식과 이메일 설정을 관리
 SMD_ORDERS_TIME      = "33 16 * * 1,5"    # 매주 월요일 15:15 실행
 SMD_VISIT_LOG        = "0 12 * * 1,3,5" # 매주 월,수,금 12:00 실행
 
-SMP_TOORDER_VOC_TIME = "30 7 * * *"     # 매일 07:30 실행
+SMP_TOORDER_VOC_TIME = "20 8 * * *"     # 매일 08:20 실행
 SMP_FDAM_CS_TIME     = "5 7 * * *"      # 매일 07:05 실행
 
 SMP_DELIVERY_ALERT_TIME  = "5 9 * * 1,2,3,4,5"  # 매주 월~금 09:00 실행
@@ -58,6 +58,9 @@ DB_POSFEED_SALES_TODAY_TIME          = "15 8,12,14,16,19,21 * * *"  # 당일 매
 DB_OKPOS_REVIEW_CARD_TODAY_TIME      = "25 12-21 * * *"  # 당일 OKPOS 카드 승인 25분 스태거
 DB_UNIFIED_SALES_TODAY_TRIGGER_TIME  = "45 8,12,14,16,21 * * *"  # 09/13/15/17/22시 목표 15분 전 통합
 DB_UNIFIED_SALES_TODAY_TRIGGER_1915_TIME = "15 19 * * *"  # 19:30 목표 15분 전 통합
+# 송파삼전점 Launch (origin/main PR 병합분)
+DB_LAUNCH_TIME               = "0 15 * * *"   # 매일 15:00 KST 실행 (송파삼전점 Launch 수집)
+DB_LAUNCH_UNIFIED_TIME       = "15 15 * * *"  # 매일 15:15 KST 실행 (송파삼전점 Launch 집계)
 
 AI_DAILY_COLLECTION_TIME = "20 7 * * *"  # 매일 07:20 실행 (KST)
 
@@ -65,7 +68,7 @@ SMD_TOORDER_SALES_REPORT_TIME = "5 6 * * *"  # 매일 6:05 실행
 
 DB_TOORDER_STORE_PLATFORM_TIME = "10 7 * * *"  # 매일 07:10 실행 (SMD_TOORDER_SALES_REPORT 이후)
 
-DB_UNIFIED_REVIEW_TIME         = "33 7 * * *"  # 매일 07:33 실행 (ToOrderVoc Transform 7:30 이후)
+DB_UNIFIED_REVIEW_TIME         = "28 8 * * *"  # 매일 08:28 실행 (직전 1일 ToOrderReview 성공 실행 조회)
 
 SMD_BAEMIN_COLLECT_BATCH1_TIME = "15 3 * * *"  # 매일 KST 03:15 실행
 SMD_BAEMIN_COLLECT_BATCH2_TIME = "30 4 * * *"  # 매일 KST 04:30 실행

@@ -456,6 +456,32 @@ def launch_uc_chrome(
             except Exception:
                 pass
 
+        # session not created / cannot connect: UC 캐시+버전파일 삭제 후 재다운로드
+        if "session not created" in err_str or "cannot connect to chrome" in err_str:
+            _emit_uc_log(log_fn, "session not created: UC driver 캐시+버전파일 삭제")
+            if data_dir:
+                for fname in ("undetected_chromedriver", "chrome_version.txt"):
+                    target = Path(data_dir) / fname
+                    if target.exists():
+                        try:
+                            target.unlink()
+                        except Exception:
+                            pass
+            configure_uc_data_path()
+            raise exc
+
+        if "undetected_chromedriver" in err_str and "No such file or directory" in err_str:
+            _emit_uc_log(log_fn, "UC driver 캐시 파일 없음: 버전파일 삭제 후 새 옵션 재시도 필요")
+            if data_dir:
+                version_file = Path(data_dir) / "chrome_version.txt"
+                if version_file.exists():
+                    try:
+                        version_file.unlink()
+                    except Exception:
+                        pass
+            configure_uc_data_path()
+            raise exc
+
         _emit_uc_log(
             log_fn,
             "browser launch failed "

@@ -25,7 +25,7 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -271,19 +271,31 @@ def _write_sheet(ws, rows: list, daily_target: dict) -> None:
 
         ws.row_dimensions[r].height = 17
 
-def _save_workbook_replace(wb: Workbook, path: Path) -> None:
+def _save_workbook_replace(wb: Workbook, path: Path, retries: int = 5) -> None:
+    import time
+
     tmp_path = path.with_name(f".{path.stem}.tmp{path.suffix}")
     tmp_path.unlink(missing_ok=True)
     wb.save(tmp_path)
     tmp_path.chmod(0o666)
-    if path.exists():
+    last_exc = None
+    for attempt in range(1, retries + 1):
         try:
+            if path.exists():
+                path.chmod(0o666)
+                path.unlink()
+            tmp_path.replace(path)
             path.chmod(0o666)
-            path.unlink()
-        except PermissionError as e:
-            raise PermissionError(f"파일이 열려 있거나 OneDrive에서 잠겨 있습니다: {path}") from e
-    tmp_path.replace(path)
-    path.chmod(0o666)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            if attempt >= retries:
+                break
+            wait_sec = min(10, attempt * 2)
+            logger.warning("Excel 파일 덮어쓰기 재시도: %s (wait=%ss)", path, wait_sec)
+            time.sleep(wait_sec)
+
+    raise PermissionError(f"파일이 열려 있거나 OneDrive에서 잠겨 있어 덮어쓸 수 없습니다: {path}") from last_exc
 
 
 def _month_file_path(ym: str) -> Path:
@@ -311,24 +323,33 @@ def _build_month_rows(sales_df: pd.DataFrame, ym: str) -> list:
     return _daily_rows(month_sales, mkt_df, _month_dates(ym))
 
 
-def _write_excel_files(sales_df: pd.DataFrame, months: list[str], daily_target: dict) -> None:
+def _write_excel_files(sales_df: pd.DataFrame, months: list[str], daily_target: dict) -> list[str]:
     OUTPUT_XLSX.parent.mkdir(parents=True, exist_ok=True)
+    if not months:
+        return []
 
-    wb = Workbook()
-    del wb[wb.active.title]
+    latest_ym = months[0]
+    rows = _build_month_rows(sales_df, latest_ym)
+    updated = [latest_ym]
 
-    for ym in months:
-        rows = _build_month_rows(sales_df, ym)
-        ws = wb.create_sheet(title=ym)
-        _write_sheet(ws, rows, daily_target)
+    if OUTPUT_XLSX.exists():
+        wb = load_workbook(OUTPUT_XLSX)
+    else:
+        wb = Workbook()
+        del wb[wb.active.title]
 
-        month_wb = Workbook()
-        month_ws = month_wb.active
-        month_ws.title = ym
-        _write_sheet(month_ws, rows, daily_target)
-        _save_workbook_replace(month_wb, _month_file_path(ym))
+    if latest_ym in wb.sheetnames:
+        del wb[latest_ym]
+    ws = wb.create_sheet(title=latest_ym, index=0)
+    _write_sheet(ws, rows, daily_target)
 
+    month_wb = Workbook()
+    month_ws = month_wb.active
+    month_ws.title = latest_ym
+    _write_sheet(month_ws, rows, daily_target)
+    _save_workbook_replace(month_wb, _month_file_path(latest_ym))
     _save_workbook_replace(wb, OUTPUT_XLSX)
+    return updated
 
 
 def _safe_div(numerator: float, denominator: float) -> float:
@@ -548,9 +569,9 @@ def build_daily_tracking_excel(monthly_targets: dict,
                                 daily_target: dict) -> str:
     sales_df = _load_sales()
     months = _available_months(sales_df)
-    _write_excel_files(sales_df, months, daily_target)
+    updated = _write_excel_files(sales_df, months, daily_target)
 
     win_path = str(OUTPUT_XLSX)
     logger.info("일단위 트래킹 저장 완료 (%s)\nWindows: %s",
-                ", ".join(months), win_path)
-    return f"완료: {', '.join(months)} → {win_path}"
+                ", ".join(updated), win_path)
+    return f"완료: {', '.join(updated)} → {win_path}"

@@ -114,9 +114,14 @@ def send_telegram(text: str) -> bool:
         logger.warning("Telegram credentials missing; skip send")
         return False
     try:
-        payload = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+        payload = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        req = urllib.request.Request(url, data=payload, method="POST")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"},
+        )
         with urllib.request.urlopen(req, timeout=10):
             pass
         logger.info("Telegram alert sent")

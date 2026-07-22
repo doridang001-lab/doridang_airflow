@@ -53,10 +53,11 @@ x-airflow-common:
   build: .
   environment:
     &airflow-common-env
-    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
-    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    # CeleryExecutor 전환 시 아래 두 줄 불필요 (유지해도 무해)
+    # AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+    # AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
     AIRFLOW__CORE__FERNET_KEY: ''
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
@@ -92,6 +93,10 @@ x-airflow-common:
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
     AIRFLOW__SCHEDULER__ALLOW_TRIGGER_IN_FUTURE: 'true'
     AIRFLOW__SCHEDULER__SCHEDULER_ZOMBIE_TASK_THRESHOLD: '450'
+    AIRFLOW__SCHEDULER__SCHEDULER_HEALTH_CHECK_THRESHOLD: '120'
+    AIRFLOW__SCHEDULER__PARSING_PROCESSES: '1'
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: '300'
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: '600'
     # WARNING: Use _PIP_ADDITIONAL_REQUIREMENTS option ONLY for a quick checks
     # for other purpose (development, test and especially production usage) build/extend Airflow image.
     # _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:--r /opt/airflow/requirements.txt}
@@ -110,6 +115,7 @@ x-airflow-common:
     - ./AGENTS.md:/opt/airflow/AGENTS.md:ro
     - ./requirements.txt:/opt/airflow/requirements.txt
     - ./.git:/opt/airflow/.git:ro
+    - ./chrome_profiles:/opt/airflow/chrome_profiles
     - "${ONEDRIVE_ROOT:-c:/Users/민준/OneDrive - 주식회사 도리당}/data/dashboard:/opt/airflow/dashboard"
     - "${ONEDRIVE_ROOT:-c:/Users/민준/OneDrive - 주식회사 도리당}/Repository:/opt/airflow/Repository"
     - "${ONEDRIVE_ROOT:-c:/Users/민준/OneDrive - 주식회사 도리당}/Collect_Data:/opt/airflow/Collect_Data"
@@ -226,6 +232,7 @@ services:
       start_period: 30s
     environment:
       <<: *airflow-common-env
+      AIRFLOW__CELERY__WORKER_CONCURRENCY: '4'
       # Required to handle warm shutdown of the celery workers properly
       # See https://airflow.apache.org/docs/docker-stack/entrypoint.html#signal-propagation
       DUMB_INIT_SETSID: "0"
