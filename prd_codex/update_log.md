@@ -299,3 +299,9 @@
 - 변경: 배민 주문서 날짜×매장에 우리가게클릭을 결합하고, 미매칭 행·결측 광고지출은 별도 누락 구분 없이 0원으로 계산하도록 명시.
 - 검증 결과: 기존 `DB_DeliveryCommission.py`의 left join 및 `fillna(0)` 동작과 계획서 기준이 일치함을 확인.
 - 남은 위험: 없음.
+
+## 2026-07-27 배민 매크로 수집 원천 00:15 시작
+- 대상: `SMD_BAEMIN_COLLECT_BATCH1_TIME`, `DB_Beamin_Macro_Dags` 메인 자동 수집 스케줄.
+- 변경: 배민 메인 수집 시작 시각을 KST 03:15에서 KST 00:15로 앞당김. Retry DAG는 트리거 전용 `schedule=None` 유지.
+- 검증 결과: 로컬·scheduler 컨테이너 Python compile 및 로컬 상수 import 확인 통과.
+- 남은 위험: scheduler 컨테이너에 Airflow CLI와 pendulum import 경로가 없어 DAG import 직접 확인은 실패했으며, 운영 scheduler 반영은 reload 후 확인 필요.
