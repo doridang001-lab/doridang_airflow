@@ -1,11 +1,14 @@
 """FinProduct 수동분류 기반 규칙 채굴 및 적용."""
 
+import hashlib
 import json
 import logging
 import os
 import re
+import shutil
 import time
 from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +16,10 @@ import pandas as pd
 
 from modules.transform.pipelines.db.DB_ItemIdAllocator import normalize_item_key
 from modules.transform.utility.paths import (
+    FIN_PRODUCT_RULE_PROPOSAL_DIR,
     FIN_PRODUCT_RULES_JSON_PATH,
     FIN_PRODUCT_RULES_MANUAL_JSON_PATH,
+    TEMP_DIR,
 )
 
 logger = logging.getLogger(__name__)
@@ -332,11 +337,133 @@ def load_rules() -> list[dict]:
     return sorted(merged, key=lambda rule: int(rule.get("priority") or 999999))
 
 
-def save_rules(rules: list[dict]) -> None:
+def _rules_sha256(rules: list[dict]) -> str:
+    payload = json.dumps(rules, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _active_rule_key(rule: dict) -> tuple[str, tuple[str, ...]]:
+    return (
+        str(rule.get("수동분류", "")).strip(),
+        tuple(str(value).strip() for value in rule.get("include_keywords") or [] if str(value).strip()),
+    )
+
+
+def build_rule_change_report(existing: list[dict], proposed: list[dict]) -> dict[str, Any]:
+    old_active = {
+        _active_rule_key(rule): rule
+        for rule in existing
+        if isinstance(rule, dict) and rule.get("status") == RULE_STATUS_ACTIVE
+    }
+    new_active = {
+        _active_rule_key(rule): rule
+        for rule in proposed
+        if isinstance(rule, dict) and rule.get("status") == RULE_STATUS_ACTIVE
+    }
+    ratio = abs(len(new_active) - len(old_active)) / len(old_active) if old_active else 0.0
+
+    def _compact(rule: dict) -> dict[str, Any]:
+        return {
+            "수동분류": str(rule.get("수동분류", "")),
+            "include_keywords": list(rule.get("include_keywords") or []),
+            "support": int(rule.get("support") or 0),
+            "confidence": float(rule.get("confidence") or 0),
+            "validation_accuracy": float((rule.get("validation") or {}).get("accuracy") or 0),
+        }
+
+    added = [_compact(new_active[key]) for key in sorted(set(new_active) - set(old_active))]
+    removed = [_compact(old_active[key]) for key in sorted(set(old_active) - set(new_active))]
+    return {
+        "old_active_count": len(old_active),
+        "new_active_count": len(new_active),
+        "active_change_ratio": round(ratio, 6),
+        "review_required": bool(old_active and ratio > MAX_ACTIVE_RULE_CHANGE_RATIO),
+        "added_active_rules": added,
+        "removed_active_rules": removed,
+        "baseline_sha256": _rules_sha256(existing),
+        "proposal_sha256": _rules_sha256(proposed),
+    }
+
+
+def evaluate_rule_change(rules: list[dict]) -> dict[str, Any]:
+    return build_rule_change_report(_load_json_rules(FIN_PRODUCT_RULES_JSON_PATH), rules)
+
+
+def save_rule_proposal(
+    rules: list[dict],
+    *,
+    run_id: str = "manual",
+    proposal_dir: Path | None = None,
+) -> tuple[Path, bool, dict[str, Any]]:
+    existing = _load_json_rules(FIN_PRODUCT_RULES_JSON_PATH)
+    report = build_rule_change_report(existing, rules)
+    safe_run_id = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(run_id or "manual")).strip("_") or "manual"
+    output_dir = proposal_dir or FIN_PRODUCT_RULE_PROPOSAL_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{safe_run_id}_{report['proposal_sha256'][:12]}.json"
+    created = not output_path.exists()
+    if created:
+        payload = {
+            "version": "1.0",
+            "created_at": datetime.now().astimezone().isoformat(),
+            "run_id": str(run_id or "manual"),
+            "active_rules_path": str(FIN_PRODUCT_RULES_JSON_PATH),
+            "change_report": report,
+            "rules": rules,
+        }
+        tmp = output_path.with_suffix(output_path.suffix + ".tmp")
+        try:
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            _safe_replace(tmp, output_path)
+        finally:
+            tmp.unlink(missing_ok=True)
+    return output_path, created, report
+
+
+def promote_rule_proposal(proposal_path: Path) -> dict[str, Any]:
+    payload = json.loads(proposal_path.read_text(encoding="utf-8"))
+    rules = payload.get("rules") if isinstance(payload, dict) else None
+    report = payload.get("change_report") if isinstance(payload, dict) else None
+    if not isinstance(rules, list) or not isinstance(report, dict):
+        raise ValueError(f"잘못된 규칙 제안 파일: {proposal_path}")
+
+    existing = _load_json_rules(FIN_PRODUCT_RULES_JSON_PATH)
+    current_sha = _rules_sha256(existing)
+    if current_sha != str(report.get("baseline_sha256") or ""):
+        raise RuntimeError("활성 규칙이 제안 생성 후 변경되어 승격을 중단합니다")
+
+    run_key = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_dir = TEMP_DIR / "backups" / "fin_product_rule_promotion" / run_key
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_dir / FIN_PRODUCT_RULES_JSON_PATH.name
+    if FIN_PRODUCT_RULES_JSON_PATH.exists():
+        shutil.copy2(FIN_PRODUCT_RULES_JSON_PATH, backup_path)
+
+    try:
+        save_rules(rules, allow_large_change=True)
+        saved = _load_json_rules(FIN_PRODUCT_RULES_JSON_PATH)
+        if _rules_sha256(saved) != str(report.get("proposal_sha256") or ""):
+            raise RuntimeError("승격 후 규칙 해시 검증 실패")
+    except Exception:
+        if backup_path.exists():
+            shutil.copy2(backup_path, FIN_PRODUCT_RULES_JSON_PATH)
+        raise
+    else:
+        shutil.rmtree(backup_dir, ignore_errors=True)
+
+    return {
+        "proposal_path": str(proposal_path),
+        "active_rules_path": str(FIN_PRODUCT_RULES_JSON_PATH),
+        "active_rule_count": int(report.get("new_active_count") or 0),
+        "proposal_sha256": str(report.get("proposal_sha256") or ""),
+    }
+
+
+def save_rules(rules: list[dict], *, allow_large_change: bool = False) -> None:
     existing = _load_json_rules(FIN_PRODUCT_RULES_JSON_PATH)
     old_active = sum(1 for rule in existing if isinstance(rule, dict) and rule.get("status") == RULE_STATUS_ACTIVE)
     new_active = sum(1 for rule in rules if rule.get("status") == RULE_STATUS_ACTIVE)
-    if old_active and abs(new_active - old_active) / old_active > MAX_ACTIVE_RULE_CHANGE_RATIO:
+    if not allow_large_change and old_active and abs(new_active - old_active) / old_active > MAX_ACTIVE_RULE_CHANGE_RATIO:
         raise RuntimeError(
             "active 규칙 수 변화가 30%를 초과해 저장 중단: "
             f"old={old_active}, new={new_active}"

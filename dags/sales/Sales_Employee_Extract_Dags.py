@@ -3,11 +3,13 @@
 Google Sheet → sales_employee.csv (플랫폼별 행 분리)
 """
 
-import pendulum
-import pandas as pd
+import logging
 import os
 import re
 from pathlib import Path
+
+import pandas as pd
+import pendulum
 from airflow import DAG
 from airflow.exceptions import AirflowException
 from airflow.operators.python import PythonOperator
@@ -24,6 +26,14 @@ from modules.transform.utility.notifier import on_failure_callback, on_retry_cal
 from modules.transform.utility.mail_recipients import (
     resolve_manager_mail,
 )
+from modules.transform.pipelines.sales.employee_toder_alert import (
+    dispatch_toder_missing_alert,
+)
+from modules.transform.pipelines.sales.employee_accounts_export import (
+    export_accounts_js,
+)
+
+logger = logging.getLogger(__name__)
 
 # 설정
 DEFAULT_CREDENTIALS_PATH = r"/opt/airflow/config/rare-ethos-483607-i5-45c9bec5b193.json"
@@ -56,58 +66,19 @@ def parse_address(address_str):
 
 def check_toder_null_values(df_original):
     """토더 ID/PW null값 있는 매장 확인 및 텔레그램 알림"""
-    if '토더ID' not in df_original.columns or '토더PW' not in df_original.columns:
-        print(f"[토더계정 알림] 스킵: 토더ID/토더PW 컬럼 없음")
-        return
-    
-    # 토더ID 또는 토더PW가 null이고 매장명이 있는 행 찾기
-    null_mask = (df_original['토더ID'].isna() | (df_original['토더ID'].astype(str).str.strip() == '')) | \
-                (df_original['토더PW'].isna() | (df_original['토더PW'].astype(str).str.strip() == ''))
-    
-    manager_mask = df_original['담당자'].notna() & ~df_original['담당자'].astype(str).str.strip().isin(['', 'nan', 'None'])
-    null_stores = df_original[null_mask & df_original['매장명'].notna() & manager_mask].copy()
-    
-    if len(null_stores) > 0:
-        print(f"\n[토더계정 알림] null값 감지: {len(null_stores)}건")
+    result = dispatch_toder_missing_alert(df_original, send_telegram_chunks)
+    if result.skipped_reason:
+        logger.warning("[토더계정 알림] 스킵: %s", result.skipped_reason)
+        return result
 
-        def get_value(row, *columns):
-            normalized_columns = {
-                re.sub(r'\s+', '', str(row_column)): row_column
-                for row_column in row.index
-            }
-            for column in columns:
-                row_column = column if column in row.index else normalized_columns.get(re.sub(r'\s+', '', column))
-                if row_column is not None and pd.notna(row[row_column]):
-                    value = str(row[row_column]).strip()
-                    if value and value not in ['nan', 'None']:
-                        return value
-            return ''
-
-        def get_account(row, id_columns, pw_columns):
-            account_id = get_value(row, *id_columns)
-            account_pw = get_value(row, *pw_columns)
-            if not account_id and not account_pw:
-                return ''
-            return f"{account_id}   // {account_pw}"
-
-        blocks = []
-        for _, row in null_stores.iterrows():
-            block_lines = [
-                "[신규 매장 / 양도양수 매장 / 해지 매장]",
-                f"- 매장명 : {get_value(row, '매장명')}",
-                f"- 사업자명의 : {get_value(row, '점주명', '사업자명의')}",
-                f"- 핸드폰번호 : {get_value(row, '전화번호', '핸드폰번호', '휴대폰번호', '연락처')}",
-                f"- 매장주소 : {get_value(row, '상세주소', '매장주소', '주소')}",
-                f"- 발주매장코드 : {get_value(row, '발주매장코드')}",
-                f"- 배민 계정 : {get_account(row, ('배민ID', '배달의민족ID', '배달의 민족ID'), ('배민PW', '배달의민족PW', '배달의 민족PW'))}",
-                f"- 요기요 계정 : {get_account(row, ('요기요ID',), ('요기요PW',))}",
-                f"- 쿠팡 계정 : {get_account(row, ('쿠팡ID', '쿠팡이츠ID'), ('쿠팡PW', '쿠팡이츠PW'))}",
-                f"- 오픈일 : {get_value(row, '실오픈일', '오픈일')}",
-                f"- 프로그램 설치 가능시간 : {get_value(row, '프로그램설치가능시간', '프로그램 설치 가능시간', '설치가능시간', '설치 가능시간')}",
-            ]
-            blocks.append("\n".join(block_lines))
-
-        send_telegram_chunks("\n\n".join(blocks))
+    logger.info(
+        "[토더계정 알림] 대상=%d 정상=%d 누락=%d 중복매장=%d",
+        result.alertable_store_count,
+        result.complete_store_count,
+        result.missing_store_count,
+        result.duplicate_store_count,
+    )
+    return result
 
 
 
@@ -201,7 +172,12 @@ def load_employee_from_gsheet(**context):
             f"({AUTOMATION_NOTE_COL}='{AUTOMATION_NOTE_VALUE}')"
         )
     else:
-        print(f"[자동화 연결 필터 스킵] '{AUTOMATION_NOTE_COL}' 컬럼 없음")
+        # 이 필터가 폐점 매장 제외의 유일한 스위치다. 컬럼이 없으면 조용히 꺼진 채로 돌기 때문에
+        # print가 아니라 warning으로 남겨 실제 시트 헤더까지 보여준다.
+        logger.warning(
+            "[자동화 연결 필터 스킵] '%s' 컬럼 없음 — 폐점 매장 제외가 동작하지 않습니다. 시트 헤더: %s",
+            AUTOMATION_NOTE_COL, list(df.columns),
+        )
     
     # 5️⃣ 이메일 매핑 및 담당자 정제
     if '담당자' in df.columns:
@@ -328,3 +304,10 @@ with DAG(
         task_id='load_employee_from_gsheet',
         python_callable=load_employee_from_gsheet,
     )
+
+    export_accounts_js_task = PythonOperator(
+        task_id='export_accounts_js',
+        python_callable=export_accounts_js,
+    )
+
+    load_employee_task >> export_accounts_js_task

@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+from airflow.exceptions import AirflowSkipException
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
@@ -26,6 +27,7 @@ from modules.transform.pipelines.db.DB_OKPOS_Sales import (
     _launch_browser,
     _login,
     _select_store as _select_store_common,
+    _is_transient_connection_error,
     _setup_download_dir,
     _wait_for_download,
 )
@@ -44,6 +46,10 @@ OKPOS_CARD_BRAND = "도리당"
 OKPOS_CARD_STORE = {"name": "도리당 송파삼전점", "shopCd": "LQ9726"}
 OKPOS_CARD_STORE_SHORT = "송파삼전점"
 OKPOS_CARD_MIN_VALIDATE_DATE = "2026-04-17"
+
+
+class StoreRowNotFoundError(TimeoutException):
+    """조회 결과는 있으나 대상 매장 행이 없는 경우."""
 
 
 def _resolve_sale_date(**context) -> str:
@@ -127,6 +133,20 @@ def _write_debug_artifacts(driver, download_dir: Path, prefix: str) -> None:
         base.with_suffix(".txt").write_text(body_text, encoding="utf-8", errors="replace")
     except Exception:
         pass
+
+
+def _page_has_no_data(driver) -> bool:
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text or ""
+    except Exception:
+        return False
+    return "조회된 데이터가 없습니다" in body_text
+
+
+def _allow_primary_empty(**context) -> bool:
+    dag_run = context.get("dag_run")
+    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    return str(conf.get("allow_primary_empty") or "").strip().lower() in {"1", "true", "yes", "y"}
 
 
 def _set_date_hyphen(driver, wait: WebDriverWait, sale_date: str, date_input_id: str) -> None:
@@ -358,6 +378,10 @@ def _click_store_row_in_results(driver, wait: WebDriverWait, shop_cd: str, store
         return
 
     _write_debug_artifacts(driver, download_dir, "okpos_card_row_click_fail")
+    if result == "no-row":
+        raise StoreRowNotFoundError(
+            f"매장현황 대상 매장 행 없음: shopCd={shop_cd}, name={store_name}, result={result!r}"
+        )
     raise TimeoutException(
         f"매장현황 팝업을 열지 못했습니다: shopCd={shop_cd}, name={store_name}, result={result!r}"
     )
@@ -873,10 +897,16 @@ def _download_one_date(driver, wait: WebDriverWait, download_dir: Path, sale_dat
             download_dir,
         )
     except TimeoutException:
-        logger.warning("OKPOS card: 매장 행 없음(승인 0건 추정) sale_date=%s -> skip", sale_date)
-        return None
+        if _page_has_no_data(driver):
+            logger.warning("OKPOS card: 조회 결과 0건 sale_date=%s -> skip", sale_date)
+            return None
+        raise
 
-    _click_store_row_in_results(driver, wait, OKPOS_CARD_STORE["shopCd"], OKPOS_CARD_STORE["name"], download_dir)
+    try:
+        _click_store_row_in_results(driver, wait, OKPOS_CARD_STORE["shopCd"], OKPOS_CARD_STORE["name"], download_dir)
+    except StoreRowNotFoundError:
+        logger.warning("OKPOS card: 대상 매장 행 없음 sale_date=%s -> skip", sale_date)
+        return None
     _wait_for_popup(driver, wait)
 
     existing_files = {path for path in download_dir.iterdir() if path.is_file()}
@@ -926,51 +956,91 @@ def download_okpos_card_test(**context) -> str:
     sale_date = _resolve_sale_date(**context)
     download_dir = OKPOS_CARD_DOWNLOAD_DIR
     _cleanup_download_dir(download_dir)
-
-    driver = _launch_browser(download_dir=download_dir)
+    max_attempts = max(1, int(os.getenv("OKPOS_CARD_TASK_RETRY_MAX", "3")))
+    retry_wait = max(0.0, float(os.getenv("OKPOS_CARD_TASK_RETRY_WAIT", "6")))
     backfilled: list[str] = []
     empty_days: list[str] = []
-    try:
-        wait = WebDriverWait(driver, WAIT_TIMEOUT)
-        _setup_download_dir(driver, download_dir)
-        _login(driver, wait)
+    last_exc: Exception | None = None
 
-        downloaded = _download_one_date(driver, wait, download_dir, sale_date)
-        if downloaded is None:
-            raise TimeoutException(
-                f"OKPOS card primary download failed: sale_date={sale_date}, "
-                f"download_dir={download_dir}"
-            )
-        primary_path = download_dir / f"primary_{sale_date}_{downloaded.name}"
-        if primary_path != downloaded:
-            primary_path.unlink(missing_ok=True)
-            downloaded = downloaded.replace(primary_path)
-
-        context["ti"].xcom_push(key="downloaded_path", value=str(downloaded))
-        logger.info("OKPOS card approval primary downloaded: %s", downloaded)
-
-        for missing_date in _missing_lookback_dates(sale_date):
+    for attempt in range(1, max_attempts + 1):
+        driver = None
+        if attempt > 1:
             _cleanup_download_dir(download_dir)
-            backfill_file = _download_one_date(driver, wait, download_dir, missing_date)
-            if backfill_file is None:
-                empty_days.append(missing_date)
-                continue
+            wait_seconds = min(retry_wait * (2 ** (attempt - 2)), 45.0)
+            logger.warning(
+                "OKPOS card WebDriver 세션 재생성 재시도: attempt=%d/%d, wait=%.1fs",
+                attempt,
+                max_attempts,
+                wait_seconds,
+            )
+            if wait_seconds:
+                time.sleep(wait_seconds)
 
-            normalized = _parse_okpos_card_workbook(backfill_file, missing_date)
-            _upsert_okpos_card_csv(normalized)
-            backfill_file.unlink(missing_ok=True)
-            backfilled.append(missing_date)
-            logger.info("OKPOS card 자동 백필 완료: %s | rows=%d", missing_date, len(normalized))
-
-        context["ti"].xcom_push(key="backfilled_dates", value=backfilled)
-        context["ti"].xcom_push(key="empty_dates", value=empty_days)
-        logger.info("OKPOS card download 완료: primary=%s, backfilled=%s, empty=%s", sale_date, backfilled, empty_days)
-        return f"downloaded primary={sale_date}, backfilled={backfilled}, empty={empty_days}"
-    finally:
+        backfilled = []
+        empty_days = []
         try:
-            driver.quit()
-        except Exception:
-            pass
+            driver = _launch_browser(download_dir=download_dir)
+            wait = WebDriverWait(driver, WAIT_TIMEOUT)
+            _setup_download_dir(driver, download_dir)
+            _login(driver, wait)
+
+            downloaded = _download_one_date(driver, wait, download_dir, sale_date)
+            if downloaded is None:
+                if _allow_primary_empty(**context):
+                    context["ti"].xcom_push(key="downloaded_path", value="")
+                    context["ti"].xcom_push(key="backfilled_dates", value=backfilled)
+                    context["ti"].xcom_push(key="empty_dates", value=[sale_date])
+                    raise AirflowSkipException(f"OKPOS card primary 0건: sale_date={sale_date}")
+                raise TimeoutException(
+                    f"OKPOS card primary download failed: sale_date={sale_date}, "
+                    f"download_dir={download_dir}"
+                )
+            primary_path = download_dir / f"primary_{sale_date}_{downloaded.name}"
+            if primary_path != downloaded:
+                primary_path.unlink(missing_ok=True)
+                downloaded = downloaded.replace(primary_path)
+
+            context["ti"].xcom_push(key="downloaded_path", value=str(downloaded))
+            logger.info("OKPOS card approval primary downloaded: %s", downloaded)
+
+            for missing_date in _missing_lookback_dates(sale_date):
+                _cleanup_download_dir(download_dir)
+                backfill_file = _download_one_date(driver, wait, download_dir, missing_date)
+                if backfill_file is None:
+                    empty_days.append(missing_date)
+                    continue
+
+                normalized = _parse_okpos_card_workbook(backfill_file, missing_date)
+                _upsert_okpos_card_csv(normalized)
+                backfill_file.unlink(missing_ok=True)
+                backfilled.append(missing_date)
+                logger.info("OKPOS card 자동 백필 완료: %s | rows=%d", missing_date, len(normalized))
+
+            context["ti"].xcom_push(key="backfilled_dates", value=backfilled)
+            context["ti"].xcom_push(key="empty_dates", value=empty_days)
+            logger.info("OKPOS card download 완료: primary=%s, backfilled=%s, empty=%s", sale_date, backfilled, empty_days)
+            return f"downloaded primary={sale_date}, backfilled={backfilled}, empty={empty_days}"
+        except Exception as exc:
+            last_exc = exc
+            if _is_transient_connection_error(exc) and attempt < max_attempts:
+                logger.warning(
+                    "OKPOS card 일시적 WebDriver 오류로 task 내부 재시도: attempt=%d/%d, error=%s",
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+                continue
+            raise
+        finally:
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("OKPOS card download failed without specific exception")
 
 
 def save_okpos_card_test_csv(**context) -> str:

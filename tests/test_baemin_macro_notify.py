@@ -8,6 +8,8 @@ from typing import Any
 
 import pendulum
 
+from modules.transform.pipelines.db.DB_Beamin_retry import merge_failed_payloads
+
 
 DAG_SOURCE = Path(__file__).resolve().parents[1] / "dags" / "db" / "DB_Beamin_Macro_Dags.py"
 
@@ -24,6 +26,10 @@ def _load_helpers():
         "_count_failed_items",
         "_task_duration_seconds",
         "_has_validation_issue",
+        "_target_date_from_context",
+        "_normalize_collect_task_ids",
+        "_pull_batch_values",
+        "_pull_batch_failures",
         "_build_collection_notification",
     ):
         matches = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name]
@@ -42,6 +48,7 @@ def _load_helpers():
         "_NOTIFY_TASK_ID": "notify_collection_result",
         "_CORE_TASK_IDS": {"load_accounts", "collect_all", "collect_shop_change", "retry_failed"},
         "_VALIDATION_TASK_IDS": {"validate_orders", "validate_ad_funnel", "validate_toorder"},
+        "merge_failed_payloads": merge_failed_payloads,
         "logger": SimpleNamespace(info=lambda *args, **kwargs: None),
     }
     exec(compile(module_ast, str(DAG_SOURCE), "exec"), namespace)
@@ -139,7 +146,8 @@ def test_notify_task_id_and_all_done_trigger_are_wired():
 
     assert notify_ids == ["notify_collection_result"]
     assert "trigger_rule=TriggerRule.ALL_DONE" in source
-    assert "t1 >> t2 >> t3 >> t4 >> t5" in source
+    assert "load_task >> init_staging_task" in source
+    assert "retry_task >> export_task >> upload_task >> notify_task" in source
 
 
 def test_collection_task_logs_and_emails_but_does_not_send_telegram():
@@ -226,3 +234,42 @@ def test_notify_keeps_partial_success_for_unrecovered_problem():
     assert "invalid session" in body
     assert should_email is True
     assert "문제 로그" in html_body
+
+
+def test_notify_marks_low_settle_rate_as_partial_success():
+    namespace = _load_helpers()
+    returns = {
+        "load_accounts": "계정 1개",
+        "collect_all": "성공 1/1 계정",
+        "collect_shop_change": "성공 1/1 계정 / store_fail=0",
+        "retry_failed": "재시도 완료: accounts=0 stores=0 orders=0 ads=0",
+        "validate_orders": "orders 검증 총 1건(일치 1, 불일치 0, 미확인 0)",
+        "validate_ad_funnel": "ad_funnel 빈값 검증: 총 1매장 / 빈값 0건 / 재수집 후 잔존 0건",
+        "validate_toorder": "토더 교차검증[2026-08-05]: 비교 1개 매장 / 불일치 0개",
+    }
+    context = _build_context(
+        returns,
+        failed={"accounts": [], "stores": [], "orders": [], "ads": []},
+        residual_failed={"accounts": [], "stores": [], "orders": [], "ads": []},
+        validation=[
+            {
+                "matched": True,
+                "status": "배달완료",
+                "store": "역삼점",
+                "settle_rate": 0.5,
+                "settle_count": 5,
+                "settle_denominator": 10,
+                "retried": 1,
+            }
+        ],
+    )
+    namespace["_extract_log_signals"] = lambda task_instance, max_lines=8: ([], 0, [])
+
+    subject, body, html_body, should_email = namespace["_build_collection_notification"](context)
+
+    assert "부분성공" in subject
+    assert "정산정보 수집 의심 1건" in body
+    assert "역삼점" in body
+    assert "50.0%" in body
+    assert should_email is True
+    assert "정산정보 수집 의심" in html_body

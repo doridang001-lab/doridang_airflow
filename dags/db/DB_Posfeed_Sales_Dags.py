@@ -63,10 +63,10 @@ COLLECT_MODE = None # None으로 두면 최신 등록날짜 기준으로 자동 
 
 # ============================================================
 # 옵션 — 여기서만 수정
-# - True : OneDrive 파티션 기준 최근 30일 누락 날짜 자동 재수집
+# - True : OneDrive 파티션 기준 최근 7일 누락 날짜 자동 재수집
 # - False: 기본 스케줄에서는 누락 날짜 체크/재수집 끔 (필요 시 날짜 conf/collect_mode로 실행)
 # ============================================================
-ENABLE_MISSING_DATES_BACKFILL = False
+ENABLE_MISSING_DATES_BACKFILL = True
 
 
 def _is_date_mode(collect_mode: str) -> bool:

@@ -44,6 +44,13 @@
 #
 # Feel free to modify this file to suit your needs.
 ---
+x-logging:
+  &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 x-airflow-common:
   &airflow-common
   # In order to add custom dependencies or upgrade provider packages you can use your extended image.
@@ -82,9 +89,17 @@ x-airflow-common:
     OKPOS_ID: ${OKPOS_ID:-}
     OKPOS_PW: ${OKPOS_PW:-}
     BAEMIN_MACRO_ROLE: ${BAEMIN_MACRO_ROLE:-}
+    FLOW_API_KEY: ${FLOW_API_KEY:-}
+    FLOW_AUTH_HEADER_NAME: ${FLOW_AUTH_HEADER_NAME:-}
+    FLOW_AUTH_HEADER_PREFIX: ${FLOW_AUTH_HEADER_PREFIX:-}
+    FLOW_PROJECTS_API_URL: ${FLOW_PROJECTS_API_URL:-}
+    FLOW_POSTS_API_URL_TEMPLATE: ${FLOW_POSTS_API_URL_TEMPLATE:-}
+    FLOW_POST_DETAIL_API_URL_TEMPLATE: ${FLOW_POST_DETAIL_API_URL_TEMPLATE:-}
+    FLOW_ATTACHMENT_PROJECT_IDS: ${FLOW_ATTACHMENT_PROJECT_IDS:-}
     # Coupang collection attaches to the minimized real Chrome launched on the Windows host.
     # Chrome DevTools rejects host.docker.internal as a Host header; use Docker Desktop's host IP.
     COUPANG_CHROME_DEBUGGER: '192.168.65.254:9222'
+    COUPANG_EXTRA_DOWNLOAD_DIRS: '/opt/airflow/user_downloads'
     # yamllint disable rule:line-length
     # Use simple http server on scheduler for health checks
     # See https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/check-health.html#scheduler-health-check-server
@@ -113,16 +128,19 @@ x-airflow-common:
     - "${ONEDRIVE_ROOT:-c:/Users/민준/OneDrive - 주식회사 도리당}/data/dashboard:/opt/airflow/dashboard"
     - "${ONEDRIVE_ROOT:-c:/Users/민준/OneDrive - 주식회사 도리당}/Repository:/opt/airflow/Repository"
     - "${ONEDRIVE_ROOT:-c:/Users/민준/OneDrive - 주식회사 도리당}/Collect_Data:/opt/airflow/Collect_Data"
+    - "${ONEDRIVE_ROOT:-c:/Users/민준/OneDrive - 주식회사 도리당}/Extention:/opt/airflow/Extention"
     - "${ONEDRIVE_ROOT:-c:/Users/민준/OneDrive - 주식회사 도리당}/data/mart:/opt/airflow/onedrive_mart"
     - "${ONEDRIVE_ROOT:-c:/Users/민준/OneDrive - 주식회사 도리당}/data/llm:/opt/airflow/onedrive_llm"
     - "${ONEDRIVE_ROOT:-c:/Users/민준/OneDrive - 주식회사 도리당}/data/analytics:/opt/airflow/analytics"
     - "${LOCAL_DB_ROOT:-c:/Local_DB}:/opt/airflow/Local_DB"
     - "${DORIDANG_ROOT:-c:/Doridang}:/opt/airflow/Doridang"
     - "${DOWN_DIR:-e:/down}:/opt/airflow/download"
+    - "${USERPROFILE:-c:/Users/민준}/Downloads:/opt/airflow/user_downloads"
     - "${D_DOWN_DIR:-e:/d_down}:/opt/airflow/manual_download"
     - "${AIRFLOW_TMP_ROOT:-e:/trash/airflow_tmp}:/tmp"
     - ./logs:/opt/airflow/logs
   user: "0:0"
+  logging: *default-logging
   depends_on:
     &airflow-common-depends-on
     redis:
@@ -147,6 +165,7 @@ services:
       retries: 5
       start_period: 5s
     restart: always
+    logging: *default-logging
 
   doridang-postgres:
     image: postgres:13
@@ -164,6 +183,7 @@ services:
       retries: 10
       start_period: 10s
     restart: always
+    logging: *default-logging
 
   redis:
     # Redis is limited to 7.2-bookworm due to licencing change
@@ -178,6 +198,7 @@ services:
       retries: 50
       start_period: 30s
     restart: always
+    logging: *default-logging
 
   airflow-webserver:
     <<: *airflow-common

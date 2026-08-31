@@ -1,4 +1,4 @@
-"""DB_UnifiedSales 08:37 스케줄 미생성 감시 및 1회 보정 트리거."""
+"""DB_UnifiedSales 07:40 스케줄 미생성 감시 및 1회 보정 트리거."""
 
 import logging
 from pathlib import Path
@@ -60,7 +60,7 @@ def guard_unified_sales_schedule(**context) -> str:
         "[Airflow 스케줄 미생성 보정]\n"
         f"dag_id={TARGET_DAG_ID}\n"
         f"target_date={target_date}\n"
-        f"expected_schedule=08:37 KST\n"
+        f"expected_schedule=07:40 KST\n"
         f"recovery_run_id={run_id}"
     )
     send_telegram(body)
@@ -71,7 +71,7 @@ def guard_unified_sales_schedule(**context) -> str:
         logger.info("%s 보정 DagRun 이미 존재: %s", TARGET_DAG_ID, run_id)
         return f"{TARGET_DAG_ID} 보정 DagRun 이미 존재: {run_id}"
 
-    logger.warning("%s 08:37 스케줄 미생성 감지 후 보정 트리거: %s", TARGET_DAG_ID, run_id)
+    logger.warning("%s 07:40 스케줄 미생성 감지 후 보정 트리거: %s", TARGET_DAG_ID, run_id)
     return f"{TARGET_DAG_ID} 보정 트리거 완료: {run_id}"
 
 

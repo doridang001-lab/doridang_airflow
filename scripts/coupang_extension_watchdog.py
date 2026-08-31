@@ -230,7 +230,12 @@ def run(args: argparse.Namespace) -> int:
 
         return 1
     finally:
-        driver.quit()
+        # debugger_address로 붙은 운영 Chrome은 수집/자동재시도 대기 상태를 유지해야 한다.
+        # quit()은 환경에 따라 연결된 브라우저까지 닫을 수 있어 chromedriver 서비스만 정리한다.
+        try:
+            driver.service.stop()
+        except Exception:
+            logger.debug("chromedriver service stop skipped", exc_info=True)
 
 
 def parse_args() -> argparse.Namespace:

@@ -16,6 +16,8 @@ from modules.transform.utility.paths import LOCAL_DB
 logger = logging.getLogger(__name__)
 
 _MISSING = object()
+_SENSITIVE_META_KEYS = {"password", "pw", "계정pw"}
+PROGRESS_FILENAME = "_collect_progress.json"
 
 _MACRO_ROLE_ALIASES: dict[str, tuple[str, str]] = {
     "상위": ("상위", "top"),
@@ -35,7 +37,6 @@ BAEMIN_STAGE_ATTRS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "BAEMIN_OUR_STORE_CLICKS_DB",
         ("metrics_our_store_clicks",),
     ),
-    ("modules.transform.pipelines.db.DB_Beamin_03_shop_change", "BAEMIN_SHOP_CHANGE_DB", ("shop_change",)),
     (
         "modules.transform.pipelines.db.DB_Beamin_03_shop_change",
         "BAEMIN_SHOP_OPERATION_DB",
@@ -61,6 +62,21 @@ def safe_run_id_part(value: str | None) -> str:
     return re.sub(r"[^A-Za-z0-9_.~-]+", "_", str(value or "manual")).strip("_")[:120]
 
 
+def sanitize_export_meta(value: Any) -> Any:
+    """공유 inbox 메타에서 인증정보를 재귀적으로 제거한다."""
+    if isinstance(value, dict):
+        return {
+            key: sanitize_export_meta(item)
+            for key, item in value.items()
+            if str(key).strip().lower() not in _SENSITIVE_META_KEYS
+        }
+    if isinstance(value, list):
+        return [sanitize_export_meta(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_export_meta(item) for item in value]
+    return value
+
+
 def resolve_macro_role(raw: str | None) -> dict[str, str | None]:
     """PC 역할을 기존 수집 범위와 안전한 폴더 slug로 정규화한다."""
     key = str(raw or "").strip().lower()
@@ -73,6 +89,76 @@ def local_stage_paths(subdir: str, run_id: str | None = None) -> tuple[Path, Pat
     if run_id:
         local_analytics = local_analytics / safe_run_id_part(run_id)
     return local_analytics, local_analytics / "baemin_macro"
+
+
+def progress_path(local_analytics: Path, progress_key: str | None = None) -> Path:
+    if not progress_key:
+        return local_analytics / PROGRESS_FILENAME
+    safe_key = safe_run_id_part(progress_key)
+    return local_analytics / f"_collect_progress_{safe_key}.json"
+
+
+def load_progress(path: Path | None, *, run_id: str, target_date: str) -> dict | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        progress = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(progress, dict):
+            raise ValueError("진행 파일 루트가 dict가 아님")
+        if progress.get("run_id") != run_id or progress.get("target_date") != target_date:
+            logger.warning(
+                "배민 수집 진행 파일 불일치, 처음부터 시작: path=%s run_id=%r target_date=%r",
+                path,
+                progress.get("run_id"),
+                progress.get("target_date"),
+            )
+            return None
+        return progress
+    except Exception as exc:
+        logger.warning("배민 수집 진행 파일 로드 실패, 처음부터 시작: %s / %s", path, exc)
+        return None
+
+
+def init_progress(
+    path: Path | None,
+    *,
+    run_id: str,
+    target_date: str,
+    total_accounts: int,
+) -> dict:
+    progress = {
+        "run_id": run_id,
+        "target_date": target_date,
+        "total_accounts": total_accounts,
+        "done_accounts": [],
+        "success": 0,
+        "fail": 0,
+        "carry": {
+            "failed": {"accounts": [], "stores": [], "orders": [], "ads": [], "stages": []},
+            "validation": [],
+            "ad_stores": [],
+            "store_info_per_account": [],
+            "metrics": {},
+        },
+    }
+    save_progress(path, progress)
+    return progress
+
+
+def save_progress(path: Path | None, progress: dict) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp_path.write_text(
+            json.dumps(progress, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 def init_empty_staging(local_baemin: Path) -> None:
@@ -169,7 +255,7 @@ def export_staging_to_inbox(
     tmp_run.mkdir(parents=True, exist_ok=True)
     if meta is not None:
         (tmp_run / "_meta.json").write_text(
-            json.dumps(meta, ensure_ascii=False, indent=2, default=str),
+            json.dumps(sanitize_export_meta(meta), ensure_ascii=False, indent=2, default=str),
             encoding="utf-8",
         )
     tmp_run.rename(inbox_run)

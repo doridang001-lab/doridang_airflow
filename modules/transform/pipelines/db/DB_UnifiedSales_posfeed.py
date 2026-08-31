@@ -45,6 +45,7 @@ from modules.transform.pipelines.db.DB_UnifiedSales_common import (
     _to_int_series,
     _kst_today_str,
     iter_unified_sales_files,
+    save_unified_parquet,
 )
 from modules.transform.pipelines.db.DB_FinProduct import _safe_replace
 from modules.transform.pipelines.db.DB_ItemIdAllocator import MANUAL_SOURCE_BASE, allocate_manual_item_ids, item_block_size
@@ -780,7 +781,7 @@ def sync_posfeed_blacklist(target_dates: list[str] | None = None) -> str:
         for col in ("unit_price", "total_price", "discount_amount"):
             if col in new_df.columns:
                 new_df[col] = pd.to_numeric(new_df[col], errors="coerce").fillna(0).astype(int)
-        new_df.to_parquet(path, index=False, engine="pyarrow")
+        save_unified_parquet(new_df, path)
 
         total_removed += removed_count
         total_updated += 1
@@ -1276,3 +1277,49 @@ def backfill_posfeed() -> str:
             logger.warning("backfill 실패: %s | %s", date_str, e)
 
     return f"posfeed backfill 완료: {len(dates)}일 / {total}행 저장"
+
+
+def backfill_posfeed_stores(stores: list[str]) -> str:
+    """지정 매장 posfeed 데이터 전체 backfill."""
+    store_scope = {str(store).strip() for store in stores if str(store).strip()}
+    if not store_scope:
+        return "SKIP: posfeed 매장 제한 backfill 대상 없음"
+
+    files = sorted(RAW_POSFEED_SALES.glob("brand=*/store=*/ym=*/posfeed_orders.csv"))
+    if not files:
+        return "SKIP: posfeed orders 파일 없음"
+
+    dates: set[str] = set()
+    for f in files:
+        try:
+            try:
+                df = pd.read_csv(f, encoding="utf-8-sig", usecols=["store", "등록날짜"], dtype=str)
+                store_col = df["store"].fillna("").astype(str).str.strip()
+            except ValueError:
+                df = pd.read_csv(f, encoding="utf-8-sig", usecols=["지점명", "등록날짜"], dtype=str)
+                store_col = df["지점명"].fillna("").astype(str).str.strip()
+            store_short = store_col.str.split().str[-1]
+            sub = df[store_col.isin(store_scope) | store_short.isin(store_scope)]
+            for d in sub["등록날짜"].dropna().unique():
+                d = str(d).strip()
+                if d and d.lower() != "nan":
+                    dates.add(d)
+        except Exception as e:
+            logger.warning("매장 제한 backfill 날짜 수집 실패: %s | %s", f, e)
+
+    if not dates:
+        return f"SKIP: posfeed 대상 매장 유효 등록날짜 없음 | stores={sorted(store_scope)}"
+
+    total = 0
+    for date_str in sorted(dates):
+        try:
+            result = run_posfeed(date_str, overwrite=False, stores=sorted(store_scope))
+            logger.info(result)
+            try:
+                total += int(result.split(":", 1)[1].strip().split("행", 1)[0].strip())
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning("매장 제한 backfill 실패: %s | stores=%s | %s", date_str, sorted(store_scope), e)
+
+    return f"posfeed 매장 제한 backfill 완료 | stores={sorted(store_scope)} | {len(dates)}일 / {total}행 저장"

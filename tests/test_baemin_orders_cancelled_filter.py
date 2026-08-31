@@ -2,7 +2,10 @@
 
 from pathlib import Path
 
-from modules.transform.pipelines.db.DB_Beamin_04_orders import _validate_collected
+from modules.transform.pipelines.db.DB_Beamin_04_orders import (
+    _block_low_settle_rate,
+    _validate_collected,
+)
 
 SOURCE = Path("modules/transform/pipelines/db/DB_Beamin_04_orders.py")
 
@@ -13,21 +16,49 @@ class TestValidateCollected:
         assert result["matched"] is None
         assert result["actual_count"] == 0
         assert result["actual_amount"] == 0
+        assert result["settle_rate"] is None
 
     def test_zero_rows_zero_summary(self):
         result = _validate_collected([], {"count": 0, "amount": 0})
         assert result["matched"] is True
+        assert result["settle_rate"] is None
 
     def test_match_success(self):
         rows = [
-            {"주문번호": "A001", "결제금액": "10,000"},
+            {"주문번호": "A001", "결제금액": "10,000", "입금예정금액": "8,000"},
             {"주문번호": "A001", "결제금액": ""},
-            {"주문번호": "A002", "결제금액": "5,000"},
+            {"주문번호": "A002", "결제금액": "5,000", "입금예정금액": "4,000"},
         ]
         result = _validate_collected(rows, {"count": 2, "amount": 15000})
         assert result["matched"] is True
         assert result["actual_count"] == 2
         assert result["actual_amount"] == 15000
+        assert result["settle_rate"] == 1.0
+
+    def test_match_success_tracks_low_settle_rate(self):
+        rows = [
+            {"주문번호": "A001", "결제금액": "10,000", "입금예정금액": "8,000"},
+            {"주문번호": "A002", "결제금액": "5,000", "입금예정금액": ""},
+        ]
+        result = _validate_collected(rows, {"count": 2, "amount": 15000})
+        assert result["matched"] is True
+        assert result["settle_count"] == 1
+        assert result["settle_denominator"] == 2
+        assert result["settle_rate"] == 0.5
+
+    def test_low_settle_rate_marks_suspect_and_blocks_save(self):
+        rows = [
+            {"주문번호": "A001", "결제금액": "10,000", "입금예정금액": "8,000"},
+            {"주문번호": "A002", "결제금액": "5,000", "입금예정금액": ""},
+        ]
+        result = _validate_collected(rows, {"count": 2, "amount": 15000})
+
+        blocked = _block_low_settle_rate(result)
+
+        assert blocked["matched"] is False
+        assert blocked["settlement_suspect"] is True
+        assert blocked["reason"] == "low_settle_rate"
+        assert blocked["save_partial"] is False
 
     def test_match_fail_count_mismatch(self):
         rows = [{"주문번호": "A001", "결제금액": "10,000"}]

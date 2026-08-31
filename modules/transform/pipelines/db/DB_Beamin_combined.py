@@ -14,6 +14,7 @@ import random
 import re
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse as _urlparse
 
@@ -44,9 +45,15 @@ from modules.transform.pipelines.db.DB_Beamin_04_orders import (
 from modules.transform.pipelines.db.DB_Beamin_05_ad_funnel import (
     collect_ad_funnel_for_account,
     collect_ad_funnel_for_driver,
+    filter_ad_funnel_zero_sales_failures,
 )
 from modules.transform.pipelines.db.DB_Beamin_03_shop_change import (
-    collect_shop_change_for_driver,
+    collect_shop_operation_for_driver,
+)
+from modules.transform.pipelines.db.beamin_staging import (
+    init_progress,
+    load_progress,
+    save_progress,
 )
 from modules.transform.pipelines.db.beamin_stability import resolve_stability_profile
 from modules.transform.utility.store_normalize import lookup_store_key, strip_brand
@@ -57,12 +64,7 @@ KST = pendulum.timezone("Asia/Seoul")
 KNOWN_BRANDS = ["도리당", "나홀로"]
 BRAND_COLLECTION_ORDER = {"도리당": 0, "나홀로": 1}
 _BRANCH_SUFFIX_RE = re.compile(r"(?:점|지점|분점|직영점)$")
-SHOP_CHANGE_COLLECTION_WEEKDAY = pendulum.SATURDAY
-
-
-def _should_collect_shop_change(now: pendulum.DateTime | None = None) -> bool:
-    current = now or pendulum.now(KST)
-    return current.in_timezone(KST).day_of_week == SHOP_CHANGE_COLLECTION_WEEKDAY
+_ORDERS_DATE_FILTER_ABORT_STREAK = 5
 
 
 def _store_collection_sort_key(store_info: dict) -> tuple[int, str]:
@@ -91,6 +93,8 @@ def _new_runtime_metrics(profile_name: str, account_list: list[dict]) -> dict:
         "session_recovery_count": 0,
         "page_timeout_count": 0,
         "account_wait_sec_total": 0.0,
+        "account_elapsed_sec_total": 0.0,
+        "account_elapsed_count": 0,
         "failed_accounts": [],
         "failed_stores": [],
         "login_second_pass_accounts": 0,
@@ -246,11 +250,11 @@ def _ensure_dashboard_store_select(
 
 
 def collect_now_and_woori(account_list: list[dict], target_date: str | None = None) -> dict:
-    """계정별로 로그인 → now → 우리가게 클릭 → 매장변경이력 순서로 수집.
+    """계정별로 로그인 → now → 우리가게 클릭 → 운영시간 순서로 수집.
 
     Chrome OOM 방지를 위해 2~3단계를 매장별 독립 Chrome 세션으로 실행한다.
       1단계(now):       공유 Chrome — 같은 페이지에서 JS 매장 전환, 메모리 부담 낮음
-      2~3단계(woori+변경이력): 매장별 신규 Chrome — 통계 페이지 반복 로드로 OOM 발생 방지
+      2~3단계(woori+운영시간): 매장별 신규 Chrome — 통계 페이지 반복 로드로 OOM 발생 방지
       4단계(orders):    기존과 동일, 매장별 독립 Chrome
 
     target_date: orders CSV 저장 시 날짜 라벨 override (None이면 어제). 브라우저는 항상 어제 날짜 조회.
@@ -266,6 +270,8 @@ def collect_now_and_woori(account_list: list[dict], target_date: str | None = No
     validation_results: list[dict] = []
     ad_store_infos: list[dict] = []
     store_info_per_account_list: list[dict] = []
+    orders_date_filter_streak = 0
+    orders_date_filter_abort = False
 
     for account in account_list:
         account_id = account["account_id"]
@@ -352,7 +358,7 @@ def collect_now_and_woori(account_list: list[dict], target_date: str | None = No
 
         store_info_per_account_list.append({"account_id": account_id, "stores": list(store_list)})
 
-        # ── 매장별 독립 Chrome: 1단계(now) + 2단계(우리가게) + 3단계(변경이력) ──
+        # ── 매장별 독립 Chrome: 1단계(now) + 2단계(우리가게) + 3단계(운영시간) ──
         # Chrome 1개당 단일 매장만 처리 → React SPA DOM 축적 없음 → OOM 방지
         for store_info in store_list:
             driver = None
@@ -750,25 +756,30 @@ def retry_once_failed(
     failed: dict,
     target_date: str | None = None,
     stability_profile: str | None = None,
+    *,
+    progress_file: Path | None = None,
+    progress_run_id: str | None = None,
 ) -> dict:
     """실패한 계정/매장만 1회 재시도."""
     n_accounts = len(failed.get("accounts", []))
     n_stores = len(failed.get("stores", []))
     n_orders = len(failed.get("orders", []))
     n_ads = len(failed.get("ads", []))
-    residual_failed = {"accounts": [], "stores": [], "orders": [], "ads": []}
+    n_stages = len(failed.get("stages", []))
+    residual_failed = {"accounts": [], "stores": [], "orders": [], "ads": [], "stages": []}
 
     def extend_residual(result_failed: dict | None) -> None:
         data = result_failed or {}
-        for key in ("accounts", "stores", "orders", "ads"):
+        for key in ("accounts", "stores", "orders", "ads", "stages"):
             residual_failed[key].extend(data.get(key) or [])
 
     logger.info(
-        "재시도 시작: accounts=%d stores=%d orders=%d ads=%d profile=%s",
+        "재시도 시작: accounts=%d stores=%d orders=%d ads=%d stages=%d profile=%s",
         n_accounts,
         n_stores,
         n_orders,
         n_ads,
+        n_stages,
         stability_profile,
     )
 
@@ -777,9 +788,64 @@ def retry_once_failed(
         kwargs = {"target_date": target_date}
         if stability_profile is not None:
             kwargs["stability_profile"] = stability_profile
-        result = collect_now_and_woori(failed["accounts"], **kwargs)
+        if progress_file is not None:
+            kwargs["progress_file"] = progress_file
+            kwargs["progress_run_id"] = progress_run_id
+        result = collect_now_and_woori(
+            failed["accounts"],
+            **kwargs,
+        )
         if isinstance(result, dict):
             extend_residual(result.get("failed"))
+
+    # 1-2. 스테이지 레벨 실패 → 해당 계정의 해당 매장/스테이지만 재수집
+    stage_groups: dict[str, dict] = {}
+    for item in failed.get("stages") or []:
+        account = item.get("account") or {}
+        store = item.get("store") or {}
+        account_id = str(account.get("account_id") or "").strip()
+        store_id = str(store.get("store_id") or "").strip()
+        stage = str(item.get("stage") or "").strip()
+        if not account_id or not stage:
+            continue
+        group = stage_groups.setdefault(
+            account_id,
+            {"account": account, "stages": set(), "store_ids": set()},
+        )
+        group["stages"].add(stage)
+        if store_id:
+            group["store_ids"].add(store_id)
+
+    for account_id, group in stage_groups.items():
+        logger.info(
+            "스테이지 재시도: %s / stages=%s / stores=%d",
+            account_id,
+            sorted(group["stages"]),
+            len(group["store_ids"]),
+        )
+        kwargs = {"target_date": target_date}
+        if stability_profile is not None:
+            kwargs["stability_profile"] = stability_profile
+        if progress_file is not None:
+            kwargs["progress_file"] = progress_file
+            kwargs["progress_run_id"] = progress_run_id
+        try:
+            result = collect_now_and_woori(
+                [group["account"]],
+                woori_only=True,
+                stage_filter=group["stages"],
+                store_id_filter=group["store_ids"] or None,
+                _raise_on_total_failure=False,
+                **kwargs,
+            )
+            if isinstance(result, dict):
+                extend_residual(result.get("failed"))
+        except Exception as exc:
+            logger.warning("스테이지 재시도 실패: %s / %s", account_id, exc)
+            residual_failed["stages"].extend(
+                item for item in (failed.get("stages") or [])
+                if str((item.get("account") or {}).get("account_id") or "") == account_id
+            )
 
     # 2. per-store 레벨 실패 → 해당 계정 로그인 후 해당 매장만
     for item in failed.get("stores", []):
@@ -828,19 +894,12 @@ def retry_once_failed(
                 "orders 재시도 완료: %s (실패 %d건)", account["account_id"], len(still_failed)
             )
             if still_failed:
-                logger.info("orders 2차 재시도 건수 %d건 (30초 대기)", len(still_failed))
-                time.sleep(30)
-                result2 = collect_orders_for_account(
-                    account["account_id"], account["password"], still_failed, target_date=target_date
-                )
-                still2 = result2.get("failed", []) if isinstance(result2, dict) else result2
-                logger.info(
-                    "orders 2차 재시도 완료 %s: 잔여 실패 %d건", account["account_id"], len(still2)
-                )
-                if still2:
-                    residual_failed["orders"].append({"account": account, "stores": still2})
-            elif still_failed:
                 residual_failed["orders"].append({"account": account, "stores": still_failed})
+                logger.info(
+                    "orders 잔여 실패 보존: %s (%d건)",
+                    account["account_id"],
+                    len(still_failed),
+                )
         except Exception as e:
             logger.error("orders 재시도 실패 [%s]: %s", account["account_id"], e)
             residual_failed["orders"].append(item)
@@ -874,11 +933,14 @@ def retry_once_failed(
                 logger.error("ads 2차 재시도 실패 [%s]: %s", account["account_id"], e2)
                 residual_failed["ads"].append(item)
 
+    residual_failed = filter_ad_funnel_zero_sales_failures(residual_failed, target_date)
     residual_counts = {key: len(value) for key, value in residual_failed.items()}
     summary = (
-        f"재시도 완료: 대상 accounts={n_accounts} stores={n_stores} orders={n_orders} ads={n_ads} "
+        f"재시도 완료: 대상 accounts={n_accounts} stores={n_stores} orders={n_orders} "
+        f"ads={n_ads} stages={n_stages} "
         f"→ 잔여 accounts={residual_counts['accounts']} stores={residual_counts['stores']} "
-        f"orders={residual_counts['orders']} ads={residual_counts['ads']}"
+        f"orders={residual_counts['orders']} ads={residual_counts['ads']} "
+        f"stages={residual_counts['stages']}"
     )
     return {"summary": summary, "residual_failed": residual_failed}
 
@@ -973,7 +1035,14 @@ def _store_list_from_account_hint(account: dict) -> list[dict]:
 
     if not (brand and store and store_id):
         return []
-    return [{"store_id": store_id, "brand": brand, "store": store}]
+    result = [{"store_id": store_id, "brand": brand, "store": store}]
+    # 계정명 brand prefix가 단일 값이라 나홀로처럼 동일 지점 다른 brand 힌트를 누락하는 것을 보완
+    for (sister_brand, sister_store), sister_id in KNOWN_STORE_ID_BY_REQUEST.items():
+        if sister_store == store and sister_brand != brand and sister_id:
+            result.append(
+                {"store_id": str(sister_id), "brand": sister_brand, "store": store}
+            )
+    return result
 
 
 def _normalize_store_token(value: str) -> str:
@@ -1022,9 +1091,16 @@ def collect_now_and_woori(
     stability_profile: str | None = None,
     woori_only: bool = False,
     *,
+    stage_filter: set[str] | None = None,
+    store_id_filter: set[str] | None = None,
+    progress_file: Path | None = None,
+    progress_run_id: str | None = None,
     _allow_login_second_pass: bool = True,
     _raise_on_total_failure: bool = True,
 ) -> dict:
+    if progress_file is not None and not progress_run_id:
+        raise ValueError("progress_file 사용 시 progress_run_id가 필요합니다")
+    progress_target_date = target_date or pendulum.yesterday(KST).format("YYYY-MM-DD")
     profile = resolve_stability_profile(stability_profile)
     metrics = _new_runtime_metrics(profile["name"], account_list)
     success, fail = 0, 0
@@ -1033,16 +1109,40 @@ def collect_now_and_woori(
     failed_stores: list[dict] = []
     failed_orders: list[dict] = []
     failed_ads: list[dict] = []
+    failed_stages: list[dict] = []
     validation_results: list[dict] = []
     ad_store_infos: list[dict] = []
     store_info_per_account_list: list[dict] = []
-    collect_shop_change_today = _should_collect_shop_change()
+    orders_date_filter_streak = 0
+    orders_date_filter_abort = False
 
     def _mark_failed_account(account: dict, account_id: str, *, login_stage: bool) -> None:
         failed_accounts.append(account)
         metrics["failed_accounts"].append(account_id)
         if login_stage:
             login_lost_accounts.append(account)
+
+    def _mark_failed_stage(
+        account: dict,
+        account_id: str,
+        store_info: dict,
+        stage_label: str,
+    ) -> None:
+        store_id = str((store_info or {}).get("store_id") or "").strip()
+        if any(
+            str((item.get("account") or {}).get("account_id") or "") == account_id
+            and str((item.get("store") or {}).get("store_id") or "") == store_id
+            and item.get("stage") == stage_label
+            for item in failed_stages
+        ):
+            return
+        failed_stages.append({"account": account, "store": store_info, "stage": stage_label})
+        logger.warning(
+            "부분 실패 스테이지 retry 등록: account=%s store=%s stage=%s",
+            account_id,
+            (store_info or {}).get("store"),
+            stage_label,
+        )
 
     def _merge_numeric_metrics(source: dict | None) -> None:
         for key in (
@@ -1053,14 +1153,79 @@ def collect_now_and_woori(
             "session_recovery_count",
             "page_timeout_count",
             "account_wait_sec_total",
+            "account_elapsed_sec_total",
+            "account_elapsed_count",
         ):
             value = (source or {}).get(key)
             if isinstance(value, (int, float)):
                 metrics[key] += value
 
-    for account in account_list:
+    progress = None
+    done_account_order: list[str] = []
+    done_accounts: set[str] = set()
+    if progress_file is not None:
+        progress = load_progress(
+            progress_file,
+            run_id=str(progress_run_id),
+            target_date=progress_target_date,
+        )
+        if progress is None:
+            progress = init_progress(
+                progress_file,
+                run_id=str(progress_run_id),
+                target_date=progress_target_date,
+                total_accounts=len(account_list),
+            )
+        else:
+            done_account_order = [str(value) for value in progress.get("done_accounts") or []]
+            done_accounts = set(done_account_order)
+            carry = progress.get("carry") or {}
+            carry_failed = carry.get("failed") or {}
+            success = int(progress.get("success") or 0)
+            fail = int(progress.get("fail") or 0)
+            failed_accounts.extend(carry_failed.get("accounts") or [])
+            failed_stores.extend(carry_failed.get("stores") or [])
+            failed_orders.extend(carry_failed.get("orders") or [])
+            failed_ads.extend(carry_failed.get("ads") or [])
+            failed_stages.extend(carry_failed.get("stages") or [])
+            validation_results.extend(carry.get("validation") or [])
+            ad_store_infos.extend(carry.get("ad_stores") or [])
+            store_info_per_account_list.extend(carry.get("store_info_per_account") or [])
+            carry_metrics = carry.get("metrics") or {}
+            _merge_numeric_metrics(carry_metrics)
+            metrics["failed_accounts"] = list(carry_metrics.get("failed_accounts") or [])
+            metrics["failed_stores"] = list(carry_metrics.get("failed_stores") or [])
+
+    account_list = [
+        account
+        for account in account_list
+        if str(account.get("account_id") or "") not in done_accounts
+    ]
+    completed_before = len(done_accounts)
+    total_accounts = completed_before + len(account_list)
+    metrics["total_accounts"] = total_accounts
+    if completed_before:
+        logger.info(
+            "이어받기: 완료 %d/%d, 남은 %d개 계정부터 재개",
+            completed_before,
+            total_accounts,
+            len(account_list),
+        )
+
+    for relative_idx, account in enumerate(account_list, start=1):
+        idx = completed_before + relative_idx
+        progress_percent = round(idx * 100 / total_accounts) if total_accounts else 100
+        account_tag = f"{idx}/{total_accounts}"
+        account_started = time.monotonic()
         account_id = account["account_id"]
         requested_store_name = str(account.get("store_name") or "").strip()
+        logger.info(
+            "[진행 %s %d%%] 계정 시작 %s (%s)",
+            account_tag,
+            progress_percent,
+            account_id,
+            requested_store_name or "-",
+        )
         store_list: list[dict] = _store_list_from_account_hint(account)
         used_store_hint = bool(store_list)
         bootstrap_driver = None
@@ -1075,6 +1240,43 @@ def collect_now_and_woori(
             if bootstrap_driver is None:
                 fail += 1
                 _mark_failed_account(account, account_id, login_stage=True)
+                account_elapsed = time.monotonic() - account_started
+                metrics["account_elapsed_sec_total"] += account_elapsed
+                metrics["account_elapsed_count"] += 1
+                if account_id not in done_accounts:
+                    done_accounts.add(account_id)
+                    done_account_order.append(account_id)
+                if progress is not None:
+                    progress["done_accounts"] = list(done_account_order)
+                    progress["success"] = success
+                    progress["fail"] = fail
+                    progress["carry"] = {
+                        "failed": {
+                            "accounts": failed_accounts,
+                            "stores": failed_stores,
+                            "orders": failed_orders,
+                            "ads": failed_ads,
+                            "stages": failed_stages,
+                        },
+                        "validation": validation_results,
+                        "ad_stores": ad_store_infos,
+                        "store_info_per_account": store_info_per_account_list,
+                        "metrics": metrics,
+                    }
+                    save_progress(progress_file, progress)
+                average_sec = metrics["account_elapsed_sec_total"] / metrics["account_elapsed_count"]
+                remaining_sec = average_sec * max(0, total_accounts - len(done_accounts))
+                logger.info(
+                    "[진행 %s %d%%] 계정 완료 fail · 누적 성공 %d 실패 %d · "
+                    "경과 %.0f분 · 평균 %.1f분/계정 · 예상잔여 %.0f분",
+                    account_tag,
+                    progress_percent,
+                    success,
+                    fail,
+                    account_elapsed / 60,
+                    average_sec / 60,
+                    remaining_sec / 60,
+                )
                 continue
 
             try:
@@ -1100,6 +1302,43 @@ def collect_now_and_woori(
                         )
                         fail += 1
                         _mark_failed_account(account, account_id, login_stage=False)
+                        account_elapsed = time.monotonic() - account_started
+                        metrics["account_elapsed_sec_total"] += account_elapsed
+                        metrics["account_elapsed_count"] += 1
+                        if account_id not in done_accounts:
+                            done_accounts.add(account_id)
+                            done_account_order.append(account_id)
+                        if progress is not None:
+                            progress["done_accounts"] = list(done_account_order)
+                            progress["success"] = success
+                            progress["fail"] = fail
+                            progress["carry"] = {
+                                "failed": {
+                                    "accounts": failed_accounts,
+                                    "stores": failed_stores,
+                                    "orders": failed_orders,
+                                    "ads": failed_ads,
+                                    "stages": failed_stages,
+                                },
+                                "validation": validation_results,
+                                "ad_stores": ad_store_infos,
+                                "store_info_per_account": store_info_per_account_list,
+                                "metrics": metrics,
+                            }
+                            save_progress(progress_file, progress)
+                        average_sec = metrics["account_elapsed_sec_total"] / metrics["account_elapsed_count"]
+                        remaining_sec = average_sec * max(0, total_accounts - len(done_accounts))
+                        logger.info(
+                            "[진행 %s %d%%] 계정 완료 fail · 누적 성공 %d 실패 %d · "
+                            "경과 %.0f분 · 평균 %.1f분/계정 · 예상잔여 %.0f분",
+                            account_tag,
+                            progress_percent,
+                            success,
+                            fail,
+                            account_elapsed / 60,
+                            average_sec / 60,
+                            remaining_sec / 60,
+                        )
                         continue
                 store_list.sort(key=_store_collection_sort_key)
                 logger.info(
@@ -1116,6 +1355,49 @@ def collect_now_and_woori(
                     quit_driver_safely(bootstrap_driver, account_id)
 
         if not store_list:
+            if not any(
+                str(item.get("account_id") or "") == account_id
+                for item in failed_accounts
+            ):
+                fail += 1
+                _mark_failed_account(account, account_id, login_stage=True)
+            account_elapsed = time.monotonic() - account_started
+            metrics["account_elapsed_sec_total"] += account_elapsed
+            metrics["account_elapsed_count"] += 1
+            if account_id not in done_accounts:
+                done_accounts.add(account_id)
+                done_account_order.append(account_id)
+            if progress is not None:
+                progress["done_accounts"] = list(done_account_order)
+                progress["success"] = success
+                progress["fail"] = fail
+                progress["carry"] = {
+                    "failed": {
+                        "accounts": failed_accounts,
+                        "stores": failed_stores,
+                        "orders": failed_orders,
+                        "ads": failed_ads,
+                        "stages": failed_stages,
+                    },
+                    "validation": validation_results,
+                    "ad_stores": ad_store_infos,
+                    "store_info_per_account": store_info_per_account_list,
+                    "metrics": metrics,
+                }
+                save_progress(progress_file, progress)
+            average_sec = metrics["account_elapsed_sec_total"] / metrics["account_elapsed_count"]
+            remaining_sec = average_sec * max(0, total_accounts - len(done_accounts))
+            logger.info(
+                "[진행 %s %d%%] 계정 완료 fail · 누적 성공 %d 실패 %d · "
+                "경과 %.0f분 · 평균 %.1f분/계정 · 예상잔여 %.0f분",
+                account_tag,
+                progress_percent,
+                success,
+                fail,
+                account_elapsed / 60,
+                average_sec / 60,
+                remaining_sec / 60,
+            )
             continue
 
         metrics["requested_store_count"] += len(store_list)
@@ -1173,17 +1455,29 @@ def collect_now_and_woori(
             *,
             require_dashboard: bool = False,
             fatal: bool = True,
+            track_account_failure: bool = False,
         ) -> None:
             nonlocal recovery_count
+            if stage_filter is not None and stage_label not in stage_filter:
+                logger.info("stage_filter: %s 스킵 [%s]", stage_label, account_id)
+                return
+            stage_stores = [
+                store_info
+                for store_info in store_list
+                if store_info["store_id"] in active_store_ids
+                and (
+                    store_id_filter is None
+                    or str(store_info["store_id"]) in store_id_filter
+                )
+            ]
             logger.info(
-                "=== %s 단계 시작 [%s]: %s ===",
+                "=== %s 단계 시작 [%s / %s]: %s ===",
                 stage_label,
+                account_tag,
                 account_id,
-                [_store_name(s) for s in store_list if s["store_id"] in active_store_ids],
+                [_store_name(s) for s in stage_stores],
             )
-            for store_info in store_list:
-                if store_info["store_id"] not in active_store_ids:
-                    continue
+            for store_idx, store_info in enumerate(stage_stores, start=1):
                 store_name = _store_name(store_info)
                 for store_attempt in range(2):
                     try:
@@ -1192,8 +1486,11 @@ def collect_now_and_woori(
                         else:
                             _ensure_driver()
                         logger.info(
-                            "=== %s brand=%s [%s / %s] ===",
+                            "=== %s [%s] 매장 %d/%d · brand=%s [%s / %s] ===",
                             stage_label,
+                            account_tag,
+                            store_idx,
+                            len(stage_stores),
                             store_info.get("brand", ""),
                             account_id,
                             store_name,
@@ -1232,6 +1529,13 @@ def collect_now_and_woori(
                                         store_name,
                                         exc,
                                     )
+                                    if track_account_failure:
+                                        _mark_failed_stage(
+                                            account,
+                                            account_id,
+                                            store_info,
+                                            stage_label,
+                                        )
                                 break
                             continue
 
@@ -1242,10 +1546,17 @@ def collect_now_and_woori(
                             _record_failed_store(metrics, account_id, store_name, f"{stage_label}: {exc}")
                         else:
                             logger.info("%s 실패(무시): %s / %s / %s", stage_label, account_id, store_name, exc)
+                            if track_account_failure:
+                                _mark_failed_stage(
+                                    account,
+                                    account_id,
+                                    store_info,
+                                    stage_label,
+                                )
                         break
 
                 time.sleep(random.uniform(1.0, 2.0))
-            logger.info("=== %s 단계 완료 [%s] ===", stage_label, account_id)
+            logger.info("=== %s 단계 완료 [%s / %s] ===", stage_label, account_tag, account_id)
 
         if used_store_hint:
             logger.info("known store_id hint 경로: NOW 대시보드 수집 스킵 [%s]", account_id)
@@ -1255,41 +1566,49 @@ def collect_now_and_woori(
                 lambda store_info: collect_now_for_driver(driver, account_id, [store_info]),
                 require_dashboard=True,
                 fatal=False,
+                track_account_failure=True,
             )
         _run_stage(
             "우리가게 수집",
             lambda store_info: collect_woori_for_driver(driver, [store_info]),
             require_dashboard=used_store_hint,
             fatal=False,
+            track_account_failure=True,
         )
         if used_store_hint:
-            logger.info("known store_id hint 경로: 변경이력 수집 스킵 [%s]", account_id)
-        elif not collect_shop_change_today:
-            logger.info("변경이력 수집 스킵: 매주 토요일 전용 [%s]", account_id)
+            logger.info("known store_id hint 경로: 운영시간 수집 스킵 [%s]", account_id)
         else:
             _run_stage(
-                "변경이력 수집",
-                lambda store_info: collect_shop_change_for_driver(driver, [store_info]),
+                "운영시간 수집",
+                lambda store_info: collect_shop_operation_for_driver(driver, [store_info]),
                 fatal=False,
+                track_account_failure=True,
             )
 
         if woori_only:
             logger.info("woori_only=true: 주문내역/광고 funnel 수집 스킵 [%s]", account_id)
         else:
+            order_stores = [
+                store_info
+                for store_info in store_list
+                if store_info["store_id"] in active_store_ids
+            ]
             logger.info(
-                "=== 주문내역 수집 단계 시작 [%s]: %s ===",
+                "=== 주문내역 수집 단계 시작 [%s / %s]: %s ===",
+                account_tag,
                 account_id,
-                [_store_name(s) for s in store_list if s["store_id"] in active_store_ids],
+                [_store_name(s) for s in order_stores],
             )
-            for store_info in store_list:
-                if store_info["store_id"] not in active_store_ids:
-                    continue
+            for store_idx, store_info in enumerate(order_stores, start=1):
                 store_name = _store_name(store_info)
                 for store_attempt in range(2):
                     try:
                         _ensure_driver()
                         logger.info(
-                            "=== 주문내역 수집 brand=%s [%s / %s] ===",
+                            "=== 주문내역 수집 [%s] 매장 %d/%d · brand=%s [%s / %s] ===",
+                            account_tag,
+                            store_idx,
+                            len(order_stores),
                             store_info.get("brand", ""),
                             account_id,
                             store_name,
@@ -1297,10 +1616,27 @@ def collect_now_and_woori(
                         orders_result = collect_orders_for_driver(driver, store_info, target_date=target_date)
                         if not orders_result.get("ok"):
                             failed_orders.append({"account": account, "stores": [store_info]})
-                            _record_failed_store(metrics, account_id, store_name, "orders failed")
+                            reason = str(orders_result.get("reason") or "orders failed")
+                            _record_failed_store(metrics, account_id, store_name, reason)
+                            if reason == "date_filter":
+                                orders_date_filter_streak += 1
+                                if orders_date_filter_streak >= _ORDERS_DATE_FILTER_ABORT_STREAK:
+                                    orders_date_filter_abort = True
+                                    metrics["orders_date_filter_abort"] = True
+                                    logger.error(
+                                        "배민 주문 날짜필터 연속 실패 %d매장 - 날짜 필터 UI 파손 의심, 잔여 실패로 보존 후 중단",
+                                        orders_date_filter_streak,
+                                    )
+                                    break
+                            else:
+                                orders_date_filter_streak = 0
+                        else:
+                            orders_date_filter_streak = 0
                         validation_results.extend(orders_result.get("validation", []))
                         break
                     except Exception as exc:
+                        if "배민 주문 날짜필터 연속 실패" in str(exc):
+                            raise
                         if _is_session_issue(exc):
                             recovery_count += 1
                             metrics["session_recovery_count"] += 1
@@ -1321,25 +1657,36 @@ def collect_now_and_woori(
                         _record_failed_store(metrics, account_id, store_name, f"orders: {exc}")
                         break
                 time.sleep(random.uniform(1.0, 2.0))
-            logger.info("=== 주문내역 수집 단계 완료 [%s] ===", account_id)
+                if orders_date_filter_abort:
+                    break
+            logger.info("=== 주문내역 수집 단계 완료 [%s / %s] ===", account_tag, account_id)
 
-            if used_store_hint:
+            if orders_date_filter_abort:
+                logger.warning("날짜필터 abort로 광고 funnel 수집 스킵 [%s]", account_id)
+            elif used_store_hint:
                 logger.info("known store_id hint 경로: 광고 funnel 수집 스킵 [%s]", account_id)
             else:
+                ad_stores = [
+                    store_info
+                    for store_info in store_list
+                    if store_info["store_id"] in active_store_ids
+                ]
                 logger.info(
-                    "=== 광고 funnel 수집 단계 시작 [%s]: %s ===",
+                    "=== 광고 funnel 수집 단계 시작 [%s / %s]: %s ===",
+                    account_tag,
                     account_id,
-                    [_store_name(s) for s in store_list if s["store_id"] in active_store_ids],
+                    [_store_name(s) for s in ad_stores],
                 )
-                for store_info in store_list:
-                    if store_info["store_id"] not in active_store_ids:
-                        continue
+                for store_idx, store_info in enumerate(ad_stores, start=1):
                     store_name = _store_name(store_info)
                     for store_attempt in range(2):
                         try:
                             _ensure_driver()
                             logger.info(
-                                "=== 광고 funnel 수집 brand=%s [%s / %s] ===",
+                                "=== 광고 funnel 수집 [%s] 매장 %d/%d · brand=%s [%s / %s] ===",
+                                account_tag,
+                                store_idx,
+                                len(ad_stores),
                                 store_info.get("brand", ""),
                                 account_id,
                                 store_name,
@@ -1389,6 +1736,46 @@ def collect_now_and_woori(
         logger.info("다음 계정까지 %.0f초 대기", wait_sec)
         time.sleep(wait_sec)
         success += 1
+        account_elapsed = time.monotonic() - account_started
+        metrics["account_elapsed_sec_total"] += account_elapsed
+        metrics["account_elapsed_count"] += 1
+        if account_id not in done_accounts:
+            done_accounts.add(account_id)
+            done_account_order.append(account_id)
+        if progress is not None:
+            progress["done_accounts"] = list(done_account_order)
+            progress["success"] = success
+            progress["fail"] = fail
+            progress["carry"] = {
+                "failed": {
+                    "accounts": failed_accounts,
+                    "stores": failed_stores,
+                    "orders": failed_orders,
+                    "ads": failed_ads,
+                    "stages": failed_stages,
+                },
+                "validation": validation_results,
+                "ad_stores": ad_store_infos,
+                "store_info_per_account": store_info_per_account_list,
+                "metrics": metrics,
+            }
+            save_progress(progress_file, progress)
+        if orders_date_filter_abort:
+            logger.warning("날짜필터 abort로 남은 계정 수집 중단")
+            break
+        average_sec = metrics["account_elapsed_sec_total"] / metrics["account_elapsed_count"]
+        remaining_sec = average_sec * max(0, total_accounts - len(done_accounts))
+        logger.info(
+            "[진행 %s %d%%] 계정 완료 ok · 누적 성공 %d 실패 %d · "
+            "경과 %.0f분 · 평균 %.1f분/계정 · 예상잔여 %.0f분",
+            account_tag,
+            progress_percent,
+            success,
+            fail,
+            account_elapsed / 60,
+            average_sec / 60,
+            remaining_sec / 60,
+        )
 
     if _allow_login_second_pass and login_lost_accounts:
         logger.info(
@@ -1436,9 +1823,28 @@ def collect_now_and_woori(
             failed_stores.extend(second_failed.get("stores") or [])
             failed_orders.extend(second_failed.get("orders") or [])
             failed_ads.extend(second_failed.get("ads") or [])
+            failed_stages.extend(second_failed.get("stages") or [])
             validation_results.extend(second_result.get("validation") or [])
             ad_store_infos.extend(second_result.get("ad_stores") or [])
             store_info_per_account_list.extend(second_result.get("store_info_per_account") or [])
+
+        if progress is not None:
+            progress["success"] = success
+            progress["fail"] = fail
+            progress["carry"] = {
+                "failed": {
+                    "accounts": failed_accounts,
+                    "stores": failed_stores,
+                    "orders": failed_orders,
+                    "ads": failed_ads,
+                    "stages": failed_stages,
+                },
+                "validation": validation_results,
+                "ad_stores": ad_store_infos,
+                "store_info_per_account": store_info_per_account_list,
+                "metrics": metrics,
+            }
+            save_progress(progress_file, progress)
 
     failed_account_ids = {str(account.get("account_id") or "") for account in failed_accounts}
     product_failed_account_ids: set[str] = set()
@@ -1446,15 +1852,28 @@ def collect_now_and_woori(
         product_failed_account_ids.add(str((item.get("account") or {}).get("account_id") or ""))
     for item in [*failed_orders, *failed_ads]:
         product_failed_account_ids.add(str((item.get("account") or {}).get("account_id") or ""))
+    for item in failed_stages:
+        product_failed_account_ids.add(str((item.get("account") or {}).get("account_id") or ""))
     product_failed_account_ids.discard("")
     partial_account_ids = product_failed_account_ids - failed_account_ids
     metrics["partial_accounts"] = len(partial_account_ids)
     metrics["completed_accounts"] = max(0, success - metrics["partial_accounts"])
     metrics["failed_orders_count"] = sum(len(item.get("stores") or []) for item in failed_orders)
     metrics["failed_ads_count"] = sum(len(item.get("stores") or []) for item in failed_ads)
+    metrics["failed_stages_count"] = len(failed_stages)
+    if orders_date_filter_abort:
+        metrics["orders_date_filter_abort"] = True
 
     total = success + fail
-    summary = f"성공 {success}/{total} 계정"
+    summary = (
+        f"계정 루프 완료 {success}/{total} 계정 "
+        f"(완전성공 {metrics['completed_accounts']}, "
+        f"부분실패 {metrics['partial_accounts']}, "
+        f"계정실패 {fail}, "
+        f"orders 실패 {metrics['failed_orders_count']}, "
+        f"ads 실패 {metrics['failed_ads_count']}, "
+        f"stages 실패 {metrics['failed_stages_count']})"
+    )
     metrics["ended_at"] = datetime.now(UTC).isoformat()
     logger.info(summary)
 
@@ -1468,6 +1887,7 @@ def collect_now_and_woori(
             "stores": failed_stores,
             "orders": failed_orders,
             "ads": failed_ads,
+            "stages": failed_stages,
         },
         "validation": validation_results,
         "ad_stores": ad_store_infos,
@@ -1493,6 +1913,8 @@ def collect_orders_only(
     failed_orders: list[dict] = []
     validation_results: list[dict] = []
     store_info_per_account_list: list[dict] = []
+    orders_date_filter_streak = 0
+    orders_date_filter_abort = False
 
     for account in account_list:
         account_id = account["account_id"]
@@ -1615,8 +2037,26 @@ def collect_orders_only(
 
             if not isinstance(result, dict) or not result.get("ok"):
                 failed_orders.append({"account": account, "stores": [store_info]})
+                reason = str((result or {}).get("reason") or "orders failed") if isinstance(result, dict) else "orders failed"
+                _record_failed_store(metrics, account_id, store_name, reason)
+                if reason == "date_filter":
+                    orders_date_filter_streak += 1
+                    if orders_date_filter_streak >= _ORDERS_DATE_FILTER_ABORT_STREAK:
+                        orders_date_filter_abort = True
+                        metrics["orders_date_filter_abort"] = True
+                        logger.error(
+                            "배민 orders-only 날짜필터 연속 실패 %d매장 - 날짜 필터 UI 파손 의심, 잔여 실패로 보존 후 중단",
+                            orders_date_filter_streak,
+                        )
+                        break
+                else:
+                    orders_date_filter_streak = 0
+            else:
+                orders_date_filter_streak = 0
             validation_results.extend(result.get("validation", []) if isinstance(result, dict) else [])
             time.sleep(random.uniform(1.0, 2.0))
+            if orders_date_filter_abort:
+                break
 
         _quit_driver_safely(driver)
         success += 1
@@ -1625,10 +2065,15 @@ def collect_orders_only(
         metrics["account_wait_sec_total"] += round(wait_sec, 1)
         logger.info("다음 계정까지 %.0f초 대기", wait_sec)
         time.sleep(wait_sec)
+        if orders_date_filter_abort:
+            logger.warning("orders-only 날짜필터 abort로 남은 계정 수집 중단")
+            break
 
     total = success + fail
     summary = f"orders-only 성공 {success}/{total} 계정 (target={target_date})"
     metrics["ended_at"] = datetime.now(UTC).isoformat()
+    if orders_date_filter_abort:
+        metrics["orders_date_filter_abort"] = True
     logger.info(summary)
 
     if success == 0 and total > 0:

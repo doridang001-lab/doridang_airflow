@@ -27,7 +27,7 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 from airflow.exceptions import AirflowSkipException
 
 from modules.transform.utility.paths import DOWN_DIR, ANALYTICS_DB, TEMP_DIR
-from modules.transform.utility.selenium_uc import configure_uc_data_path
+from modules.transform.utility.selenium_uc import launch_uc_chrome
 from modules.transform.utility.store_normalize import normalize as _normalize_store_series
 from modules.load.load_onedrive import onedrive_csv_save
 
@@ -63,6 +63,21 @@ ORDER_URL   = "https://admin.posfeed.co.kr/#/order/list"
 # ============================================================
 HEADLESS_MODE = os.getenv("AIRFLOW_HOME") is not None
 INTEGRITY_WARN_THRESHOLD = 10_000  # 이 금액 미만 차이는 float 오차로 무시
+POSFEED_SOURCE_LOOKBACK_DAYS = 7  # 원천 주문 수집 누락 검사 기본 범위
+_LOGIN_ID_LOCATORS = (
+    (By.NAME, "username"),
+    (By.CSS_SELECTOR, 'input[autocomplete="username"]'),
+    (By.CSS_SELECTOR, 'input[aria-label="Username"]'),
+    (By.CSS_SELECTOR, 'input[placeholder="Username"]'),
+    (By.CSS_SELECTOR, 'input[type="text"], input[type="email"]'),
+)
+_LOGIN_PW_LOCATORS = (
+    (By.NAME, "password"),
+    (By.CSS_SELECTOR, 'input[autocomplete="current-password"]'),
+    (By.CSS_SELECTOR, 'input[aria-label="Password"]'),
+    (By.CSS_SELECTOR, 'input[placeholder="Password"]'),
+    (By.CSS_SELECTOR, 'input[type="password"]'),
+)
 
 
 # ============================================================
@@ -155,7 +170,6 @@ def _launch_browser(download_dir: Path) -> uc.Chrome:
     """다운로드 경로가 설정된 Chrome 브라우저 실행"""
     _kill_chrome_processes()
     logger.info(f"브라우저 실행 (headless={HEADLESS_MODE})")
-    configure_uc_data_path()
 
     def _make_options() -> uc.ChromeOptions:
         options = uc.ChromeOptions()
@@ -180,44 +194,25 @@ def _launch_browser(download_dir: Path) -> uc.Chrome:
         })
         return options
 
-    chrome_version = _get_chrome_version()
-    try:
-        kwargs = {"options": _make_options()}
-        if chrome_version:
-            kwargs["version_main"] = chrome_version
-            logger.info(f"ChromeDriver 버전: {chrome_version}")
-        driver = uc.Chrome(**kwargs)
+    def _finalize_driver(driver: uc.Chrome) -> uc.Chrome:
         driver.set_window_size(1920, 1080)
-        logger.info("브라우저 실행 성공")
+        try:
+            driver.set_page_load_timeout(int(os.getenv("POSFEED_PAGELOAD_TIMEOUT_SEC", "45")))
+            driver.set_script_timeout(int(os.getenv("POSFEED_SCRIPT_TIMEOUT_SEC", "45")))
+        except Exception as timeout_err:
+            logger.warning("WebDriver timeout 설정 실패(무시): %s", timeout_err)
         return driver
-    except Exception as e:
-        match = re.search(r"Current browser version is (\d+)", str(e))
-        if match:
-            detected = int(match.group(1))
-            logger.warning(f"버전 불일치 → {detected} 으로 재시도")
-            driver = uc.Chrome(options=_make_options(), version_main=detected)
-            driver.set_window_size(1920, 1080)
-            logger.info("브라우저 실행 성공 (재시도)")
-            return driver
-        # DNS/네트워크 오류: 기존에 패치된 바이너리를 직접 지정하여 오프라인 재시도
-        # (is_binary_patched()가 True이면 fetch_release_number() 네트워크 호출 생략)
-        if "No address associated with hostname" in str(e) or "URLError" in type(e).__name__:
-            _known_paths = [
-                "/tmp/undetected_chromedriver/undetected_chromedriver",
-                "/root/.local/share/undetected_chromedriver/undetected_chromedriver",
-            ]
-            for _p in _known_paths:
-                if Path(_p).exists():
-                    logger.warning("DNS 오류 → 캐시 드라이버 재사용: %s", _p)
-                    driver = uc.Chrome(
-                        options=_make_options(),
-                        version_main=chrome_version,
-                        driver_executable_path=_p,
-                    )
-                    driver.set_window_size(1920, 1080)
-                    logger.info("브라우저 실행 성공 (오프라인 재시도)")
-                    return driver
-        raise
+
+    driver = launch_uc_chrome(
+        options=_make_options(),
+        account_id=POSFEED_ID,
+        chrome_bin=os.getenv("CHROME_BIN", "/usr/bin/google-chrome"),
+        log_fn=logger.info,
+        prefer_standard=os.getenv("POSFEED_PREFER_STANDARD_CHROME", "").lower() in {"1", "true", "yes"},
+        command_timeout_sec=int(os.getenv("POSFEED_DRIVER_COMMAND_TIMEOUT_SEC", "45")),
+    )
+    logger.info("브라우저 실행 성공")
+    return _finalize_driver(driver)
 
 
 def _restart_driver_with_download(download_dir: Path) -> tuple[uc.Chrome, WebDriverWait]:
@@ -236,14 +231,10 @@ def _restart_driver_with_download(download_dir: Path) -> tuple[uc.Chrome, WebDri
 
 def _login(driver: uc.Chrome, wait: WebDriverWait) -> None:
     """Posfeed 로그인"""
-    driver.get(LOGIN_URL)
-    time.sleep(2)
-
-    id_input = wait.until(EC.presence_of_element_located((By.NAME, "username")))
+    id_input, pw_input = _wait_for_posfeed_login_form(driver, wait)
     id_input.clear()
     id_input.send_keys(POSFEED_ID)
 
-    pw_input = driver.find_element(By.NAME, "password")
     pw_input.clear()
     pw_input.send_keys(POSFEED_PW)
     pw_input.send_keys(Keys.RETURN)  # Vue SPA: submit() 대신 Enter
@@ -262,6 +253,57 @@ def _login(driver: uc.Chrome, wait: WebDriverWait) -> None:
         ) from exc
     time.sleep(2)
     logger.info(f"Posfeed 로그인 완료 | URL: {driver.current_url}")
+
+
+def _find_first_visible(driver: uc.Chrome, locators: tuple[tuple[str, str], ...]):
+    for locator in locators:
+        for element in driver.find_elements(*locator):
+            try:
+                if element.is_displayed():
+                    return element
+            except Exception:
+                continue
+    return None
+
+
+def _wait_for_posfeed_login_form(driver: uc.Chrome, wait: WebDriverWait):
+    """SPA 로그인 폼이 렌더링될 때까지 재진입하며 대기한다."""
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            driver.get(LOGIN_URL)
+            wait.until(lambda d: d.execute_script("return document.readyState") in ("interactive", "complete"))
+            time.sleep(2)
+            return wait.until(
+                lambda d: (
+                    _find_first_visible(d, _LOGIN_ID_LOCATORS),
+                    _find_first_visible(d, _LOGIN_PW_LOCATORS),
+                )
+                if _find_first_visible(d, _LOGIN_ID_LOCATORS) and _find_first_visible(d, _LOGIN_PW_LOCATORS)
+                else False
+            )
+        except TimeoutException as exc:
+            last_exc = exc
+            debug_path = _save_posfeed_login_debug(driver, f"login_form_missing_{attempt}")
+            logger.warning(
+                "Posfeed 로그인 폼 대기 실패 %d/3 | url=%s | debug=%s",
+                attempt,
+                getattr(driver, "current_url", ""),
+                debug_path or "unavailable",
+            )
+            if attempt < 3:
+                try:
+                    driver.refresh()
+                except Exception:
+                    pass
+                time.sleep(3)
+
+    current_url = getattr(driver, "current_url", "")
+    input_state = _posfeed_login_input_state(driver)
+    raise TimeoutException(
+        "Posfeed 로그인 화면을 불러오지 못했습니다. "
+        f"current_url={current_url!r}, input_state={input_state}"
+    ) from last_exc
 
 
 def _posfeed_login_input_state(driver: uc.Chrome) -> dict:
@@ -300,7 +342,7 @@ def _posfeed_login_input_state(driver: uc.Chrome) -> dict:
 
 
 def _save_posfeed_login_debug(driver: uc.Chrome, tag: str) -> str | None:
-    """Posfeed 로그인 실패 디버그 파일을 temp 경로에 저장한다."""
+    """Posfeed 화면 디버그 파일을 temp 경로에 저장한다."""
     try:
         debug_dir = TEMP_DIR / "posfeed_login_debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
@@ -310,10 +352,10 @@ def _save_posfeed_login_debug(driver: uc.Chrome, tag: str) -> str | None:
         html = base.with_suffix(".html")
         driver.save_screenshot(str(png))
         html.write_text(driver.page_source or "", encoding="utf-8", errors="replace")
-        logger.error("Posfeed 로그인 실패 디버그 저장: %s", png)
+        logger.error("Posfeed 화면 디버그 저장: %s", png)
         return str(png)
     except Exception as exc:
-        logger.warning("Posfeed 로그인 실패 디버그 저장 실패: %s", exc)
+        logger.warning("Posfeed 화면 디버그 저장 실패: %s", exc)
         return None
 
 
@@ -434,6 +476,93 @@ def _click_download(driver: uc.Chrome, wait: WebDriverWait, target_date: datetim
     if target_date is None:
         target_date = _kst_now() - _td(days=1)
 
+    def _find_visible_element(selectors: list[tuple[str, str]]):
+        for selector in selectors:
+            for element in driver.find_elements(*selector):
+                try:
+                    if element.is_displayed():
+                        return element
+                except Exception:
+                    continue
+        return None
+
+    def _visible_button_texts(limit: int = 20) -> list[str]:
+        texts: list[str] = []
+        for button in driver.find_elements(By.CSS_SELECTOR, "button,[role='button']"):
+            try:
+                if not button.is_displayed():
+                    continue
+                text = (button.text or "").strip()
+                aria = (button.get_attribute("aria-label") or "").strip()
+                title = (button.get_attribute("title") or "").strip()
+                label = " / ".join(part for part in (text, aria, title) if part)
+                if label:
+                    texts.append(label)
+            except Exception:
+                continue
+        return texts[:limit]
+
+    def _set_mui_date_input(input_el, value: str) -> None:
+        """MUI date text field 값을 React input 이벤트와 함께 설정한다."""
+        driver.execute_script(
+            """
+            const input = arguments[0];
+            const value = arguments[1];
+            const setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype,
+                'value'
+            ).set;
+            setter.call(input, value);
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            input.dispatchEvent(new Event('blur', { bubbles: true }));
+            """,
+            input_el,
+            value,
+        )
+
+    def _set_mui_date_range(target: datetime) -> bool:
+        target_iso = target.strftime("%Y-%m-%d")
+        selectors = [
+            "input[readonly][type='text']",
+            "input[placeholder][readonly]",
+        ]
+        inputs: list = []
+        for selector in selectors:
+            inputs = [
+                e
+                for e in driver.find_elements(By.CSS_SELECTOR, selector)
+                if e.is_displayed()
+            ]
+            if len(inputs) >= 2:
+                break
+        if len(inputs) < 2:
+            return False
+
+        def _select_from_popup(input_el) -> None:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", input_el)
+            root = input_el.find_element(By.XPATH, "./parent::*")
+            driver.execute_script("arguments[0].click();", root)
+            date_button = WebDriverWait(driver, 8).until(
+                lambda d: _find_visible_element(
+                    [(By.CSS_SELECTOR, f"button[aria-label='{target_iso}']")]
+                )
+            )
+            driver.execute_script("arguments[0].click();", date_button)
+            WebDriverWait(driver, 5).until(
+                lambda _d: (input_el.get_attribute("value") or "").strip() == target_iso
+            )
+
+        _select_from_popup(inputs[0])
+        time.sleep(0.4)
+        _select_from_popup(inputs[1])
+        values = [
+            (el.get_attribute("aria-label") or "", el.get_attribute("value") or "")
+            for el in inputs[:2]
+        ]
+        logger.info("MUI 날짜 선택 설정: %s | values=%s", target_iso, values)
+        return True
+
     def _ensure_order_page() -> None:
         """주문 목록 페이지 진입 보장 - 로그인 리다이렉트 시 재로그인"""
         driver.get(ORDER_URL)
@@ -482,23 +611,48 @@ def _click_download(driver: uc.Chrome, wait: WebDriverWait, target_date: datetim
 
     try:
         date_editors = WebDriverWait(driver, 8).until(
-            lambda d: [e for e in d.find_elements(By.CSS_SELECTOR, ".el-date-editor--date") if e.is_displayed()]
+            lambda d: [
+                e
+                for e in d.find_elements(
+                    By.CSS_SELECTOR,
+                    ".el-date-editor, .el-date-editor--date, .el-date-editor--daterange",
+                )
+                if e.is_displayed()
+            ]
         )
     except TimeoutException:
         date_editors = []
 
-    if len(date_editors) >= 2:
+    if _set_mui_date_range(target_date):
+        pass
+    elif len(date_editors) >= 2:
         _select_date(driver, date_editors[0], target_date)  # 시작일
         _select_date(driver, date_editors[1], target_date)  # 종료일
     elif len(date_editors) == 1:
+        editor_class = date_editors[0].get_attribute("class") or ""
+        input_count = len(date_editors[0].find_elements(By.TAG_NAME, "input"))
         _select_date(driver, date_editors[0], target_date)
+        if "daterange" in editor_class or input_count >= 2:
+            _select_date(driver, date_editors[0], target_date)
     else:
-        logger.warning("날짜 입력 필드를 찾지 못했습니다 - 기본값(오늘) 사용")
+        _save_posfeed_login_debug(driver, "order_date_editor_missing")
+        raise TimeoutException(
+            "날짜 입력 필드를 찾지 못했습니다. 기본값으로 다운로드하면 날짜 오염이 발생하므로 중단합니다."
+        )
 
-    # 검색 버튼: el-icon-search 아이콘으로 특정 (el-button--success 단독보다 명확)
-    search_btn = wait.until(EC.presence_of_element_located(
-        (By.XPATH, "//button[contains(@class,'el-button--success')][.//i[contains(@class,'el-icon-search')]]")
-    ))
+    # 검색 버튼: Element UI 아이콘과 MUI/일반 버튼 텍스트를 모두 허용한다.
+    _SEARCH_SELECTORS = [
+        (By.XPATH, "//button[contains(@class,'el-button--success')][.//i[contains(@class,'el-icon-search')]]"),
+        (By.XPATH, "//button[not(@disabled) and (contains(normalize-space(.),'검색') or contains(normalize-space(.),'조회'))]"),
+        (By.XPATH, "//*[@role='button' and (contains(normalize-space(.),'검색') or contains(normalize-space(.),'조회'))]"),
+        (By.CSS_SELECTOR, "button[aria-label*='검색'],button[aria-label*='조회']"),
+    ]
+    try:
+        search_btn = wait.until(lambda _d: _find_visible_element(_SEARCH_SELECTORS))
+    except TimeoutException:
+        _save_posfeed_login_debug(driver, "order_search_missing")
+        logger.error("검색 버튼 못 찾음 | URL=%s | 버튼목록=%s", driver.current_url, _visible_button_texts())
+        raise
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", search_btn)
     time.sleep(0.5)
     driver.execute_script("arguments[0].click();", search_btn)
@@ -506,9 +660,16 @@ def _click_download(driver: uc.Chrome, wait: WebDriverWait, target_date: datetim
 
     # 검색 클릭 후: 로그인 리다이렉트 OR 다운로드 버튼 출현 대기 (최대 20초)
     _DL_XPATH = "//button[contains(@class,'el-button--primary')][.//i[contains(@class,'el-icon-download')]]"
+    _DL_SELECTORS = [
+        (By.XPATH, _DL_XPATH),
+        (By.XPATH, "//button[not(@disabled) and (.//span[contains(normalize-space(),'엑셀 다운로드')] or contains(normalize-space(.),'엑셀 다운로드'))]"),
+        (By.XPATH, "//button[not(@disabled) and (contains(normalize-space(.),'엑셀') or contains(normalize-space(.),'다운로드') or contains(normalize-space(.),'Excel') or contains(normalize-space(.),'Download'))]"),
+        (By.XPATH, "//*[@role='button' and (contains(normalize-space(.),'엑셀') or contains(normalize-space(.),'다운로드') or contains(normalize-space(.),'Excel') or contains(normalize-space(.),'Download'))]"),
+        (By.CSS_SELECTOR, "button[aria-label*='다운로드'],button[aria-label*='Download'],button[title*='다운로드'],button[title*='Download']"),
+    ]
 
     def _search_result_or_redirect(d):
-        return "#/login" in d.current_url or len(d.find_elements(By.XPATH, _DL_XPATH)) > 0
+        return "#/login" in d.current_url or _find_visible_element(_DL_SELECTORS) is not None
 
     try:
         WebDriverWait(driver, 20).until(_search_result_or_redirect)
@@ -522,9 +683,7 @@ def _click_download(driver: uc.Chrome, wait: WebDriverWait, target_date: datetim
         logger.warning("검색 후 세션 만료 감지 - 재로그인 후 전체 재시도")
         _login(driver, wait)
         _ensure_order_page()
-        search_btn2 = wait.until(EC.presence_of_element_located(
-            (By.XPATH, "//button[contains(@class,'el-button--success')][.//i[contains(@class,'el-icon-search')]]")
-        ))
+        search_btn2 = wait.until(lambda _d: _find_visible_element(_SEARCH_SELECTORS))
         driver.execute_script("arguments[0].click();", search_btn2)
         logger.info("검색 버튼 재클릭")
         try:
@@ -536,19 +695,15 @@ def _click_download(driver: uc.Chrome, wait: WebDriverWait, target_date: datetim
 
     # 다운로드 버튼 탐색 (이미 대기 중 발견됐거나, 아직 로딩 중이면 추가 대기)
     download_btn = None
-    _DL_SELECTORS = [
-        (By.XPATH, _DL_XPATH),
-        (By.XPATH, "//button[.//span[contains(normalize-space(),'엑셀 다운로드')]]"),
-    ]
     for sel in _DL_SELECTORS:
         try:
-            download_btn = WebDriverWait(driver, 10).until(EC.presence_of_element_located(sel))
+            download_btn = WebDriverWait(driver, 10).until(lambda _d, _sel=sel: _find_visible_element([_sel]))
             break
         except TimeoutException:
             continue
     if download_btn is None:
-        btns = [b.text.strip() for b in driver.find_elements(By.TAG_NAME, "button") if b.text.strip()]
-        logger.error(f"다운로드 버튼 못 찾음 | URL={driver.current_url} | 버튼목록={btns[:15]}")
+        _save_posfeed_login_debug(driver, "order_download_missing")
+        logger.error("다운로드 버튼 못 찾음 | URL=%s | 버튼목록=%s", driver.current_url, _visible_button_texts())
         raise TimeoutException("엑셀 다운로드 버튼을 찾을 수 없습니다.")
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", download_btn)
     time.sleep(0.5)
@@ -561,6 +716,7 @@ def _click_download(driver: uc.Chrome, wait: WebDriverWait, target_date: datetim
         (By.CSS_SELECTOR, ".el-dialog__footer .el-button--primary"),
         (By.CSS_SELECTOR, ".el-dialog .el-button--primary"),
         (By.XPATH, "//div[contains(@class,'el-dialog')]//button[contains(@class,'el-button--primary')]"),
+        (By.XPATH, "//button[normalize-space(.)='확인' or normalize-space(.)='다운로드']"),
         (By.XPATH, "//span[normalize-space(text())='확인']/parent::button"),
         (By.XPATH, "//span[normalize-space(text())='확인']"),
     ]
@@ -1111,10 +1267,8 @@ def check_monthly_collection(**context) -> str:
     """월별 수집 현황 점검, 갭 감지·재수집, 금액 무결성 검사.
 
     1. posfeed_sales 파티션 → 월별 현황 표 로그
-    2. 갭 감지: 파티션 최초 날짜 ~ yesterday 전체 범위에서 누락 날짜 탐지
-       (step 1에서 1월 데이터가 보이면 1월부터 전부 검사)
-    3. 누락 날짜 중 최근 _MONTHLY_CHECK_REDOWNLOAD_DAYS일만 Selenium 재다운로드
-       (주말은 no-data 처리, 실패는 경고만, 태스크 미실패)
+    2. 갭 감지: 최근 POSFEED_SOURCE_LOOKBACK_DAYS 범위에서 누락 날짜 탐지
+    3. 누락 날짜를 Selenium으로 재다운로드
     4. 완성된 ym(당월 제외): sum(총 주문금액) vs sum(합계) 비교 → WARNING 경고만
        (아이템은 주문코드별 개별 스크래핑이므로 날짜 재다운로드로 자동 수정 불가)
     """
@@ -1148,19 +1302,9 @@ def check_monthly_collection(**context) -> str:
         logger.info("[월별 현황] 수집된 파티션 없음")
 
     # ── STEP 2: 갭 감지 ──────────────────────────────────────────
-    # 파티션에 데이터가 있으면 가장 이른 ym 첫날부터 검사 (step 1과 범위 일치)
-    # 데이터가 없으면 어제 하루만 검사
     today     = _kst_now().date()
     yesterday = today - timedelta(days=1)
-
-    if summary_rows:
-        earliest_ym = summary_rows[0]["ym"]  # 이미 정렬됨
-        try:
-            start_dt = datetime.strptime(earliest_ym + "-01", "%Y-%m-%d").date()
-        except Exception:
-            start_dt = yesterday
-    else:
-        start_dt = yesterday
+    start_dt = yesterday - timedelta(days=POSFEED_SOURCE_LOOKBACK_DAYS - 1)
 
     expected_dates: set[str] = set()
     cur = start_dt
@@ -1183,8 +1327,12 @@ def check_monthly_collection(**context) -> str:
         logger.info("[갭 감지] %s ~ %s 누락 없음", start_dt, yesterday)
     else:
         logger.info(
-            "[갭 감지] %s ~ %s 중 누락 %d일 (전체 재다운로드): %s",
-            start_dt, yesterday, original_missing_count, missing_dates,
+            "[갭 감지] %s ~ %s 중 누락 %d일 (최근 %d일 재다운로드): %s",
+            start_dt,
+            yesterday,
+            original_missing_count,
+            POSFEED_SOURCE_LOOKBACK_DAYS,
+            missing_dates,
         )
 
     # ── STEP 3: 누락 날짜 재다운로드 ────────────────────────────
@@ -1220,12 +1368,6 @@ def check_monthly_collection(**context) -> str:
             for date_str in missing_dates:
                 target_date = datetime.strptime(date_str, "%Y-%m-%d")
 
-                # 주말 → no-data 처리 (Saturday=5, Sunday=6)
-                if target_date.weekday() >= 5:
-                    logger.info("[재수집] %s 주말 — no-data 처리", date_str)
-                    nodata_dates.append(date_str)
-                    continue
-
                 try:
                     download_start = time.time()
                     _click_download(driver, wait, target_date=target_date)
@@ -1233,18 +1375,19 @@ def check_monthly_collection(**context) -> str:
 
                     df_new = pd.read_excel(str(downloaded_file), dtype=str, engine="openpyxl")
 
-                    # 날짜 정합성 검증
+                    # 날짜 정합성 검증: target_date와 정확히 같은 주문등록 시각만 허용한다.
                     if "주문등록 시각" in df_new.columns and len(df_new) > 0:
-                        actual_months = (
+                        actual_dates = (
                             pd.to_datetime(df_new["주문등록 시각"], errors="coerce")
-                            .dt.month.dropna()
+                            .dt.strftime("%Y-%m-%d")
+                            .dropna()
                         )
-                        if len(actual_months) > 0:
-                            actual_month = actual_months.mode()[0]
-                            if actual_month != target_date.month:
+                        if len(actual_dates) > 0:
+                            unexpected_dates = sorted(set(actual_dates) - {date_str})
+                            if unexpected_dates:
                                 logger.warning(
-                                    "[재수집] %s 날짜 피커 오류: 실제월=%d 대상월=%d — 건너뜀",
-                                    date_str, int(actual_month), target_date.month,
+                                    "[재수집] %s 날짜 피커 오류: 다운로드 날짜=%s — 건너뜀",
+                                    date_str, unexpected_dates[:10],
                                 )
                                 downloaded_file.unlink(missing_ok=True)
                                 fail_dates.append(date_str)
@@ -1386,7 +1529,7 @@ def check_monthly_collection(**context) -> str:
 # 누락 날짜 재수집: partition_to_onedrive 완료 후 자동 실행
 # ============================================================
 
-_MISSING_LOOKBACK_DAYS = 30  # 최근 N일 검사
+_MISSING_LOOKBACK_DAYS = POSFEED_SOURCE_LOOKBACK_DAYS  # 최근 N일 검사
 
 
 def _resolve_missing_scan_range(collect_mode: str, conf: dict) -> tuple[datetime, datetime, str]:
@@ -1508,15 +1651,19 @@ def collect_missing_dates(
 
                 df = pd.read_excel(str(downloaded_file), dtype=str, engine="openpyxl")
 
-                # 날짜 정합성 검증: 주문등록 시각이 target_date와 같은 달인지 확인
+                # 날짜 정합성 검증: target_date와 정확히 같은 주문등록 시각만 허용한다.
                 if "주문등록 시각" in df.columns and len(df) > 0:
-                    actual_months = pd.to_datetime(df["주문등록 시각"], errors="coerce").dt.month.dropna()
-                    if len(actual_months) > 0:
-                        actual_month = actual_months.mode()[0]
-                        if actual_month != target_date.month:
+                    actual_dates = (
+                        pd.to_datetime(df["주문등록 시각"], errors="coerce")
+                        .dt.strftime("%Y-%m-%d")
+                        .dropna()
+                    )
+                    if len(actual_dates) > 0:
+                        unexpected_dates = sorted(set(actual_dates) - {date_str})
+                        if unexpected_dates:
                             logger.warning(
-                                "[%s] 날짜 피커 오류 감지 — 다운로드 데이터 월(%d월)이 대상 월(%d월)과 불일치. 건너뜀.",
-                                date_str, int(actual_month), target_date.month,
+                                "[%s] 날짜 피커 오류 감지 — 다운로드 날짜=%s. 건너뜀.",
+                                date_str, unexpected_dates[:10],
                             )
                             downloaded_file.unlink(missing_ok=True)
                             fail_dates.append(date_str)

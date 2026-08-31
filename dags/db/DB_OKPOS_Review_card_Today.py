@@ -26,9 +26,10 @@ def download_okpos_card_today(**context) -> str:
     conf = getattr(dag_run, "conf", None)
     if not isinstance(conf, dict):
         conf = {}
-        if dag_run is not None:
-            dag_run.conf = conf
+    if dag_run is not None:
+        dag_run.conf = conf
     conf.setdefault("sale_date", pendulum.now("Asia/Seoul").format("YYYY-MM-DD"))
+    conf.setdefault("allow_primary_empty", True)
     return download_okpos_card_test(**context)
 
 

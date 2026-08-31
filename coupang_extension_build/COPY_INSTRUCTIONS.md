@@ -20,6 +20,11 @@ OneDrive 확장 폴더를 Claude가 직접 못 고치게 막혀 있어, 완성�
 
 > 위 표에 없는 기존 content script와 `accounts.js`는 그대로 둡니다.
 
+> ⚠️ **`content/02_baemin.js` 원본은 여기가 아니라
+> `C:\Users\민준\OneDrive - 주식회사 도리당\Extention\doridang_collector_개발용\content\02_baemin.js` 입니다.**
+> 배민 수동수집(`baemin_manual.html`)은 그 폴더에서만 동작하므로, 배민 관련 수정은 개발용 폴더에서 하고
+> 이 빌드 폴더의 사본은 거기서 복사해 맞춥니다(반대 방향으로 덮어쓰지 마세요).
+
 PowerShell 한 줄 복사 예시:
 ```powershell
 $src = "C:\airflow\coupang_extension_build"

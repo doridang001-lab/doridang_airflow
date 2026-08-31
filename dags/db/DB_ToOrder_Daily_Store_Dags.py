@@ -25,6 +25,7 @@ from modules.transform.utility.notifier import on_failure_callback
 
 
 TARGET_DEST_DIR = ANALYTICS_DB / "toorder_daily_store"
+TOORDER_SELENIUM_POOL = "toorder_selenium_serial"
 
 # LOOKBACK_DAYS: conf 미지정 시 최근 N일 중 parquet 없는 날만 수집
 # None → 어제 1일만, int → 최근 N일 중 누락분만
@@ -76,4 +77,5 @@ with DAG(
     PythonOperator(
         task_id="collect_toorder_daily_store",
         python_callable=collect_toorder_daily_store,
+        pool=TOORDER_SELENIUM_POOL,
     )

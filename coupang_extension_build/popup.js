@@ -274,7 +274,7 @@ if (runBtn) {
     chrome.action.setBadgeBackgroundColor({ color: '#4a90d9', tabId: tab.id });
 
     try {
-      await chrome.tabs.sendMessage(tab.id, { type: 'COLLECT' });
+      await chrome.tabs.sendMessage(tab.id, { type: 'COLLECT', source: 'manual' });
 
       chrome.action.setBadgeText({ text: '✓', tabId: tab.id });
       chrome.action.setBadgeBackgroundColor({ color: '#28a745', tabId: tab.id });
@@ -293,7 +293,7 @@ if (runBtn) {
 
         setTimeout(async () => {
           try {
-            await chrome.tabs.sendMessage(tab.id, { type: 'COLLECT' });
+            await chrome.tabs.sendMessage(tab.id, { type: 'COLLECT', source: 'manual' });
 
             chrome.action.setBadgeText({ text: '✓', tabId: tab.id });
             chrome.action.setBadgeBackgroundColor({ color: '#28a745', tabId: tab.id });

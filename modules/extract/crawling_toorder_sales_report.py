@@ -51,6 +51,8 @@ SALES_REPORT_DATE_URL = "https://ceo.toorder.co.kr/dashboard/sales-report/orderk
 SALES_REPORT_DATEDETAIL_URL = "https://ceo.toorder.co.kr/dashboard/sales-report/datedetail"
 LOGIN_FAIL_URL_PATTERNS = ["/login", "/auth"]
 LOGIN_SUCCESS_URL_PATTERNS = ["/dashboard"]
+LOGIN_IS_COMPANY_ATTEMPTS = (True, False)
+LOGIN_ACCOUNT_TYPE_HINTS = ("계정유형", "아이디 또는 비밀번호", "비밀번호가 잘못")
 
 
 # ============================================================
@@ -199,6 +201,7 @@ def _is_retriable_driver_error(message: str) -> bool:
             "chrome not reachable",
             "disconnected: not connected to devtools",
             "no such window",
+            "downloaded file not found",
             "chromeoptions object",
             "reuse the chromeoptions object",
             "cannot reuse chromeoptions object",
@@ -248,6 +251,38 @@ def _xlsx_member_preview(path: Path, limit: int = 5) -> str:
         return f"{type(exc).__name__}: {exc}"
 
 
+def _file_signature_preview(path: Path, limit: int = 16) -> str:
+    try:
+        return path.read_bytes()[:limit].hex(" ")
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+def _download_dir_diagnostics(
+    download_dir: Path,
+    download_started_at: float,
+    *,
+    limit: int = 10,
+) -> list[str]:
+    candidates = sorted(
+        (
+            path
+            for path in download_dir.glob("*")
+            if path.is_file() and path.stat().st_mtime >= download_started_at - 5
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return [
+        (
+            f"{path.name} size={path.stat().st_size} "
+            f"mtime={datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec='seconds')} "
+            f"sig={_file_signature_preview(path)}"
+        )
+        for path in candidates[:limit]
+    ]
+
+
 def _wait_for_report_xlsx_download(
     *,
     download_dir: Path,
@@ -285,6 +320,82 @@ def _wait_for_report_xlsx_download(
                 )
         time.sleep(1)
     return None
+
+
+def _cleanup_expected_report_downloads(
+    download_dir: Path,
+    expected_stem: str,
+    preserve_paths: list[str | Path] | None = None,
+) -> None:
+    preserve_names = {
+        Path(str(path)).name
+        for path in (preserve_paths or [])
+        if str(path or "").strip()
+    }
+    for path in download_dir.glob(f"{expected_stem}*.xlsx*"):
+        if not path.is_file():
+            continue
+        if path.name in preserve_names:
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning("기존 보고서 다운로드 파일 정리 실패: %s (%s)", path, exc)
+
+
+def _datedetail_workbook_matches_date(path: Path, target_date: str) -> bool:
+    if not _wait_for_xlsx_ready(path, timeout_sec=5):
+        return False
+    try:
+        from openpyxl import load_workbook
+
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            if target_date in wb.sheetnames:
+                return True
+            for sheet_name in wb.sheetnames[:3]:
+                ws = wb[sheet_name]
+                for row in ws.iter_rows(min_row=1, max_row=3, max_col=2, values_only=True):
+                    if any(target_date in str(value or "") for value in row):
+                        return True
+        finally:
+            wb.close()
+    except Exception as exc:
+        logger.warning("datedetail workbook date check failed: %s (%s)", path.name, exc)
+    return False
+
+
+def _find_existing_datedetail_download(download_dir: Path, target_date: str) -> Path | None:
+    expected_stem = Path(ORIG_DATEDETAIL_FILENAME).stem
+    candidates = sorted(
+        (
+            path
+            for path in download_dir.glob(f"{expected_stem}*.xlsx")
+            if path.is_file() and not path.name.startswith("~$")
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for candidate in candidates:
+        if _datedetail_workbook_matches_date(candidate, target_date):
+            return candidate
+    return None
+
+
+def _rename_daily_datedetail_download(downloaded_file: Path, target_date: str, download_dir: Path) -> Path:
+    yymmdd = datetime.strptime(target_date, "%Y-%m-%d").strftime("%y%m%d")
+    stem = Path(ORIG_DATEDETAIL_FILENAME).stem
+    suffix = Path(ORIG_DATEDETAIL_FILENAME).suffix
+    new_path = download_dir / f"{stem}_{yymmdd}{suffix}"
+    if downloaded_file.resolve() == new_path.resolve():
+        return downloaded_file
+    if new_path.exists():
+        bak = new_path.with_name(
+            f"{new_path.stem}_bak_{datetime.now().strftime('%H%M%S')}{new_path.suffix}"
+        )
+        new_path.rename(bak)
+    downloaded_file.rename(new_path)
+    return new_path
 
 
 # ============================================================
@@ -395,12 +506,18 @@ def _build_report_browser_options(
     options.add_argument("--disable-renderer-backgrounding")
     options.add_argument("--disable-background-timer-throttling")
     options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-component-extensions-with-background-pages")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--disable-sync")
     options.add_argument("--disable-features=Translate,BackForwardCache")
 
     prefs = {
         "download.default_directory": str(download_dir.absolute()),
         "download.prompt_for_download": False,
         "download.directory_upgrade": True,
+        "download.extensions_to_open": "",
+        "profile.default_content_settings.popups": 0,
         "safebrowsing.enabled": True,
     }
     options.add_experimental_option("prefs", prefs)
@@ -500,24 +617,43 @@ def _wait_for_react_load(driver, timeout: int = 10) -> bool:
     return False
 
 
-def _do_login(driver, account_id: str, password: str) -> bool:
+def _set_is_company_checkbox(driver, account_id: str, is_company: bool) -> None:
+    try:
+        checkbox = driver.find_element(By.CSS_SELECTOR, "input[name='isCompany']")
+        try:
+            checked = bool(driver.execute_script("return !!arguments[0].checked;", checkbox))
+        except Exception:
+            checked = checkbox.is_selected()
+        if checked != is_company:
+            driver.execute_script("arguments[0].click();", checkbox)
+        logger.info("[%s] 기업회원 %s", account_id, "체크" if is_company else "해제")
+    except Exception:
+        logger.warning("[%s] 기업회원 체크박스 제어 실패(무시)", account_id)
+
+
+def _do_login_once(driver, account_id: str, password: str, *, is_company: bool) -> bool:
     """
-    투오더 CEO 사이트에 로그인한다.
+    투오더 CEO 사이트에 1회 로그인한다.
 
     Parameters:
         driver:     Chrome 드라이버
         account_id: 투오더 로그인 ID
         password:   투오더 비밀번호
+        is_company: 기업회원 체크 여부
 
     Returns:
         True: 로그인 성공, False: 실패
     """
-    logger.info("[%s] 로그인 시도", account_id)
+    logger.info("[%s] 로그인 시도(isCompany=%s)", account_id, is_company)
 
     try:
         driver.get(LOGIN_URL)
         if not _wait_for_react_load(driver, timeout=15):
             logger.error("[%s] React 앱 로드 타임아웃", account_id)
+            try:
+                setattr(driver, "_toorder_login_error", "React 앱 로드 타임아웃")
+            except Exception:
+                pass
             return False
         time.sleep(1.0)
     except Exception as exc:
@@ -534,12 +670,20 @@ def _do_login(driver, account_id: str, password: str) -> bool:
         wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[name='id']")))
     except TimeoutException:
         logger.error("[%s] ID 필드 타임아웃", account_id)
+        try:
+            setattr(driver, "_toorder_login_error", "ID 필드 타임아웃")
+        except Exception:
+            pass
         return False
 
     try:
         pw_input = driver.find_element(By.CSS_SELECTOR, "input[name='password']")
     except NoSuchElementException:
         logger.error("[%s] 비밀번호 필드 없음", account_id)
+        try:
+            setattr(driver, "_toorder_login_error", "비밀번호 필드 없음")
+        except Exception:
+            pass
         return False
 
     if not _fill_react_input(driver, id_input, account_id, account_id, "ID"):
@@ -560,15 +704,7 @@ def _do_login(driver, account_id: str, password: str) -> bool:
     )
 
     time.sleep(0.3)
-    try:
-        checkbox = driver.find_element(By.CSS_SELECTOR, "input[name='isCompany']")
-        if not checkbox.is_selected():
-            driver.execute_script("arguments[0].click();", checkbox)
-            logger.info("[%s] 기업회원 체크박스 체크", account_id)
-        else:
-            logger.info("[%s] 기업회원 체크박스 이미 체크됨 (유지)", account_id)
-    except Exception:
-        pass
+    _set_is_company_checkbox(driver, account_id, is_company)
 
     time.sleep(0.5)
 
@@ -618,7 +754,7 @@ def _do_login(driver, account_id: str, password: str) -> bool:
     if success:
         logger.info("[%s] 로그인 성공: %s", account_id, current_url)
     else:
-        debug_path = _save_login_debug(driver, account_id, "login_fail")
+        debug_path = _save_login_debug(driver, account_id, f"login_fail_company{int(is_company)}")
         try:
             title = driver.title or ""
             error_texts = driver.execute_script(
@@ -652,6 +788,71 @@ def _do_login(driver, account_id: str, password: str) -> bool:
             pass
         logger.error("[%s] %s", account_id, error)
     return success
+
+
+def _looks_like_account_type_failure(error: str) -> bool:
+    return any(hint in (error or "") for hint in LOGIN_ACCOUNT_TYPE_HINTS)
+
+
+def _is_retriable_login_failure(error: str) -> bool:
+    if _looks_like_account_type_failure(error):
+        return False
+    lowered = (error or "").lower()
+    return (
+        not lowered
+        or _is_retriable_driver_error(lowered)
+        or any(
+            keyword in lowered
+            for keyword in (
+                "react 앱 로드 타임아웃",
+                "id 필드 타임아웃",
+                "비밀번호 필드 없음",
+                "로그인 실패",
+            )
+        )
+    )
+
+
+def _do_login(
+    driver,
+    account_id: str,
+    password: str,
+    *,
+    is_company_attempts: tuple[bool, ...] = LOGIN_IS_COMPANY_ATTEMPTS,
+) -> bool:
+    """계정유형 토글 때문에 동일한 ID/PW 오류가 나는 케이스를 자동 재시도한다."""
+    last_error = ""
+    total = len(is_company_attempts)
+    for index, is_company in enumerate(is_company_attempts, start=1):
+        if _do_login_once(driver, account_id, password, is_company=is_company):
+            return True
+        last_error = getattr(driver, "_toorder_login_error", "") or ""
+        if index >= total:
+            break
+        if not _looks_like_account_type_failure(last_error):
+            logger.warning("[%s] 계정유형 오류로 보이지 않아 토글 재시도 생략: %s", account_id, last_error)
+            break
+        logger.warning(
+            "[%s] 로그인 실패(isCompany=%s) - 계정유형 토글 재시도 %d/%d",
+            account_id,
+            is_company,
+            index + 1,
+            total,
+        )
+        try:
+            driver.delete_all_cookies()
+        except Exception:
+            pass
+        time.sleep(1.0)
+    try:
+        setattr(
+            driver,
+            "_toorder_login_error",
+            f"login failed (isCompany attempts={list(is_company_attempts)}): {last_error}",
+        )
+    except Exception:
+        pass
+    return False
 
 
 # ============================================================
@@ -933,6 +1134,7 @@ def _download_datedetail_month(
             "arguments[0].scrollIntoView({block: 'center'});", report_btn
         )
         time.sleep(0.5)
+        download_started_at = time.time()
         try:
             driver.execute_script("arguments[0].focus();", report_btn)
             time.sleep(0.2)
@@ -940,32 +1142,24 @@ def _download_datedetail_month(
         except Exception as exc:
             logger.warning("[%s] keyboard report submit failed, fallback native click: %s", account_id, exc)
             report_btn.click()
-        download_started_at = time.time()
         logger.info("[%s] datedetail report button submitted: %s ~ %s", account_id, month_start, month_end)
 
-        downloaded_file = None
-        for _ in range(180):
-            time.sleep(1)
-            expected_stem = Path(ORIG_DATEDETAIL_FILENAME).stem
-            completed = sorted(
-                (
-                    xlsx
-                    for xlsx in download_dir.glob("*.xlsx")
-                    if not xlsx.name.endswith(".crdownload")
-                    and xlsx.is_file()
-                    and xlsx.stem.startswith(expected_stem)
-                    and xlsx.stat().st_mtime >= download_started_at - 1
-                ),
-                key=lambda xlsx: xlsx.stat().st_mtime,
-            )
-            for candidate in completed:
-                if _wait_for_xlsx_ready(candidate):
-                    downloaded_file = candidate
-                    break
-            if downloaded_file:
-                break
+        expected_stem = Path(ORIG_DATEDETAIL_FILENAME).stem
+        downloaded_file = _wait_for_report_xlsx_download(
+            download_dir=download_dir,
+            expected_stem=expected_stem,
+            download_started_at=download_started_at,
+            timeout_sec=180,
+        )
 
         if not downloaded_file:
+            diagnostics = _download_dir_diagnostics(download_dir, download_started_at)
+            logger.error(
+                "[%s] no datedetail xlsx download: expected_stem=%s recent_files=%s",
+                account_id,
+                expected_stem,
+                diagnostics,
+            )
             try:
                 debug_dir = Path(r"C:\airflow\tmp\toorder_datedetail_debug")
                 debug_dir.mkdir(parents=True, exist_ok=True)
@@ -1015,6 +1209,23 @@ def _datedetail_failure_results(
     ]
 
 
+def _merge_datedetail_results(
+    month_spans: list[tuple[str, str]],
+    results_by_month: dict[str, Dict[str, Any]],
+    default_error: str,
+) -> list[Dict[str, Any]]:
+    merged: list[Dict[str, Any]] = []
+    for month_start, _month_end in month_spans:
+        month = month_start[:7]
+        merged.append(
+            results_by_month.get(
+                month,
+                {"success": False, "file": None, "month": month, "error": default_error},
+            )
+        )
+    return merged
+
+
 def run_crawling_datedetail_months(
     toorder_id: str,
     toorder_pw: str,
@@ -1027,39 +1238,66 @@ def run_crawling_datedetail_months(
         return []
 
     last_results = _datedetail_failure_results(month_spans, "not attempted")
+    results_by_month: dict[str, Dict[str, Any]] = {}
+    pending_spans = list(month_spans)
     for attempt in range(1, PIPELINE_RETRIES + 1):
         driver = None
         try:
+            expected_stem = Path(ORIG_DATEDETAIL_FILENAME).stem
+            _cleanup_expected_report_downloads(
+                download_dir,
+                expected_stem,
+                preserve_paths=[
+                    str(result.get("file") or "")
+                    for result in results_by_month.values()
+                ],
+            )
             driver = _launch_report_browser(toorder_id, download_dir)
             if not _do_login(driver, toorder_id, toorder_pw):
                 error = getattr(driver, "_toorder_login_error", None) or (
                     f"login failed: account_id={toorder_id}, url={getattr(driver, 'current_url', '')}"
                 )
-                return _datedetail_failure_results(month_spans, error)
+                return _merge_datedetail_results(month_spans, results_by_month, error)
 
             logger.info("[%s] opening datedetail report page", toorder_id)
             driver.get(SALES_REPORT_DATEDETAIL_URL)
             time.sleep(4.0)
             if "sales-report/datedetail" not in driver.current_url:
-                return _datedetail_failure_results(
+                return _merge_datedetail_results(
                     month_spans,
+                    results_by_month,
                     f"datedetail page navigation failed: {driver.current_url}",
                 )
             if not _open_datedetail_report_tab(driver, toorder_id):
-                return _datedetail_failure_results(
+                return _merge_datedetail_results(
                     month_spans,
+                    results_by_month,
                     "datedetail report tab open failed",
                 )
 
             results: list[Dict[str, Any]] = []
-            for month_start, month_end in month_spans:
+            for month_start, month_end in pending_spans:
                 result = _download_datedetail_month(
                     driver, toorder_id, month_start, month_end, download_dir
                 )
                 results.append(result)
+                month = str(result.get("month") or month_start[:7])
+                if result.get("success"):
+                    results_by_month[month] = result
                 time.sleep(1.0)
 
-            last_results = results
+            last_results = _merge_datedetail_results(
+                month_spans,
+                results_by_month,
+                next((str(result.get("error") or "") for result in results if not result.get("success")), ""),
+            )
+            pending_spans = [
+                span
+                for span in month_spans
+                if span[0][:7] not in results_by_month
+            ]
+            if not pending_spans:
+                return last_results
             retriable_error = next(
                 (
                     str(result.get("error") or "")
@@ -1079,11 +1317,11 @@ def run_crawling_datedetail_months(
                 )
                 time.sleep(PIPELINE_RETRY_BASE_SEC * attempt)
                 continue
-            return results
+            return last_results
 
         except Exception as exc:
             msg = str(exc)
-            last_results = _datedetail_failure_results(month_spans, msg)
+            last_results = _merge_datedetail_results(month_spans, results_by_month, msg)
             if attempt < PIPELINE_RETRIES and _is_retriable_driver_error(msg):
                 logger.warning(
                     "[%s] run_crawling_datedetail_months exception retry %d/%d: %s",
@@ -1188,7 +1426,18 @@ def run_crawling_single_date(
             driver = _launch_report_browser(toorder_id, download_dir)
 
             if not _do_login(driver, toorder_id, toorder_pw):
-                result["error"] = "로그인 실패"
+                login_error = getattr(driver, "_toorder_login_error", "") or "로그인 실패"
+                result["error"] = login_error
+                if attempt < PIPELINE_RETRIES and _is_retriable_login_failure(login_error):
+                    logger.warning(
+                        "[%s] run_crawling_single_date 로그인 재시도 %d/%d: %s",
+                        toorder_id,
+                        attempt,
+                        PIPELINE_RETRIES,
+                        login_error,
+                    )
+                    time.sleep(PIPELINE_RETRY_BASE_SEC * attempt)
+                    continue
                 return result
 
             if not _navigate_to_sales_report(driver, toorder_id):
@@ -1269,10 +1518,30 @@ def run_crawling_daily_date_page(
     for attempt in range(1, PIPELINE_RETRIES + 1):
         driver = None
         try:
+            expected_stem = Path(ORIG_DATEDETAIL_FILENAME).stem
+            existing_file = _find_existing_datedetail_download(download_dir, target_date)
+            if existing_file:
+                daily_file = _rename_daily_datedetail_download(existing_file, target_date, download_dir)
+                result["success"] = True
+                result["file"] = str(daily_file)
+                logger.info("[%s] 기존 datedetail 다운로드 회수: %s", toorder_id, daily_file.name)
+                return result
+            _cleanup_expected_report_downloads(download_dir, expected_stem)
             driver = _launch_report_browser(toorder_id, download_dir)
 
             if not _do_login(driver, toorder_id, toorder_pw):
-                result["error"] = "로그인 실패"
+                login_error = getattr(driver, "_toorder_login_error", "") or "로그인 실패"
+                result["error"] = login_error
+                if attempt < PIPELINE_RETRIES and _is_retriable_login_failure(login_error):
+                    logger.warning(
+                        "[%s] run_crawling_daily_date_page 로그인 재시도 %d/%d: %s",
+                        toorder_id,
+                        attempt,
+                        PIPELINE_RETRIES,
+                        login_error,
+                    )
+                    time.sleep(PIPELINE_RETRY_BASE_SEC * attempt)
+                    continue
                 return result
 
             logger.info("[%s] 일별매출보고서 페이지 이동", toorder_id)
@@ -1290,45 +1559,41 @@ def run_crawling_daily_date_page(
                 result["error"] = "날짜 설정 실패"
                 return result
 
-            wait = WebDriverWait(driver, 15)
-            report_btn = wait.until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, "//button[contains(text(), '보고서 생성')]")
-                )
+            result = _download_datedetail_month(
+                driver,
+                toorder_id,
+                target_date,
+                target_date,
+                download_dir,
             )
-            driver.execute_script(
-                "arguments[0].scrollIntoView({block: 'center'});", report_btn
-            )
-            time.sleep(0.5)
-            driver.execute_script("arguments[0].click();", report_btn)
-            download_started_at = time.time()
-            logger.info("[%s] 보고서 생성 클릭: %s", toorder_id, target_date)
-
-            downloaded_file = _wait_for_report_xlsx_download(
-                download_dir=download_dir,
-                expected_stem=Path(ORIG_DATEDETAIL_FILENAME).stem,
-                download_started_at=download_started_at,
-                timeout_sec=120,
-            )
-
-            if not downloaded_file:
-                result["error"] = "다운로드 파일 없음 또는 유효한 xlsx 보고서 없음"
+            result["date"] = target_date
+            if result.get("success") and result.get("file"):
+                daily_file = _rename_daily_datedetail_download(Path(str(result["file"])), target_date, download_dir)
+                result["file"] = str(daily_file)
+                logger.info("[%s] 일별 datedetail 파일명 정리: %s", toorder_id, daily_file.name)
+                return result
+            if not result.get("success"):
+                late_file = _find_existing_datedetail_download(download_dir, target_date)
+                if late_file:
+                    daily_file = _rename_daily_datedetail_download(late_file, target_date, download_dir)
+                    result["success"] = True
+                    result["file"] = str(daily_file)
+                    result["error"] = None
+                    logger.info("[%s] 지연 생성 datedetail 다운로드 회수: %s", toorder_id, daily_file.name)
+                    return result
+                error_msg = str(result.get("error") or "")
+                if attempt < PIPELINE_RETRIES and _is_retriable_driver_error(error_msg):
+                    logger.warning(
+                        "[%s] run_crawling_daily_date_page 오류 재시도 %d/%d: %s",
+                        toorder_id,
+                        attempt,
+                        PIPELINE_RETRIES,
+                        error_msg,
+                    )
+                    time.sleep(PIPELINE_RETRY_BASE_SEC * attempt)
+                    continue
                 return result
 
-            yymmdd = datetime.strptime(target_date, "%Y-%m-%d").strftime("%y%m%d")
-            new_name = f"{Path(ORIG_DATEDETAIL_FILENAME).stem}_{yymmdd}{Path(ORIG_DATEDETAIL_FILENAME).suffix}"
-            new_path = download_dir / new_name
-
-            if new_path.exists():
-                bak = new_path.with_name(
-                    f"{new_path.stem}_bak_{datetime.now().strftime('%H%M%S')}{new_path.suffix}"
-                )
-                new_path.rename(bak)
-
-            downloaded_file.rename(new_path)
-            result["success"] = True
-            result["file"] = str(new_path)
-            logger.info("[%s] 다운로드 완료: %s", toorder_id, new_path.name)
             return result
 
         except TimeoutException:

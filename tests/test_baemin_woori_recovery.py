@@ -9,12 +9,13 @@ from modules.transform.pipelines.db import DB_Beamin_02_woori_shop_click as woor
 
 def test_collect_woori_retries_revisit_after_empty_and_saves():
     store_info = {"store_id": "14778331", "brand": "brand", "store": "송파삼전점"}
-    rows = [{"날짜": "2026-05-01"}]
+    rows = [{"날짜": "2026-06-01"}]
 
     with patch.object(woori, "KNOWN_BRANDS", ["brand"]), \
-         patch.object(woori, "_get_target_months", return_value=["2026-05"]), \
+         patch.object(woori, "_get_target_months", return_value=["2026-06"]), \
          patch.object(woori, "_navigate_to_woori_url"), \
          patch.object(woori, "_extract_table_rows", side_effect=[[], [], rows]), \
+         patch.object(woori, "_existing_woori_row_count", return_value=12), \
          patch.object(woori, "_save_csv", return_value=Path("saved.csv")) as mock_save, \
          patch.object(woori, "time") as mock_time:
         mock_time.sleep.return_value = None
@@ -29,7 +30,7 @@ def test_collect_woori_raises_when_previous_month_was_previously_collected_but_n
     store_info = {"store_id": "14778331", "brand": "brand", "store": "송파삼전점"}
 
     with patch.object(woori, "KNOWN_BRANDS", ["brand"]), \
-         patch.object(woori, "_get_target_months", return_value=["2026-05"]), \
+         patch.object(woori, "_get_target_months", return_value=["2026-06"]), \
          patch.object(woori, "_navigate_to_woori_url"), \
          patch.object(woori, "_extract_table_rows", side_effect=[[], [], []]), \
          patch.object(woori, "_existing_woori_row_count", return_value=12), \

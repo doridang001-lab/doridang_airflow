@@ -90,6 +90,9 @@ def test_dag_runs_daily_at_nine_and_orders_sensors_before_upload():
     assert susam_dag.dag.timezone.name == "Asia/Seoul"
     assert susam_dag.dag.catchup is False
     assert susam_dag.dag.max_active_runs == 1
+    source_sensor = susam_dag.dag.get_task("wait_for_source_ready")
+    assert susam_dag.SOURCE_STABILITY_SECONDS == 60 * 5
+    assert source_sensor.timeout == 60 * 60 * 3
     assert susam_dag.dag.get_task("wait_for_source_ready").downstream_task_ids == {
         "wait_for_flow_chrome"
     }

@@ -14,7 +14,10 @@ if (-not (Test-Path -LiteralPath $runner)) {
     throw "Flow Chrome runner was not found: $runner"
 }
 
-$argument = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`""
+$argument = (
+    "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass " +
+    "-File `"$runner`" -MaxRestarts 3 -RestartDelaySeconds 10 -CompletionGraceSeconds 30"
+)
 $action = New-ScheduledTaskAction `
     -Execute $powershell `
     -Argument $argument `
@@ -37,7 +40,7 @@ Register-ScheduledTask `
     -Trigger $trigger `
     -Settings $settings `
     -Principal $principal `
-    -Description "Open dedicated Flow Chrome daily from 08:55 to 11:10 for Docker Airflow" `
+    -Description "Open and recover dedicated Flow Chrome daily for Docker Airflow" `
     -Force | Out-Null
 
 $task = Get-ScheduledTask -TaskName $TaskName

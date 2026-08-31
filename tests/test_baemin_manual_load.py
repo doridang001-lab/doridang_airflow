@@ -4,8 +4,16 @@ from pathlib import Path
 import pandas as pd
 
 from modules.transform.pipelines.db import DB_BaeminManual_load as manual
+from modules.transform.pipelines.db import DB_Beamin_04_orders as collected_orders
+from modules.transform.pipelines.db import DB_UnifiedSales_baemin as unified_baemin
+from modules.transform.pipelines.db import DB_UnifiedSales_common as unified_common
 from modules.transform.pipelines.db.DB_Beamin_04_orders import _COLUMNS
-from modules.transform.pipelines.db.beamin_store_io import read_table, write_table
+from modules.transform.pipelines.db.beamin_store_io import (
+    order_date,
+    read_table,
+    replace_covered_date_range,
+    write_table,
+)
 from scripts import fix_baemin_price_optname_260721 as price_fix
 from scripts import repartition_baemin_orders as repartition
 
@@ -198,6 +206,245 @@ def test_manual_baemin_latest_upsert_keeps_latest_order_snapshot():
     assert out[out["주문번호"].eq("B")]["주문내역"].tolist() == ["keep"]
 
 
+def test_replace_covered_date_range_removes_ghost_and_keeps_outside_range():
+    existing = pd.DataFrame(
+        [
+            _row("OUT", "2026. 05. 20. (수) 오후 1:00:00", "9000", "구간밖"),
+            _row("GHOST", "2026. 06. 17. (수) 오후 1:00:00", "22000", "유령"),
+            _row("EMPTY_DAY", "2026. 06. 18. (목) 오후 1:00:00", "10000", "빈날짜"),
+        ],
+        columns=_COLUMNS,
+    )
+    new = pd.DataFrame(
+        [
+            _row("B", "2026. 06. 17. (수) 오후 2:00:00", "50000", "정상1"),
+            _row("C", "2026. 06. 19. (금) 오후 2:00:00", "60000", "정상2"),
+        ],
+        columns=_COLUMNS,
+    )
+
+    out, info = replace_covered_date_range(
+        existing,
+        new,
+        order_date(existing["주문시각"]),
+        order_date(new["주문시각"]),
+    )
+
+    assert set(out["주문번호"]) == {"OUT", "B", "C"}
+    assert info["range"] == ("2026-06-17", "2026-06-19")
+    assert info["removed"] == 2
+    assert info["covered_dates"] == ["2026-06-17", "2026-06-18", "2026-06-19"]
+    assert info["shrunk_dates"] == ["2026-06-18"]
+
+
+def test_collected_baemin_orders_replace_same_date_ghost(tmp_path, monkeypatch):
+    orders_root = tmp_path / "orders"
+    monkeypatch.setattr(collected_orders, "BAEMIN_ORDERS_DB", orders_root)
+    recorded = []
+    monkeypatch.setattr(
+        collected_orders,
+        "record_manual_reingest_marker",
+        lambda source, store, date, meta: recorded.append((source, store, date, meta)) or True,
+    )
+    stem = _orders_stem(orders_root)
+    existing = pd.DataFrame(
+        [
+            _row("OUT", "2026. 06. 16. (화) 오후 1:00:00", "9000", "구간밖"),
+            _row("GHOST", "2026. 06. 17. (수) 오후 1:00:00", "22000", "유령"),
+        ],
+        columns=_COLUMNS,
+    )
+    write_table(existing, stem)
+
+    collected_orders._save_orders_csv(
+        [_row("B", "2026. 06. 17. (수) 오후 2:00:00", "50000", "정상")],
+        "도리당",
+        "해운대중동점",
+        "2026-06-17",
+    )
+
+    out = read_table(stem)
+    assert set(out["주문번호"]) == {"OUT", "B"}
+    assert recorded == [
+        (
+            "배민수동",
+            "해운대중동점",
+            "2026-06-17",
+            {"rows": 1, "removed": 1},
+        )
+    ]
+
+
+def test_manual_baemin_all_cancelled_file_preserves_existing_without_force(tmp_path, monkeypatch):
+    monkeypatch.setattr(manual, "BAEMIN_ORDERS_DB", tmp_path / "orders")
+    monkeypatch.setattr(manual, "_manual_baemin_store_meta", lambda raw, fallback: ("해운대중동점", "도리당"))
+    recorded = []
+    monkeypatch.setattr(
+        manual,
+        "record_manual_reingest_marker",
+        lambda source, store, date, meta: recorded.append((source, store, date, meta)) or True,
+    )
+
+    existing = pd.DataFrame(
+        [_row("A", "2026. 06. 01. (월) 오후 1:00:00", "100", "기존메뉴")],
+        columns=_COLUMNS,
+    )
+    write_table(existing, _orders_stem(manual.BAEMIN_ORDERS_DB))
+    cancelled = pd.DataFrame(
+        [
+            {
+                **_row("A", "2026. 06. 01. (월) 오후 1:00:00", "100", "취소메뉴"),
+                "주문상태": "취소",
+            }
+        ],
+        columns=_COLUMNS,
+    )
+    csv_path = tmp_path / "baemin_orders_cancelled.csv"
+    cancelled.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    loaded_rows, ok = manual._load_one_file(csv_path)
+
+    out = read_table(_orders_stem(manual.BAEMIN_ORDERS_DB))
+    assert ok is True
+    assert loaded_rows == 0
+    assert out["주문번호"].tolist() == ["A"]
+    assert list(out.columns) == _COLUMNS
+    assert recorded == [
+        (
+            "배민수동",
+            "해운대중동점",
+            "2026-06-01",
+            {"rows": 0, "removed": 0},
+        )
+    ]
+
+
+def test_manual_baemin_partial_shrink_overwrites_new_and_preserves_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(manual, "BAEMIN_ORDERS_DB", tmp_path / "orders")
+    monkeypatch.setattr(manual, "_manual_baemin_store_meta", lambda raw, fallback: ("해운대중동점", "도리당"))
+    recorded = []
+    monkeypatch.setattr(
+        manual,
+        "record_manual_reingest_marker",
+        lambda source, store, date, meta: recorded.append((source, store, date, meta)) or True,
+    )
+
+    existing = pd.DataFrame(
+        [
+            _row("A", "2026. 06. 01. (월) 오후 1:00:00", "100", "기존A"),
+            _row("B", "2026. 06. 01. (월) 오후 2:00:00", "200", "기존B"),
+        ],
+        columns=_COLUMNS,
+    )
+    write_table(existing, _orders_stem(manual.BAEMIN_ORDERS_DB))
+    new = pd.DataFrame(
+        [
+            {
+                **_row("A", "2026. 06. 01. (월) 오후 1:00:00", "110", "신규A"),
+                "주문상태": "배달완료",
+            }
+        ],
+        columns=_COLUMNS,
+    )
+    csv_path = tmp_path / "baemin_orders_partial.csv"
+    new.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    loaded_rows, ok = manual._load_one_file(csv_path)
+
+    out = read_table(_orders_stem(manual.BAEMIN_ORDERS_DB))
+    assert ok is True
+    assert loaded_rows == 1
+    assert set(out["주문번호"]) == {"A", "B"}
+    assert out.loc[out["주문번호"].eq("A"), "주문내역"].iloc[0] == "신규A"
+    assert out.loc[out["주문번호"].eq("B"), "주문내역"].iloc[0] == "기존B"
+    assert recorded == [
+        (
+            "배민수동",
+            "해운대중동점",
+            "2026-06-01",
+            {"rows": 1, "removed": 1},
+        )
+    ]
+
+
+def test_manual_baemin_force_shrink_allows_range_clear(tmp_path, monkeypatch):
+    monkeypatch.setattr(manual, "BAEMIN_ORDERS_DB", tmp_path / "orders")
+    monkeypatch.setattr(manual, "_manual_baemin_store_meta", lambda raw, fallback: ("해운대중동점", "도리당"))
+    recorded = []
+    monkeypatch.setattr(
+        manual,
+        "record_manual_reingest_marker",
+        lambda source, store, date, meta: recorded.append((source, store, date, meta)) or True,
+    )
+
+    existing = pd.DataFrame(
+        [_row("A", "2026. 06. 01. (월) 오후 1:00:00", "100", "기존메뉴")],
+        columns=_COLUMNS,
+    )
+    write_table(existing, _orders_stem(manual.BAEMIN_ORDERS_DB))
+    cancelled = pd.DataFrame(
+        [
+            {
+                **_row("A", "2026. 06. 01. (월) 오후 1:00:00", "100", "취소메뉴"),
+                "주문상태": "취소",
+            }
+        ],
+        columns=_COLUMNS,
+    )
+    csv_path = tmp_path / "baemin_orders_cancelled.csv"
+    cancelled.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    loaded_rows, ok = manual._load_one_file(csv_path, force=True)
+
+    out = read_table(_orders_stem(manual.BAEMIN_ORDERS_DB))
+    assert ok is True
+    assert loaded_rows == 0
+    assert out.empty
+    assert recorded == [
+        (
+            "배민수동",
+            "해운대중동점",
+            "2026-06-01",
+            {"rows": 0, "removed": 1},
+        )
+    ]
+
+
+def test_manual_reingest_marker_is_total_only_target(tmp_path, monkeypatch):
+    marker_root = tmp_path / "markers"
+    unified_root = tmp_path / "unified"
+    unified_root.mkdir()
+    monkeypatch.setattr(unified_common, "MANUAL_REINGEST_MARKER_ROOT", marker_root)
+    monkeypatch.setattr(unified_common, "UNIFIED_ROOT", unified_root)
+    monkeypatch.setattr(unified_baemin, "UNIFIED_ROOT", unified_root)
+
+    date = "2000-01-01"
+    store = "테스트매장"
+    assert unified_common.record_manual_reingest_marker("배민수동", store, date, {}) is True
+    base_dates = unified_baemin._resolve_baemin_target_dates([store], None, 14)
+
+    assert date not in base_dates
+    assert date in unified_baemin._target_dates_for_store(
+        "배민수동",
+        store,
+        base_dates,
+        None,
+        14,
+        unified_baemin._resolve_baemin_target_dates,
+        include_reingest_markers=True,
+    )
+
+
+def test_manual_reingest_recent_window_filter_excludes_last_nine_days():
+    now = unified_common.pendulum.datetime(2026, 8, 5, tz="Asia/Seoul")
+
+    assert unified_common.filter_manual_reingest_dates_outside_recent_window(
+        ["2026-08-05", "2026-08-04", "2026-07-28", "2026-07-27", "2026-01-02"],
+        recent_days=9,
+        now=now,
+    ) == ["2026-01-02", "2026-07-27"]
+
+
 def test_cleanup_manual_baemin_orders_moves_down_source_to_collect_dir(tmp_path, monkeypatch):
     down_dir = tmp_path / "down"
     collect_dir = tmp_path / "collect"
@@ -255,6 +502,91 @@ def test_iter_manual_files_includes_upload_temp_and_deduplicates(tmp_path, monke
         {"path": str(temp_file), "source": "down"},
         {"path": str(collect_file), "source": "collect"},
     ]
+
+
+def test_count_pending_manual_baemin_order_files_includes_all_order_sources(tmp_path, monkeypatch):
+    down_dir = tmp_path / "down"
+    upload_temp = down_dir / "업로드_temp"
+    collect_dir = tmp_path / "collect"
+    manual_dir = tmp_path / "manual"
+    for directory in (down_dir, upload_temp, collect_dir, manual_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    for path in (
+        down_dir / "baemin_orders_down.csv",
+        upload_temp / "baemin_orders_temp.csv",
+        collect_dir / "baemin_orders_collect.csv",
+        manual_dir / "baemin_orders_manual.csv",
+        manual_dir / "baemin_orders_manual_20260826_nodate.csv",
+        manual_dir / "baemin_orders_manual_20260826_partial.csv",
+        manual_dir / "baemin_orders_manual_20260826_nodate_partial.csv",
+        collect_dir / "baemin_marketing_collect.csv",
+    ):
+        path.write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(manual, "DOWN_DIR", down_dir)
+    monkeypatch.setattr(manual, "COLLECT_SRC", collect_dir)
+    monkeypatch.setattr(manual, "MANUAL_DOWN_DIR", manual_dir)
+
+    assert manual.count_pending_manual_baemin_order_files() == 5
+    assert manual.count_partial_manual_baemin_order_files() == 2
+
+
+def test_load_manual_baemin_orders_reports_actual_order_dates(tmp_path, monkeypatch):
+    down_dir = tmp_path / "down"
+    collect_dir = tmp_path / "collect"
+    out_root = tmp_path / "orders"
+    down_dir.mkdir()
+    collect_dir.mkdir()
+
+    monkeypatch.setattr(manual, "DOWN_DIR", down_dir)
+    monkeypatch.setattr(manual, "COLLECT_SRC", collect_dir)
+    monkeypatch.setattr(manual, "MANUAL_DOWN_DIR", tmp_path / "manual")
+    monkeypatch.setattr(manual, "BAEMIN_ORDERS_DB", out_root)
+    monkeypatch.setattr(manual, "_manual_baemin_store_meta", lambda raw, fallback: ("해운대중동점", "도리당"))
+    monkeypatch.setattr(manual, "record_manual_reingest_marker", lambda *args, **kwargs: True)
+
+    rows = pd.DataFrame(
+        [
+            _row("A", "2026. 08. 25. (화) 오후 1:00:00", "10000", "메뉴A"),
+            _row("B", "2026. 08. 26. (수) 오후 1:00:00", "12000", "메뉴B"),
+        ],
+        columns=_COLUMNS,
+    )
+    csv_path = down_dir / "baemin_orders_해운대중동점_1_20260826_nodate.csv"
+    rows.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    payload = json.loads(manual.load_manual_baemin_orders(dag_run=type("DR", (), {"conf": {}})()))
+
+    assert payload["order_dates"] == ["2026-08-25", "2026-08-26"]
+    assert payload["loaded_files"][0]["dates"] == ["2026-08-25", "2026-08-26"]
+
+
+def test_load_manual_baemin_orders_skips_partial_files_without_loading(tmp_path, monkeypatch):
+    down_dir = tmp_path / "down"
+    collect_dir = tmp_path / "collect"
+    down_dir.mkdir()
+    collect_dir.mkdir()
+
+    partial_path = down_dir / "baemin_orders_해운대중동점_1_20260826_nodate_partial.csv"
+    pd.DataFrame([_row("A", "2026. 08. 26. (수) 오후 1:00:00", "10000", "메뉴A")]).to_csv(
+        partial_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    monkeypatch.setattr(manual, "DOWN_DIR", down_dir)
+    monkeypatch.setattr(manual, "COLLECT_SRC", collect_dir)
+    monkeypatch.setattr(manual, "MANUAL_DOWN_DIR", tmp_path / "manual")
+    monkeypatch.setattr(manual, "_load_one_file", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("partial loaded")))
+
+    payload = json.loads(manual.load_manual_baemin_orders(dag_run=type("DR", (), {"conf": {}})()))
+
+    assert payload["loaded_files"] == []
+    assert payload["skipped_files"] == []
+    assert payload["partial_files"] == [str(partial_path)]
+    assert payload["order_dates"] == []
+    assert partial_path.exists()
 
 
 def test_load_manual_baemin_marketing_upserts_latest_by_store_id_and_date(tmp_path, monkeypatch):

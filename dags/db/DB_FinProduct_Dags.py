@@ -8,7 +8,7 @@
 4) CSV에 append (llm_check=Y)
 5) 이메일 알림 → map DAG/review 파일에서 표준명과 수동분류 검수
 
-스케줄: DB_FIN_PRODUCT_TIME (매일 10:35, OKPOS Product 완료 후)
+스케줄: DB_FIN_PRODUCT_TIME (매일 10:00, UnifiedSales 및 상품 map 완료 후)
 """
 
 import logging

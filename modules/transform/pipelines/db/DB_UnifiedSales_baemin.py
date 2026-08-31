@@ -18,15 +18,24 @@ from modules.transform.pipelines.db.DB_UnifiedSales_common import (
     UNIFIED_COLUMNS,
     UNIFIED_ROOT,
     clear_manual_fallback_marker,
+    clear_manual_partial_marker,
+    clear_manual_reingest_marker,
+    detect_manual_partial_collection,
+    delivery_baseline_summary,
+    fill_missing_manual_item_name,
     _load_store_map,
     _lookup_store_meta,
     _make_unified_pk,
     _to_int_series,
     _unified_daily_path,
     iter_unified_sales_files,
+    list_manual_reingest_dates,
     notify_manual_fallback,
-    pos_delivery_summary,
+    notify_manual_missing_all,
+    notify_manual_partial,
     record_manual_fallback_marker,
+    record_manual_partial_marker,
+    save_unified_parquet,
 )
 from modules.transform.pipelines.db.DB_ItemIdAllocator import allocate_manual_item_ids
 
@@ -41,6 +50,7 @@ def reconcile_baemin_for_test_stores(
     stores: list[str],
     sale_date: str | None = None,
     lookback_days: int | None = 7,
+    include_reingest_markers: bool = False,
 ) -> str:
     """
     TEST_STORES의 배달의민족 행을 baemin_macro 직수집 기준으로 교정.
@@ -49,17 +59,30 @@ def reconcile_baemin_for_test_stores(
     - 직수집 파일은 있지만 해당 날짜 행이 0건인 경우: 기존 배달의민족 행 제거
     - 배민 원천은 주문상태=배달완료, 주문금액=결제금액 기준으로 교정
     """
-    dates = _resolve_baemin_target_dates(stores, sale_date, lookback_days)
-    if not dates:
-        return "배민수동 교정 스킵 | 대상 날짜 없음"
-    ym_list = sorted({d[:7] for d in dates})
+    base_dates = _resolve_baemin_target_dates(stores, sale_date, lookback_days)
 
     total_added = 0
     total_removed = 0
+    processed_dates = 0
     fallback_events: list[dict] = []
+    partial_events: list[dict] = []
+    missing_events: list[dict] = []
     store_map = _load_store_map()
 
     for store in stores:
+        dates = _target_dates_for_store(
+            BAEMIN_SOURCE,
+            store,
+            base_dates,
+            sale_date,
+            lookback_days,
+            _resolve_baemin_target_dates,
+            include_reingest_markers=include_reingest_markers,
+        )
+        if not dates:
+            continue
+        processed_dates += len(dates)
+        ym_list = sorted({d[:7] for d in dates})
         for ym in ym_list:
             baemin_files = list(dict.fromkeys(
                 _find_baemin_files(store, ym)
@@ -70,7 +93,8 @@ def reconcile_baemin_for_test_stores(
                     if date[:7] != ym:
                         continue
                     removed, added = _upsert_daily(pd.DataFrame(columns=UNIFIED_COLUMNS), date, store)
-                    _record_baemin_fallback_event(date, store, fallback_events)
+                    clear_manual_reingest_marker(BAEMIN_SOURCE, store, date)
+                    _record_baemin_fallback_event(date, store, fallback_events, missing_events)
                     total_removed += removed
                     total_added += added
                     logger.info(
@@ -88,7 +112,8 @@ def reconcile_baemin_for_test_stores(
                     if date[:7] != ym:
                         continue
                     removed, added = _upsert_daily(pd.DataFrame(columns=UNIFIED_COLUMNS), date, store)
-                    _record_baemin_fallback_event(date, store, fallback_events)
+                    clear_manual_reingest_marker(BAEMIN_SOURCE, store, date)
+                    _record_baemin_fallback_event(date, store, fallback_events, missing_events)
                     total_removed += removed
                     total_added += added
                     logger.info(
@@ -127,7 +152,8 @@ def reconcile_baemin_for_test_stores(
                 df_day = df_raw[df_raw["sale_date"] == date].copy()
                 if df_day.empty:
                     removed, added = _upsert_daily(pd.DataFrame(columns=UNIFIED_COLUMNS), date, store)
-                    _record_baemin_fallback_event(date, store, fallback_events)
+                    clear_manual_reingest_marker(BAEMIN_SOURCE, store, date)
+                    _record_baemin_fallback_event(date, store, fallback_events, missing_events)
                     total_removed += removed
                     total_added += added
                     logger.info(
@@ -152,7 +178,8 @@ def reconcile_baemin_for_test_stores(
                 )
                 if df_unified.empty:
                     removed, added = _upsert_daily(df_unified, date, store)
-                    _record_baemin_fallback_event(date, store, fallback_events)
+                    clear_manual_reingest_marker(BAEMIN_SOURCE, store, date)
+                    _record_baemin_fallback_event(date, store, fallback_events, missing_events)
                     total_removed += removed
                     total_added += added
                     logger.info(
@@ -165,8 +192,37 @@ def reconcile_baemin_for_test_stores(
                     continue
                 df_unified = _recalculate_order_fields(df_unified)
 
+                manual_total = int(
+                    pd.to_numeric(df_unified["total_price"], errors="coerce")
+                    .fillna(0)
+                    .sum()
+                )
+                partial = detect_manual_partial_collection(
+                    date,
+                    store,
+                    BAEMIN_PLATFORMS,
+                    BAEMIN_SOURCE,
+                    manual_total,
+                )
+                if partial:
+                    partial["platform"] = BAEMIN_PLATFORM
+                    if record_manual_partial_marker(BAEMIN_SOURCE, store, date, partial):
+                        partial_events.append(partial)
+                    logger.warning(
+                        "배민수동 부분수집 의심: store=%s date=%s 수동=%d %s=%d 부족=%d",
+                        store,
+                        date,
+                        partial["manual_total"],
+                        partial.get("baseline_label") or "POS",
+                        partial.get("baseline_total") or partial["pos_total"],
+                        partial["gap"],
+                    )
+                else:
+                    clear_manual_partial_marker(BAEMIN_SOURCE, store, date)
+
                 removed, added = _upsert_daily(df_unified, date, store)
                 clear_manual_fallback_marker(BAEMIN_SOURCE, store, date)
+                clear_manual_reingest_marker(BAEMIN_SOURCE, store, date)
                 total_removed += removed
                 total_added += added
                 logger.info(
@@ -177,13 +233,40 @@ def reconcile_baemin_for_test_stores(
                     added,
                 )
 
+    if processed_dates == 0:
+        return "배민수동 교정 스킵 | 대상 날짜 없음"
     notify_manual_fallback("배민수동", fallback_events)
-    return f"배민수동 교정 완료 | 제거={total_removed}행 추가={total_added}행 폴백={len(fallback_events)}건"
+    notify_manual_partial("배민수동", partial_events)
+    notify_manual_missing_all("배민수동", missing_events)
+    return (
+        f"배민수동 교정 완료 | 제거={total_removed}행 추가={total_added}행 "
+        f"폴백={len(fallback_events)}건 부분수집={len(partial_events)}건 "
+        f"무데이터={len(missing_events)}건"
+    )
 
 
-def _record_baemin_fallback_event(date: str, store: str, events: list[dict]) -> None:
-    amount, order_cnt, rows = pos_delivery_summary(date, store, BAEMIN_PLATFORMS, BAEMIN_SOURCE)
+def _record_baemin_fallback_event(
+    date: str,
+    store: str,
+    events: list[dict],
+    missing: list[dict] | None = None,
+) -> None:
+    clear_manual_partial_marker(BAEMIN_SOURCE, store, date)
+    baseline = delivery_baseline_summary(date, store, BAEMIN_PLATFORMS, BAEMIN_SOURCE)
+    amount = baseline["baseline_total"]
+    order_cnt = baseline["baseline_order_cnt"]
+    rows = baseline["baseline_rows"]
     if rows <= 0:
+        event = {
+            "date": date,
+            "store": store,
+            "platform": BAEMIN_PLATFORM,
+            "rows": 0,
+            "alert_suppressed": True,
+            "reason": "no_delivery_baseline",
+            **baseline,
+        }
+        record_manual_fallback_marker(BAEMIN_SOURCE, store, date, event)
         return
     event = {
         "date": date,
@@ -192,6 +275,7 @@ def _record_baemin_fallback_event(date: str, store: str, events: list[dict]) -> 
         "total_price": amount,
         "order_cnt": order_cnt,
         "rows": rows,
+        **baseline,
     }
     if record_manual_fallback_marker(BAEMIN_SOURCE, store, date, event):
         events.append(event)
@@ -246,6 +330,8 @@ def enforce_baemin_manual_only_for_test_stores(
         removed = int(remove_mask.sum())
         if removed == 0:
             logger.info("배민수동 최종 정리 변경 없음: %s", daily_path.name)
+            for store in store_set:
+                clear_manual_reingest_marker(BAEMIN_SOURCE, store, date)
             continue
 
         df_out = df[~remove_mask].reset_index(drop=True)
@@ -253,7 +339,7 @@ def enforce_baemin_manual_only_for_test_stores(
             if col in df_out.columns:
                 df_out[col] = pd.to_numeric(df_out[col], errors="coerce").fillna(0).astype(int)
         df_out = df_out.reindex(columns=UNIFIED_COLUMNS, fill_value="")
-        df_out.to_parquet(daily_path, index=False, engine="pyarrow")
+        save_unified_parquet(df_out, daily_path)
 
         total_removed += removed
         changed_files += 1
@@ -263,6 +349,8 @@ def enforce_baemin_manual_only_for_test_stores(
             removed,
             sorted(df.loc[remove_mask, "store"].dropna().astype(str).unique().tolist()),
         )
+        for store in store_set:
+            clear_manual_reingest_marker(BAEMIN_SOURCE, store, date)
 
     return f"배민수동 최종 정리 완료 | 파일={changed_files} 제거={total_removed}행"
 
@@ -285,16 +373,43 @@ def _resolve_baemin_target_dates(
 
     if lookback_days is not None:
         kst_now = pendulum.now("Asia/Seoul")
-        return [
+        dates = {
             (kst_now - timedelta(days=i)).strftime("%Y-%m-%d")
             for i in range(1, lookback_days + 1)
-        ]
+        }
+        return sorted(
+            d for d in dates
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) and d != today
+        )
 
     dates: set[str] = set()
     for store in stores:
         dates.update(_collect_baemin_source_dates(store))
     dates.update(_collect_existing_unified_baemin_manual_dates(stores))
     dates.update(_collect_existing_baemin_duplicate_dates(stores))
+    return sorted(
+        d for d in dates
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) and d != today
+    )
+
+
+def _target_dates_for_store(
+    source: str,
+    store: str,
+    base_dates: list[str],
+    sale_date: str | None,
+    lookback_days: int | None,
+    full_resolver,
+    *,
+    include_reingest_markers: bool = False,
+) -> list[str]:
+    """기본 날짜에 해당 매장의 재수집 마커만 더한다."""
+    if lookback_days is None and not sale_date:
+        return full_resolver([store], sale_date, lookback_days)
+    dates = set(base_dates)
+    if include_reingest_markers and not sale_date:
+        dates.update(list_manual_reingest_dates(source, [store]))
+    today = pendulum.now("Asia/Seoul").strftime("%Y-%m-%d")
     return sorted(
         d for d in dates
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) and d != today
@@ -522,7 +637,14 @@ def _transform_to_unified(
     )
     option_name = df["주문옵션상세"].fillna("").astype(str).str.strip()
     is_price = option_name.str.fullmatch(r"[\d,]+")
-    out["item_name"] = option_name.mask(is_price, out["menu_name"])
+    out["item_name"] = fill_missing_manual_item_name(
+        option_name.mask(is_price, out["menu_name"]),
+        source=BAEMIN_SOURCE,
+        label="배민",
+        store=store,
+        sale_date=out["sale_date"],
+        order_id=out["order_id"],
+    )
     out["qty"] = _to_int_series(df["주문수량"]).replace(0, 1)
     out["unit_price"] = _to_int_series(df["주문옵션금액"])
     out["discount_amount"] = 0
@@ -606,7 +728,9 @@ def _recalculate_order_fields(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _upsert_daily(df_new: pd.DataFrame, date: str, store: str) -> tuple[int, int]:
+def _upsert_daily(
+    df_new: pd.DataFrame, date: str, store: str, *, verified_zero: bool = False
+) -> tuple[int, int]:
     """
     unified_sales 일별 parquet에서 해당 store의 배달의민족 행을 교체.
 
@@ -631,7 +755,11 @@ def _upsert_daily(df_new: pd.DataFrame, date: str, store: str) -> tuple[int, int
         source_s = df_existing["source"].fillna("").astype(str).str.strip()
         remove_mask = store_s.eq(store) & platform_s.isin(BAEMIN_PLATFORMS)
         if df_new is None or df_new.empty:
-            remove_mask = remove_mask & source_s.eq(BAEMIN_SOURCE)
+            if not verified_zero:
+                # 수집 실패/빈 수집에서 기존 배민행 삭제를 막기 위해 삭제 보류
+                remove_mask = pd.Series(False, index=df_existing.index)
+            else:
+                remove_mask = remove_mask & source_s.eq(BAEMIN_SOURCE)
         removed_count = int(remove_mask.sum())
         df_existing = df_existing[~remove_mask]
     else:
@@ -644,7 +772,7 @@ def _upsert_daily(df_new: pd.DataFrame, date: str, store: str) -> tuple[int, int
             if col in df_out.columns:
                 df_out[col] = pd.to_numeric(df_out[col], errors="coerce").fillna(0).astype(int)
         df_out = df_out.reindex(columns=UNIFIED_COLUMNS, fill_value="")
-        df_out.to_parquet(daily_path, index=False, engine="pyarrow")
+        save_unified_parquet(df_out, daily_path)
         return removed_count, 0
 
     df_out = pd.concat([df_existing, df_new], ignore_index=True)
@@ -660,5 +788,5 @@ def _upsert_daily(df_new: pd.DataFrame, date: str, store: str) -> tuple[int, int
             df_out[col] = pd.to_numeric(df_out[col], errors="coerce").fillna(0).astype(int)
 
     df_out = df_out.reindex(columns=UNIFIED_COLUMNS, fill_value="")
-    df_out.to_parquet(daily_path, index=False, engine="pyarrow")
+    save_unified_parquet(df_out, daily_path)
     return removed_count, len(df_new)

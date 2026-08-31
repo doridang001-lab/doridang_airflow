@@ -10,9 +10,14 @@ $env:HEAL_TASK_STATE_PATH = if ($env:HEAL_TASK_STATE_PATH) { $env:HEAL_TASK_STAT
 $env:AUTOHEAL_HEARTBEAT_PATH = if ($env:AUTOHEAL_HEARTBEAT_PATH) { $env:AUTOHEAL_HEARTBEAT_PATH } else { "C:\airflow\logs\autoheal_heartbeat.json" }
 $env:AIRFLOW_RUNTIME_WORKDIR = if ($env:AIRFLOW_RUNTIME_WORKDIR) { $env:AIRFLOW_RUNTIME_WORKDIR } else { $root }
 $env:CODEX_WORKDIR = $worktree
+$env:CODEX_AUTOHEAL_BACKEND = "windows"
+$env:CODEX_COMMAND = if ($env:CODEX_COMMAND) { $env:CODEX_COMMAND } else { "$env:APPDATA\npm\codex.cmd" }
 
 if (-not (Test-Path $worktree)) {
     throw "Codex auto-heal worktree not found: $worktree"
+}
+if (-not (Test-Path $env:CODEX_COMMAND)) {
+    throw "Codex command not found: $($env:CODEX_COMMAND)"
 }
 
 New-Item -ItemType Directory -Force -Path (Split-Path $logPath -Parent) | Out-Null

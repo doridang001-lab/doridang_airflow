@@ -157,6 +157,7 @@ _ORDER_COLUMNS = [
     "order_summary",
     "total_price",
     "is_cancelled",
+    "item_menu",
     "menu_name",
     "menu_qty",
     "menu_price",
@@ -1937,6 +1938,7 @@ def _parse_order_card(driver, card, store_id: str, store_name: str, collected_at
                 for opt in menu["options"]:
                     rows.append({
                         **base,
+                        "item_menu": menu["name"],
                         "menu_name": menu["name"],
                         "menu_qty": menu["qty"],
                         "menu_price": menu["price"] if first_opt else "",
@@ -1946,7 +1948,15 @@ def _parse_order_card(driver, card, store_id: str, store_name: str, collected_at
                     first_opt = False
                     first_row = False
         else:
-            rows.append({**base, "menu_name": "", "menu_qty": "", "menu_price": "", "menu_options": "", **settlement})
+            rows.append({
+                **base,
+                "item_menu": "",
+                "menu_name": "",
+                "menu_qty": "",
+                "menu_price": "",
+                "menu_options": "",
+                **settlement,
+            })
 
     except Exception as exc:
         log(f"_parse_order_card error: {exc}", "")

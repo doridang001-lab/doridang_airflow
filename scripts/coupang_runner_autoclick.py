@@ -13,13 +13,27 @@ import struct
 import time
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
 import urllib.error
 
 logger = logging.getLogger(__name__)
 
 RUNNER_URL_SUFFIX = "/runner.html"
-RUNNER_URL_FALLBACK = "chrome-extension://ocpdgnoaajajnlehamcalfcpholjhfbe/runner.html"
+DEFAULT_INSTALLED_EXTENSION_DIR = (
+    Path.home()
+    / "OneDrive - 주식회사 도리당"
+    / "Extention"
+    / "doridang_collector_개발용"
+)
+DEFAULT_BUILD_EXTENSION_DIR = (
+    DEFAULT_INSTALLED_EXTENSION_DIR
+    if DEFAULT_INSTALLED_EXTENSION_DIR.exists()
+    else Path(r"C:\airflow\coupang_extension_build")
+)
+BUILD_EXTENSION_DIR = Path(os.getenv("COUPANG_EXTENSION_DIR") or DEFAULT_BUILD_EXTENSION_DIR)
+CHROME_PROFILE_NAME = os.getenv("COUPANG_CHROME_PROFILE", "Default")
+DEFAULT_EXTENSION_ID = os.getenv("COUPANG_EXTENSION_ID", "ocpdgnoaajajnlehamcalfcpholjhfbe")
 DEFAULT_BUTTON_ID = "topHalfBtn"
 DEBUG_ENDPOINT = "http://127.0.0.1:9222"
 TIMEOUT_SECONDS = 60
@@ -40,31 +54,130 @@ def _fetch_tabs() -> list[dict]:
     return _http_json(f"{DEBUG_ENDPOINT}/json")
 
 
-def _find_runner_url() -> str:
-    """extension ID를 동적으로 탐색해 runner.html URL을 반환."""
-    tabs = _fetch_tabs()
+def _path_key(path: Path) -> str:
+    try:
+        return str(path.resolve()).casefold()
+    except OSError:
+        return str(path.absolute()).casefold()
+
+
+def _runner_url_from_loaded_extensions(tabs: list[dict]) -> str | None:
     for tab in tabs:
         url = str(tab.get("url", ""))
         if url.startswith("chrome-extension://") and url.endswith(RUNNER_URL_SUFFIX):
             return url
-    return RUNNER_URL_FALLBACK
+
+    for tab in tabs:
+        url = str(tab.get("url", ""))
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme == "chrome-extension" and parsed.netloc:
+            return f"chrome-extension://{parsed.netloc}/runner.html"
+
+    return None
+
+
+def _chrome_profile_dir() -> Path:
+    local_app_data = os.getenv("LOCALAPPDATA")
+    if not local_app_data:
+        raise RuntimeError("LOCALAPPDATA is not set; cannot inspect Chrome profile")
+    return Path(local_app_data) / "Google" / "Chrome" / "User Data" / CHROME_PROFILE_NAME
+
+
+def _iter_chrome_preference_files() -> list[Path]:
+    profile_dir = _chrome_profile_dir()
+    return [
+        profile_dir / "Secure Preferences",
+        profile_dir / "Preferences",
+    ]
+
+
+def _build_extension_ids_from_chrome_preferences() -> list[str]:
+    target_key = _path_key(BUILD_EXTENSION_DIR)
+    candidates: list[str] = []
+
+    for pref_path in _iter_chrome_preference_files():
+        if not pref_path.exists():
+            continue
+        try:
+            data = json.loads(pref_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Chrome preference read failed: %s | %s", pref_path, exc)
+            continue
+
+        settings = data.get("extensions", {}).get("settings", {})
+        if not isinstance(settings, dict):
+            continue
+        for extension_id, config in settings.items():
+            if not isinstance(config, dict):
+                continue
+            extension_path = config.get("path")
+            if not extension_path:
+                continue
+            if _path_key(Path(str(extension_path))) == target_key:
+                candidates.append(str(extension_id))
+
+    return list(dict.fromkeys(candidates))
+
+
+def _runner_url_from_chrome_preferences() -> str | None:
+    extension_ids = _build_extension_ids_from_chrome_preferences()
+    if not extension_ids:
+        return None
+    if len(extension_ids) > 1:
+        logger.warning("multiple Coupang build extension IDs found; using first: %s", extension_ids)
+    return f"chrome-extension://{extension_ids[0]}/runner.html"
+
+
+def _runner_url_from_default_extension() -> str | None:
+    if not DEFAULT_EXTENSION_ID:
+        return None
+    return f"chrome-extension://{DEFAULT_EXTENSION_ID}/runner.html"
+
+
+def _find_runner_url(tabs: list[dict] | None = None) -> str:
+    """현재 로드되었거나 등록된 확장 ID로 runner.html URL을 반환."""
+    if tabs is None:
+        tabs = _fetch_tabs()
+
+    preference_url = _runner_url_from_chrome_preferences()
+    if preference_url:
+        return preference_url
+
+    loaded_url = _runner_url_from_loaded_extensions(tabs)
+    if loaded_url:
+        return loaded_url
+
+    fallback_url = _runner_url_from_default_extension()
+    if fallback_url:
+        logger.warning(
+            "Coupang build extension ID not found for %s; using configured extension ID: %s",
+            BUILD_EXTENSION_DIR,
+            DEFAULT_EXTENSION_ID,
+        )
+        return fallback_url
+
+    raise RuntimeError(f"Unable to find Coupang runner extension ID for {BUILD_EXTENSION_DIR}.")
 
 
 def _ensure_runner_tab() -> str:
-    runner_url = RUNNER_URL_FALLBACK
+    expected_runner_url = _runner_url_from_chrome_preferences() or _runner_url_from_default_extension()
     start = time.time()
     while time.time() - start < 10:
         tabs = _fetch_tabs()
         for tab in tabs:
             url = str(tab.get("url", ""))
-            if url.startswith("chrome-extension://") and url.endswith(RUNNER_URL_SUFFIX):
+            if (
+                url.startswith("chrome-extension://")
+                and url.endswith(RUNNER_URL_SUFFIX)
+                and (expected_runner_url is None or url == expected_runner_url)
+            ):
                 ws_url = tab.get("webSocketDebuggerUrl")
                 if ws_url:
                     logger.info("existing runner tab found: %s", url)
                     return ws_url
         time.sleep(POLL_INTERVAL_SECONDS)
 
-    runner_url = _find_runner_url()
+    runner_url = _find_runner_url(tabs)
 
     logger.info("runner tab not found, create one: %s", runner_url)
     encoded = urllib.parse.quote(runner_url, safe="")

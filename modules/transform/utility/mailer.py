@@ -31,6 +31,7 @@ def send_email(
     conn_id="doridang_conn_smtp_gmail",
     attachments=None,
     inline_images=None,
+    raise_on_error=False,
     **context,
 ):
     """Airflow SMTP Connection을 사용해 메일을 발송한다."""
@@ -117,5 +118,9 @@ def send_email(
         logger.info("메일 발송 성공: %d명", len(to_list))
         return f"메일 발송 완료: {len(to_list)}명"
     except Exception as exc:
-        logger.error("메일 발송 실패: %s", exc)
-        raise
+        msg = f"메일 발송 실패: {exc}"
+        if raise_on_error:
+            logger.error(msg)
+            raise
+        logger.error("%s - DAG 진행을 위해 실패를 반환값으로 처리", msg)
+        return msg

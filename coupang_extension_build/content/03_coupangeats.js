@@ -486,14 +486,28 @@ Sites['coupangeats'] = {
   },
 
   _isTargetBrandStoreName(text) {
+    return !!this._targetBrandKey(text);
+  },
+
+  _targetBrandKey(text) {
     const normalized = String(text || '').replace(/\s+/g, ' ').trim();
-    return /(^|[^가-힣A-Za-z0-9])(도리당|나홀로)/.test(normalized);
+    const compact = normalized.replace(/\s+/g, '');
+    if (!compact || compact.includes('곱도리당')) return '';
+    if (/(^|[^가-힣A-Za-z0-9])나홀로/.test(normalized) || compact.startsWith('나홀로')) return 'nahollo';
+    if (
+      /(^|[^가-힣A-Za-z0-9])도리당/.test(normalized) ||
+      compact.startsWith('도리당') ||
+      compact.startsWith('닭도리탕전문도리당')
+    ) {
+      return 'doridang';
+    }
+    return '';
   },
 
   _targetBrandRank(text) {
-    const normalized = String(text || '').replace(/\s+/g, ' ').trim();
-    if (/(^|[^가-힣A-Za-z0-9])도리당/.test(normalized)) return 0;
-    if (/(^|[^가-힣A-Za-z0-9])나홀로/.test(normalized)) return 1;
+    const brandKey = this._targetBrandKey(text);
+    if (brandKey === 'doridang') return 0;
+    if (brandKey === 'nahollo') return 1;
     return 2;
   },
 
@@ -505,6 +519,19 @@ Sites['coupangeats'] = {
     normalized = normalized.replace(/^닭도리탕전문/, '');
     normalized = normalized.replace(/구로디지털단지점/g, '구로디지털점');
     return normalized;
+  },
+
+  _isNonTargetLookalikeStoreName(text) {
+    const normalized = String(text || '').replace(/\s+/g, '');
+    return normalized.includes('곱도리당');
+  },
+
+  _isOrdersStoreNameMatch(storeName, targetName) {
+    if (this._isNonTargetLookalikeStoreName(storeName)) return false;
+    const normalized = this._normalizeStoreName(storeName);
+    const target = this._normalizeStoreName(targetName);
+    if (!normalized || !target) return false;
+    return normalized === target || normalized.includes(target) || target.includes(normalized);
   },
 
   _targetStoreSet(opts = {}) {
@@ -522,11 +549,10 @@ Sites['coupangeats'] = {
     const brandStores = (storeNames || []).filter(storeName => this._isTargetBrandStoreName(storeName));
     if (!targetSet) return brandStores;
     const candidates = storeNames || [];
-    const targets = [...targetSet];
     const targetBranches = new Set((opts.targetStores || []).map(name => this._storeBranchKey(name)).filter(Boolean));
     return candidates.filter(storeName => {
-      const normalized = this._normalizeStoreName(storeName);
-      const directMatch = targets.some(target => normalized === target || normalized.includes(target) || target.includes(normalized));
+      if (this._isNonTargetLookalikeStoreName(storeName)) return false;
+      const directMatch = (opts.targetStores || []).some(target => this._isOrdersStoreNameMatch(storeName, target));
       if (directMatch) return true;
       return this._isTargetBrandStoreName(storeName) && targetBranches.has(this._storeBranchKey(storeName));
     });
@@ -535,9 +561,7 @@ Sites['coupangeats'] = {
   _isTargetRequested(storeName, opts = {}) {
     const targetSet = this._targetStoreSet(opts);
     if (!targetSet) return this._isTargetBrandStoreName(storeName);
-    const normalized = this._normalizeStoreName(storeName);
-    return [...targetSet]
-      .some(target => normalized === target || normalized.includes(target) || target.includes(normalized));
+    return (opts.targetStores || []).some(target => this._isOrdersStoreNameMatch(storeName, target));
   },
 
   _resolveBatchTargetDate(opts = {}) {
@@ -556,13 +580,79 @@ Sites['coupangeats'] = {
     return d;
   },
 
+  _resolveBatchTargetRange(opts = {}) {
+    const parse = (raw) => {
+      const value = String(raw || '').trim();
+      const m = value.match(/^(\d{4})(\d{2})(\d{2})$/) || value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (!m) return null;
+      const d = new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10));
+      if (isNaN(d.getTime())) return null;
+      d.setHours(0, 0, 0, 0);
+      return d;
+    };
+    if (opts.targetDateMode === 'custom') {
+      let startDate = parse(opts.targetStartDate);
+      let endDate = parse(opts.targetEndDate) || parse(opts.targetDate);
+      if (!startDate) startDate = endDate;
+      if (!endDate) endDate = this._resolveBatchTargetDate(opts);
+      if (startDate > endDate) {
+        const t = startDate;
+        startDate = endDate;
+        endDate = t;
+      }
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      if (endDate > today) endDate = today;
+      if (startDate > today) startDate = new Date(today);
+      const key = `${this._formatDate(startDate).replace(/-/g, '')}-${this._formatDate(endDate).replace(/-/g, '')}`;
+      return { startDate, endDate, key, label: `${this._formatDate(startDate)}~${this._formatDate(endDate)}` };
+    }
+    const targetDate = this._resolveBatchTargetDate(opts);
+    const key = this._formatDate(targetDate).replace(/-/g, '');
+    return { startDate: targetDate, endDate: targetDate, key, label: this._batchTargetDateLabel(opts) };
+  },
+
   _batchTargetDateLabel(opts = {}) {
+    if (opts.targetDateMode === 'custom') {
+      const start = String(opts.targetStartDate || '').trim();
+      const end = String(opts.targetEndDate || opts.targetDate || '').trim();
+      return start && end ? `지정기간 ${start}~${end}` : '지정기간';
+    }
     return opts.targetDateMode === 'today' ? '오늘' : '어제';
+  },
+
+  // CMG는 누락 방지를 위해 매 실행마다 -2 ~ -1 (2일치)를 재수집한다.
+  CMG_BATCH_LOOKBACK_DAYS: 2,
+
+  // CMG 배치 판정 — 주문서와 달리 targetStores가 비어도 batch면 prompt를 띄우지 않는다.
+  // (runner에서 throttle로 activeTargetStores가 []가 되면 자동화 탭에 prompt가 떠서 블록됨)
+  // 주문서 날짜 클릭 규칙(_isDashboardBatchOrders)은 건드리지 않는다. AGENTS.md:36 CMG 예외 조항.
+  _isBatchCMG(opts = {}) {
+    return opts.source === 'batch';
+  },
+
+  // 배치 CMG 날짜 범위: end = 기준일(어제), start = end - (LOOKBACK - 1)
+  _resolveBatchCMGRange(opts = {}) {
+    const endDate = this._resolveBatchTargetDate(opts);
+    const startDate = new Date(endDate);
+    startDate.setDate(startDate.getDate() - (this.CMG_BATCH_LOOKBACK_DAYS - 1));
+    startDate.setHours(0, 0, 0, 0);
+    return { startDate, endDate };
   },
 
   _ordersDownloadDateStr() {
     const range = this._readOrdersDateRange?.();
+    const startMs = parseInt(range?.start, 10);
     const endMs = parseInt(range?.end, 10);
+    if (!isNaN(startMs) && !isNaN(endMs)) {
+      const start = new Date(startMs);
+      const end = new Date(endMs);
+      if (!isNaN(start.getTime()) && !isNaN(end.getTime())) {
+        const startStr = this._formatDate(start).replace(/-/g, '');
+        const endStr = this._formatDate(end).replace(/-/g, '');
+        return startStr === endStr ? endStr : `${startStr}-${endStr}`;
+      }
+    }
     if (!isNaN(endMs)) {
       const d = new Date(endMs);
       if (!isNaN(d.getTime())) return this._formatDate(d).replace(/-/g, '');
@@ -622,27 +712,25 @@ Sites['coupangeats'] = {
         return;
     }
 
-    // 캘린더에서 날짜 범위 읽기
-    let dateRange = this._readCMGDateRange(doc);
-    if (!dateRange) {
-      // 달력(.calendar-dropdown-input) 없음 → 날짜 선택 불가 → 데이터 0행 수집
-      // 어제날짜 강제 수집 시 calendarBtn null → 빈 결과 → cmgOk 오판 문제 있음
-      // → error:true 반환해서 runner의 F5 재시도 유도
-      Utils.updateProgressModal({ debug: '⚠️ 달력 없음 → F5 재시도 필요 (error 반환)' });
-      _sendCMGComplete(0, 0, false, true);  // error:true → runner F5
+    if (!doc.querySelector('.calendar-dropdown-input')) {
+      Utils.updateProgressModal({ debug: '⚠️ 달력 버튼 없음 → F5 재시도 필요 (error 반환)' });
+      _sendCMGComplete(0, 0, false, true);
       return;
     }
 
-    let { startDate, endDate } = dateRange;
-    if (this._isDashboardBatchOrders(opts)) {
-      const targetDate = this._resolveBatchTargetDate(opts);
-      startDate = new Date(targetDate);
-      endDate = new Date(targetDate);
+    let startDate, endDate;
+    if (this._isBatchCMG(opts)) {
+      ({ startDate, endDate } = this._resolveBatchCMGRange(opts));
+      Utils.updateProgressModal({ debug: `📅 배치 수집(누락방지 ${this.CMG_BATCH_LOOKBACK_DAYS}일): ${this._formatDate(startDate)} ~ ${this._formatDate(endDate)}` });
     } else {
-      // 수동 수집은 기존 캘린더 날짜를 쓰되 오늘/미래는 어제로 clamp
-      const yd = new Date(); yd.setDate(yd.getDate() - 1); yd.setHours(0, 0, 0, 0);
-      if (startDate > yd) startDate = new Date(yd);
-      if (endDate > yd) endDate = new Date(yd);
+      const range = this._promptCMGDateRange(matchingStores.join(', '));
+      if (!range) {
+        _sendCMGComplete(0, 0, true, false);
+        return;
+      }
+      startDate = range.startDate;
+      endDate = range.endDate;
+      Utils.updateProgressModal({ debug: `📅 수동 수집: prompt 입력 (${this._formatDate(startDate)} ~ ${this._formatDate(endDate)})` });
     }
 
     const dates = [];
@@ -744,9 +832,50 @@ Sites['coupangeats'] = {
     _sendCMGComplete(matchingStores.length, storeResults.filter(r => r.completed).length, this._stopFlag, false, storeResults);
   },
 
+  _promptCMGDateRange(selectedStoreLabel = '') {
+    const rangeInput = prompt(
+      'CMG 수집 날짜 범위를 입력하세요.\n\n' +
+      (selectedStoreLabel ? `선택된 매장: ${selectedStoreLabel}\n\n` : '') +
+      '형식0: -YY.MM.DD 또는 -YYYYMMDD → 입력한 날짜까지 최근 7일을 하루씩 수집\n' +
+      '형식0-2: -{YY.MM.DD} 또는 -{YYYYMMDD} → 위와 동일\n' +
+      '형식1: YY.MM.DD-YY.MM.DD (예: 26.01.01-26.01.15)\n' +
+      '형식2: YY.MM.DD (예: 26.01.15) → 해당일부터 어제까지 (오늘 입력 시 어제 하루)\n' +
+      '형식3: YYYYMMDD-YYYYMMDD (예: 20260101-20260115)\n' +
+      '형식4: YYYYMMDD (예: 20260115) → 해당일부터 어제까지 (오늘 입력 시 어제 하루)'
+    );
+
+    if (!rangeInput) {
+      Utils.showError('취소됨', '날짜를 입력하지 않았습니다.');
+      return null;
+    }
+
+    const parsed = this._parseDateRange(rangeInput);
+    if (parsed.error) {
+      Utils.showError('형식 오류', parsed.error);
+      return null;
+    }
+    if (!parsed.startDate || !parsed.endDate) {
+      Utils.showError('날짜 오류 [03.js]', `start=${parsed.startDate}, end=${parsed.endDate}, keys=${Object.keys(parsed)}`);
+      return null;
+    }
+
+    let startDate = new Date(parsed.startDate);
+    let endDate = new Date(parsed.endDate);
+    if (startDate > endDate) {
+      const t = startDate;
+      startDate = endDate;
+      endDate = t;
+    }
+
+    return { startDate, endDate, mode: parsed.mode };
+  },
+
   _readCMGDateRange(doc) {
     const calBtn = doc.querySelector('.calendar-dropdown-input');
-    if (!calBtn) return null;
+    if (!calBtn) {
+      Utils.updateProgressModal({ debug: '❌ 달력 읽기 실패 — .calendar-dropdown-input 없음' });
+      return null;
+    }
     const startTxt = calBtn.querySelector('.start-date')?.textContent.trim();
     const endTxt = calBtn.querySelector('.end-date')?.textContent.replace(/[~\s]/g, '').trim();
     const parseYYMMDD = (s) => {
@@ -757,8 +886,16 @@ Sites['coupangeats'] = {
       return isNaN(dt.getTime()) ? null : dt;
     };
     const startDate = parseYYMMDD(startTxt);
-    const endDate = parseYYMMDD(endTxt);
-    return (startDate && endDate) ? { startDate, endDate } : null;
+    const parsedEndDate = parseYYMMDD(endTxt);
+    if (!startDate) {
+      Utils.updateProgressModal({ debug: `❌ 달력 읽기 실패 — start:"${startTxt ?? ''}" end:"${endTxt ?? ''}"` });
+      return null;
+    }
+    if (!parsedEndDate) {
+      Utils.updateProgressModal({ debug: '📅 CMG 단일일자 표시 감지 — 종료일을 시작일로 보정' });
+    }
+    const endDate = parsedEndDate || new Date(startDate);
+    return { startDate, endDate };
   },
 
   // ant-design 드롭다운 항목 탐색 (shadow root / document 양쪽, offsetParent 체크 없음)
@@ -867,6 +1004,15 @@ Sites['coupangeats'] = {
         const clicked = await this._selectDateInCalendar(doc, targetDate);
         if (!clicked) { Utils.updateProgressModal({ debug: `❌ ${dateStr} 선택 실패` }); continue; }
 
+        // 달력이 실제로 목표 날짜로 바뀌었는지 확인.
+        // 미검증 시 이전 날짜 데이터가 이번 날짜의 조회일자로 저장된다
+        // (적용버튼 미발견·월이동 실패도 _selectDateInCalendar가 true를 반환하므로).
+        const applied = this._readCMGDateRange(doc);
+        if (!applied || this._formatDate(applied.endDate) !== dateStr) {
+          Utils.updateProgressModal({ debug: `⚠️ ${dateStr} 미반영 (화면: ${applied ? this._formatDate(applied.endDate) : '읽기실패'}) → 재시도` });
+          continue;
+        }
+
         Utils.updateProgressModal({ debug: `✅ ${dateStr} 선택 완료` });
         dateSuccess = true;
         break;
@@ -920,68 +1066,16 @@ Sites['coupangeats'] = {
     let startDate, endDate;
     let parseResult = {};
 
-    if (!this._isDashboardBatchOrders(opts)) {
-      // 수동 수집: 현재 캘린더에 설정된 날짜 그대로 사용 (prompt 없음)
-      const dateRange = this._readCMGDateRange(doc);
-      if (!dateRange) {
-        Utils.showError('날짜 읽기 실패', '현재 페이지의 달력에서 날짜를 읽을 수 없습니다.\n날짜를 직접 설정한 후 다시 시도해주세요.');
-        return;
-      }
-      startDate = dateRange.startDate;
-      endDate = dateRange.endDate;
-      Utils.updateProgressModal({ debug: `📅 수동 수집: 현재 캘린더 날짜 사용 (${this._formatDate(startDate)} ~ ${this._formatDate(endDate)})` });
-    } else if (opts.targetDate || opts.targetDateMode) {
-      const targetDate = this._resolveBatchTargetDate(opts);
-      startDate = new Date(targetDate);
-      endDate = new Date(targetDate);
-      Utils.updateProgressModal({ debug: `📅 배치 수집: ${this._batchTargetDateLabel(opts)} 날짜 사용 (${this._formatDate(targetDate)})` });
+    if (this._isBatchCMG(opts)) {
+      ({ startDate, endDate } = this._resolveBatchCMGRange(opts));
+      Utils.updateProgressModal({ debug: `📅 배치 수집(누락방지 ${this.CMG_BATCH_LOOKBACK_DAYS}일): ${this._formatDate(startDate)} ~ ${this._formatDate(endDate)}` });
     } else {
-      // 배치/일반 수집: 날짜 범위 입력 prompt
-      const rangeInput = prompt(
-        'CMG 수집 날짜 범위를 입력하세요.\n\n' +
-        `선택된 매장: ${selectedStore}\n\n` +
-        '형식0: -YY.MM.DD 또는 -YYYYMMDD → 입력한 날짜까지 최근 7일을 하루씩 수집\n' +
-        '형식0-2: -{YY.MM.DD} 또는 -{YYYYMMDD} → 위와 동일\n' +
-        '형식1: YY.MM.DD-YY.MM.DD (예: 26.01.01-26.01.15)\n' +
-        '형식2: YY.MM.DD (예: 26.01.15) → 해당일부터 어제까지 (오늘 입력 시 어제 하루)\n' +
-        '형식3: YYYYMMDD-YYYYMMDD (예: 20260101-20260115)\n' +
-        '형식4: YYYYMMDD (예: 20260115) → 해당일부터 어제까지 (오늘 입력 시 어제 하루)'
-      );
-
-      if (!rangeInput) {
-        Utils.showError('취소됨', '날짜를 입력하지 않았습니다.');
-        return;
-      }
-
-      parseResult = this._parseDateRange(rangeInput);
-      console.log('[CMG-DEBUG] parseResult:', JSON.stringify(parseResult, null, 2), 'raw:', parseResult);
-
-      if (parseResult.error) {
-        Utils.showError('형식 오류', parseResult.error);
-        return;
-      }
-
-      startDate = parseResult.startDate;
-      endDate = parseResult.endDate;
-
-      if (!startDate || !endDate) {
-        Utils.showError('날짜 오류 [03.js]', `start=${startDate}, end=${endDate}, keys=${Object.keys(parseResult)}`);
-        return;
-      }
-    }
-
-    // 수동/프롬프트 수집은 오늘/미래 날짜 → 어제로 clamp. 배치 버튼 날짜는 그대로 허용.
-    if (!(opts.targetDate || opts.targetDateMode)) {
-      const yd = new Date();
-      yd.setDate(yd.getDate() - 1);
-      yd.setHours(0, 0, 0, 0);
-      if (startDate > yd) { startDate = new Date(yd); }
-      if (endDate > yd) { endDate = new Date(yd); }
-    }
-    if (startDate > endDate) {
-      const tmp = new Date(startDate);
-      startDate = new Date(endDate);
-      endDate = tmp;
+      const range = this._promptCMGDateRange(selectedStore);
+      if (!range) return;
+      startDate = range.startDate;
+      endDate = range.endDate;
+      parseResult = { mode: range.mode };
+      Utils.updateProgressModal({ debug: `📅 수동 수집: prompt 입력 (${this._formatDate(startDate)} ~ ${this._formatDate(endDate)})` });
     }
     
     // 날짜 목록 생성
@@ -1034,6 +1128,15 @@ Sites['coupangeats'] = {
         const clicked = await this._selectDateInCalendar(doc, targetDate);
         if (!clicked) {
           Utils.updateProgressModal({ debug: `❌ ${dateStr} 선택 실패` });
+          continue;
+        }
+
+        // 달력이 실제로 목표 날짜로 바뀌었는지 확인.
+        // 미검증 시 이전 날짜 데이터가 이번 날짜의 조회일자로 저장된다
+        // (적용버튼 미발견·월이동 실패도 _selectDateInCalendar가 true를 반환하므로).
+        const applied = this._readCMGDateRange(doc);
+        if (!applied || this._formatDate(applied.endDate) !== dateStr) {
+          Utils.updateProgressModal({ debug: `⚠️ ${dateStr} 미반영 (화면: ${applied ? this._formatDate(applied.endDate) : '읽기실패'}) → 재시도` });
           continue;
         }
 
@@ -2485,9 +2588,11 @@ ${filename}`;
         dataReady = await this._waitForOrdersDataReady(8000);
         if (dataReady) await this._waitForStableState(5000);
       } else {
-        const targetDate = this._resolveBatchTargetDate(opts);
-        Utils.showProgressModal('쿠팡이츠 수집', `날짜 설정 중 (${this._batchTargetDateLabel(opts)})...`);
-        dateSet = await this._setOrdersDateToYesterday(targetDate);
+        const targetRange = this._resolveBatchTargetRange(opts);
+        Utils.showProgressModal('쿠팡이츠 수집', `날짜 설정 중 (${targetRange.label})...`);
+        dateSet = opts.targetDateMode === 'custom'
+          ? await this._setOrdersDateRange(targetRange.startDate, targetRange.endDate)
+          : await this._setOrdersDateToYesterday(targetRange.endDate);
         Utils.updateProgressModal({ debug: dateSet ? '✅ 날짜 설정 완료' : '⚠️ 날짜 설정 실패, 기존 날짜로 진행' });
         if (dateSet) {
           const prevCount = this._getExpectedOrderCount();
@@ -2527,8 +2632,8 @@ ${filename}`;
     matchingStores.sort((a, b) => this._targetBrandRank(a) - this._targetBrandRank(b));
 
     // 실행 기준일별 완료 매장 체크포인트 로드
-    const batchTargetDate = this._resolveBatchTargetDate(opts);
-    const checkpointDate = this._formatDate(batchTargetDate).replace(/-/g, '');
+    const batchTargetRange = this._resolveBatchTargetRange(opts);
+    const checkpointDate = batchTargetRange.key;
     const checkpoint = await this._loadOrdersCheckpoint();
     const completedStores = (checkpoint?.targetDate === checkpointDate)
       ? (checkpoint.completedStores || []).filter(store => {
@@ -2622,9 +2727,11 @@ ${filename}`;
       if (!this._isDashboardBatchOrders(opts)) {
         Utils.updateProgressModal({ debug: `📅 수동 수집: 현재 날짜 그대로 사용` });
       } else {
-        const targetDate = this._resolveBatchTargetDate(opts);
-        Utils.updateProgressModal({ debug: `📅 주문일 설정 중 (${this._batchTargetDateLabel(opts)}~${this._batchTargetDateLabel(opts)})` });
-        dateSet = await this._setOrdersDateToYesterday(targetDate);
+        const targetRange = this._resolveBatchTargetRange(opts);
+        Utils.updateProgressModal({ debug: `📅 주문일 설정 중 (${targetRange.label})` });
+        dateSet = opts.targetDateMode === 'custom'
+          ? await this._setOrdersDateRange(targetRange.startDate, targetRange.endDate)
+          : await this._setOrdersDateToYesterday(targetRange.endDate);
         Utils.updateProgressModal({ debug: dateSet ? `✅ 주문일 설정 완료` : `⚠️ 주문일 설정 실패, 기존 날짜로 진행` });
       }
       if (this._isSafeOrdersPacingEnabled()) {
@@ -2789,6 +2896,8 @@ ${filename}`;
         ce_orders_restart: { date: today },
         ce_current_target_stores: Array.isArray(opts.targetStores) ? opts.targetStores : matchingStores,
         ce_current_target_date: opts.targetDate || '',
+        ce_current_target_start_date: opts.targetStartDate || '',
+        ce_current_target_end_date: opts.targetEndDate || '',
         ce_current_target_date_mode: opts.targetDateMode || 'yesterday',
         ce_orders_batch_reload_count: reloadCount
       }, resolve);
@@ -2807,6 +2916,8 @@ ${filename}`;
         'ce_orders_restart',
         'ce_current_target_stores',
         'ce_current_target_date',
+        'ce_current_target_start_date',
+        'ce_current_target_end_date',
         'ce_current_target_date_mode',
         'ce_orders_batch_reload_count'
       ], resolve);
@@ -2835,10 +2946,7 @@ ${filename}`;
   _isCurrentOrdersStore(storeText) {
     const curText = document.querySelector('.dropdown-btn.highlight')?.textContent?.trim();
     if (!curText) return false;
-    const targetKey = this._normalizeStoreName(storeText);
-    const curKey = this._normalizeStoreName(curText);
-    if (!targetKey || !curKey) return false;
-    return curKey === targetKey || curKey.includes(targetKey) || targetKey.includes(curKey);
+    return this._isOrdersStoreNameMatch(curText, storeText);
   },
 
   async _selectStoreInOrdersDropdown(storeText) {
@@ -2864,11 +2972,9 @@ ${filename}`;
     }
 
     const items = [...document.querySelectorAll('.dropdown-list li a')];
-    const targetKey = this._normalizeStoreName(storeText);
     const target = items.find(el => {
       const t = el.textContent.trim();
-      const key = this._normalizeStoreName(t);
-      return key === targetKey || key.includes(targetKey) || targetKey.includes(key);
+      return this._isOrdersStoreNameMatch(t, storeText);
     });
 
     if (!target) {

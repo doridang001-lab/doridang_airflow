@@ -19,7 +19,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from modules.transform.pipelines.db.DB_UnifiedSales_common import UNIFIED_ROOT, _unified_daily_path, iter_unified_sales_files
+from modules.transform.pipelines.db.DB_UnifiedSales_common import UNIFIED_ROOT, _unified_daily_path, iter_unified_sales_files, save_unified_parquet
 from modules.transform.utility.paths import MART_DB
 
 logger = logging.getLogger(__name__)
@@ -117,7 +117,7 @@ def _upsert_rows(new_rows: pd.DataFrame) -> int:
     merged["객단가_t"] = pd.to_numeric(merged["객단가_t"], errors="coerce").fillna(0.0).astype(float)
 
     merged = merged.sort_values(["sale_date", "order_type"]).reset_index(drop=True)
-    merged.to_parquet(HALL_VIZ_PATH, index=False, engine="pyarrow")
+    save_unified_parquet(merged, HALL_VIZ_PATH)
     return len(new_rows)
 
 
@@ -188,7 +188,7 @@ def backfill_hall_viz() -> str:
     df = df.reindex(columns=HALL_VIZ_COLUMNS, fill_value=0).sort_values(["sale_date", "order_type"]).reset_index(drop=True)
 
     HALL_VIZ_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(HALL_VIZ_PATH, index=False, engine="pyarrow")
+    save_unified_parquet(df, HALL_VIZ_PATH)
     result = f"hall_viz backfill 완료 | dates={df['sale_date'].nunique()} rows={len(df)}"
     logger.info(result)
     return result

@@ -4,20 +4,22 @@ Baemin macro DAG — 배달의민족 계정별 자동 수집
 === 수집 흐름 (계정 단위, 단일 브라우저 세션) ===
   load_accounts
       ↓
-  collect_all
+  init_staging
+    ├─ collect_batch_1 → collect_batch_2
+    └─ collect_batch_3 → collect_batch_4
     ├─ 로그인
     ├─ 매장/store_id 확인
     ├─ 우가클 수집     (우리가게 클릭 현황 - 이번달 + 저번달)
-    ├─ 변경이력 수집   (매장 변경이력 - history/change/shop)
+    ├─ 운영시간 수집   (매장 운영시간 - manage/operation)
     ├─ 주문내역 수집   (orders/history - 어제 배달완료)
     ├─ 광고 funnel 수집 (stat/advertisement - 어제)
     └─ 로그아웃
+      ↓
+  retry_failed (네 배치 실패 통합 최종 재시도)
 
 === 저장 경로 ===
   우가클    : analytics/baemin_macro/metrics_our_store_clicks/
                brand={brand}/store={store}/ym={YYYY-MM}/woori_shop_click.csv
-  변경이력  : analytics/baemin_macro/shop_change/
-               brand={brand}/store={store}/ym={YYYY-MM}/shop_change.csv
   주문내역  : analytics/baemin_macro/orders/
   광고funnel: analytics/baemin_macro/ad_funnel/
                brand={brand}/store={store}/ym={YYYY-MM}/orders_{YYYY-MM-DD}.csv
@@ -41,6 +43,7 @@ from typing import Any
 import pendulum
 import pandas as pd
 from airflow import DAG
+from airflow.exceptions import AirflowTaskTimeout
 from airflow.operators.python import PythonOperator
 from airflow.utils.trigger_rule import TriggerRule
 
@@ -54,28 +57,37 @@ from modules.transform.pipelines.db.beamin_stability import (
 )
 from modules.transform.pipelines.db.DB_Beamin_combined import (
     collect_now_and_woori as pipeline_collect_all,
+    collect_orders_only as pipeline_collect_orders_only,
     retry_once_failed as pipeline_retry_failed,
 )
 from modules.transform.pipelines.db.beamin_staging import (
     cleanup_staging,
     export_staging_to_inbox,
     init_empty_staging,
+    init_progress,
+    load_progress,
     local_stage_paths,
     patch_baemin_staging_paths,
+    progress_path,
     resolve_macro_role,
+    safe_run_id_part,
     restore_baemin_staging_paths,
 )
 from modules.transform.pipelines.db.DB_Beamin_retry import (
     build_retry_conf,
     count_failed_items,
+    merge_failed_payloads,
     retry_needed,
 )
 from modules.transform.pipelines.db.DB_Beamin_pc2_distribute import UPLOAD_INBOX_DIR
 from modules.transform.utility.schedule import (
     SMD_BAEMIN_COLLECT_BATCH1_TIME,
 )
-from modules.transform.pipelines.db.DB_Beamin_Macro_validate import validate_toorder_orders
-from modules.transform.pipelines.db.DB_UnifiedSales_common import DELIVERY_MANUAL_TEST_STORES
+from modules.transform.pipelines.db.DB_Beamin_Macro_validate import (
+    _merge_order_amounts,
+    _order_amounts,
+    validate_toorder_orders,
+)
 from modules.transform.utility.paths import ANALYTICS_DB, COLLECT_DB
 from modules.transform.utility.store_normalize import normalize as normalize_store_names, strip_brand
 from modules.transform.utility.mail_recipients import MAIL_CMJ_PM
@@ -91,8 +103,22 @@ warnings.filterwarnings(
 
 KST = pendulum.timezone("Asia/Seoul")
 _ALERT_EMAILS = [MAIL_CMJ_PM]
-
-TARGET_STORES = DELIVERY_MANUAL_TEST_STORES  # empty list means all stores
+_UPLOAD_DAG_ID = "DB_Beamin_Macro_Upload_Dags"
+_BATCH_TASK_IDS = (
+    "collect_batch_1",
+    "collect_batch_2",
+    "collect_batch_3",
+    "collect_batch_4",
+)
+_LANES: tuple[tuple[str, ...], ...] = (
+    ("collect_batch_1", "collect_batch_2"),
+    ("collect_batch_3", "collect_batch_4"),
+)
+_LANE_OFFSET_RANGE: tuple[float, float] = (15.0, 20.0)
+COLLECT_LANES: int = 2
+BAEMIN_SELENIUM_POOL = "baemin_selenium_pool"
+_RETRY_FAILED_TIMEOUT_MINUTES = 120
+TARGET_STORES: list[str] = []  # empty list means all stores (전체매장 대상 → COLLECT_RANGE로 상/하위 분할)
 # None: 전체 수집, "상위": 가나다순 상위 절반, "하위": 가나다순 하위 절반(나머지)
 # ex ) COLLECT_RANGE="상위" → 가나다순 상위 절반만 수집
 COLLECT_RANGE: str | None = "상위" # 상위, 하위, None
@@ -115,7 +141,143 @@ def _main_stage_paths(context) -> tuple[Path, Path]:
 def _target_date_from_context(context) -> str:
     dag_run = context.get("dag_run")
     conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    return conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
+    if conf.get("target_date"):
+        return conf["target_date"]
+    data_interval_end = context.get("data_interval_end")
+    if data_interval_end is not None:
+        return pendulum.instance(data_interval_end).in_timezone(KST).subtract(days=1).format("YYYY-MM-DD")
+    return pendulum.now(KST).subtract(days=1).format("YYYY-MM-DD")
+
+
+def _normalize_collect_task_ids(collect_task_ids=None) -> tuple[str, ...]:
+    if not collect_task_ids:
+        return ("collect_all",)
+    return tuple(str(task_id) for task_id in collect_task_ids)
+
+
+def _pull_batch_values(ti, collect_task_ids, key: str) -> list:
+    values: list = []
+    for task_id in _normalize_collect_task_ids(collect_task_ids):
+        value = ti.xcom_pull(task_ids=task_id, key=key)
+        if isinstance(value, list):
+            values.extend(value)
+    return values
+
+
+def _pull_batch_failures(ti, collect_task_ids) -> dict:
+    return merge_failed_payloads(
+        *(
+            ti.xcom_pull(task_ids=task_id, key="failed") or {}
+            for task_id in _normalize_collect_task_ids(collect_task_ids)
+        )
+    )
+
+
+def _loaded_account_ids(context) -> set[str]:
+    account_list = context["ti"].xcom_pull(task_ids="load_accounts", key="account_list") or []
+    return {
+        str((account or {}).get("account_id") or "").strip()
+        for account in account_list
+        if str((account or {}).get("account_id") or "").strip()
+    }
+
+
+def _account_id_from_failed_account(account: Any) -> str:
+    if not isinstance(account, dict):
+        return ""
+    return str(account.get("account_id") or "").strip()
+
+
+def _account_id_from_failed_item(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    account = item.get("account") or {}
+    if not isinstance(account, dict):
+        return ""
+    return str(account.get("account_id") or "").strip()
+
+
+def _unique_failed_account_ids(failed: dict | None) -> set[str]:
+    data = failed or {}
+    account_ids = {
+        _account_id_from_failed_account(account)
+        for account in data.get("accounts") or []
+    }
+    for key in ("stores", "orders", "ads", "stages"):
+        account_ids.update(
+            _account_id_from_failed_item(item)
+            for item in data.get(key) or []
+        )
+    account_ids.discard("")
+    return account_ids
+
+
+def _collect_scope_label(context) -> str | None:
+    dag_run = context.get("dag_run")
+    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    params = context.get("params") or {}
+    for candidate in (
+        conf.get("collect_range"),
+        params.get("collect_range"),
+        _MACRO_ROLE["range"],
+        COLLECT_RANGE,
+    ):
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _filter_failed_to_loaded_accounts(failed: dict | None, allowed_ids: set[str]) -> dict:
+    data = failed or {}
+    if not allowed_ids:
+        return {
+            "accounts": data.get("accounts") or [],
+            "stores": data.get("stores") or [],
+            "orders": data.get("orders") or [],
+            "ads": data.get("ads") or [],
+            "stages": data.get("stages") or [],
+        }
+
+    def account_allowed(account: dict | None) -> bool:
+        account_id = str((account or {}).get("account_id") or "").strip()
+        return bool(account_id and account_id in allowed_ids)
+
+    filtered = {
+        "accounts": [
+            account
+            for account in data.get("accounts") or []
+            if account_allowed(account if isinstance(account, dict) else None)
+        ],
+        "stores": [
+            item
+            for item in data.get("stores") or []
+            if isinstance(item, dict) and account_allowed(item.get("account"))
+        ],
+        "orders": [
+            item
+            for item in data.get("orders") or []
+            if isinstance(item, dict) and account_allowed(item.get("account"))
+        ],
+        "ads": [
+            item
+            for item in data.get("ads") or []
+            if isinstance(item, dict) and account_allowed(item.get("account"))
+        ],
+        "stages": [
+            item
+            for item in data.get("stages") or []
+            if isinstance(item, dict) and account_allowed(item.get("account"))
+        ],
+    }
+    dropped = count_failed_items(data) - count_failed_items(filtered)
+    if dropped:
+        logger.warning(
+            "상위 수집 범위 밖 실패 제외: dropped=%d allowed_accounts=%d",
+            dropped,
+            len(allowed_ids),
+        )
+    return filtered
 
 
 def _save_validate_log(target_date: str, section: str, text: str) -> None:
@@ -161,9 +323,13 @@ def _split_accounts_by_range(accounts: list[dict], collect_range: str | None) ->
         if batch_total <= 0 or batch_index < 1 or batch_index > batch_total:
             logger.warning("알 수 없는 COLLECT_RANGE=%r", collect_range)
             return accounts
-        start = len(ordered) * (batch_index - 1) // batch_total
-        end = len(ordered) * batch_index // batch_total
-        selected = ordered[start:end]
+        groups: dict[str, list[dict]] = {}
+        for account in ordered:
+            groups.setdefault(str(account.get("account_id") or ""), []).append(account)
+        group_keys = list(groups)
+        start = len(group_keys) * (batch_index - 1) // batch_total
+        end = len(group_keys) * batch_index // batch_total
+        selected = [account for key in group_keys[start:end] for account in groups[key]]
         logger.info(
             "매장 분할 [%s]: 전체 %d개 -> %d개 (%s ~ %s)",
             collect_range,
@@ -211,13 +377,34 @@ def load_accounts(**context) -> str:
     accounts = pipeline_load_accounts(target_stores=target, exact=False)
 
     if not stores_override:
-        collect_range = (
-            conf.get("collect_range")
-            or params.get("collect_range")
-            or _MACRO_ROLE["range"]
-            or COLLECT_RANGE
+        conf_range = conf.get("collect_range")
+        param_range = params.get("collect_range")
+        role_range = _MACRO_ROLE["range"] or COLLECT_RANGE
+        for candidate in (conf_range, param_range):
+            if str(candidate or "").strip() in {"상위", "하위"}:
+                role_range = str(candidate).strip()
+                break
+
+        batch_range = None
+        if params.get("batch_orchestration") != "single_dag":
+            for candidate in (conf_range, param_range):
+                normalized = str(candidate or "").strip()
+                if re.fullmatch(r"batch:\d+/\d+", normalized):
+                    batch_range = normalized
+                    break
+
+        all_count = len(accounts)
+        accounts = _split_accounts_by_range(accounts, role_range)
+        role_count = len(accounts)
+        accounts = _split_accounts_by_range(accounts, batch_range)
+        logger.info(
+            "계정 2단계 분할: 전체 %d개 -> %s %d개 -> %s %d개",
+            all_count,
+            role_range or "전체",
+            role_count,
+            batch_range or "배치 없음",
+            len(accounts),
         )
-        accounts = _split_accounts_by_range(accounts, collect_range)
 
     if _MACRO_ROLE["slug"]:
         logger.info(
@@ -280,34 +467,27 @@ def _collect_manual_baemin_orders(target_date: str, base_dir: Path) -> tuple[dic
         if not store_key:
             logger.warning("manual baemin store parse failed: %s / raw=%s", csv_path.name, raw_store_name)
             continue
-        required = {"주문상태", "주문번호", "주문시각", "결제금액"}
+        required = {"주문상태", "주문번호", "주문시각"}
         if not required.issubset(df.columns):
             logger.warning("manual baemin CSV missing required columns: %s", csv_path.name)
             continue
         filtered = df[
             (df["주문상태"].astype(str) == "배달완료")
             & df["주문시각"].astype(str).str.startswith(date_prefix, na=False)
-            & df["결제금액"].astype(str).str.strip().ne("")
-        ][["주문번호", "결제금액"]].copy()
-        if filtered.empty:
+        ]
+        # ToOrder와 같은 기준(총결제금액, 없으면 결제금액)으로 집약한다.
+        amounts = _order_amounts(filtered)
+        if amounts.empty:
             continue
-        store_frames.setdefault(store_key, []).append(filtered)
+        store_frames.setdefault(store_key, []).append(amounts)
         used_files.append(csv_path.name)
 
     result: dict[str, dict] = {}
     for store_key, frames in store_frames.items():
-        combined = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["주문번호"])
-        amount = int(
-            combined["결제금액"]
-            .astype(str)
-            .str.replace(",", "", regex=False)
-            .pipe(pd.to_numeric, errors="coerce")
-            .fillna(0)
-            .sum()
-        )
+        combined = _merge_order_amounts(frames)
         result[store_key] = {
-            "amount": amount,
-            "orders": int(combined["주문번호"].nunique()),
+            "amount": int(combined["amount"].sum()),
+            "orders": int(len(combined)),
         }
     return result, used_files
 
@@ -315,7 +495,7 @@ def _collect_manual_baemin_orders(target_date: str, base_dir: Path) -> tuple[dic
 def precheck_manual_baemin_orders(**context) -> str:
     dag_run = context.get("dag_run")
     conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
+    target_date = _target_date_from_context(context)
     manual_dir = Path(str(conf.get("manual_baemin_dir") or MANUAL_BAEMIN_ORDERS_DIR))
 
     if not manual_dir.exists():
@@ -373,26 +553,41 @@ def precheck_manual_baemin_orders(**context) -> str:
     return summary
 
 
-def retry_failed(**context) -> str:
+def retry_failed(
+    *,
+    collect_task_ids=None,
+    retry_all_types: bool = False,
+    **context,
+) -> str:
     dag_run = context.get("dag_run")
     conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date")
+    target_date = _target_date_from_context(context)
     profile = resolve_stability_profile(conf.get("stability_profile") or SCHEDULED_DEFAULT_STABILITY_PROFILE)
     logger.info("재시도 안정성 프로필: %s", profile["name"])
 
-    failed = context["ti"].xcom_pull(task_ids="collect_all", key="failed") or {}
-    residual_failed = {"accounts": [], "stores": [], "orders": [], "ads": []}
-    immediate_failed = {
-        "accounts": failed.get("accounts") or [],
-        "stores": [],
-        "orders": failed.get("orders") or [],
-        "ads": [],
-    }
-    deferred_counts = {
-        "stores": len(failed.get("stores") or []),
-        "ads": len(failed.get("ads") or []),
-    }
-    if not any(immediate_failed.get(k) for k in ("accounts", "orders")):
+    allowed_account_ids = _loaded_account_ids(context)
+    failed = _filter_failed_to_loaded_accounts(
+        _pull_batch_failures(context["ti"], collect_task_ids),
+        allowed_account_ids,
+    )
+    context["ti"].xcom_push(key="original_failed", value=failed)
+    residual_failed = {"accounts": [], "stores": [], "orders": [], "ads": [], "stages": []}
+    if retry_all_types:
+        immediate_failed = failed
+        deferred_counts = {"stores": 0, "ads": 0}
+    else:
+        immediate_failed = {
+            "accounts": failed.get("accounts") or [],
+            "stages": failed.get("stages") or [],
+            "stores": [],
+            "orders": failed.get("orders") or [],
+            "ads": [],
+        }
+        deferred_counts = {
+            "stores": len(failed.get("stores") or []),
+            "ads": len(failed.get("ads") or []),
+        }
+    if count_failed_items(immediate_failed) == 0:
         logger.info(
             "즉시 재시도 대상 없음: deferred stores=%d ads=%d",
             deferred_counts["stores"],
@@ -410,26 +605,30 @@ def retry_failed(**context) -> str:
         return "재시도 없음"
 
     local_analytics, _local_baemin = _main_stage_paths(context)
+    prog_path = progress_path(local_analytics, "retry")
     analytics_original, patched_paths = patch_baemin_staging_paths(local_analytics)
     try:
         result = pipeline_retry_failed(
             immediate_failed,
             target_date=target_date,
             stability_profile=profile["name"],
+            progress_file=prog_path,
+            progress_run_id=_current_run_id(context),
         )
     finally:
         restore_baemin_staging_paths(analytics_original, patched_paths)
     if isinstance(result, dict):
         residual_failed = result.get("residual_failed") or residual_failed
-        residual_failed["stores"].extend(failed.get("stores") or [])
-        residual_failed["ads"].extend(failed.get("ads") or [])
+        if not retry_all_types:
+            residual_failed["stores"].extend(failed.get("stores") or [])
+            residual_failed["ads"].extend(failed.get("ads") or [])
         context["ti"].xcom_push(key="residual_failed", value=residual_failed)
         return str(result.get("summary") or "재시도 완료")
     context["ti"].xcom_push(key="residual_failed", value=residual_failed)
     return str(result)
 
 
-def export_to_upload_inbox(**context) -> str:
+def export_to_upload_inbox(*, collect_task_ids=None, **context) -> str:
     ti = context["ti"]
     local_analytics, local_baemin = _main_stage_paths(context)
     if not local_baemin.exists():
@@ -437,12 +636,20 @@ def export_to_upload_inbox(**context) -> str:
         return "upload inbox export 스킵: staging 없음"
 
     account_list = ti.xcom_pull(task_ids="load_accounts", key="account_list") or []
-    validation = ti.xcom_pull(task_ids="collect_all", key="validation") or []
-    ad_stores = ti.xcom_pull(task_ids="collect_all", key="ad_stores") or []
-    store_info_per_account = ti.xcom_pull(task_ids="collect_all", key="store_info_per_account") or []
-    original_failed = ti.xcom_pull(task_ids="collect_all", key="failed") or {}
+    validation = _pull_batch_values(ti, collect_task_ids, "validation")
+    ad_stores = _pull_batch_values(ti, collect_task_ids, "ad_stores")
+    store_info_per_account = _pull_batch_values(
+        ti,
+        collect_task_ids,
+        "store_info_per_account",
+    )
+    original_failed = ti.xcom_pull(task_ids="retry_failed", key="original_failed")
+    if original_failed is None:
+        original_failed = _pull_batch_failures(ti, collect_task_ids)
     residual_failed = ti.xcom_pull(task_ids="retry_failed", key="residual_failed")
     failed = residual_failed if residual_failed is not None else original_failed
+    if residual_failed is None:
+        logger.warning("retry_failed residual_failed XCom 없음: 원본 실패 payload를 upload meta failed로 사용")
     meta = {
         "target_date": _target_date_from_context(context),
         "account_list": account_list,
@@ -451,6 +658,7 @@ def export_to_upload_inbox(**context) -> str:
         "store_info_per_account": store_info_per_account,
         "original_failed": original_failed,
         "failed": failed,
+        "residual_failed": failed,
     }
     final_run = export_staging_to_inbox(
         local_baemin,
@@ -465,14 +673,68 @@ def export_to_upload_inbox(**context) -> str:
     return f"upload inbox export 완료: {final_run}"
 
 
+def trigger_upload_after_export(**context) -> str:
+    """수집 종료 시각과 무관하게 이번 top 폴더만 중앙 적재 큐에 넣는다."""
+    if _MACRO_ROLE["slug"] != "top":
+        logger.info(
+            "배민 upload 직접 트리거 스킵: role=%s (중앙 top 전용)",
+            _MACRO_ROLE["slug"] or _MACRO_ROLE_RAW,
+        )
+        return f"upload 직접 트리거 스킵: role={_MACRO_ROLE['slug'] or _MACRO_ROLE_RAW}"
+
+    ti = context["ti"]
+    exported = ti.xcom_pull(task_ids="export_to_upload_inbox", key="upload_inbox_run")
+    if not exported:
+        logger.warning("배민 upload 트리거 스킵: export 폴더 없음")
+        return "upload 트리거 스킵: export 폴더 없음"
+
+    folder_name = Path(str(exported)).name
+    if not folder_name.startswith("manual__"):
+        raise ValueError(f"허용되지 않은 upload 폴더명: {folder_name}")
+
+    source_run_id = _current_run_id(context)
+    upload_run_id = f"collect_export__{safe_run_id_part(source_run_id)}"
+    trigger_conf = {
+        "folder_pattern": folder_name,
+        "skip_if_empty": True,
+        "source": "main_top_collect_export",
+        "target_date": _target_date_from_context(context),
+    }
+    dag_run = context.get("dag_run")
+    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    if conf.get("manual_baemin_dir"):
+        trigger_conf["manual_baemin_dir"] = conf["manual_baemin_dir"]
+
+    from airflow.api.common.trigger_dag import trigger_dag
+    from airflow.exceptions import DagRunAlreadyExists
+
+    try:
+        trigger_dag(
+            dag_id=_UPLOAD_DAG_ID,
+            run_id=upload_run_id,
+            conf=trigger_conf,
+        )
+    except DagRunAlreadyExists:
+        logger.info("배민 upload DAG run 이미 존재: %s", upload_run_id)
+        return f"upload DAG run 이미 존재: {upload_run_id}"
+
+    logger.info(
+        "배민 upload DAG 트리거 완료: run_id=%s folder=%s",
+        upload_run_id,
+        folder_name,
+    )
+    return f"upload DAG 트리거 완료: {upload_run_id}"
+
+
 _NOTIFY_TASK_ID = "notify_collection_result"
 _CORE_TASK_IDS = {
     "load_accounts",
+    "init_staging",
     "collect_all",
+    *_BATCH_TASK_IDS,
     "retry_failed",
     "export_to_upload_inbox",
 }
-_VALIDATION_TASK_IDS = set()
 _PROBLEM_LOG_PATTERNS = (
     "ERROR",
     "WARNING",
@@ -627,12 +889,16 @@ def _extract_log_signals(task_instance, max_lines: int = 8) -> tuple[list[str], 
     return problem_lines[-max_lines:], empty_signal_count, recovered_lines[-max_lines:]
 
 
-def _build_collection_notification(context) -> tuple[str, str, str, bool]:
+def _build_collection_notification(
+    context,
+    *,
+    collect_task_ids=None,
+) -> tuple[str, str, str, bool]:
     ti = context["ti"]
     dag_run = context.get("dag_run")
     logical_date = context.get("logical_date") or getattr(ti, "execution_date", None)
     conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
+    target_date = _target_date_from_context(context)
     run_id = getattr(dag_run, "run_id", getattr(ti, "run_id", "?"))
     current_dag_id = getattr(ti, "dag_id", dag_id)
     execution_time = (
@@ -646,32 +912,42 @@ def _build_collection_notification(context) -> tuple[str, str, str, bool]:
         task_instances = [t for t in dag_run.get_task_instances() if getattr(t, "task_id", None) != _NOTIFY_TASK_ID]
     task_by_id = {t.task_id: t for t in task_instances}
 
-    original_failed = ti.xcom_pull(task_ids="collect_all", key="failed") or {}
+    normalized_collect_task_ids = _normalize_collect_task_ids(collect_task_ids)
+    original_failed = ti.xcom_pull(task_ids="retry_failed", key="original_failed")
+    if original_failed is None:
+        original_failed = _pull_batch_failures(ti, normalized_collect_task_ids)
     residual_failed = ti.xcom_pull(task_ids="retry_failed", key="residual_failed")
     final_failed = residual_failed if residual_failed is not None else original_failed
-    validation = ti.xcom_pull(task_ids="collect_all", key="validation") or []
+    validation = _pull_batch_values(ti, normalized_collect_task_ids, "validation")
+    summary_task_ids = (
+        "load_accounts",
+        *normalized_collect_task_ids,
+        "retry_failed",
+        "export_to_upload_inbox",
+    )
     returns = {
         task_id: ti.xcom_pull(task_ids=task_id, key="return_value")
-        for task_id in (
-            "load_accounts",
-            "collect_all",
-            "retry_failed",
-            "export_to_upload_inbox",
-        )
+        for task_id in summary_task_ids
     }
 
     hard_failures = [
         t for t in task_instances
         if getattr(t, "state", None) in {"failed", "upstream_failed"}
-        and getattr(t, "task_id", None) in (_CORE_TASK_IDS | _VALIDATION_TASK_IDS)
+        and getattr(t, "task_id", None) in _CORE_TASK_IDS
     ]
     mismatches = [v for v in validation if isinstance(v, dict) and v.get("matched") is False]
-    validation_texts = [
-        _safe_text(returns.get(task_id), 500)
-        for task_id in ()
-        if returns.get(task_id)
+    settle_suspects = [
+        v
+        for v in validation
+        if isinstance(v, dict)
+        and (
+            v.get("settlement_suspect")
+            or (
+                v.get("settle_rate") is not None
+                and float(v.get("settle_rate") or 0) < 0.9
+            )
+        )
     ]
-    validation_issue = _has_validation_issue(validation_texts)
 
     task_rows: list[tuple[str, str, str, str]] = []
     lines = [
@@ -683,12 +959,7 @@ def _build_collection_notification(context) -> tuple[str, str, str, bool]:
         "",
         "[수집 요약]",
     ]
-    for task_id in (
-        "load_accounts",
-        "collect_all",
-        "retry_failed",
-        "export_to_upload_inbox",
-    ):
+    for task_id in summary_task_ids:
         task = task_by_id.get(task_id)
         state = getattr(task, "state", "?") if task else "?"
         duration = _task_duration_seconds(task) if task else None
@@ -705,17 +976,29 @@ def _build_collection_notification(context) -> tuple[str, str, str, bool]:
             f"accounts={len(original_failed.get('accounts') or [])}, "
             f"stores={len(original_failed.get('stores') or [])}, "
             f"orders={len(original_failed.get('orders') or [])}, "
-            f"ads={len(original_failed.get('ads') or [])}"
+            f"ads={len(original_failed.get('ads') or [])}, "
+            f"stages={len(original_failed.get('stages') or [])}"
         )
         lines.append(
             "최종 잔여 실패 "
             f"accounts={len(final_failed.get('accounts') or [])}, "
             f"stores={len(final_failed.get('stores') or [])}, "
             f"orders={len(final_failed.get('orders') or [])}, "
-            f"ads={len(final_failed.get('ads') or [])}"
+            f"ads={len(final_failed.get('ads') or [])}, "
+            f"stages={len(final_failed.get('stages') or [])}"
         )
     if mismatches:
         lines.append(f"orders 검증 불일치 {len(mismatches)}건")
+    if settle_suspects:
+        lines.append(f"정산정보 수집 의심 {len(settle_suspects)}건")
+        for item in settle_suspects[:12]:
+            rate = item.get("settle_rate")
+            rate_text = "-" if rate is None else f"{float(rate) * 100:.1f}%"
+            lines.append(
+                f"  - {item.get('store', '?')} [{item.get('status', '?')}] "
+                f"rate={rate_text} 정산={item.get('settle_count')}/{item.get('settle_denominator')} "
+                f"재시도={item.get('retried', 0)}"
+            )
 
     problem_lines: list[str] = []
     recovered_lines: list[str] = []
@@ -730,7 +1013,7 @@ def _build_collection_notification(context) -> tuple[str, str, str, bool]:
             recovered_lines.append(f"- {task.task_id}:")
             recovered_lines.extend(f"  {line}" for line in task_recovered)
 
-    has_final_issue = bool(mismatches or validation_issue or final_retry_count)
+    has_final_issue = bool(mismatches or settle_suspects or final_retry_count)
     if hard_failures:
         status = "실패"
     elif has_final_issue:
@@ -739,8 +1022,6 @@ def _build_collection_notification(context) -> tuple[str, str, str, bool]:
         status = "성공"
     lines[0] = f"[배민 수집 결과] {status}"
 
-    if validation_texts:
-        lines.extend(["", "[검증 요약]", *validation_texts])
     if empty_signal_count:
         lines.extend(["", f"[정상 빈값 신호] 우가클/빈 테이블 로그 {empty_signal_count}건"])
     if recovered_lines:
@@ -761,7 +1042,17 @@ def _build_collection_notification(context) -> tuple[str, str, str, bool]:
     problem_title = "참고 로그: 복구/재시도 후 최종 성공" if status == "성공" else "문제 로그"
     problem_html = "".join(f"<li>{html.escape(line)}</li>" for line in problem_lines[:24]) or "<li>없음</li>"
     recovered_html = "".join(f"<li>{html.escape(line)}</li>" for line in recovered_lines[:24]) or "<li>없음</li>"
-    validation_html = "".join(f"<li>{html.escape(text)}</li>" for text in validation_texts) or "<li>없음</li>"
+    settle_html = "".join(
+        "<li>"
+        + html.escape(
+            f"{item.get('store', '?')} [{item.get('status', '?')}] "
+            f"rate={float(item.get('settle_rate') or 0) * 100:.1f}% "
+            f"정산={item.get('settle_count')}/{item.get('settle_denominator')} "
+            f"재시도={item.get('retried', 0)}"
+        )
+        + "</li>"
+        for item in settle_suspects[:24]
+    ) or "<li>없음</li>"
     html_rows = "".join(
         f"<tr><td>{html.escape(task_id)}</td><td>{html.escape(state)}</td><td>{html.escape(duration)}</td><td>{html.escape(summary)}</td></tr>"
         for task_id, state, duration, summary in task_rows
@@ -779,8 +1070,8 @@ def _build_collection_notification(context) -> tuple[str, str, str, bool]:
           <table style="width:100%;border-collapse:collapse;margin-bottom:20px;">
             <tr><td style="padding:8px 0;font-weight:700;">DAG</td><td>{html.escape(current_dag_id)}</td></tr>
             <tr><td style="padding:8px 0;font-weight:700;">실행시각</td><td>{html.escape(execution_time)}</td></tr>
-            <tr><td style="padding:8px 0;font-weight:700;">원본 수집 실패 신호</td><td>accounts={len(original_failed.get('accounts') or [])}, stores={len(original_failed.get('stores') or [])}, orders={len(original_failed.get('orders') or [])}, ads={len(original_failed.get('ads') or [])}</td></tr>
-            <tr><td style="padding:8px 0;font-weight:700;">최종 잔여 실패</td><td>accounts={len(final_failed.get('accounts') or [])}, stores={len(final_failed.get('stores') or [])}, orders={len(final_failed.get('orders') or [])}, ads={len(final_failed.get('ads') or [])}</td></tr>
+            <tr><td style="padding:8px 0;font-weight:700;">원본 수집 실패 신호</td><td>accounts={len(original_failed.get('accounts') or [])}, stores={len(original_failed.get('stores') or [])}, orders={len(original_failed.get('orders') or [])}, ads={len(original_failed.get('ads') or [])}, stages={len(original_failed.get('stages') or [])}</td></tr>
+            <tr><td style="padding:8px 0;font-weight:700;">최종 잔여 실패</td><td>accounts={len(final_failed.get('accounts') or [])}, stores={len(final_failed.get('stores') or [])}, orders={len(final_failed.get('orders') or [])}, ads={len(final_failed.get('ads') or [])}, stages={len(final_failed.get('stages') or [])}</td></tr>
             <tr><td style="padding:8px 0;font-weight:700;">정상 빈값 신호</td><td>{empty_signal_count}건</td></tr>
           </table>
           <h3 style="margin:20px 0 8px 0;">Task 요약</h3>
@@ -795,10 +1086,10 @@ def _build_collection_notification(context) -> tuple[str, str, str, bool]:
             </thead>
             <tbody>{html_rows}</tbody>
           </table>
-          <h3 style="margin:20px 0 8px 0;">검증 요약</h3>
-          <ul>{validation_html}</ul>
           <h3 style="margin:20px 0 8px 0;">복구된 경고</h3>
           <ul>{recovered_html}</ul>
+          <h3 style="margin:20px 0 8px 0;">정산정보 수집 의심</h3>
+          <ul>{settle_html}</ul>
           <h3 style="margin:20px 0 8px 0;">{html.escape(problem_title)}</h3>
           <ul>{problem_html}</ul>
         </div>
@@ -809,8 +1100,11 @@ def _build_collection_notification(context) -> tuple[str, str, str, bool]:
     return subject, body, html_body, status != "성공"
 
 
-def notify_collection_result(**context) -> str:
-    subject, body, html_body, should_email = _build_collection_notification(context)
+def notify_collection_result(*, collect_task_ids=None, **context) -> str:
+    subject, body, html_body, should_email = _build_collection_notification(
+        context,
+        collect_task_ids=collect_task_ids,
+    )
     logger.info(body)
     if should_email:
         try:
@@ -820,7 +1114,24 @@ def notify_collection_result(**context) -> str:
     return subject
 
 
-def collect_all(**context) -> str:
+def init_staging(**context) -> str:
+    dag_run = context.get("dag_run")
+    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    _local_analytics, local_baemin = _main_stage_paths(context)
+    if conf.get("force_restart") or not local_baemin.exists():
+        init_empty_staging(local_baemin)
+        return f"staging 초기화: {local_baemin}"
+    local_baemin.mkdir(parents=True, exist_ok=True)
+    logger.info("배민 staging 누적 유지(태스크 재시도): %s", local_baemin)
+    return f"staging 유지: {local_baemin}"
+
+
+def collect_batch(
+    *,
+    batch_range: str | None = None,
+    lane_offset: bool = False,
+    **context,
+) -> str:
     dag_run = context.get("dag_run")
     conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
     profile = resolve_stability_profile(conf.get("stability_profile") or SCHEDULED_DEFAULT_STABILITY_PROFILE)
@@ -830,33 +1141,153 @@ def collect_all(**context) -> str:
         profile.get("driver_restart_every_stores"),
         profile.get("max_session_recovery_per_account"),
     )
+    if lane_offset:
+        offset_range = conf.get("lane_offset_range") or _LANE_OFFSET_RANGE
+        offset_sec = random.uniform(*offset_range)
+        logger.info("레인 B 시작 오프셋 %.0f초", offset_sec)
+        time.sleep(offset_sec)
     wait_sec = random.uniform(*profile["initial_stagger_range"])
     logger.info("수집 시작 전 계정 지터 대기 %.0f초", wait_sec)
     time.sleep(wait_sec)
 
-    target_date = conf.get("target_date")
+    target_date = _target_date_from_context(context)
+    context["ti"].xcom_push(key="target_date", value=target_date)
     account_list = context["ti"].xcom_pull(task_ids="load_accounts", key="account_list")
     if not account_list:
         logger.warning("수집 대상 계정 없음")
         return "수집 대상 없음"
 
+    requested_batch = str(conf.get("collect_range") or "").strip()
+    if not re.fullmatch(r"batch:\d+/\d+", requested_batch):
+        requested_batch = ""
+    if batch_range:
+        first_batch = "batch:1/4"
+        selected_batch = requested_batch or first_batch
+        partial_run = bool(conf.get("stores")) or not _batch_chain_enabled(
+            conf.get("run_all_batches", True)
+        )
+        if (requested_batch and batch_range != requested_batch) or (
+            partial_run and not requested_batch and batch_range != first_batch
+        ):
+            logger.info(
+                "배치 수집 스킵: task=%s batch=%s requested=%s stores=%s run_all_batches=%r",
+                context["ti"].task_id,
+                batch_range,
+                selected_batch,
+                bool(conf.get("stores")),
+                conf.get("run_all_batches", True),
+            )
+            for key in ("failed", "validation", "ad_stores", "store_info_per_account"):
+                context["ti"].xcom_push(
+                    key=key,
+                    value={"accounts": [], "stores": [], "orders": [], "ads": [], "stages": []}
+                    if key == "failed"
+                    else [],
+                )
+            return f"배치 스킵: {batch_range}"
+        if not conf.get("stores"):
+            account_list = _split_accounts_by_range(account_list, batch_range)
+        logger.info(
+            "단일 DAG 배치 수집 대상: task=%s range=%s accounts=%d",
+            context["ti"].task_id,
+            batch_range,
+            len(account_list),
+        )
+
     local_analytics, local_baemin = _main_stage_paths(context)
-    init_empty_staging(local_baemin)
+    run_id = _current_run_id(context)
+    progress_key = batch_range.replace(":", "_").replace("/", "_") if batch_range else None
+    prog_path = progress_path(local_analytics, progress_key)
+    orders_only = bool(conf.get("orders_only"))
+    resume_progress = None
+    if not orders_only and not conf.get("force_restart"):
+        resume_progress = load_progress(
+            prog_path,
+            run_id=run_id,
+            target_date=target_date,
+        )
+
+    if resume_progress is not None:
+        logger.info("배민 수집 이어받기: staging 유지 %s", local_baemin)
+    else:
+        local_baemin.mkdir(parents=True, exist_ok=True)
+        logger.info("배민 배치 staging 누적 유지: %s", local_baemin)
+        if not orders_only:
+            init_progress(
+                prog_path,
+                run_id=run_id,
+                target_date=target_date,
+                total_accounts=len(account_list),
+            )
+
+    def _push_interrupted_state() -> None:
+        progress = None
+        if not orders_only:
+            progress = load_progress(
+                prog_path,
+                run_id=run_id,
+                target_date=target_date,
+            )
+        done_ids = {str(value) for value in (progress or {}).get("done_accounts") or []}
+        remaining_accounts = [
+            account
+            for account in account_list
+            if str(account.get("account_id") or "") not in done_ids
+        ]
+        carry = (progress or {}).get("carry") or {}
+        carry_failed = carry.get("failed") or {}
+        failed_accounts = list(carry_failed.get("accounts") or [])
+        failed_ids = {str(account.get("account_id") or "") for account in failed_accounts}
+        failed_accounts.extend(
+            account
+            for account in remaining_accounts
+            if str(account.get("account_id") or "") not in failed_ids
+        )
+        failed = {
+            "accounts": failed_accounts,
+            "stores": list(carry_failed.get("stores") or []),
+            "orders": list(carry_failed.get("orders") or []),
+            "ads": list(carry_failed.get("ads") or []),
+            "stages": list(carry_failed.get("stages") or []),
+        }
+        context["ti"].xcom_push(key="failed", value=failed)
+        context["ti"].xcom_push(key="validation", value=list(carry.get("validation") or []))
+        context["ti"].xcom_push(key="ad_stores", value=list(carry.get("ad_stores") or []))
+        context["ti"].xcom_push(
+            key="store_info_per_account",
+            value=list(carry.get("store_info_per_account") or []),
+        )
+
     analytics_original, patched_paths = patch_baemin_staging_paths(local_analytics)
     try:
-        result = pipeline_collect_all(
-            account_list,
-            target_date=target_date,
-            stability_profile=profile["name"],
-            woori_only=bool(conf.get("woori_only")),
+        if orders_only:
+            result = pipeline_collect_orders_only(
+                account_list,
+                target_date=target_date,
+                stability_profile=profile["name"],
+            )
+        else:
+            result = pipeline_collect_all(
+                account_list,
+                target_date=target_date,
+                stability_profile=profile["name"],
+                woori_only=bool(conf.get("woori_only")),
+                progress_file=prog_path,
+                progress_run_id=run_id,
+            )
+    except AirflowTaskTimeout:
+        _push_interrupted_state()
+        logger.exception(
+            "%s 타임아웃 - 미완료 계정만 재시도 대상으로 XCom 저장",
+            context["ti"].task_id,
         )
+        raise
     except Exception:
-        failed = {"accounts": account_list, "stores": [], "orders": [], "ads": []}
-        context["ti"].xcom_push(key="failed", value=failed)
-        context["ti"].xcom_push(key="validation", value=[])
-        context["ti"].xcom_push(key="ad_stores", value=[])
-        context["ti"].xcom_push(key="store_info_per_account", value=[])
-        logger.exception("collect_all 실패 - 전체 계정을 재시도 대상으로 XCom 저장")
+        _push_interrupted_state()
+        logger.exception(
+            "%s 실패 - 미완료 계정만 재시도 대상으로 XCom 저장",
+            context["ti"].task_id,
+        )
         raise
     finally:
         restore_baemin_staging_paths(analytics_original, patched_paths)
@@ -868,8 +1299,19 @@ def collect_all(**context) -> str:
     context["ti"].xcom_push(key="store_info_per_account", value=store_info_per_account)
     metrics = result.get("metrics")
     if metrics and dag_run:
-        write_runtime_metrics(run_id=dag_run.run_id, stage="collect_all", payload=metrics)
+        write_runtime_metrics(
+            run_id=dag_run.run_id,
+            stage=context["ti"].task_id,
+            payload=metrics,
+        )
     return result["summary"]
+
+
+def collect_all(**context) -> str:
+    """legacy B2/B3/B4와 기존 수동 실행 호환용 단일 배치 수집."""
+    _local_analytics, local_baemin = _main_stage_paths(context)
+    init_empty_staging(local_baemin)
+    return collect_batch(**context)
 
 
 def _send_alert(subject: str, body: str, html_content: str | None = None) -> None:
@@ -887,9 +1329,7 @@ def _send_alert(subject: str, body: str, html_content: str | None = None) -> Non
 
 
 def validate_orders(**context) -> str:
-    dag_run = context.get("dag_run")
-    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
+    target_date = _target_date_from_context(context)
 
     validation = context["ti"].xcom_pull(task_ids="collect_all", key="validation") or []
     if not validation:
@@ -922,9 +1362,7 @@ def validate_orders(**context) -> str:
 def validate_ad_funnel(**context) -> str:
     from modules.transform.pipelines.db.DB_Beamin_05_ad_funnel import _validate_and_retry_ad_funnel
 
-    dag_run = context.get("dag_run")
-    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
+    target_date = _target_date_from_context(context)
 
     ad_stores = context["ti"].xcom_pull(task_ids="collect_all", key="ad_stores") or []
     if not ad_stores:
@@ -954,9 +1392,7 @@ def validate_ad_funnel(**context) -> str:
 
 
 def validate_toorder(**context) -> str:
-    dag_run = context.get("dag_run")
-    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
+    target_date = _target_date_from_context(context)
 
     account_list = context["ti"].xcom_pull(task_ids="load_accounts", key="account_list") or []
     store_info_per_account = context["ti"].xcom_pull(task_ids="collect_all", key="store_info_per_account") or []
@@ -1040,14 +1476,33 @@ def trigger_retry_if_needed(**context) -> str:
     ti = context["ti"]
     dag_run = context.get("dag_run")
     conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
+    target_date = _target_date_from_context(context)
 
+    allowed_account_ids = _loaded_account_ids(context)
     residual_failed = ti.xcom_pull(task_ids="retry_failed", key="residual_failed")
     failed = residual_failed if residual_failed is not None else (ti.xcom_pull(task_ids="collect_all", key="failed") or {})
+    failed = _filter_failed_to_loaded_accounts(failed, allowed_account_ids)
     failed_count = count_failed_items(failed)
     if failed_count == 0:
         logger.info("Retry DAG 트리거 스킵: 원본 실패 없음")
         return "Retry DAG 트리거 스킵: 원본 실패 없음"
+
+    failed_account_ids = _unique_failed_account_ids(failed)
+    loaded_account_count = len(allowed_account_ids)
+    failed_account_count = len(failed_account_ids)
+    retry_account_ratio = (
+        failed_account_count / loaded_account_count
+        if loaded_account_count
+        else 0.0
+    )
+    if loaded_account_count and failed_account_count:
+        logger.warning(
+            "Retry 대상 계정 비율: failed_accounts=%d/%d ratio=%.1f%% failed_items=%d",
+            failed_account_count,
+            loaded_account_count,
+            retry_account_ratio * 100,
+            failed_count,
+        )
 
     toorder_result = ti.xcom_pull(task_ids="validate_toorder", key="toorder_result")
     ad_funnel_result = ti.xcom_pull(task_ids="validate_ad_funnel", key="ad_funnel_result")
@@ -1056,6 +1511,7 @@ def trigger_retry_if_needed(**context) -> str:
         return "Retry DAG 트리거 스킵: 추가 재시도 불필요"
 
     source_run_id = getattr(dag_run, "run_id", context.get("run_id", "manual"))
+    scope_label = _collect_scope_label(context)
     retry_conf = build_retry_conf(
         failed=failed,
         target_date=target_date,
@@ -1064,6 +1520,8 @@ def trigger_retry_if_needed(**context) -> str:
         attempt=1,
         max_attempts=int(conf.get("max_attempts", 3)),
         stability_profile=conf.get("stability_profile") or SCHEDULED_DEFAULT_STABILITY_PROFILE,
+        allowed_account_ids=sorted(allowed_account_ids),
+        collect_range=scope_label,
     )
     run_id = (
         f"retry__{target_date.replace('-', '')}__attempt_1__"
@@ -1084,75 +1542,117 @@ def trigger_retry_if_needed(**context) -> str:
         return f"Retry DAG run 이미 존재: {run_id}"
 
     logger.info(
-        "Retry DAG 트리거 완료: run_id=%s failed_count=%d accounts=%d stores=%d orders=%d ads=%d",
+        "Retry DAG 트리거 완료: run_id=%s range=%s allowed_accounts=%d failed_count=%d accounts=%d stores=%d orders=%d ads=%d stages=%d",
         run_id,
+        retry_conf.get("collect_range") or "-",
+        len(retry_conf.get("allowed_account_ids") or []),
         failed_count,
         len(retry_conf.get("failed_account_ids") or []),
         len(retry_conf.get("failed_stores") or []),
         len(retry_conf.get("failed_orders") or []),
         len(retry_conf.get("failed_ads") or []),
+        len(retry_conf.get("failed_stages") or []),
     )
     return f"Retry DAG 트리거 완료: {run_id}"
 
 
-def _build_baemin_macro_dag(
-    *,
-    dag_id_value: str,
-    schedule: str,
-    collect_range: str | None,
-) -> DAG:
+def _batch_chain_enabled(value: Any) -> bool:
+    if value is False:
+        return False
+    if isinstance(value, str) and value.strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _build_single_dag_parallel_lanes() -> DAG:
+    parallel_enabled = COLLECT_LANES == 2
     with DAG(
-        dag_id=dag_id_value,
-        schedule=schedule,
+        dag_id=dag_id,
+        schedule=SMD_BAEMIN_COLLECT_BATCH1_TIME,
         start_date=pendulum.datetime(2024, 1, 1, tz="Asia/Seoul"),
         catchup=False,
-        concurrency=1,
+        concurrency=2 if parallel_enabled else 1,
         max_active_runs=1,
-        max_active_tasks=1,
+        max_active_tasks=2 if parallel_enabled else 1,
         default_args=default_args,
-        params={"collect_range": collect_range},
+        params={
+            "collect_range": None,
+            "batch_orchestration": "single_dag",
+        },
+        is_paused_upon_creation=False,
         tags=["db", "baemin", "crawl"],
     ) as built_dag:
-        t1 = PythonOperator(
+        load_task = PythonOperator(
             task_id="load_accounts",
             python_callable=load_accounts,
         )
-
-        t2 = PythonOperator(
-            task_id="collect_all",
-            python_callable=collect_all,
-            pool="selenium_pool",
-            execution_timeout=timedelta(minutes=300),
+        init_staging_task = PythonOperator(
+            task_id="init_staging",
+            python_callable=init_staging,
+            execution_timeout=timedelta(minutes=5),
         )
-
-        t3 = PythonOperator(
+        batch_tasks = [
+            PythonOperator(
+                task_id=task_id,
+                python_callable=collect_batch,
+                op_kwargs={
+                    "batch_range": f"batch:{index}/4",
+                    "lane_offset": parallel_enabled and task_id == "collect_batch_3",
+                },
+                pool=BAEMIN_SELENIUM_POOL,
+                trigger_rule=(
+                    TriggerRule.ALL_SUCCESS
+                    if task_id in {lane[0] for lane in _LANES}
+                    else TriggerRule.ALL_DONE
+                ),
+                execution_timeout=timedelta(minutes=300),
+            )
+            for index, task_id in enumerate(_BATCH_TASK_IDS, start=1)
+        ]
+        retry_task = PythonOperator(
             task_id="retry_failed",
             python_callable=retry_failed,
-            pool="selenium_pool",
-            trigger_rule="all_done",
-            execution_timeout=timedelta(minutes=120),
+            op_kwargs={
+                "collect_task_ids": list(_BATCH_TASK_IDS),
+                "retry_all_types": False,
+            },
+            pool=BAEMIN_SELENIUM_POOL,
+            trigger_rule=TriggerRule.ALL_DONE,
+            retries=0,
+            execution_timeout=timedelta(minutes=_RETRY_FAILED_TIMEOUT_MINUTES),
         )
-
-        t4 = PythonOperator(
+        export_task = PythonOperator(
             task_id="export_to_upload_inbox",
             python_callable=export_to_upload_inbox,
+            op_kwargs={"collect_task_ids": list(_BATCH_TASK_IDS)},
             trigger_rule=TriggerRule.ALL_DONE,
             execution_timeout=timedelta(minutes=30),
         )
-
-        t5 = PythonOperator(
+        upload_task = PythonOperator(
+            task_id="trigger_upload_after_export",
+            python_callable=trigger_upload_after_export,
+            trigger_rule=TriggerRule.ALL_DONE,
+            execution_timeout=timedelta(minutes=5),
+        )
+        notify_task = PythonOperator(
             task_id=_NOTIFY_TASK_ID,
             python_callable=notify_collection_result,
+            op_kwargs={"collect_task_ids": list(_BATCH_TASK_IDS)},
             trigger_rule=TriggerRule.ALL_DONE,
         )
 
-        t1 >> t2 >> t3 >> t4 >> t5
+        load_task >> init_staging_task
+        if parallel_enabled:
+            init_staging_task >> batch_tasks[0] >> batch_tasks[1]
+            init_staging_task >> batch_tasks[2] >> batch_tasks[3]
+            [batch_tasks[1], batch_tasks[3]] >> retry_task
+        else:
+            init_staging_task >> batch_tasks[0]
+            batch_tasks[0] >> batch_tasks[1] >> batch_tasks[2] >> batch_tasks[3]
+            batch_tasks[3] >> retry_task
+        retry_task >> export_task >> upload_task >> notify_task
 
     return built_dag
 
 
-dag = _build_baemin_macro_dag(
-    dag_id_value=dag_id,
-    schedule=SMD_BAEMIN_COLLECT_BATCH1_TIME,
-    collect_range=None,
-)
+dag = _build_single_dag_parallel_lanes()

@@ -13,12 +13,22 @@ chrome.storage.sync.get(['shortcutKey', 'downloadPath'], (result) => {
 const MANUAL_COLLECT_MIN_INTERVAL_MS = 10 * 60 * 1000;
 const MANUAL_LOCK_KEY = 'ce_manual_collect_lock_until';
 const MANUAL_LAST_START_KEY = 'ce_manual_collect_last_started_at';
-const RUNNER_STOP_KEY = 'ce_runner_stop_requested';
+const COUPANG_RUNNER_STOP_KEY = 'ce_coupang_runner_stop_requested';
+const NAVERADS_RUNNER_STOP_KEY = 'naverads_runner_stop_requested';
+const RUNNER_STOP_KEY = COUPANG_RUNNER_STOP_KEY;
 const RUNNER_RELOAD_KEYS = ['ce_orders_restart', 'ce_orders_resume', 'ce_orders_batch_reload_count'];
 
-function isRunnerStopRequested() {
+function isNaverAdsMessage(msg = {}) {
+  return msg.runnerName === 'naverads' || !!msg.naverAdsMode || !!msg.expectedCampaignId || !!msg.expectedAdgroupId;
+}
+
+function stopKeyForMessage(msg = {}) {
+  return isNaverAdsMessage(msg) ? NAVERADS_RUNNER_STOP_KEY : COUPANG_RUNNER_STOP_KEY;
+}
+
+function isRunnerStopRequested(stopKey = COUPANG_RUNNER_STOP_KEY) {
   return new Promise((resolve) => {
-    chrome.storage.local.get([RUNNER_STOP_KEY], (result) => resolve(result[RUNNER_STOP_KEY] === true));
+    chrome.storage.local.get([stopKey], (result) => resolve(result[stopKey] === true));
   });
 }
 
@@ -84,7 +94,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === SHORTCUT_KEY) {
     e.preventDefault();
     sessionStorage.removeItem('__collector_auto_run');
-    chrome.storage.local.remove(['ce_current_target_stores', 'ce_current_target_date', 'ce_current_target_date_mode', 'ce_orders_restart', 'ce_orders_resume', RUNNER_STOP_KEY], async () => {
+    chrome.storage.local.remove(['ce_current_target_stores', 'ce_current_target_date', 'ce_current_target_start_date', 'ce_current_target_end_date', 'ce_current_target_date_mode', 'ce_orders_restart', 'ce_orders_resume', RUNNER_STOP_KEY], async () => {
       if (!await canStartManualCoupangCollect()) return;
       runCollector({ source: 'manual', targetStores: null });
     });
@@ -97,7 +107,7 @@ window.addEventListener('load', () => {
 
   // F5 새로고침 후 자동 재시작 (무한루프 감지로 인한 reload)
   if (url.includes('store.coupangeats.com/merchant/management/orders/')) {
-    chrome.storage.local.get(['ce_orders_restart', 'ce_orders_resume', 'ce_current_target_stores', 'ce_current_target_date', 'ce_current_target_date_mode', RUNNER_STOP_KEY], (result) => {
+    chrome.storage.local.get(['ce_orders_restart', 'ce_orders_resume', 'ce_current_target_stores', 'ce_current_target_date', 'ce_current_target_start_date', 'ce_current_target_end_date', 'ce_current_target_date_mode', RUNNER_STOP_KEY], (result) => {
       const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
 
       if (result[RUNNER_STOP_KEY] === true) {
@@ -127,7 +137,7 @@ window.addEventListener('load', () => {
         setTimeout(() => {
           console.log('[Collector] F5 재시작 - 체크포인트 기반 수집 재개');
           const targetStores = Array.isArray(result.ce_current_target_stores) ? result.ce_current_target_stores : [];
-          if (targetStores.length > 0) runRunnerCollectorUnlessStopped({ source: 'batch', targetStores, targetDate: result.ce_current_target_date, targetDateMode: result.ce_current_target_date_mode }, 'F5 배치');
+          if (targetStores.length > 0) runRunnerCollectorUnlessStopped({ source: 'batch', targetStores, targetDate: result.ce_current_target_date, targetStartDate: result.ce_current_target_start_date, targetEndDate: result.ce_current_target_end_date, targetDateMode: result.ce_current_target_date_mode }, 'F5 배치');
         }, 3000);
         return;
       }
@@ -138,7 +148,7 @@ window.addEventListener('load', () => {
         setTimeout(() => {
           console.log('[Collector] 건수 불일치 - 자동 재수집 시작...');
           const targetStores = Array.isArray(result.ce_current_target_stores) ? result.ce_current_target_stores : [];
-          if (targetStores.length > 0) runRunnerCollectorUnlessStopped({ source: 'batch', targetStores, targetDate: result.ce_current_target_date, targetDateMode: result.ce_current_target_date_mode }, '건수 불일치');
+          if (targetStores.length > 0) runRunnerCollectorUnlessStopped({ source: 'batch', targetStores, targetDate: result.ce_current_target_date, targetStartDate: result.ce_current_target_start_date, targetEndDate: result.ce_current_target_end_date, targetDateMode: result.ce_current_target_date_mode }, '건수 불일치');
         }, 2500);
       }
     });
@@ -150,9 +160,9 @@ window.addEventListener('load', () => {
     sessionStorage.removeItem('__collector_auto_run');
     setTimeout(() => {
       console.log('[Collector] 건수 불일치 - 자동 재수집 시작...');
-      chrome.storage.local.get(['ce_current_target_stores', 'ce_current_target_date', 'ce_current_target_date_mode'], (result) => {
+      chrome.storage.local.get(['ce_current_target_stores', 'ce_current_target_date', 'ce_current_target_start_date', 'ce_current_target_end_date', 'ce_current_target_date_mode'], (result) => {
         const targetStores = Array.isArray(result.ce_current_target_stores) ? result.ce_current_target_stores : [];
-          if (targetStores.length > 0) runRunnerCollectorUnlessStopped({ source: 'batch', targetStores, targetDate: result.ce_current_target_date, targetDateMode: result.ce_current_target_date_mode }, '건수 불일치');
+          if (targetStores.length > 0) runRunnerCollectorUnlessStopped({ source: 'batch', targetStores, targetDate: result.ce_current_target_date, targetStartDate: result.ce_current_target_start_date, targetEndDate: result.ce_current_target_end_date, targetDateMode: result.ce_current_target_date_mode }, '건수 불일치');
       });
     }, 2500);
   }
@@ -185,11 +195,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg?.type === 'STOP') {
     try {
-      if (Sites['coupangeats']) Sites['coupangeats']._stopFlag = true;
-      if (Sites['baemin']) Sites['baemin']._stopFlag = true;
-      sessionStorage.removeItem('__collector_auto_run');
-      chrome.storage.local.set({ [RUNNER_STOP_KEY]: true }, () => {
-        chrome.storage.local.remove(RUNNER_RELOAD_KEYS, () => sendResponse({ success: true, stopped: true }));
+      const stopKey = stopKeyForMessage(msg);
+      const naverOnly = isNaverAdsMessage(msg);
+      const coupangOnly = msg.runnerName === 'coupang';
+      if (!naverOnly && Sites['coupangeats']) Sites['coupangeats']._stopFlag = true;
+      if (!naverOnly && Sites['baemin']) Sites['baemin']._stopFlag = true;
+      if (!coupangOnly && Sites['naverads']) Sites['naverads']._stopFlag = true;
+      if (!naverOnly) sessionStorage.removeItem('__collector_auto_run');
+      chrome.storage.local.set({ [stopKey]: true }, () => {
+        if (naverOnly) sendResponse({ success: true, stopped: true });
+        else chrome.storage.local.remove(RUNNER_RELOAD_KEYS, () => sendResponse({ success: true, stopped: true }));
       });
     } catch (e) {
       sendResponse({ success: false, stopped: false, error: String(e) });
@@ -200,21 +215,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === 'COLLECT') {
     const targetStores = Array.isArray(msg.targetStores) ? msg.targetStores : null;
     const source = msg.source || 'manual';
+    const naverAdsCollect = isNaverAdsMessage(msg);
+    const stopKey = stopKeyForMessage(msg);
     (async () => {
       const runnerManaged = source === 'batch' || msg.runnerManaged === true;
-      if (runnerManaged && await isRunnerStopRequested()) {
+      if (runnerManaged && await isRunnerStopRequested(stopKey)) {
         sendResponse({ success: false, source, stopped: true });
         return;
       }
-      if (!runnerManaged) await chrome.storage.local.remove([RUNNER_STOP_KEY]);
-      if (source === 'batch' && targetStores && targetStores.length > 0) {
+      if (!runnerManaged) await chrome.storage.local.remove([stopKey]);
+      if (!naverAdsCollect && source === 'batch' && targetStores && targetStores.length > 0) {
         chrome.storage.local.set({
           ce_current_target_stores: targetStores,
           ce_current_target_date: msg.targetDate || '',
+          ce_current_target_start_date: msg.targetStartDate || '',
+          ce_current_target_end_date: msg.targetEndDate || '',
           ce_current_target_date_mode: msg.targetDateMode || 'yesterday'
         });
-      } else {
-        chrome.storage.local.remove(['ce_current_target_stores', 'ce_current_target_date', 'ce_current_target_date_mode', 'ce_orders_restart']);
+      } else if (!naverAdsCollect) {
+        chrome.storage.local.remove(['ce_current_target_stores', 'ce_current_target_date', 'ce_current_target_start_date', 'ce_current_target_end_date', 'ce_current_target_date_mode', 'ce_orders_restart']);
       }
       if (source === 'manual' && !msg.manualGuardChecked && !await canStartManualCoupangCollect()) {
         sendResponse({ success: false, source, blocked: true });
@@ -224,7 +243,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         source,
         targetStores,
         targetDate: msg.targetDate || '',
-        targetDateMode: msg.targetDateMode || 'yesterday',
+        targetStartDate: msg.targetStartDate || '',
+        targetEndDate: msg.targetEndDate || '',
+        targetDateMode: source === 'batch' ? (msg.targetDateMode || 'yesterday') : (msg.targetDateMode || ''),
         expectedStore: msg.expectedStore || '',
         expectedStoreId: msg.expectedStoreId || '',
         runnerManaged

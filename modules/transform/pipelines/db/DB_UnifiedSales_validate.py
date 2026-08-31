@@ -35,6 +35,7 @@ from modules.transform.pipelines.db.DB_UnifiedSales_common import (
     DELIVERY_PLATFORM_FAMILIES,
     PLATFORM_TO_MANUAL_SOURCE,
     iter_unified_sales_files,
+    save_unified_parquet,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,7 @@ UNIFIED_ROOT = MART_DB / "unified_sales_grp"
 VALIDATION_DIR = MART_DB / "unified_sales_grp_error_list"
 VALIDATION_FILE_PREFIX = "unified_sales_error_"
 MONTHLY_FILE_PREFIX = "unified_sales_monthly_"
+TOORDER_DAILY_PARQUET = ANALYTICS_DB / "toorder_daily_store_platform" / "toorder_store_platform_daily.parquet"
 HALL_PLATFORMS = {"홀", "홀 포장", "홀 배달"}
 POS_HALL_SOURCES = {"okpos", "unionpos", "easypos"}
 _ALERT_CHANNELS = ["총합", "쿠팡", "배민", "기타"]
@@ -223,10 +225,11 @@ def _load_unified_pos_hall_totals(
     target_date: str | None = None,
     target_ym: str | None = None,
     max_date: str | None = None,
+    exclude_dates: set[str] | None = None,
 ) -> pd.DataFrame:
     files = iter_unified_sales_files()
     if not files:
-        cols = ["sale_date", "store", "channel", "excel_total"] if target_date else ["ym", "store", "channel", "excel_total"]
+        cols = ["sale_date", "store", "excel_total"] if target_date else ["ym", "store", "excel_total"]
         return pd.DataFrame(columns=cols)
 
     parts = []
@@ -241,7 +244,7 @@ def _load_unified_pos_hall_totals(
             continue
         parts.append(frame)
     if not parts:
-        cols = ["sale_date", "store", "channel", "excel_total"] if target_date else ["ym", "store", "channel", "excel_total"]
+        cols = ["sale_date", "store", "excel_total"] if target_date else ["ym", "store", "excel_total"]
         return pd.DataFrame(columns=cols)
 
     df = pd.concat(parts, ignore_index=True)
@@ -259,22 +262,23 @@ def _load_unified_pos_hall_totals(
         df = df[df["ym"] == target_ym].copy()
     if max_date is not None:
         df = df[df["sale_date"] <= max_date].copy()
+    if exclude_dates:
+        df = df[~df["sale_date"].isin(exclude_dates)].copy()
     if df.empty:
-        cols = ["sale_date", "store", "channel", "excel_total"] if target_date else ["ym", "store", "channel", "excel_total"]
+        cols = ["sale_date", "store", "excel_total"] if target_date else ["ym", "store", "excel_total"]
         return pd.DataFrame(columns=cols)
 
     df["store"] = df["store"].fillna("").astype(str).str.strip()
-    df["channel"] = "홀"
     df["total_price"] = pd.to_numeric(df["total_price"], errors="coerce").fillna(0)
     if target_date is not None:
         grouped = (
-            df.groupby(["sale_date", "store", "channel"], as_index=False)["total_price"]
+            df.groupby(["sale_date", "store"], as_index=False)["total_price"]
             .sum()
             .rename(columns={"total_price": "excel_total"})
         )
     else:
         grouped = (
-            df.groupby(["ym", "store", "channel"], as_index=False)["total_price"]
+            df.groupby(["ym", "store"], as_index=False)["total_price"]
             .sum()
             .rename(columns={"total_price": "excel_total"})
         )
@@ -552,23 +556,22 @@ def _load_parquet_totals(target_date: str) -> pd.DataFrame:
         return pd.DataFrame(columns=["sale_date", "store", "channel", "unified_total"])
 
     df["store"] = df["store"].astype(str).str.strip()
-    df["platform"] = df["platform"].fillna("").astype(str).str.strip()
-    df["channel"] = df["platform"].map(_platform_family)
     df["total_price"] = pd.to_numeric(df["total_price"], errors="coerce").fillna(0)
     grouped = (
-        df.groupby(["sale_date", "store", "channel"], as_index=False)["total_price"]
+        df.groupby(["sale_date", "store"], as_index=False)["total_price"]
         .sum()
         .rename(columns={"total_price": "unified_total"})
     )
+    grouped["channel"] = "총합"
     grouped["unified_total"] = grouped["unified_total"].round().astype(int)
-    return grouped
+    return grouped[["sale_date", "store", "channel", "unified_total"]]
 
 
 def _load_excel_totals(
     target_date: str,
     unified_platform_keys: set[tuple[str, str, str]] | None = None,
 ) -> pd.DataFrame:
-    path = ANALYTICS_DB / "toorder_daily_store_platform" / "toorder_store_platform_daily.parquet"
+    path = TOORDER_DAILY_PARQUET
     if not path.exists():
         logger.warning("토더 parquet 없음: %s", path)
         return pd.DataFrame(columns=["sale_date", "store", "channel", "excel_total"])
@@ -584,21 +587,23 @@ def _load_excel_totals(
     df = df[df["sale_date"] == target_date].copy()
     if df.empty:
         logger.warning("토더 parquet 데이터 없음: %s", target_date)
-        return pd.DataFrame(columns=["sale_date", "store", "channel", "excel_total"])
-
-    df["store"] = df["store"].astype(str).str.strip()
-    df["platform"] = df["platform"].fillna("").astype(str).str.strip()
-    df["channel"] = df["platform"].map(_platform_family)
-    df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0)
-    toorder_grouped = (
-        df.groupby(["sale_date", "store", "channel"], as_index=False)["price"]
-        .sum()
-        .rename(columns={"price": "excel_total"})
-    )
-    toorder_grouped["excel_total"] = toorder_grouped["excel_total"].round().astype(int)
+        toorder_grouped = pd.DataFrame(columns=["sale_date", "store", "excel_total"])
+    else:
+        df["store"] = df["store"].astype(str).str.strip()
+        df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0)
+        toorder_grouped = (
+            df.groupby(["sale_date", "store"], as_index=False)["price"]
+            .sum()
+            .rename(columns={"price": "excel_total"})
+        )
+        toorder_grouped["excel_total"] = toorder_grouped["excel_total"].round().astype(int)
 
     unified_hall_grouped = _load_unified_pos_hall_totals(target_date=target_date)
-    return _sum_validation_baseline([toorder_grouped, unified_hall_grouped], ["sale_date", "store", "channel"])
+    grouped = _sum_validation_baseline([toorder_grouped, unified_hall_grouped], ["sale_date", "store"])
+    if grouped.empty:
+        return pd.DataFrame(columns=["sale_date", "store", "channel", "excel_total"])
+    grouped["channel"] = "총합"
+    return grouped[["sale_date", "store", "channel", "excel_total"]]
 
 
 def _compute_diff(excel: pd.DataFrame, parquet: pd.DataFrame) -> pd.DataFrame:
@@ -704,8 +709,22 @@ def validate_sales(**context) -> str:
     logger.info("unified_sales 검증 대상일: %s", target_date)
 
     parquet = _load_parquet_totals(target_date=target_date)
+    baseline_usable, baseline_reason = _is_toorder_baseline_date_usable(target_date)
+    if not baseline_usable:
+        msg = (
+            f"[도리당] unified_sales 일별 검증 보류: {target_date} "
+            f"ToOrder 기준값 부분 수집 의심({baseline_reason})"
+        )
+        logger.warning(msg)
+        send_telegram(msg)
+        return msg
     unified_platform_keys = _load_unified_platform_keys(target_date[:7], max_date=target_date)
     excel = _load_excel_totals(target_date=target_date, unified_platform_keys=unified_platform_keys)
+    if excel.empty:
+        msg = f"[도리당] unified_sales 일별 검증 보류: {target_date} ToOrder 기준값 없음(수집 지연)"
+        logger.warning(msg)
+        send_telegram(msg)
+        return msg
     diff = _compute_diff(excel=excel, parquet=parquet)
     csv_path = _save_validation_csv(diff=diff, target_date=target_date)
     logger.info("검증 결과 저장: %s | rows=%d", csv_path, len(diff))
@@ -766,25 +785,170 @@ def _load_parquet_monthly_totals(target_ym: str, max_date: str | None = None) ->
             return pd.DataFrame(columns=["ym", "store", "channel", "unified_total"])
 
     df["store"] = df["store"].astype(str).str.strip()
-    df["platform"] = df["platform"].fillna("").astype(str).str.strip()
-    df["channel"] = df["platform"].map(_platform_family)
     df["total_price"] = pd.to_numeric(df["total_price"], errors="coerce").fillna(0)
     grouped = (
-        df.groupby(["ym", "store", "channel"], as_index=False)["total_price"]
+        df.groupby(["ym", "store"], as_index=False)["total_price"]
         .sum()
         .rename(columns={"total_price": "unified_total"})
     )
+    grouped["channel"] = "총합"
     grouped["unified_total"] = grouped["unified_total"].round().astype(int)
-    return grouped
+    return grouped[["ym", "store", "channel", "unified_total"]]
+
+
+def _load_parquet_monthly_totals_excluding_dates(
+    target_ym: str,
+    *,
+    max_date: str | None = None,
+    exclude_dates: set[str] | None = None,
+) -> pd.DataFrame:
+    """월별 unified 합계에서 검증 기준 불량일을 제외한다."""
+    files = iter_unified_sales_files()
+    if not files:
+        return pd.DataFrame(columns=["ym", "store", "channel", "unified_total"])
+
+    parts = []
+    for file_path in files:
+        try:
+            frame = pd.read_parquet(file_path, columns=["sale_date", "store", "platform", "total_price"])
+        except Exception as exc:
+            logger.warning("parquet 로드 실패: %s | %s", file_path, exc)
+            continue
+        parts.append(frame)
+    if not parts:
+        return pd.DataFrame(columns=["ym", "store", "channel", "unified_total"])
+
+    df = pd.concat(parts, ignore_index=True)
+    df["sale_date"] = pd.to_datetime(df["sale_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df["ym"] = df["sale_date"].str[:7]
+    df = df[df["ym"] == target_ym].copy()
+    if max_date is not None:
+        df = df[df["sale_date"] <= max_date].copy()
+    if exclude_dates:
+        df = df[~df["sale_date"].isin(exclude_dates)].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["ym", "store", "channel", "unified_total"])
+
+    df["store"] = df["store"].astype(str).str.strip()
+    df["total_price"] = pd.to_numeric(df["total_price"], errors="coerce").fillna(0)
+    grouped = (
+        df.groupby(["ym", "store"], as_index=False)["total_price"]
+        .sum()
+        .rename(columns={"total_price": "unified_total"})
+    )
+    grouped["channel"] = "총합"
+    grouped["unified_total"] = grouped["unified_total"].round().astype(int)
+    return grouped[["ym", "store", "channel", "unified_total"]]
+
+
+TOORDER_BASELINE_REF_DAYS = 7
+TOORDER_BASELINE_MIN_REF_DAYS = 3
+TOORDER_BASELINE_MIN_STORE_RATIO = 0.70
+TOORDER_BASELINE_MIN_ROW_RATIO = 0.70
+TOORDER_BASELINE_MIN_TOTAL_RATIO = 0.50
+
+
+def _load_toorder_daily_quality() -> pd.DataFrame:
+    """ToOrder 일별 적재 품질 지표를 반환한다."""
+    if not TOORDER_DAILY_PARQUET.exists():
+        logger.warning("토더 기준 parquet 없음: %s", TOORDER_DAILY_PARQUET)
+        return pd.DataFrame(columns=["date", "rows", "stores", "total"])
+    try:
+        df = pd.read_parquet(TOORDER_DAILY_PARQUET, columns=["date", "store", "price"])
+    except Exception as exc:
+        logger.warning("토더 기준 품질 조회 실패: %s | %s", TOORDER_DAILY_PARQUET, exc)
+        return pd.DataFrame(columns=["date", "rows", "stores", "total"])
+
+    out = df.copy()
+    out["date"] = out["date"].astype(str).str[:10]
+    out = out[out["date"].str.match(r"\d{4}-\d{2}-\d{2}", na=False)]
+    if out.empty:
+        return pd.DataFrame(columns=["date", "rows", "stores", "total"])
+    out["store"] = out["store"].fillna("").astype(str).str.strip()
+    out["price"] = pd.to_numeric(out["price"], errors="coerce").fillna(0)
+    quality = (
+        out.groupby("date", as_index=False)
+        .agg(rows=("date", "size"), stores=("store", "nunique"), total=("price", "sum"))
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+    quality["total"] = quality["total"].round().astype(int)
+    return quality
+
+
+def _toorder_quality_reason(quality: pd.DataFrame, target_date: str) -> str:
+    """특정 ToOrder 일자가 최근 정상 범위 대비 부분 수집인지 판단한다."""
+    if quality.empty:
+        return "no_quality"
+    current_rows = quality[quality["date"].eq(target_date)]
+    if current_rows.empty:
+        return "missing_date"
+
+    current = current_rows.iloc[-1]
+    refs = quality[quality["date"].lt(target_date)].tail(TOORDER_BASELINE_REF_DAYS)
+    if len(refs) < TOORDER_BASELINE_MIN_REF_DAYS:
+        return ""
+
+    checks = [
+        ("stores", TOORDER_BASELINE_MIN_STORE_RATIO),
+        ("rows", TOORDER_BASELINE_MIN_ROW_RATIO),
+        ("total", TOORDER_BASELINE_MIN_TOTAL_RATIO),
+    ]
+    failed = []
+    for col, min_ratio in checks:
+        ref_value = float(refs[col].median())
+        if ref_value <= 0:
+            continue
+        value = float(current[col])
+        ratio = value / ref_value
+        if ratio < min_ratio:
+            failed.append(f"{col} {value:.0f}/{ref_value:.0f} ({ratio:.0%})")
+    return ", ".join(failed)
+
+
+def _is_toorder_baseline_date_usable(target_date: str) -> tuple[bool, str]:
+    quality = _load_toorder_daily_quality()
+    reason = _toorder_quality_reason(quality, target_date)
+    return reason == "", reason
+
+
+def _toorder_baseline_max_date() -> str | None:
+    """부분 수집일을 제외한 ToOrder 기준값의 최신 정상 날짜를 반환한다."""
+    quality = _load_toorder_daily_quality()
+    if quality.empty:
+        return None
+
+    for target_date in sorted(quality["date"].astype(str).unique(), reverse=True):
+        reason = _toorder_quality_reason(quality, target_date)
+        if not reason:
+            return str(target_date)
+        logger.warning("ToOrder 부분 수집일 제외: %s | %s", target_date, reason)
+    return None
+
+
+def _toorder_partial_dates_for_month(target_ym: str, max_date: str | None = None) -> dict[str, str]:
+    quality = _load_toorder_daily_quality()
+    if quality.empty:
+        return {}
+    dates = quality[quality["date"].astype(str).str.startswith(target_ym)]["date"].astype(str)
+    if max_date is not None:
+        dates = dates[dates <= max_date]
+    bad: dict[str, str] = {}
+    for target_date in sorted(dates.unique()):
+        reason = _toorder_quality_reason(quality, target_date)
+        if reason:
+            bad[target_date] = reason
+    return bad
 
 
 def _load_excel_monthly_totals(
     target_ym: str,
     max_date: str | None = None,
     unified_platform_keys: set[tuple[str, str, str]] | None = None,
+    exclude_dates: set[str] | None = None,
 ) -> pd.DataFrame:
     """ToOrder parquet 전체 로드 → ym 기준 필터 → store 기준 합산."""
-    path = ANALYTICS_DB / "toorder_daily_store_platform" / "toorder_store_platform_daily.parquet"
+    path = TOORDER_DAILY_PARQUET
     if not path.exists():
         logger.warning("토더 parquet 없음 (월별): %s", path)
         return pd.DataFrame(columns=["ym", "store", "channel", "excel_total"])
@@ -797,30 +961,39 @@ def _load_excel_monthly_totals(
     )
     df = _exclude_pos_hall_platforms(df)
     df["ym"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m")
+    df["sale_date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
     df = df[df["ym"] == target_ym].copy()
+    if max_date is not None and not df.empty:
+        df = df[df["sale_date"] <= max_date].copy()
+    if exclude_dates and not df.empty:
+        df = df[~df["sale_date"].isin(exclude_dates)].copy()
     if df.empty:
-        logger.warning("토더 parquet 데이터 없음 (월별): %s", target_ym)
-        return pd.DataFrame(columns=["ym", "store", "channel", "excel_total"])
-    if max_date is not None:
-        df = df[df["date"].astype(str).str[:10] <= max_date].copy()
-        if df.empty:
+        if max_date is not None:
             logger.warning("토더 parquet 데이터 없음 (월별, 컷오프): %s <= %s", target_ym, max_date)
-            return pd.DataFrame(columns=["ym", "store", "channel", "excel_total"])
+        else:
+            logger.warning("토더 parquet 데이터 없음 (월별): %s", target_ym)
+        toorder_grouped = pd.DataFrame(columns=["ym", "store", "excel_total"])
+    else:
+        df["store"] = df["store"].astype(str).str.strip()
+        df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0)
+        toorder_grouped = (
+            df.groupby(["ym", "store"], as_index=False)["price"]
+            .sum()
+            .rename(columns={"price": "excel_total"})
+        )
+        toorder_grouped["store"] = toorder_grouped["store"].astype(str).str.strip()
+        toorder_grouped["excel_total"] = toorder_grouped["excel_total"].round().astype(int)
 
-    df["store"] = df["store"].astype(str).str.strip()
-    df["platform"] = df["platform"].fillna("").astype(str).str.strip()
-    df["channel"] = df["platform"].map(_platform_family)
-    df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0)
-    toorder_grouped = (
-        df.groupby(["ym", "store", "channel"], as_index=False)["price"]
-        .sum()
-        .rename(columns={"price": "excel_total"})
+    unified_hall_grouped = _load_unified_pos_hall_totals(
+        target_ym=target_ym,
+        max_date=max_date,
+        exclude_dates=exclude_dates,
     )
-    toorder_grouped["store"] = toorder_grouped["store"].astype(str).str.strip()
-    toorder_grouped["excel_total"] = toorder_grouped["excel_total"].round().astype(int)
-
-    unified_hall_grouped = _load_unified_pos_hall_totals(target_ym=target_ym, max_date=max_date)
-    return _sum_validation_baseline([toorder_grouped, unified_hall_grouped], ["ym", "store", "channel"])
+    grouped = _sum_validation_baseline([toorder_grouped, unified_hall_grouped], ["ym", "store"])
+    if grouped.empty:
+        return pd.DataFrame(columns=["ym", "store", "channel", "excel_total"])
+    grouped["channel"] = "총합"
+    return grouped[["ym", "store", "channel", "excel_total"]]
 
 
 def _compute_monthly_diff(excel: pd.DataFrame, parquet: pd.DataFrame) -> pd.DataFrame:
@@ -858,12 +1031,18 @@ def _send_monthly_alert(
     csv_path: Path,
     *,
     max_date: str | None = None,
+    baseline_lagged: bool = False,
+    excluded_dates: dict[str, str] | None = None,
     **context,
 ) -> None:
     display = error_rows[["ym", "store", "channel", "excel_total", "unified_total", "difference", "error_rate", "reason", "status"]]
     target_label = f"대상월: {target_ym}"
     if max_date:
         target_label += f"\n비교범위: {target_ym}-01 ~ {max_date}"
+    if baseline_lagged and max_date:
+        target_label += f"\n※ ToOrder 최신일 부분 수집 의심으로 {max_date}까지만 비교"
+    if excluded_dates:
+        target_label += f"\n※ ToOrder 부분 수집일 제외: {', '.join(sorted(excluded_dates))}"
     message = _build_telegram_message(
         title="[도리당] unified_sales 월별 검증 알림",
         target_label=target_label,
@@ -883,6 +1062,15 @@ def validate_monthly_sales(**context) -> str:
         cutoff_date = (datetime.now(KST) - timedelta(days=1)).strftime("%Y-%m-%d")
     else:
         cutoff_date = target_date
+    baseline_max = _toorder_baseline_max_date()
+    baseline_lagged = baseline_max is not None and baseline_max < cutoff_date
+    if baseline_lagged:
+        logger.warning(
+            "기준값(ToOrder) 지연으로 월별 검증 컷오프 축소: %s → %s",
+            cutoff_date,
+            baseline_max,
+        )
+        cutoff_date = baseline_max
     current_year = target_date[:4]
     current_ym = target_date[:7]
     logger.info("unified_sales 월별 검증 시작: year=%s, alert_ym=%s", current_year, current_ym)
@@ -896,12 +1084,20 @@ def validate_monthly_sales(**context) -> str:
     alert_sent = False
     for ym in all_ym:
         max_date = cutoff_date if ym == current_ym else None
-        parquet = _load_parquet_monthly_totals(ym, max_date=max_date)
+        excluded_dates = _toorder_partial_dates_for_month(ym, max_date=max_date) if ym == current_ym else {}
+        if excluded_dates:
+            logger.warning("월별 검증 ToOrder 부분 수집일 제외: %s | %s", ym, excluded_dates)
+        parquet = _load_parquet_monthly_totals_excluding_dates(
+            ym,
+            max_date=max_date,
+            exclude_dates=set(excluded_dates),
+        )
         unified_platform_keys = _load_unified_platform_keys(ym, max_date=max_date)
         excel = _load_excel_monthly_totals(
             ym,
             max_date=max_date,
             unified_platform_keys=unified_platform_keys,
+            exclude_dates=set(excluded_dates),
         )
         diff = _compute_monthly_diff(excel=excel, parquet=parquet)
         csv_path = _save_monthly_comparison_csv(diff=diff, target_ym=ym)
@@ -911,7 +1107,15 @@ def validate_monthly_sales(**context) -> str:
         if ym == current_ym:
             error_rows = _alert_summary_rows(diff, date_col="ym")
             if not error_rows.empty:
-                _send_monthly_alert(ym, error_rows, csv_path, max_date=max_date, **context)
+                _send_monthly_alert(
+                    ym,
+                    error_rows,
+                    csv_path,
+                    max_date=max_date,
+                    baseline_lagged=baseline_lagged,
+                    excluded_dates=excluded_dates,
+                    **context,
+                )
                 alert_sent = True
 
     summary = f"월별 검증 완료: {', '.join(saved)} | CSV {len(saved)}개 저장"
@@ -1204,6 +1408,6 @@ def build_daily_summary() -> str:
     # ── 10. 최종 컬럼 순서 & 저장 ────────────────────────────────────────────
     daily = daily[DAILY_SUMMARY_COLUMNS]
     DAILY_SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    daily.to_parquet(DAILY_SUMMARY_PATH, index=False, engine="pyarrow")
+    save_unified_parquet(daily, DAILY_SUMMARY_PATH)
     logger.info("일별 요약 저장: %s (%d행)", DAILY_SUMMARY_PATH, len(daily))
     return f"일별 요약 {len(daily)}행 → {DAILY_SUMMARY_PATH}"

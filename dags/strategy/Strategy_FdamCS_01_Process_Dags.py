@@ -1602,10 +1602,13 @@ def _build_overdue_email_html(df: pd.DataFrame, today_str: str) -> str:
 def _send_cs_alert_email(subject: str, html_content: str,
                          to_emails: list, cc_emails: list = None):
     """CS 알림 전용 SMTP 발송 — TO / CC 헤더 분리 지원"""
+    import logging
     import smtplib
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
     from airflow.hooks.base import BaseHook
+
+    logger = logging.getLogger(__name__)
 
     conn = BaseHook.get_connection(CS_ALERT_EMAIL_CONN_ID)
     from_email = conn.extra_dejson.get('from_email') or conn.login
@@ -1628,10 +1631,14 @@ def _send_cs_alert_email(subject: str, html_content: str,
 
     print(f"  📧 발송: TO={to_list} | CC={cc_list}")
 
-    with smtplib.SMTP(conn.host, conn.port) as server:
-        server.starttls()
-        server.login(conn.login, conn.password)
-        server.sendmail(from_email, all_recipients, msg.as_string())
+    try:
+        with smtplib.SMTP(conn.host, conn.port) as server:
+            server.starttls()
+            server.login(conn.login, conn.password)
+            server.sendmail(from_email, all_recipients, msg.as_string())
+    except Exception as exc:
+        logger.error("CS 알림 메일 발송 실패 - DAG 진행을 위해 실패를 반환값으로 처리: %s", exc)
+        return f"메일 발송 실패: {exc}"
 
     return f"TO={to_list} CC={cc_list}"
 

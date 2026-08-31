@@ -6,6 +6,9 @@ param(
     [int]$StopHour = 11,
     [int]$StopMinute = 10,
     [int]$MaxRunMinutes = 135,
+    [int]$MaxRestarts = 3,
+    [int]$RestartDelaySeconds = 10,
+    [int]$CompletionGraceSeconds = 30,
     [switch]$IgnoreDailyCutoff
 )
 
@@ -26,6 +29,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $UserDataDir $ProfileDirectory))) {
 $logDir = "C:\airflow\.tmp\flow_susam_chrome"
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 $logPath = Join-Path $logDir ("flow_chrome_{0:yyyyMMdd}.log" -f (Get-Date))
+$chromeLogPath = Join-Path $logDir ("chrome_debug_{0:yyyyMMdd}.log" -f (Get-Date))
 $releaseMarker = "C:\Local_DB\flow_susam_chrome_release.json"
 $windowStartUtc = [datetime]::UtcNow
 $markerBaselineUtc = if (Test-Path -LiteralPath $releaseMarker) {
@@ -69,26 +73,84 @@ function Wait-DevToolsEndpoint {
     throw "Chrome DevTools did not become ready in ${TimeoutSeconds}s: 127.0.0.1:$TargetPort"
 }
 
-function Stop-FlowChromeListener {
-    param([int]$TargetPort)
-    $listeners = Get-NetTCPConnection -LocalPort $TargetPort -State Listen -ErrorAction SilentlyContinue
-    foreach ($listener in $listeners) {
-        $processId = [int]$listener.OwningProcess
-        $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
-        $commandLine = if ($null -ne $processInfo) { [string]$processInfo.CommandLine } else { "" }
-        $isExpected = (
-            $null -ne $processInfo -and
-            $processInfo.Name -eq "chrome.exe" -and
-            $commandLine.Contains("--remote-debugging-port=$TargetPort") -and
-            $commandLine.Contains("--user-data-dir=$UserDataDir")
-        )
-        if ($isExpected) {
-            Write-FlowLog "Stopping Flow Chrome: pid=$processId port=$TargetPort"
-            Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
-        } else {
-            Write-FlowLog "Unexpected port owner was not stopped: pid=$processId port=$TargetPort"
-        }
+function Test-NewCompletionMarker {
+    if (-not (Test-Path -LiteralPath $releaseMarker)) {
+        return $false
     }
+    $markerTimeUtc = (Get-Item -LiteralPath $releaseMarker).LastWriteTimeUtc
+    return $markerTimeUtc -gt $markerBaselineUtc -and $markerTimeUtc -ge $windowStartUtc
+}
+
+function Start-FlowChrome {
+    param(
+        [int]$TargetPort,
+        [string]$Reason
+    )
+    $chromeArgs = @(
+        "--remote-debugging-port=$TargetPort",
+        "--remote-debugging-address=0.0.0.0",
+        "--remote-allow-origins=*",
+        "--user-data-dir=$UserDataDir",
+        "--profile-directory=$ProfileDirectory",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--start-minimized",
+        "--enable-logging",
+        "--log-file=$chromeLogPath",
+        $PostUrl
+    )
+    $process = Start-Process `
+        -FilePath $chrome `
+        -ArgumentList $chromeArgs `
+        -WindowStyle Minimized `
+        -PassThru
+    Wait-DevToolsEndpoint -TargetPort $TargetPort -TimeoutSeconds 30
+    Write-FlowLog "Flow Chrome ready: pid=$($process.Id) port=$TargetPort reason=$Reason deadline=$deadline"
+}
+
+function Wait-CompletionGrace {
+    param([int]$TimeoutSeconds)
+    $graceDeadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $graceDeadline) {
+        if (Test-NewCompletionMarker) {
+            return $true
+        }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
+function Get-FlowChromeProcesses {
+    $plainProfileArg = "--user-data-dir=$UserDataDir"
+    $quotedProfileArg = "--user-data-dir=`"$UserDataDir`""
+    return @(
+        Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" -ErrorAction SilentlyContinue |
+            Where-Object {
+                $commandLine = [string]$_.CommandLine
+                $commandLine.Contains($plainProfileArg) -or $commandLine.Contains($quotedProfileArg)
+            }
+    )
+}
+
+function Stop-FlowChromeProcesses {
+    param([int]$TargetPort)
+    $processes = @(Get-FlowChromeProcesses)
+    if ($processes.Count -eq 0) {
+        return
+    }
+    Write-FlowLog "Stopping dedicated Flow Chrome processes: count=$($processes.Count) port=$TargetPort"
+    foreach ($processInfo in ($processes | Sort-Object ParentProcessId -Descending)) {
+        Write-FlowLog "Stopping Flow Chrome process: pid=$($processInfo.ProcessId) ppid=$($processInfo.ParentProcessId)"
+        Stop-Process -Id ([int]$processInfo.ProcessId) -Force -ErrorAction SilentlyContinue
+    }
+    $stopDeadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $stopDeadline) {
+        if (@(Get-FlowChromeProcesses).Count -eq 0) {
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    throw "Dedicated Flow Chrome processes did not stop within 10s: $UserDataDir"
 }
 
 $now = Get-Date
@@ -104,42 +166,54 @@ if (-not $IgnoreDailyCutoff) {
     }
 }
 
+$completed = $false
+$restartCount = 0
 try {
     if (Test-DevToolsEndpoint -TargetPort $Port) {
         Write-FlowLog "Reusing existing Flow Chrome: port=$Port deadline=$deadline"
     } else {
-        $chromeArgs = @(
-            "--remote-debugging-port=$Port",
-            "--remote-debugging-address=0.0.0.0",
-            "--remote-allow-origins=*",
-            "--user-data-dir=$UserDataDir",
-            "--profile-directory=$ProfileDirectory",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--start-minimized",
-            $PostUrl
-        )
-        Start-Process -FilePath $chrome -ArgumentList $chromeArgs -WindowStyle Minimized
-        Wait-DevToolsEndpoint -TargetPort $Port -TimeoutSeconds 30
-        Write-FlowLog "Flow Chrome ready: port=$Port deadline=$deadline"
+        Stop-FlowChromeProcesses -TargetPort $Port
+        Start-FlowChrome -TargetPort $Port -Reason "initial"
     }
 
     while ((Get-Date) -lt $deadline) {
-        if (-not (Test-DevToolsEndpoint -TargetPort $Port)) {
-            Write-FlowLog "DevTools closed: Airflow upload completed or Chrome exited"
+        if (Test-NewCompletionMarker) {
+            $completed = $true
+            Write-FlowLog "Airflow completion marker detected: $releaseMarker"
             break
         }
-        if (Test-Path -LiteralPath $releaseMarker) {
-            $markerTimeUtc = (Get-Item -LiteralPath $releaseMarker).LastWriteTimeUtc
-            if ($markerTimeUtc -gt $markerBaselineUtc -and $markerTimeUtc -ge $windowStartUtc) {
-                Write-FlowLog "Airflow completion marker detected: $releaseMarker"
+
+        if (-not (Test-DevToolsEndpoint -TargetPort $Port)) {
+            Write-FlowLog "DevTools closed unexpectedly; waiting ${CompletionGraceSeconds}s for completion marker"
+            if (Wait-CompletionGrace -TimeoutSeconds $CompletionGraceSeconds) {
+                $completed = $true
+                Write-FlowLog "Airflow completion marker detected during grace period: $releaseMarker"
                 break
             }
+
+            if ($restartCount -ge $MaxRestarts) {
+                throw "Flow Chrome restart limit exceeded: restarts=$restartCount max=$MaxRestarts"
+            }
+            $restartCount++
+            Write-FlowLog "Restarting Flow Chrome: attempt=$restartCount/$MaxRestarts delay=${RestartDelaySeconds}s"
+            if ($RestartDelaySeconds -gt 0) {
+                Start-Sleep -Seconds $RestartDelaySeconds
+            }
+            try {
+                Stop-FlowChromeProcesses -TargetPort $Port
+                Start-FlowChrome -TargetPort $Port -Reason "restart-$restartCount"
+            } catch {
+                Write-FlowLog "Flow Chrome restart failed: attempt=$restartCount error=$($_.Exception.Message)"
+            }
+            continue
         }
         Start-Sleep -Seconds 15
     }
+    if (-not $completed) {
+        throw "Flow Chrome completion marker was not detected before deadline: $deadline"
+    }
 } finally {
-    Stop-FlowChromeListener -TargetPort $Port
+    Stop-FlowChromeProcesses -TargetPort $Port
     Start-Sleep -Seconds 1
     if (Test-DevToolsEndpoint -TargetPort $Port) {
         Write-FlowLog "WARNING: Flow Chrome DevTools is still open: $Port"

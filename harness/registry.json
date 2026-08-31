@@ -11,12 +11,14 @@
   "overrides": [
     {"dag": "dags/db/DB_Beamin_Macro_Dags.py", "harness_docs": ["baemin_macro"]},
     {"dag": "dags/db/DB_Beamin_Macro_Dags_Retry.py", "harness_docs": ["baemin_macro"]},
-    {"dag": "dags/db/DB_Beamin_Macro_Pc2_Dags.py", "harness_docs": ["baemin_macro"]},
+    {"dag": "dags/db/DB_Beamin_Macro_Upload_Pc2_Dags.py", "harness_docs": ["baemin_macro"]},
     {"dag": "dags/db/DB_CoupangMacro_Load_Dags.py", "harness_docs": ["coupang_macro"]},
     {"dag": "dags/db/DB_Coupang_Notify_Dags.py", "harness_docs": ["coupang_macro"]},
     {"dag": "dags/sales/Sales_CoupangEats_CMG_Partition_Dags.py", "harness_docs": ["coupang_macro"]},
     {"dag": "dags/db/DB_FinProduct_Dags.py", "harness_docs": ["fin_product"]},
     {"dag": "dags/db/DB_FinProduct_Map_Dags.py", "harness_docs": ["fin_product"]},
-    {"dag": "dags/db/DB_UnifiedSales_Dags.py", "harness_docs": ["unified_sales_grp"]}
+    {"dag": "dags/db/DB_UnifiedSales_Dags.py", "harness_docs": ["unified_sales_grp"]},
+    {"dag": "dags/db/DB_UnifiedSales_Today_Dags.py", "harness_docs": ["unified_sales_grp"]},
+    {"dag": "dags/db/DB_UnifiedSales_Total_Macro_Dags.py", "harness_docs": ["unified_sales_grp"]}
   ]
 }

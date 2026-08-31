@@ -14,6 +14,60 @@ def _unified_rows(rows):
     return pd.DataFrame(rows).reindex(columns=common.UNIFIED_COLUMNS, fill_value="")
 
 
+def test_save_unified_parquet_normalizes_baemin1_and_recalculates_pk(tmp_path):
+    row = {
+        "sale_date": "2026-07-07",
+        "source": "posfeed",
+        "store": "법흥리점",
+        "platform": "배민1",
+        "order_id": "A",
+        "item_seq": "1",
+        "total_price": 1000,
+    }
+    df = _unified_rows([row])
+    df["_pk"] = common._make_unified_pk(df)
+    old_pk = df.loc[0, "_pk"]
+
+    path = tmp_path / "unified_sales_260707.parquet"
+    common.save_unified_parquet(df, path)
+
+    out = pd.read_parquet(path)
+    expected = out.copy()
+    expected["_pk"] = common._make_unified_pk(expected)
+    assert out.loc[0, "platform"] == "배달의민족"
+    assert out.loc[0, "_pk"] != old_pk
+    assert out.loc[0, "_pk"] == expected.loc[0, "_pk"]
+
+
+def test_normalize_existing_unified_platforms_rewrites_only_changed_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(common, "UNIFIED_ROOT", tmp_path)
+    changed_path = tmp_path / "unified_sales_260707.parquet"
+    unchanged_path = tmp_path / "unified_sales_260708.parquet"
+    _unified_rows(
+        [
+            {"sale_date": "2026-07-07", "source": "posfeed", "store": "법흥리점", "platform": "배민1", "total_price": 1000},
+            {"sale_date": "2026-07-07", "source": "posfeed", "store": "법흥리점", "platform": "배민 포장", "total_price": 2000},
+        ]
+    ).to_parquet(changed_path, index=False, engine="pyarrow")
+    _unified_rows(
+        [
+            {"sale_date": "2026-07-08", "source": "posfeed", "store": "법흥리점", "platform": "쿠팡이츠", "total_price": 3000},
+        ]
+    ).to_parquet(unchanged_path, index=False, engine="pyarrow")
+
+    dry_run = common.normalize_existing_unified_platforms(apply=False)
+    assert "파일=1" in dry_run
+    assert "행=1" in dry_run
+    assert "배민1" in set(pd.read_parquet(changed_path)["platform"])
+
+    applied = common.normalize_existing_unified_platforms(apply=True, rebuild_summary=False)
+    out = pd.read_parquet(changed_path)
+    assert "파일=1" in applied
+    assert "행=1" in applied
+    assert set(out["platform"]) == {"배달의민족", "배민 포장"}
+    assert set(pd.read_parquet(unchanged_path)["platform"]) == {"쿠팡이츠"}
+
+
 def test_baemin_transform_falls_back_to_menu_for_price_option_names(monkeypatch):
     monkeypatch.setattr(
         baemin,
@@ -155,7 +209,7 @@ def test_filter_manual_delivery_sources_for_test_stores_keeps_past_manual_only(m
     assert set(out["total_price"].astype(int)) == {2000, 4000}
 
 
-def test_empty_manual_baemin_upsert_removes_past_test_store_posfeed(tmp_path, monkeypatch):
+def test_empty_manual_baemin_upsert_keeps_past_test_store_posfeed(tmp_path, monkeypatch):
     monkeypatch.setattr(common, "UNIFIED_ROOT", tmp_path)
     monkeypatch.setattr(baemin, "UNIFIED_ROOT", tmp_path)
     path = tmp_path / "unified_sales_260707.parquet"
@@ -169,11 +223,11 @@ def test_empty_manual_baemin_upsert_removes_past_test_store_posfeed(tmp_path, mo
     removed, added = baemin._upsert_daily(pd.DataFrame(columns=common.UNIFIED_COLUMNS), "2026-07-07", "법흥리점")
 
     out = pd.read_parquet(path)
-    assert (removed, added) == (1, 0)
-    assert set(out["total_price"].astype(int)) == {2000}
+    assert (removed, added) == (0, 0)
+    assert set(out["total_price"].astype(int)) == {1000, 2000}
 
 
-def test_empty_manual_coupang_upsert_removes_past_test_store_posfeed(tmp_path, monkeypatch):
+def test_empty_manual_coupang_upsert_keeps_past_test_store_posfeed(tmp_path, monkeypatch):
     monkeypatch.setattr(common, "UNIFIED_ROOT", tmp_path)
     monkeypatch.setattr(coupang, "UNIFIED_ROOT", tmp_path)
     path = tmp_path / "unified_sales_260707.parquet"
@@ -187,8 +241,77 @@ def test_empty_manual_coupang_upsert_removes_past_test_store_posfeed(tmp_path, m
     removed, added = coupang._upsert_daily(pd.DataFrame(columns=common.UNIFIED_COLUMNS), "2026-07-07", "법흥리점")
 
     out = pd.read_parquet(path)
-    assert (removed, added) == (1, 0)
-    assert set(out["total_price"].astype(int)) == {2000}
+    assert (removed, added) == (0, 0)
+    assert set(out["total_price"].astype(int)) == {1000, 2000}
+
+
+def test_coupang_transform_uses_settlement_sales_for_cancel_amounts(monkeypatch):
+    monkeypatch.setattr(
+        coupang,
+        "allocate_manual_item_ids",
+        lambda df: pd.Series(
+            [f"9000000{i}" for i in range(1, len(df) + 1)],
+            index=df.index,
+        ),
+    )
+    raw = pd.DataFrame(
+        [
+            {
+                "order_id": "CURRENT",
+                "order_time": "12:00:00",
+                "sale_date": "2026-07-19",
+                "order_summary": "취소 메뉴",
+                "menu_options": "현행 취소",
+                "menu_name": "취소 메뉴",
+                "menu_qty": 1,
+                "menu_price": 40_000,
+                "delivery_type": "배달",
+                "is_cancelled": "Y",
+                "매출액": 0,
+                "취소금액": 40_000,
+                "total_price": 40_000,
+            },
+            {
+                "order_id": "LEGACY",
+                "order_time": "12:01:00",
+                "sale_date": "2026-07-19",
+                "order_summary": "취소 메뉴",
+                "menu_options": "기존 주문행",
+                "menu_name": "취소 메뉴",
+                "menu_qty": 1,
+                "menu_price": 40_000,
+                "delivery_type": "배달",
+                "is_cancelled": "Y",
+                "매출액": 0,
+                "취소금액": 40_000,
+                "total_price": 40_000,
+            },
+            {
+                "order_id": "LEGACY",
+                "order_time": "12:01:00",
+                "sale_date": "2026-07-19",
+                "order_summary": "취소 메뉴",
+                "menu_options": "기존 환불행",
+                "menu_name": "취소 메뉴",
+                "menu_qty": 1,
+                "menu_price": 0,
+                "delivery_type": "배달",
+                "is_cancelled": "Y",
+                "매출액": -40_000,
+                "취소금액": 0,
+                "total_price": 40_000,
+            },
+        ]
+    )
+
+    out = coupang._transform_to_unified(raw, "송파삼전점", "도리당", {})
+    totals = out.groupby("order_id")["total_price"].sum().astype(int).to_dict()
+
+    assert totals == {"CURRENT": 0, "LEGACY": -40_000}
+    assert out.groupby("order_id")["order_cnt"].sum().astype(int).to_dict() == {
+        "CURRENT": 0,
+        "LEGACY": 0,
+    }
 
 
 def test_validation_excludes_only_missing_test_store_manual_delivery_family():
@@ -412,6 +535,7 @@ def test_validation_load_excel_totals_adds_pos_hall_baseline(tmp_path, monkeypat
     ).to_parquet(unified_path, index=False, engine="pyarrow")
 
     monkeypatch.setattr(validate, "ANALYTICS_DB", tmp_path / "analytics")
+    monkeypatch.setattr(validate, "TOORDER_DAILY_PARQUET", toorder_path)
     monkeypatch.setattr(validate, "RAW_OKPOS_SALES", tmp_path / "okpos")
     monkeypatch.setattr(validate, "RAW_UNIONPOS_SALES", tmp_path / "unionpos")
     monkeypatch.setattr(validate, "iter_unified_sales_files", lambda: [unified_path])
@@ -426,6 +550,48 @@ def test_validation_load_excel_totals_adds_pos_hall_baseline(tmp_path, monkeypat
         ("2026-07-07", "해운대중동점", 1200),
     }
     assert set(zip(out["sale_date"], out["store"], out["excel_total"])) == expected
+
+
+def test_validation_load_excel_totals_keeps_unified_hall_when_toorder_hall_excluded(tmp_path, monkeypatch):
+    analytics_root = tmp_path / "analytics" / "toorder_daily_store_platform"
+    analytics_root.mkdir(parents=True)
+    toorder_path = analytics_root / "toorder_store_platform_daily.parquet"
+    pd.DataFrame(
+        [
+            {
+                "date": "2026-07-07",
+                "store": "송파삼전점",
+                "platform": "홀",
+                "price": 3000,
+            },
+        ]
+    ).to_parquet(toorder_path, index=False, engine="pyarrow")
+
+    okpos_root = tmp_path / "okpos" / "brand=도리당"
+    (okpos_root / "store=송파삼전점").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "unionpos").mkdir(parents=True, exist_ok=True)
+
+    unified_path = tmp_path / "unified_sales_260707.parquet"
+    _unified_rows(
+        [
+            {"sale_date": "2026-07-07", "store": "송파삼전점", "source": "okpos", "platform": "홀", "total_price": 1100},
+        ]
+    ).to_parquet(unified_path, index=False, engine="pyarrow")
+
+    monkeypatch.setattr(validate, "ANALYTICS_DB", tmp_path / "analytics")
+    monkeypatch.setattr(validate, "TOORDER_DAILY_PARQUET", toorder_path)
+    monkeypatch.setattr(validate, "RAW_OKPOS_SALES", tmp_path / "okpos")
+    monkeypatch.setattr(validate, "RAW_UNIONPOS_SALES", tmp_path / "unionpos")
+    monkeypatch.setattr(validate, "iter_unified_sales_files", lambda: [unified_path])
+
+    out = validate._load_excel_totals(
+        target_date="2026-07-07",
+        unified_platform_keys=set(),
+    )
+
+    assert out.to_dict("records") == [
+        {"sale_date": "2026-07-07", "store": "송파삼전점", "channel": "총합", "excel_total": 1100},
+    ]
 
 
 def test_validation_load_excel_monthly_totals_adds_pos_hall_baseline(tmp_path, monkeypatch):
@@ -470,6 +636,7 @@ def test_validation_load_excel_monthly_totals_adds_pos_hall_baseline(tmp_path, m
     ).to_parquet(unified_path, index=False, engine="pyarrow")
 
     monkeypatch.setattr(validate, "ANALYTICS_DB", tmp_path / "analytics")
+    monkeypatch.setattr(validate, "TOORDER_DAILY_PARQUET", toorder_path)
     monkeypatch.setattr(validate, "RAW_OKPOS_SALES", tmp_path / "okpos")
     monkeypatch.setattr(validate, "RAW_UNIONPOS_SALES", tmp_path / "unionpos")
     monkeypatch.setattr(validate, "iter_unified_sales_files", lambda: [unified_path])
@@ -572,6 +739,29 @@ def test_run_lookback_posfeed_uses_yesterday_as_start(monkeypatch):
 
     assert captured == ["2026-07-07", "2026-07-06", "2026-07-05"]
     assert result == "posfeed lookback(3일): 3행 저장"
+
+
+def test_unified_sales_dag_lookback_target_dates_use_yesterday(monkeypatch, tmp_path):
+    import pendulum as real_pendulum
+
+    monkeypatch.setenv("AIRFLOW_HOME", str(tmp_path / "airflow_home"))
+    monkeypatch.setenv("AIRFLOW__CORE__LOAD_EXAMPLES", "False")
+
+    from dags.db import DB_UnifiedSales_Dags as dag_mod
+
+    class FixedPendulum:
+        @staticmethod
+        def now(tz: str):
+            assert tz == "Asia/Seoul"
+            return real_pendulum.datetime(2026, 8, 10, tz=tz)
+
+    monkeypatch.setattr(dag_mod, "pendulum", FixedPendulum)
+
+    assert dag_mod._lookback_target_dates(3) == [
+        "2026-08-09",
+        "2026-08-08",
+        "2026-08-07",
+    ]
 
 
 def test_unionpos_fin_product_write_permission_error_keeps_pending_file(tmp_path, monkeypatch):

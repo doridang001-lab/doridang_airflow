@@ -47,9 +47,11 @@ def _normalize_easypos_product_name(name: str) -> str:
     s = s.strip()
     if not s or s.lower() == "nan":
         return ""
-    # EasyPOS 영수증 item_name에 붙는 트리 표시(prefix) 제거만 적용
+    # EasyPOS 영수증 item_name에 붙는 표시(prefix) 제거만 적용
     # 예: "└▶ 낙곱새 전골" -> "낙곱새 전골"
     s = re.sub(r"^(?:└\s*▶|└▶)\s*", "", s).strip()
+    # 예: "[포장]소주" -> "소주"
+    s = re.sub(r"^\[\s*포장\s*\]\s*", "", s).strip()
     return s
 
 
@@ -328,5 +330,44 @@ def backfill_easypos() -> str:
             logger.warning("run_easypos 실패: %s | %s", date_str, e)
 
     result = f"unified_sales(easypos) backfill 완료 | {total_targets}일"
+    logger.info(result)
+    return result
+
+
+def backfill_easypos_stores(stores: list[str]) -> str:
+    """지정 매장 easypos_sales_raw 전체를 일자별로 unified_sales에 재적재."""
+    store_scope = {str(store).strip() for store in stores if str(store).strip()}
+    if not store_scope:
+        return "SKIP: easypos 매장 제한 backfill 대상 없음"
+    if EASYPOS_STORE not in store_scope:
+        return f"SKIP: easypos 매장 제한 backfill 대상 없음 | stores={sorted(store_scope)}"
+
+    paths = sorted(EASYPOS_ROOT.glob("ym=*/receipts.csv"))
+    if not paths:
+        raise FileNotFoundError(f"easypos receipts.csv 없음 | {EASYPOS_ROOT}")
+
+    date_set: set[str] = set()
+    for p in paths:
+        try:
+            tmp = pd.read_csv(p, dtype=str, usecols=["sale_date"])
+            date_set.update(tmp["sale_date"].astype(str).str.strip().dropna().unique())
+        except Exception as e:
+            logger.warning("매장 제한 sale_date 스캔 실패: %s | %s", p, e)
+
+    total_days = 0
+    total_saved = 0
+    for date_str in sorted(date_set):
+        if not date_str or date_str.lower() == "nan":
+            continue
+        try:
+            result = run_easypos(date_str, overwrite=False, stores=sorted(store_scope))
+            logger.info(result)
+            total_days += 1
+            if "|" in result and "행" in result:
+                total_saved += int(result.rsplit("|", 1)[1].strip().split("행", 1)[0])
+        except Exception as e:
+            logger.warning("매장 제한 run_easypos 실패: %s | stores=%s | %s", date_str, sorted(store_scope), e)
+
+    result = f"unified_sales(easypos) 매장 제한 backfill 완료 | stores={sorted(store_scope)} | {total_days}일 / {total_saved}행"
     logger.info(result)
     return result

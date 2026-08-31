@@ -25,7 +25,6 @@ from modules.transform.pipelines.db.DB_UnifiedSales_common import (
     _to_int_series,
 )
 from modules.transform.pipelines.db.DB_ItemIdAllocator import OKPOS_ADJUSTMENT_ITEM_ID, allocate_manual_item_ids
-from modules.transform.pipelines.db.DB_OKPOS_Sales import _sum_csv_amount_for_date
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +43,13 @@ _OKPOS_MONTH_CACHE: dict[str, tuple[pd.DataFrame, pd.DataFrame, float]] = {}
 
 # 미매칭 상품코드 누적 (run 종료 시 1회 이메일 발송)
 _PENDING_UNMATCHED: set[str] = set()
+
+
+def _sum_okpos_csv_amount_for_date(csv_path, sale_date: str, amount_col: str):
+    """수집기 의존성은 daily gate를 실제 사용할 때만 로드한다."""
+    from modules.transform.pipelines.db.DB_OKPOS_Sales import _sum_csv_amount_for_date
+
+    return _sum_csv_amount_for_date(csv_path, sale_date, amount_col)
 
 
 def _dedup_okpos_df_by_stable_key(df: pd.DataFrame, kind: str) -> pd.DataFrame:
@@ -220,6 +226,10 @@ def _resolve_menu_name(merged: pd.DataFrame) -> pd.Series:
     unit_each = (amt_num / safe_qty).where(qty_num > 0, amt_num)
     merged["_unit_price_num"] = unit_each.fillna(0)
     merged["_item_seq_num"] = pd.to_numeric(merged["item_seq"], errors="coerce").fillna(9999)
+    if "discount_amount" in merged.columns:
+        merged["_discount_amount_num"] = _to_int_series(merged["discount_amount"]).abs()
+    else:
+        merged["_discount_amount_num"] = 0
 
     result = pd.Series("", index=merged.index, dtype=str)
     unmatched_codes: set[str] = set()
@@ -285,7 +295,10 @@ def _resolve_menu_name(merged: pd.DataFrame) -> pd.Series:
                 pool = valid[~fee_like]
                 if pool.empty:
                     pool = valid
-                best_idx = pool["_unit_price_num"].idxmax()
+                if pool["_unit_price_num"].abs().max() <= 0 and pool["_discount_amount_num"].max() > 0:
+                    best_idx = pool["_discount_amount_num"].idxmax()
+                else:
+                    best_idx = pool["_unit_price_num"].idxmax()
                 name = str(pool.loc[best_idx, "상품명"])
                 result.loc[group.index] = name
             else:
@@ -452,8 +465,11 @@ def _make_okpos_pk(sale_date: str, store: str, platform: str, order_id: str, ite
     return hashlib.md5(key.encode()).hexdigest()
 
 
-def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.DataFrame:
+def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame, *, amount_basis: str = "actual") -> pd.DataFrame:
     """OKPOS order + order_item → unified_sales 스키마 DataFrame."""
+    if amount_basis not in {"actual", "gross"}:
+        raise ValueError("amount_basis는 'actual' 또는 'gross'여야 합니다.")
+
     order = order_df.copy()
     item = item_df.copy()
 
@@ -540,9 +556,16 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
         no_match = merged["총매출액_y"].isna()
         total_y = total_y.where(~no_match, _to_int_series(merged["총매출액_x"]))
 
-    # total_price 기준은 "실매출액" (할인 반영 후 금액)으로 고정한다.
-    # (OKPOS 화면/일자별 종합매출의 '실매출'과 일치해야 함)
-    merged["_item_amt"] = actual_y
+    if amount_basis == "gross":
+        if total_col:
+            merged["_item_amt"] = total_y
+        else:
+            logger.warning("OKPOS 총매출액 컬럼 없음: amount_basis=gross 요청을 실매출액 기준으로 fallback")
+            merged["_item_amt"] = actual_y
+    else:
+        # total_price 기준은 "실매출액" (할인 반영 후 금액)으로 고정한다.
+        # (OKPOS 화면/일자별 종합매출의 '실매출'과 일치해야 함)
+        merged["_item_amt"] = actual_y
 
     # total_price: 원천 리포트 기준 라인 총액(반올림 없는 합계용)
     merged["total_price"] = pd.to_numeric(merged["_item_amt"], errors="coerce").fillna(0).astype(int)
@@ -586,7 +609,7 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
 
     merged["item_seq"] = (merged.groupby("_order_key").cumcount() + 1).astype(str)
     merged["menu_name"] = _resolve_menu_name(merged).fillna("").astype(str)
-    merged.drop(columns=["_is_main", "_unit_price_num", "_item_seq_num"], errors="ignore", inplace=True)
+    merged.drop(columns=["_is_main", "_unit_price_num", "_item_seq_num", "_discount_amount_num"], errors="ignore", inplace=True)
     # sale_type 확정 후 order_cnt 계산하기 위해 _item_seq_int만 미리 계산해 둠
     merged["_item_seq_int"] = pd.to_numeric(merged["item_seq"], errors="coerce").fillna(0).astype(int)
 
@@ -781,11 +804,11 @@ def _transform_okpos_df(order_df: pd.DataFrame, item_df: pd.DataFrame) -> pd.Dat
         channel_col2 = "주문채널" if "주문채널" in merged.columns else None
         order_actual_col2 = "실매출액_x" if "실매출액_x" in merged.columns else "실매출액" if "실매출액" in merged.columns else None
         order_total_col2 = "총매출액_x" if "총매출액_x" in merged.columns else "총매출액" if "총매출액" in merged.columns else None
-        if channel_col2 and order_actual_col2 and "_order_key" in merged.columns:
-            order_actual2 = _to_int_series(merged[order_actual_col2])
-            order_amt = order_actual2.astype(int)
+        order_amount_col2 = order_total_col2 if amount_basis == "gross" and order_total_col2 else order_actual_col2
+        if channel_col2 and order_amount_col2 and "_order_key" in merged.columns:
+            order_amt = _to_int_series(merged[order_amount_col2]).astype(int)
 
-            # 실매출액_x는 CSV 저장 시 반품 행이 이미 음수로 저장됨 → 직접 사용 (sign flip 금지)
+            # OKPOS CSV 저장 금액은 반품 행이 이미 음수로 저장됨 → 직접 사용 (sign flip 금지)
             order_amt_signed = order_amt.astype(int)
 
             tmp = pd.DataFrame({
@@ -976,7 +999,7 @@ def _okpos_daily_gate(df: pd.DataFrame, date_str: str) -> pd.DataFrame:
             continue
 
         daily_csv = OKPOS_BRAND_ROOT / f"store={store_short}" / f"ym={date_str[:7]}" / "okpos_daily.csv"
-        daily_net, reason = _sum_csv_amount_for_date(daily_csv, date_str, "실매출액")
+        daily_net, reason = _sum_okpos_csv_amount_for_date(daily_csv, date_str, "실매출액")
         order_total = int(pd.to_numeric(group["total_price"], errors="coerce").fillna(0).sum())
 
         if reason is not None:
@@ -1204,5 +1227,42 @@ def backfill_okpos() -> str:
 
     _flush_unmatched_alert()
     result = f"unified_sales(okpos) backfill 완료 | {total}일"
+    logger.info(result)
+    return result
+
+
+def backfill_okpos_stores(stores: list[str]) -> str:
+    """지정 매장 OKPOS order CSV → unified_sales 일별 매장 제한 재생성."""
+    store_scope = {str(store).strip() for store in stores if str(store).strip()}
+    if not store_scope:
+        return "SKIP: okpos 매장 제한 backfill 대상 없음"
+
+    date_set: set[str] = set()
+    for order_path in sorted(OKPOS_BRAND_ROOT.glob("store=*/ym=*/okpos_order.csv")):
+        try:
+            df = pd.read_csv(order_path, dtype=str, usecols=["매장명", "sale_date"])
+            store_col = df["매장명"].fillna("").astype(str).str.strip()
+            store_short = store_col.str.split().str[-1]
+            sub = df[store_col.isin(store_scope) | store_short.isin(store_scope)]
+            date_set.update(sub["sale_date"].astype(str).str.strip().dropna().unique())
+        except Exception as e:
+            logger.warning("매장 제한 날짜 스캔 실패: %s | %s", order_path, e)
+
+    total_days = 0
+    total_saved = 0
+    for date_str in sorted(date_set):
+        if not date_str or date_str.lower() == "nan":
+            continue
+        try:
+            result = run_okpos(date_str, overwrite=False, stores=sorted(store_scope))
+            logger.info(result)
+            total_days += 1
+            if "|" in result and "행" in result:
+                total_saved += int(result.rsplit("|", 1)[1].strip().split("행", 1)[0])
+        except Exception as e:
+            logger.warning("매장 제한 backfill 실패: %s | stores=%s | %s", date_str, sorted(store_scope), e)
+
+    _flush_unmatched_alert()
+    result = f"unified_sales(okpos) 매장 제한 backfill 완료 | stores={sorted(store_scope)} | {total_days}일 / {total_saved}행"
     logger.info(result)
     return result

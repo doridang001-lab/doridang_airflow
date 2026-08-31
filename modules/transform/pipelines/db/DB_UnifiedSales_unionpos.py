@@ -766,3 +766,43 @@ def backfill_unionpos() -> str:
     result = f"unified_sales(unionpos) backfill 완료 | {total_targets}일"
     logger.info(result)
     return result
+
+
+def backfill_unionpos_stores(stores: list[str]) -> str:
+    """지정 매장 unionpos_sales_raw 전체를 일자별로 unified_sales에 재적재."""
+    store_scope = {str(store).strip() for store in stores if str(store).strip()}
+    if not store_scope:
+        return "SKIP: unionpos 매장 제한 backfill 대상 없음"
+
+    paths = sorted(UNIONPOS_BRAND_ROOT.glob("store=*/ym=*/unionpos_receipt_list.csv"))
+    if not paths:
+        raise FileNotFoundError(f"unionpos_receipt_list.csv 없음 | {UNIONPOS_BRAND_ROOT}")
+
+    date_set: set[str] = set()
+    for p in paths:
+        try:
+            tmp = pd.read_csv(p, dtype=str, usecols=["매장명", "sale_date"])
+            store_col = tmp["매장명"].fillna("").astype(str).str.strip()
+            store_short = store_col.str.split().str[-1]
+            sub = tmp[store_col.isin(store_scope) | store_short.isin(store_scope)]
+            date_set.update(sub["sale_date"].astype(str).str.strip().dropna().unique())
+        except Exception as e:
+            logger.warning("매장 제한 sale_date 스캔 실패: %s | %s", p, e)
+
+    total_days = 0
+    total_saved = 0
+    for date_str in sorted(date_set):
+        if not date_str or date_str.lower() == "nan":
+            continue
+        try:
+            result = run_unionpos(date_str, overwrite=False, stores=sorted(store_scope))
+            logger.info(result)
+            total_days += 1
+            if "|" in result and "행" in result:
+                total_saved += int(result.rsplit("|", 1)[1].strip().split("행", 1)[0])
+        except Exception as e:
+            logger.warning("매장 제한 run_unionpos 실패: %s | stores=%s | %s", date_str, sorted(store_scope), e)
+
+    result = f"unified_sales(unionpos) 매장 제한 backfill 완료 | stores={sorted(store_scope)} | {total_days}일 / {total_saved}행"
+    logger.info(result)
+    return result

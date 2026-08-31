@@ -1390,6 +1390,9 @@ def _login(driver: uc.Chrome, wait: WebDriverWait) -> None:
         wait.until(lambda d: "/login" not in d.current_url)
     except TimeoutException as exc:
         page_text = _okpos_login_page_text(driver)
+        if _is_okpos_logged_in_page(driver, page_text):
+            logger.info("OKPOS 로그인 성공 페이지 지연 감지, 성공 처리 | URL: %s", driver.current_url)
+            return
         _raise_okpos_login_failure(driver, "login_failed", page_text, exc)
     time.sleep(2)
     logger.info(f"OKPOS 로그인 완료 | URL: {driver.current_url}")
@@ -1477,6 +1480,30 @@ def _is_okpos_auth_failure_text(text: str) -> bool:
     if not compact:
         return False
     return any(phrase in compact for phrase in OKPOS_AUTH_FAILURE_PHRASES)
+
+
+def _is_okpos_logged_in_page(driver: uc.Chrome, page_text: str | None = None) -> bool:
+    """OKPOS 대시보드에 이미 도달했는지 URL/DOM으로 판정한다."""
+    current_url = str(getattr(driver, "current_url", "") or "")
+    if "/asp/main" in current_url or "/asp/login" not in current_url:
+        text = _compact_text(page_text if page_text is not None else _okpos_login_page_text(driver), limit=2000)
+        if text and any(phrase in text for phrase in ("매출관리", "오케이포스 가이드", "매출 현황")):
+            return True
+        try:
+            state = _okpos_login_input_state(driver)
+        except Exception:
+            state = {}
+        title = str((state or {}).get("title") or "")
+        inputs = (state or {}).get("inputs") or []
+        visible_login_inputs = [
+            item
+            for item in inputs
+            if str(item.get("type") or "").lower() in {"text", "password"}
+            and str(item.get("id") or item.get("name") or "").strip()
+        ]
+        if "OKPOS" in title and not visible_login_inputs:
+            return True
+    return False
 
 
 def _raise_okpos_login_failure(

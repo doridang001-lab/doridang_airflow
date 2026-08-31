@@ -13,6 +13,7 @@ psycopg2-binary
 playwright==1.57.0
 nest_asyncio
 pyperclip
+pywinauto
 selenium
 webdriver-manager
 undetected-chromedriver

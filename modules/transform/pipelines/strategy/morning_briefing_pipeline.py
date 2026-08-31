@@ -23,6 +23,7 @@ import queue
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pendulum
 
@@ -38,6 +39,11 @@ _FLOW_CALENDAR_PROCESS_TIMEOUT_SEC = int(
 )
 _FLOW_CALENDAR_NAV_TIMEOUT_SEC = int(os.getenv("FLOW_CALENDAR_NAV_TIMEOUT_SEC", "120"))
 _FLOW_TEAM_LOGIN_WAIT_SEC = 15
+_FLOW_BRIEFING_TARGET_NAME = os.getenv("FLOW_BRIEFING_TARGET_NAME", "조민준").strip() or "조민준"
+_FLOW_BRIEFING_COMMENT_LOOKBACK_DAYS = int(os.getenv("FLOW_BRIEFING_COMMENT_LOOKBACK_DAYS", "3"))
+_FLOW_BRIEFING_MAX_ITEMS = int(os.getenv("FLOW_BRIEFING_MAX_ITEMS", "20"))
+_FLOW_BRIEFING_STALE_HOURS = int(os.getenv("FLOW_BRIEFING_STALE_HOURS", "30"))
+_FLOW_BRIEFING_USE_LLM = os.getenv("FLOW_BRIEFING_USE_LLM", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ============================================================
@@ -1056,7 +1062,7 @@ def _collect_previous_day_dag_results() -> tuple[list[dict], list[dict]]:
                             }
                         )
             else:
-                logger.warning(f"모니터링 CSV 없음: {csv_path}")
+                pass
         except Exception:
             logger.warning("dags_monitoring CSV fallback 실패")
 
@@ -1228,13 +1234,468 @@ def _collect_scheduled_dags() -> list[str]:
         return []
 
 
+def _flow_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and str(value) == "nan":
+        return ""
+    return str(value).replace("\xa0", " ").strip()
+
+
+def _compact_person(value: Any) -> str:
+    return re.sub(r"\s+", "", _flow_text(value))
+
+
+def _person_matches(value: Any, target_name: str = _FLOW_BRIEFING_TARGET_NAME) -> bool:
+    target = _compact_person(target_name)
+    text = _compact_person(value)
+    return bool(target and text and target in text)
+
+
+def _worker_matches(value: Any, target_name: str = _FLOW_BRIEFING_TARGET_NAME) -> bool:
+    text = _flow_text(value)
+    if not text:
+        return False
+    workers = [part.strip() for part in re.split(r"[,;/\n]+", text) if part.strip()]
+    return any(_person_matches(worker, target_name) for worker in workers)
+
+
+def _parse_flow_date(value: Any) -> str:
+    text = _flow_text(value)
+    if not text:
+        return ""
+    digits = re.sub(r"\D", "", text)
+    if len(digits) >= 8:
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+    match = re.search(r"(\d{4})-(\d{2})-(\d{2})", text)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+    return ""
+
+
+def _parse_flow_datetime(value: Any) -> pendulum.DateTime | None:
+    text = _flow_text(value)
+    if not text:
+        return None
+    digits = re.sub(r"\D", "", text)
+    try:
+        if len(digits) >= 14:
+            return pendulum.from_format(digits[:14], "YYYYMMDDHHmmss", tz="Asia/Seoul")
+        if len(digits) >= 8:
+            return pendulum.from_format(digits[:8], "YYYYMMDD", tz="Asia/Seoul")
+        return pendulum.parse(text, tz="Asia/Seoul")
+    except Exception:
+        return None
+
+
+def _flow_status(value: Any) -> str:
+    status = _flow_text(value)
+    return status or "상태없음"
+
+
+def _is_done_or_hold(status: Any) -> bool:
+    return _flow_status(status) in {"완료", "보류"}
+
+
+def _flow_title(row: dict[str, Any]) -> str:
+    return _flow_text(row.get("title")) or _flow_text(row.get("task_nm")) or "(제목 없음)"
+
+
+def _brief_text(value: Any, max_len: int = 70) -> str:
+    text = re.sub(r"\s+", " ", _flow_text(value))
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+
+def _flow_item_source(row: dict[str, Any], target_name: str) -> str:
+    labels = []
+    if _person_matches(row.get("author_name"), target_name):
+        labels.append("작성자")
+    if _worker_matches(row.get("worker"), target_name):
+        labels.append("담당자")
+    return "+".join(labels) if labels else "관련"
+
+
+def _format_role_bar(item: dict[str, Any]) -> str:
+    author = _flow_text(item.get("author_name")) or "미상"
+    worker = _flow_text(item.get("worker")) or "미지정"
+    return f"작성자: {author} | 담당자: {worker}"
+
+
+def _flow_sort_key(row: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        _parse_flow_date(row.get("end_dt")) or "9999-99-99",
+        _parse_flow_date(row.get("start_dt")) or "9999-99-99",
+        _flow_title(row),
+    )
+
+
+def _dedupe_flow_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for item in items:
+        key = _flow_text(item.get("post_id")) or "|".join(
+            [
+                _flow_text(item.get("project_name")),
+                _flow_text(item.get("title")),
+                _flow_text(item.get("event")),
+            ]
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _read_flow_briefing_frames() -> tuple[Any, Any, list[str], str]:
+    warnings: list[str] = []
+    collected_at = ""
+    try:
+        import pandas as pd
+        from modules.transform.utility.paths import FLOW_COMMENT_PARQUET, FLOW_POST_PARQUET
+
+        if not FLOW_POST_PARQUET.exists():
+            warnings.append(f"Flow 게시글 parquet 없음: {FLOW_POST_PARQUET}")
+            return pd.DataFrame(), pd.DataFrame(), warnings, collected_at
+        posts = pd.read_parquet(FLOW_POST_PARQUET)
+        if FLOW_COMMENT_PARQUET.exists():
+            comments = pd.read_parquet(FLOW_COMMENT_PARQUET)
+        else:
+            warnings.append(f"Flow 댓글 parquet 없음: {FLOW_COMMENT_PARQUET}")
+            comments = pd.DataFrame()
+
+        collected_values = []
+        if "collected_at" in posts.columns:
+            collected_values.extend(posts["collected_at"].dropna().astype(str).tolist())
+        if "collected_at" in comments.columns:
+            collected_values.extend(comments["collected_at"].dropna().astype(str).tolist())
+        collected_at = max(collected_values) if collected_values else ""
+        collected_dt = _parse_flow_datetime(collected_at)
+        if collected_dt:
+            age_hours = pendulum.now("Asia/Seoul").diff(collected_dt).in_hours()
+            if age_hours > _FLOW_BRIEFING_STALE_HOURS:
+                warnings.append(f"Flow 수집 최신성 확인 필요: 마지막 수집 {collected_at}")
+        return posts, comments, warnings, collected_at
+    except Exception as exc:
+        logger.warning("Flow parquet 읽기 실패: %s", exc)
+        warnings.append(f"Flow parquet 읽기 실패: {str(exc)[:160]}")
+        try:
+            import pandas as pd
+
+            return pd.DataFrame(), pd.DataFrame(), warnings, collected_at
+        except Exception:
+            return [], [], warnings, collected_at
+
+
+def _normalize_flow_post_row(row: dict[str, Any], target_name: str) -> dict[str, Any]:
+    start_date = _parse_flow_date(row.get("start_dt"))
+    end_date = _parse_flow_date(row.get("end_dt"))
+    return {
+        "post_id": _flow_text(row.get("post_id")),
+        "project_name": _flow_text(row.get("project_name")),
+        "title": _flow_title(row),
+        "summary": _flow_title(row),
+        "status": _flow_status(row.get("task_status")),
+        "worker": _flow_text(row.get("worker")),
+        "author_name": _flow_text(row.get("author_name")),
+        "start_dt": start_date,
+        "end_dt": end_date,
+        "post_date": _parse_flow_date(row.get("post_date")),
+        "registered_at": _parse_flow_date(row.get("registered_at")),
+        "edited_at": _parse_flow_date(row.get("edited_at")),
+        "post_url": _flow_text(row.get("post_url")),
+        "source": _flow_item_source(row, target_name),
+        "time": "마감" if end_date else "시작",
+        "content_text": _brief_text(row.get("content_text"), 120),
+    }
+
+
+def _is_flow_personal_post(row: dict[str, Any], target_name: str) -> bool:
+    return _person_matches(row.get("author_name"), target_name) or _worker_matches(row.get("worker"), target_name)
+
+
+def _collect_today_flow_items(posts: Any, target_day: str, target_name: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    if getattr(posts, "empty", True):
+        return items
+    for row in posts.to_dict("records"):
+        if not _is_flow_personal_post(row, target_name):
+            continue
+        if _is_done_or_hold(row.get("task_status")):
+            continue
+        end_date = _parse_flow_date(row.get("end_dt"))
+        start_date = _parse_flow_date(row.get("start_dt"))
+        if end_date == target_day or (not end_date and start_date == target_day):
+            items.append(_normalize_flow_post_row(row, target_name))
+    items = _dedupe_flow_items(items)
+    items.sort(key=lambda item: (item.get("time") != "마감", item.get("status", ""), item.get("project_name", ""), item.get("title", "")))
+    return items[:_FLOW_BRIEFING_MAX_ITEMS]
+
+
+def _is_status_change_comment(row: dict[str, Any]) -> bool:
+    text = _flow_text(row.get("content_text"))
+    return "상태를 변경" in text or _flow_text(row.get("sys_code")).startswith("S45")
+
+
+def _collect_yesterday_review_items(
+    posts: Any,
+    comments: Any,
+    yesterday: str,
+    target_name: str,
+) -> list[dict[str, Any]]:
+    if getattr(posts, "empty", True):
+        return []
+
+    post_rows = {_flow_text(row.get("post_id")): row for row in posts.to_dict("records")}
+    review_by_post_id: dict[str, dict[str, Any]] = {}
+
+    def ensure_item(post_id: str, fallback_row: dict[str, Any] | None = None) -> dict[str, Any]:
+        row = post_rows.get(post_id) or fallback_row or {}
+        item = review_by_post_id.get(post_id)
+        if item is None:
+            base = _normalize_flow_post_row(row, target_name)
+            item = {
+                **base,
+                "post_id": post_id,
+                "events": [],
+                "comment_samples": [],
+                "status_changes": [],
+                "sort_dt": "",
+            }
+            review_by_post_id[post_id] = item
+        return item
+
+    for row in post_rows.values():
+        post_id = _flow_text(row.get("post_id"))
+        if not post_id or not _is_flow_personal_post(row, target_name):
+            continue
+        authored_yesterday = _person_matches(row.get("author_name"), target_name) and (
+            _parse_flow_date(row.get("post_date")) == yesterday
+            or _parse_flow_date(row.get("registered_at")) == yesterday
+        )
+        assigned_edited_yesterday = _worker_matches(row.get("worker"), target_name) and (
+            _parse_flow_date(row.get("edited_at")) == yesterday
+        )
+        if authored_yesterday or assigned_edited_yesterday:
+            item = ensure_item(post_id, row)
+            if authored_yesterday:
+                item["events"].append("게시글 작성")
+            if assigned_edited_yesterday:
+                item["events"].append("담당업무 수정")
+            item["sort_dt"] = _flow_text(row.get("edited_at")) or _flow_text(row.get("registered_at"))
+
+    if not getattr(comments, "empty", True):
+        for row in comments.to_dict("records"):
+            if _parse_flow_date(row.get("written_at")) != yesterday:
+                continue
+            if not _person_matches(row.get("author_name"), target_name):
+                continue
+            if bool(row.get("is_system")) and not _is_status_change_comment(row):
+                continue
+            post_id = _flow_text(row.get("post_id"))
+            if not post_id:
+                continue
+            item = ensure_item(post_id)
+            if _is_status_change_comment(row):
+                item["events"].append("상태 변경")
+                item["status_changes"].append(_brief_text(row.get("content_text"), 80))
+            else:
+                item["events"].append("댓글 작성")
+                sample = _brief_text(row.get("content_text"), 80)
+                if sample:
+                    item["comment_samples"].append(sample)
+            item["sort_dt"] = max(item.get("sort_dt") or "", _flow_text(row.get("written_at")))
+
+    items = list(review_by_post_id.values())
+    for item in items:
+        item["events"] = list(dict.fromkeys(item.get("events") or []))
+        item["comment_samples"] = item.get("comment_samples", [])[:2]
+        item["status_changes"] = item.get("status_changes", [])[:2]
+    items.sort(key=lambda item: item.get("sort_dt") or "", reverse=True)
+    return items[:_FLOW_BRIEFING_MAX_ITEMS]
+
+
+def _collect_flow_recent_comment_dates(comments: Any, target_name: str) -> dict[str, str]:
+    recent_by_post: dict[str, str] = {}
+    if getattr(comments, "empty", True):
+        return recent_by_post
+    for row in comments.to_dict("records"):
+        if bool(row.get("is_system")) and not _is_status_change_comment(row):
+            continue
+        post_id = _flow_text(row.get("post_id"))
+        if not post_id:
+            continue
+        written_at = _flow_text(row.get("written_at"))
+        if _person_matches(row.get("author_name"), target_name):
+            recent_by_post[post_id] = max(recent_by_post.get(post_id, ""), written_at)
+    return recent_by_post
+
+
+def _collect_flow_improvements(
+    posts: Any,
+    comments: Any,
+    today: str,
+    yesterday_items: list[dict[str, Any]],
+    target_name: str,
+) -> list[str]:
+    improvements: list[str] = []
+    if getattr(posts, "empty", True):
+        return improvements
+
+    recent_comment_dates = _collect_flow_recent_comment_dates(comments, target_name)
+    today_dt = pendulum.parse(today, tz="Asia/Seoul")
+    stale_cutoff = today_dt.subtract(days=_FLOW_BRIEFING_COMMENT_LOOKBACK_DAYS).to_date_string()
+    yesterday_post_ids = {_flow_text(item.get("post_id")) for item in yesterday_items}
+
+    for row in posts.to_dict("records"):
+        if not _is_flow_personal_post(row, target_name):
+            continue
+        post_id = _flow_text(row.get("post_id"))
+        is_target_author = _person_matches(row.get("author_name"), target_name)
+        is_yesterday_activity = post_id in yesterday_post_ids
+        if not is_target_author and not is_yesterday_activity:
+            continue
+        status = _flow_status(row.get("task_status"))
+        if status == "상태없음" and not is_yesterday_activity:
+            continue
+        if _is_done_or_hold(status):
+            continue
+        title = _brief_text(_flow_title(row), 42)
+        project = _brief_text(row.get("project_name"), 24)
+        role_bar = _format_role_bar(row)
+        end_date = _parse_flow_date(row.get("end_dt"))
+        if end_date and end_date < today:
+            improvements.append(f"마감 초과 확인: {project} / {title} ({end_date}, {status}) | {role_bar}")
+        worker = _flow_text(row.get("worker"))
+        if is_yesterday_activity and worker in {"", "ALL"}:
+            improvements.append(f"담당자 보강 필요: {project} / {title} | {role_bar}")
+        if is_yesterday_activity and not end_date and not _parse_flow_date(row.get("start_dt")):
+            improvements.append(f"일정 기준일 보강 필요: {project} / {title} | {role_bar}")
+        recent_comment_date = _parse_flow_date(recent_comment_dates.get(post_id, ""))
+        if is_target_author and status in {"대기", "진행", "진행중"} and (not recent_comment_date or recent_comment_date < stale_cutoff):
+            improvements.append(f"진행상태 업데이트 필요: {project} / {title} ({status}) | {role_bar}")
+
+    for item in yesterday_items:
+        if "작성자" in _flow_text(item.get("source")) and not item.get("worker"):
+            improvements.append(
+                f"어제 작성 글 담당자 지정 필요: {_brief_text(item.get('project_name'), 24)} / "
+                f"{_brief_text(item.get('title'), 42)} | {_format_role_bar(item)}"
+            )
+
+    deduped = list(dict.fromkeys(improvements))
+    return deduped[:10]
+
+
+def _collect_flow_briefing_items(
+    target_name: str = _FLOW_BRIEFING_TARGET_NAME,
+) -> dict[str, Any]:
+    today = pendulum.now("Asia/Seoul").to_date_string()
+    yesterday = pendulum.now("Asia/Seoul").subtract(days=1).to_date_string()
+    posts, comments, warnings, collected_at = _read_flow_briefing_frames()
+    today_items = _collect_today_flow_items(posts, today, target_name)
+    review_items = _collect_yesterday_review_items(posts, comments, yesterday, target_name)
+    improvements = _collect_flow_improvements(posts, comments, today, review_items, target_name)
+    ok = not warnings or bool(today_items or review_items or improvements)
+    logger.info(
+        "Flow 개인 브리핑 수집: target=%s today=%s review=%s improvements=%s warnings=%s",
+        target_name,
+        len(today_items),
+        len(review_items),
+        len(improvements),
+        len(warnings),
+    )
+    return {
+        "ok": ok,
+        "target_name": target_name,
+        "today": today,
+        "yesterday": yesterday,
+        "today_items": today_items,
+        "review_items": review_items,
+        "improvements": improvements,
+        "warnings": warnings,
+        "collected_at": collected_at,
+    }
+
+
+def _format_flow_today_sections(events: list[dict[str, Any]]) -> str:
+    lines = []
+    for event in events or []:
+        status = event.get("status") or "상태없음"
+        project = _brief_text(event.get("project_name"), 26)
+        title = _brief_text(event.get("title"), 54)
+        role_bar = _format_role_bar(event)
+        basis = event.get("end_dt") or event.get("start_dt") or ""
+        date_label = f" {basis}" if basis else ""
+        lines.append(f"  {event.get('time', '종일')}{date_label}  [{status}] {project} / {title}")
+        lines.append(f"    {role_bar}")
+    return "\n".join(lines)
+
+
+def _format_flow_review_sections(items: list[dict[str, Any]]) -> str:
+    lines = []
+    for item in items or []:
+        events = ", ".join(item.get("events") or ["활동"])
+        project = _brief_text(item.get("project_name"), 26)
+        title = _brief_text(item.get("title"), 54)
+        status = item.get("status") or "상태없음"
+        lines.append(f"  [{events}] {project} / {title} ({status})")
+        lines.append(f"    {_format_role_bar(item)}")
+        for change in item.get("status_changes") or []:
+            lines.append(f"    - 상태: {change}")
+        for comment in item.get("comment_samples") or []:
+            lines.append(f"    - 댓글: {comment}")
+    return "\n".join(lines)
+
+
+def _format_improvement_sections(improvements: list[str]) -> str:
+    return "\n".join(f"  - {line}" for line in improvements or [])
+
+
+def _build_rule_based_priority(data: dict[str, Any], fail_lines: list[str]) -> str:
+    priorities: list[str] = []
+    if fail_lines:
+        priorities.append(f"1. 실패/경고 DAG {len(fail_lines)}건 먼저 확인")
+    for warning in data.get("flow_warnings") or []:
+        priorities.append(f"{len(priorities) + 1}. {warning}")
+    if data.get("improvements"):
+        priorities.append(f"{len(priorities) + 1}. Flow 보완할 점 {len(data['improvements'])}건 정리")
+    if data.get("calendar"):
+        priorities.append(f"{len(priorities) + 1}. 오늘 조민준 관련 Flow 업무 {len(data['calendar'])}건 처리")
+    if not priorities:
+        return "특이사항 없음 — 정상 운영"
+    return "\n".join(priorities[:5])
+
+
+def _maybe_refine_improvements(improvements: list[str]) -> list[str]:
+    if not improvements or not _FLOW_BRIEFING_USE_LLM:
+        return improvements
+    prompt = "\n".join(f"- {line}" for line in improvements[:8])
+    system = (
+        "너는 한국어 업무 브리핑 편집자다. "
+        "입력된 보완 포인트를 의미를 바꾸지 말고 더 짧은 실행 문장으로 정리한다. "
+        "각 줄은 '- '로 시작하고 최대 8줄만 출력한다."
+    )
+    try:
+        refined = _llm_call(prompt, system, num_predict=300)
+    except Exception:
+        return improvements
+    if not refined or "LLM 응답 없음" in refined:
+        return improvements
+    lines = [line.strip()[2:].strip() for line in refined.splitlines() if line.strip().startswith("- ")]
+    return lines[:8] or improvements
+
+
 # ============================================================
 # Task 함수
 # ============================================================
 
 def collect_briefing_data(**context):
     """브리핑에 필요한 모든 데이터 수집 후 XCom 저장."""
-    calendar, calendar_ok = _collect_calendar_events()
+    flow = _collect_flow_briefing_items()
+    calendar = flow["today_items"]
+    calendar_ok = flow["ok"]
     failures, log_warnings = _collect_previous_day_dag_results_v2()
     git = _collect_git_status()
     freshness = _collect_data_freshness()
@@ -1248,9 +1709,18 @@ def collect_briefing_data(**context):
         "freshness": freshness,
         "scheduled": scheduled[:10],
         "log_warnings": log_warnings,
+        "flow_target_name": flow["target_name"],
+        "flow_yesterday": flow["yesterday"],
+        "flow_collected_at": flow["collected_at"],
+        "flow_warnings": flow["warnings"],
+        "review_items": flow["review_items"],
+        "improvements": flow["improvements"],
     }
     context["ti"].xcom_push(key="briefing_data", value=json.dumps(payload, ensure_ascii=False))
-    msg = f"수집 완료 — 일정 {len(calendar)}건 / 실패 {len(failures)}건 / 로그오류 DAG {len(log_warnings)}건"
+    msg = (
+        f"수집 완료 — 오늘 업무 {len(calendar)}건 / 어제 리뷰 {len(flow['review_items'])}건 / "
+        f"보완 {len(flow['improvements'])}건 / 실패 {len(failures)}건 / 로그오류 DAG {len(log_warnings)}건"
+    )
     logger.info(msg)
     return msg
 
@@ -1286,6 +1756,10 @@ def _llm_call(prompt: str, system: str, num_predict: int = 300) -> str:
 
 def _analyze_fail_dag(dag_id: str, error_excerpt: str) -> str:
     """gpt-oss로 FAIL DAG 원인 한 줄 분석."""
+    if not _FLOW_BRIEFING_USE_LLM:
+        lines = [line.strip() for line in (error_excerpt or "").splitlines() if line.strip()]
+        summary = lines[-1] if lines else "로그 상세 확인 필요"
+        return f"확인 필요: {summary[:160]}"
     system = (
         "You are an Airflow expert. Analyze the error and reply ONLY in Korean, "
         "one line: '문제: X / 원인: Y / 조치: Z'."
@@ -1299,11 +1773,10 @@ def _analyze_fail_dag(dag_id: str, error_excerpt: str) -> str:
 
 
 def generate_briefing(**context):
-    """gpt-oss로 우선순위 브리핑 생성 후 XCom 저장."""
+    """Flow 개인 업무와 DAG 상태를 조합해 브리핑 생성 후 XCom 저장."""
     ti = context["ti"]
     data = json.loads(ti.xcom_pull(task_ids="collect_briefing_data", key="briefing_data"))
 
-    # Step A — 각 FAIL DAG 원인 분석
     fail_lines = []
     for f in data["failures"]:
         if f["error_excerpt"]:
@@ -1313,28 +1786,9 @@ def generate_briefing(**context):
             label = f["error_summary"] or f["fail_type"] or f["status"]
             fail_lines.append(f"• {f['dag_id']} [{f['status']}]: {label}")
 
-    # Step B — 전체 우선순위 브리핑
-    if not data.get("calendar_ok", True):
-        cal_text = "  (수집 실패)"
-    else:
-        cal_text = "\n".join(f"  {e['time']} {e['summary']}" for e in data["calendar"]) or "  (없음)"
-    fail_text = "\n".join(fail_lines) or "  (없음)"
+    priority_text = _build_rule_based_priority(data, fail_lines)
+    data["improvements"] = _maybe_refine_improvements(data.get("improvements") or [])
 
-    b_prompt = (
-        f"오늘 일정:\n{cal_text}\n\n"
-        f"실패/경고 DAG(오늘, KST 기준):\n{fail_text}"
-    )
-    b_system = (
-        "너는 데이터 엔지니어의 아침 업무 비서야. "
-        "아래 정보를 보고 오늘 가장 먼저 처리해야 할 작업을 번호 목록으로 정리해줘. "
-        "무조건 한국어로만 답변해. 영어 금지. 최대 5줄. "
-        "절대 사용자에게 되묻거나 추가 정보를 요구하지 마. "
-        "주어진 정보만으로 판단하고, 처리할 실패나 일정이 없으면 "
-        "번호 목록 대신 '특이사항 없음 — 정상 운영' 한 줄만 출력해."
-    )
-    priority_text = _llm_call(b_prompt, b_system, num_predict=400)
-
-    # 메시지 조합
     today = pendulum.now("Asia/Seoul").strftime("%Y-%m-%d (%a)")
     fail_cnt = len(data["failures"])
     warn_cnt = sum(1 for f in data["failures"] if f.get("status") == "WARN")
@@ -1348,26 +1802,42 @@ def generate_briefing(**context):
 
     sections = []
 
-    # 헤더
     sections.append(
         f"[AI 브리핑] {today}\n"
         f"FAIL {fail_cnt} / WARN {warn_cnt} / 로그오류 {log_err_cnt} / 로그경고 {log_warn_msg_cnt}"
     )
 
-    # 우선순위
+    target_name = data.get("flow_target_name") or _FLOW_BRIEFING_TARGET_NAME
+    collected_at = data.get("flow_collected_at") or ""
+    if collected_at:
+        sections.append(f"📌 Flow 기준\n대상: {target_name} / 마지막 수집: {collected_at}")
+    else:
+        sections.append(f"📌 Flow 기준\n대상: {target_name}")
+
     sections.append(f"🎯 오늘 우선순위\n{priority_text}")
 
-    # 일정
     if not data.get("calendar_ok", True):
-        sections.append("📅 오늘 일정\n  (수집 실패 — collect_briefing_data 로그 확인)")
+        warning_lines = _format_improvement_sections(data.get("flow_warnings") or [])
+        sections.append(f"📅 오늘 할 일\n  (Flow 데이터 수집/읽기 확인 필요)\n{warning_lines}".rstrip())
     elif data["calendar"]:
-        sections.append(f"📅 오늘 일정\n{_format_calendar_sections(data['calendar'])}")
+        sections.append(f"📅 오늘 할 일\n{_format_flow_today_sections(data['calendar'])}")
     else:
-        sections.append("📅 오늘 일정\n  (없음)")
+        sections.append("📅 오늘 할 일\n  (없음)")
 
-    # 실패/경고 DAG (오늘)
+    review_items = data.get("review_items") or []
+    if review_items:
+        sections.append(f"🧾 어제 한 일 리뷰\n{_format_flow_review_sections(review_items)}")
+    else:
+        sections.append("🧾 어제 한 일 리뷰\n  (없음)")
+
+    improvements = data.get("improvements") or []
+    if improvements:
+        sections.append(f"🛠 보완할 점\n{_format_improvement_sections(improvements)}")
+    else:
+        sections.append("🛠 보완할 점\n  (없음)")
+
     if fail_lines:
-        sections.append("❌ 실패/경고 DAG\n" + "\n".join(fail_lines))
+        sections.append("🚨 실패/경고 DAG\n" + "\n".join(fail_lines))
 
     message = "\n\n".join(sections)
     ti.xcom_push(key="briefing_message", value=message)

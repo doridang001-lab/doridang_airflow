@@ -278,8 +278,9 @@ def collect_now_for_driver(driver, account_id: str, store_list: list[dict]) -> N
                 )
 
         except Exception as e:
-            # Selenium/renderer timeout은 세션 복구 또는 Retry DAG가 처리할 수 있게 상위로 전파한다.
+            # 모든 NOW 실패를 상위에 전달해야 배치 통합 최종 retry에서 누락되지 않는다.
             if _is_recoverable_driver_error(e):
                 logger.info("Chrome 세션 종료, now 수집 중단: %s", e)
-                raise
-            logger.info("매장 now 수집 실패 (건너뜀): %s / %s", store_info["store"], e)
+            else:
+                logger.warning("매장 now 수집 실패: %s / %s", store_info["store"], e)
+            raise

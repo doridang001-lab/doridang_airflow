@@ -53,7 +53,7 @@ def test_collect_shop_change_retries_dead_store_and_continues():
          patch.object(shop_change, "_load_shop_change_store_list", return_value=stores), \
          patch.object(
              shop_change,
-             "collect_shop_change_for_driver",
+             "collect_shop_operation_for_driver",
              side_effect=[Exception("Connection refused"), None, None],
          ):
         mock_time.sleep.return_value = None
@@ -73,7 +73,6 @@ def test_collect_now_and_woori_runs_all_now_before_woori_in_brand_order():
     account = {
         "account_id": "acct1",
         "password": "pw",
-        "store_name": "도리당 송파삼전점",
     }
     driver = MagicMock()
     driver.current_url = "about:blank"
@@ -104,7 +103,7 @@ def test_collect_now_and_woori_runs_all_now_before_woori_in_brand_order():
          patch.object(combined, "get_store_options", return_value=raw_options), \
          patch.object(combined, "collect_now_for_driver", side_effect=record_now), \
          patch.object(combined, "collect_woori_for_driver", side_effect=record_woori), \
-         patch.object(combined, "collect_shop_change_for_driver"), \
+         patch.object(combined, "collect_shop_operation_for_driver"), \
          patch.object(combined, "collect_orders_for_driver", return_value={"ok": True, "validation": []}), \
          patch.object(combined, "collect_ad_funnel_for_driver", return_value=True), \
          patch.object(combined, "logout_baemin"), \
@@ -112,13 +111,69 @@ def test_collect_now_and_woori_runs_all_now_before_woori_in_brand_order():
          patch.object(combined.time, "sleep"):
         result = combined.collect_now_and_woori([account], stability_profile="test")
 
-    assert result["summary"] == "성공 1/1 계정"
+    assert result["summary"] == (
+        "계정 루프 완료 1/1 계정 "
+        "(완전성공 1, 부분실패 0, 계정실패 0, orders 실패 0, ads 실패 0, stages 실패 0)"
+    )
     assert calls == [
         ("now", "도리당", "송파삼전점"),
         ("now", "나홀로", "송파삼전점"),
         ("woori", "도리당", "송파삼전점"),
         ("woori", "나홀로", "송파삼전점"),
     ]
+
+
+def test_now_partial_failure_registers_stage_for_final_retry():
+    account = {"account_id": "acct1", "password": "pw"}
+    driver = MagicMock()
+    driver.current_url = "about:blank"
+    raw_options = [{"store_id": "1", "text": "도리당 송파삼전점"}]
+
+    with patch.object(
+        combined,
+        "resolve_stability_profile",
+        return_value={
+            "name": "test",
+            "max_session_recovery_per_account": 2,
+            "driver_restart_every_stores": 999,
+            "account_wait_range": (0, 0),
+        },
+    ), \
+         patch.object(combined, "_build_account_session", return_value=driver), \
+         patch.object(combined, "wait_for_page", return_value=True), \
+         patch.object(combined, "get_store_options", return_value=raw_options), \
+         patch.object(
+             combined,
+             "collect_now_for_driver",
+             side_effect=RuntimeError("NOW render/metrics failed"),
+         ), \
+         patch.object(combined, "collect_woori_for_driver"), \
+         patch.object(combined, "collect_shop_operation_for_driver"), \
+         patch.object(
+             combined,
+             "collect_orders_for_driver",
+             return_value={"ok": True, "validation": []},
+         ), \
+         patch.object(combined, "collect_ad_funnel_for_driver", return_value=True), \
+         patch.object(combined, "logout_baemin"), \
+         patch.object(combined.random, "uniform", return_value=0), \
+         patch.object(combined.time, "sleep"):
+        result = combined.collect_now_and_woori(
+            [account],
+            stability_profile="test",
+        )
+
+    assert result["failed"]["accounts"] == []
+    assert [
+        (
+            item["account"]["account_id"],
+            item["store"]["store_id"],
+            item["stage"],
+        )
+        for item in result["failed"]["stages"]
+    ] == [("acct1", "1", "NOW 수집")]
+    assert "부분실패 1" in result["summary"]
+    assert "stages 실패 1" in result["summary"]
 
 
 def test_renderer_timeout_is_treated_as_driver_crash():
@@ -137,7 +192,7 @@ def test_shop_change_save_csv_keeps_same_timestamp_multiple_rows(tmp_path):
     with patch.object(shop_change, "BAEMIN_SHOP_CHANGE_DB", tmp_path):
         out_path = shop_change._save_csv(rows, "brand", "store")
 
-    df = pd.read_csv(out_path, dtype=str)
+    df = shop_change.read_file(out_path)
     assert len(df) == 2
 
 

@@ -102,6 +102,7 @@ def load_automation_account_df(
     target_stores: list[str] | None = None,
     exact: bool = True,
     csv_path: Path | None = None,
+    require_note: bool = False,
 ) -> pd.DataFrame:
     """Return rows explicitly marked as automation-linked in sales_employee.csv."""
     df = _read_sales_employee_csv(csv_path)
@@ -110,6 +111,12 @@ def load_automation_account_df(
     if missing:
         logger.warning("자동화 계정 필터 컬럼 누락: %s columns=%s", missing, list(df.columns))
         if AUTOMATION_NOTE_COLUMN in missing:
+            if require_note:
+                logger.warning(
+                    "비고 컬럼 없음 - require_note=True 이므로 platform-only fallback 미적용: columns=%s",
+                    list(df.columns),
+                )
+                return pd.DataFrame(columns=list(required) + ["매장명"])
             required_without_note = {"플랫폼", "계정ID", "계정PW"}
             if required_without_note.issubset(df.columns):
                 logger.warning(
@@ -146,21 +153,45 @@ def load_automation_account_df(
     return filtered
 
 
+def _legacy_account_row(channel: str) -> pd.Series | None:
+    legacy_df = account_df[account_df["channel"] == str(channel).strip()]
+    return None if legacy_df.empty else legacy_df.iloc[0]
+
+
 def get_default_account(channel: str) -> tuple[str, str]:
-    """Return the first automation-linked account for a channel."""
-    platform = CHANNEL_TO_PLATFORM.get(str(channel).strip())
+    """채널 대표(기업) 계정을 반환한다."""
+    channel_key = str(channel).strip()
+    platform = CHANNEL_TO_PLATFORM.get(channel_key)
     if not platform:
         return "", ""
 
-    df = load_automation_account_df(platform=platform)
-    if df.empty:
-        legacy_df = account_df[account_df["channel"] == channel]
-        if legacy_df.empty:
-            logger.warning("자동화 연결 기본 계정 없음: channel=%s platform=%s", channel, platform)
-            return "", ""
-        row = legacy_df.iloc[0]
-        logger.warning("자동화 연결 기본 계정 없음 - 내장 계정 fallback 사용: channel=%s", channel)
-        return str(row.get("id", "")).strip(), str(row.get("pw", "")).strip()
+    legacy_row = _legacy_account_row(channel_key)
+    legacy_id = str(legacy_row.get("id", "")).strip() if legacy_row is not None else ""
 
-    row = df.iloc[0]
-    return str(row.get("계정ID", "")).strip(), str(row.get("계정PW", "")).strip()
+    df = load_automation_account_df(platform=platform, require_note=True)
+    if not df.empty:
+        matched = df
+        if legacy_id and "계정ID" in df.columns:
+            preferred = df[df["계정ID"].astype(str).str.strip() == legacy_id]
+            if not preferred.empty:
+                matched = preferred
+            else:
+                logger.warning(
+                    "자동화 연결 행에 대표 계정ID 없음 - 첫 행 사용: channel=%s expected=%s",
+                    channel_key,
+                    legacy_id,
+                )
+        row = matched.iloc[0]
+        return str(row.get("계정ID", "")).strip(), str(row.get("계정PW", "")).strip()
+
+    if legacy_row is None:
+        logger.warning("기본 계정 없음: channel=%s platform=%s", channel_key, platform)
+        return "", ""
+
+    password = get_pw(channel_key, legacy_id) or str(legacy_row.get("pw", "")).strip()
+    logger.warning(
+        "자동화 연결(비고) 기본 계정 없음 - 내장 대표 계정 사용: channel=%s account_id=%s",
+        channel_key,
+        legacy_id,
+    )
+    return legacy_id, password

@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest.mock import ANY, MagicMock, patch
 
 import pandas as pd
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -56,3 +57,15 @@ def test_collect_now_for_driver_saves_ok_status(tmp_path: Path):
     assert df.loc[0, "collection_status"] == "ok"
     assert df.loc[0, "collection_note"] == "metric_values"
     assert df.loc[0, "조리소요시간"] == "12"
+
+
+def test_collect_now_for_driver_propagates_navigation_failure():
+    store_info = {"store_id": "1", "brand": "도리당", "store": "store"}
+
+    with patch.object(
+        now,
+        "navigate_to_store_now",
+        return_value={"status": "missing", "reason": "navigation_failed"},
+    ):
+        with pytest.raises(RuntimeError, match="NOW render/metrics failed"):
+            now.collect_now_for_driver(MagicMock(), "acct", [store_info])

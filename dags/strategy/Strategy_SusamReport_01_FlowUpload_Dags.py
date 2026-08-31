@@ -1,4 +1,4 @@
-"""전일 수삼 CSV를 저장하고 표 텍스트를 매일 Flow 고정 게시글 댓글에 업로드한다.
+"""전일 미수백 CSV와 일·주·월 Flow 하위업무 본문을 매일 갱신한다.
 
 conf 없는 예약/수동 실행: KST 전일
 단일 재처리 예시: {"date": "2026-07-03"}
@@ -34,7 +34,8 @@ DEBUGGER_VARIABLE = "FLOW_SUSAM_CHROME_DEBUGGER"
 CHROMEDRIVER_VARIABLE = "FLOW_SUSAM_CHROMEDRIVER_PATH"
 KST = pendulum.timezone("Asia/Seoul")
 UNIFIED_DAG_ID = "DB_UnifiedSales"
-SOURCE_STABILITY_SECONDS = 60 * 10
+SOURCE_STABILITY_SECONDS = 60 * 5
+SOURCE_SENSOR_TIMEOUT_SECONDS = 60 * 60 * 3
 FLOW_CHROME_RELEASE_PATH = LOCAL_DB / "flow_susam_chrome_release.json"
 
 
@@ -207,8 +208,8 @@ def _upload_daily_report(**context):
 
     result = main(args)
     if result["failed"]:
-        raise AirflowException(f"일별 상품 매출 Flow 업로드 실패: {result['failed']}")
-    logger.info("일별 상품 매출 Flow 업로드 DAG 완료 | target=%s result=%s", target_label, result)
+        raise AirflowException(f"미수백 Flow 하위업무 본문 갱신 실패: {result['failed']}")
+    logger.info("미수백 Flow 하위업무 본문 갱신 완료 | target=%s result=%s", target_label, result)
     return result
 
 
@@ -229,20 +230,20 @@ def _signal_flow_chrome_release(**context) -> str:
 
 with DAG(
     dag_id=DAG_ID,
-    description="매일 전일 수삼 CSV를 저장하고 표 텍스트를 Flow 댓글에 업로드",
+    description="매일 미수백 일별 CSV와 일·주·월 Flow 하위업무 본문을 갱신",
     schedule=SMP_SUSAM_REPORT_TIME,
     start_date=pendulum.datetime(2026, 7, 1, tz="Asia/Seoul"),
     catchup=False,
     max_active_runs=1,
     default_args={"retries": 0},
-    tags=["strategy", "flow", "daily-sales"],
+    tags=["strategy", "flow", "subtask", "susam-report"],
 ) as dag:
     wait_for_source_ready = PythonSensor(
         task_id="wait_for_source_ready",
         python_callable=_wait_for_source_ready,
         mode="reschedule",
         poke_interval=300,
-        timeout=60 * 60 * 2,
+        timeout=SOURCE_SENSOR_TIMEOUT_SECONDS,
     )
 
     wait_for_flow_chrome = PythonSensor(

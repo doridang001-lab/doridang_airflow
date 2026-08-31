@@ -2,7 +2,7 @@
     [string]$TaskName = "CoupangAutoCollect",
     [string]$UserId = $env:USERNAME,
     [int]$LogonDelaySeconds = 60,
-    [int]$ExecutionTimeLimitMinutes = 45,
+    [int]$ExecutionTimeLimitMinutes = 360,
     [int]$StartupDelaySeconds = 60,
     [int]$CollectionWaitSeconds = 1200,
     [int]$CollectionStableSeconds = 60,
@@ -59,6 +59,8 @@ Register-ScheduledTask `
     -Principal $principal `
     -Description "로그온 후 쿠팡이츠 수집용 Chrome 확장 runner 자동 클릭 및 적재 DAG 트리거" `
     -Force | Out-Null
+
+Enable-ScheduledTask -TaskName $TaskName | Out-Null
 
 Write-Host "Scheduled task ready: $TaskName"
 Write-Host "User: $UserId"

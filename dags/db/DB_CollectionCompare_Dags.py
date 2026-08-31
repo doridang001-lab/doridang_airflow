@@ -12,7 +12,10 @@ from modules.transform.pipelines.db.DB_BaeminManual_load import (
     load_manual_baemin_files,
     cleanup_manual_baemin_files,
 )
-from modules.transform.pipelines.db.DB_CoupangMacro_load import load_coupang_macro_partition
+from modules.transform.pipelines.db.DB_CoupangMacro_load import (
+    move_coupang_down_to_collect,
+    load_coupang_macro_partition,
+)
 from modules.transform.utility.schedule import DB_COLLECTION_COMPARE_TIME
 
 dag_id = Path(__file__).stem
@@ -45,8 +48,13 @@ with DAG(
         python_callable=cleanup_manual_baemin_files,
     )
 
-    ingest_coupangeats = PythonOperator(
-        task_id="ingest_coupangeats_orders",
+    move_coupang = PythonOperator(
+        task_id="move_coupang_to_collect",
+        python_callable=move_coupang_down_to_collect,
+    )
+
+    load_coupang = PythonOperator(
+        task_id="load_coupang_macro_partition",
         python_callable=load_coupang_macro_partition,
     )
 
@@ -56,4 +64,5 @@ with DAG(
     )
 
     ingest_baemin >> cleanup_baemin
-    [cleanup_baemin, ingest_coupangeats] >> build_compare
+    move_coupang >> load_coupang
+    [cleanup_baemin, load_coupang] >> build_compare

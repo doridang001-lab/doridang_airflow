@@ -12,12 +12,14 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from datetime import datetime
 
 import pandas as pd
 import pendulum
 
 from modules.transform.utility.paths import (
+    ANALYTICS_DB,
     FIN_PRODUCT_CSV_PATH,
     LOCAL_DB,
     MART_DB,
@@ -30,26 +32,121 @@ from modules.transform.pipelines.db.DB_ItemIdAllocator import canonical_source
 logger = logging.getLogger(__name__)
 
 UNIFIED_ROOT = MART_DB / "unified_sales_grp"
+UNIFIED_DAILY_RE = re.compile(r"^unified_sales_\d{6}\.parquet$")
+CONFLICT_QUARANTINE_DIR = UNIFIED_ROOT / "_conflicts"
+PLATFORM_NORMALIZE_MAP = {
+    "배민1": "배달의민족",
+}
 MANUAL_FALLBACK_MARKER_ROOT = LOCAL_DB / "manual_fallback_markers"
+MANUAL_REINGEST_MARKER_ROOT = LOCAL_DB / "manual_reingest_markers"
+MANUAL_PARTIAL_MARKER_ROOT = LOCAL_DB / "manual_partial_markers"
+MANUAL_PARTIAL_MIN_RATIO = 0.8
+MANUAL_PARTIAL_MIN_GAP = 100_000
+MANUAL_ITEM_DETAIL_GAP_MARKER_ROOT = LOCAL_DB / "manual_item_detail_gap_markers"
+MANUAL_UNKNOWN_ITEM_NAME_FMT = "메뉴미상({label})"
+TOORDER_DAILY_STORE_PLATFORM_PATH = (
+    ANALYTICS_DB
+    / "toorder_daily_store_platform"
+    / "toorder_store_platform_daily.parquet"
+)
 
 
 def _kst_today_str() -> str:
     return pendulum.now("Asia/Seoul").strftime("%Y-%m-%d")
 
 
+def is_canonical_unified_file(path) -> bool:
+    """정규 일별 unified_sales parquet만 True."""
+    return bool(UNIFIED_DAILY_RE.match(path.name))
+
+
 def iter_unified_sales_files() -> list:
     """실제 unified_sales parquet만 반환한다.
 
-    백필 백업 파일은 `unified_sales_YYMMDD.bak_*.parquet` 형태라 단순 glob에
-    같이 잡힌다. 운영 집계/검증/정리에서는 반드시 제외해야 한다.
+    OneDrive 충돌본, 백필 백업, 원자적 쓰기 임시 파일은 단순 glob에
+    같이 잡히므로 정규 일별 파일명만 허용한다.
     """
     if not UNIFIED_ROOT.exists():
         return []
     return sorted(
         path
         for path in UNIFIED_ROOT.glob("unified_sales_*.parquet")
-        if ".bak_" not in path.name
+        if is_canonical_unified_file(path)
     )
+
+
+def normalize_unified_platforms(df: pd.DataFrame) -> pd.DataFrame:
+    """unified_sales platform 표기를 저장 표준값으로 정규화한다."""
+    if df is None or df.empty or "platform" not in df.columns:
+        return df
+
+    out = df.copy()
+    platform = out["platform"].fillna("").astype(str).str.strip()
+    normalized = platform.map(lambda value: PLATFORM_NORMALIZE_MAP.get(value, value))
+    changed = ~platform.eq(normalized)
+    if not changed.any():
+        return df
+
+    out["platform"] = normalized
+    if "_pk" in out.columns:
+        out["_pk"] = _make_unified_pk(out)
+    return out
+
+
+def save_unified_parquet(df: pd.DataFrame, path) -> None:
+    """같은 폴더의 tmp 파일로 쓴 뒤 최종 경로를 원자 교체한다."""
+    df = normalize_unified_platforms(df)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        df.to_parquet(tmp, index=False, engine="pyarrow")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def quarantine_conflict_copies() -> str:
+    """비정규 unified_sales 파일을 격리하고 알림을 보낸다."""
+    if not UNIFIED_ROOT.exists():
+        return "충돌본 없음"
+
+    targets = []
+    for path in UNIFIED_ROOT.glob("unified_sales_*"):
+        if not path.is_file():
+            continue
+        name = path.name
+        if is_canonical_unified_file(path) or ".bak_" in name or name.endswith(".tmp"):
+            continue
+        targets.append(path)
+
+    if not targets:
+        return "충돌본 없음"
+
+    quarantine_dir = CONFLICT_QUARANTINE_DIR / pendulum.now("Asia/Seoul").strftime("%Y%m%d")
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+
+    moved_names = []
+    for path in sorted(targets):
+        dest = quarantine_dir / path.name
+        if dest.exists():
+            dest.unlink()
+        shutil.move(str(path), str(dest))
+        moved_names.append(path.name)
+
+    try:
+        from modules.transform.utility.notifier import send_telegram
+
+        send_telegram(
+            "[도리당] unified_sales OneDrive 충돌본 격리\n"
+            f"건수: {len(moved_names)}\n"
+            f"파일: {', '.join(moved_names)}"
+        )
+    except Exception as exc:
+        logger.warning("충돌본 격리 텔레그램 알림 실패(무시): %s", exc)
+
+    result = f"OK: 충돌본 격리 {len(moved_names)}건 | {', '.join(moved_names)}"
+    logger.warning(result)
+    return result
 
 
 def pos_delivery_summary(
@@ -91,15 +188,167 @@ def pos_delivery_summary(
     return int(total_price), int(order_cnt), int(mask.sum())
 
 
-def record_manual_fallback_marker(
-    source: str,
-    store: str,
+def toorder_delivery_summary(
     date: str,
-    meta: dict,
-) -> bool:
-    """폴백 마커를 기록하고 신규 생성 여부를 반환한다."""
+    store: str,
+    platforms: set[str],
+) -> tuple[int, int, int]:
+    """ToOrder 일별 매장×플랫폼 기준 금액/영수수/행수를 반환한다."""
+    path = TOORDER_DAILY_STORE_PLATFORM_PATH
+    if not path.exists():
+        return 0, 0, 0
+
     try:
-        path = MANUAL_FALLBACK_MARKER_ROOT / str(source).strip() / str(store).strip() / f"{date}.json"
+        df = pd.read_parquet(
+            path,
+            columns=["date", "store", "platform", "price", "receipts_num"],
+        )
+    except Exception as exc:
+        logger.warning("ToOrder 배달 요약 로드 실패: %s | %s", path, exc)
+        return 0, 0, 0
+
+    if df.empty:
+        return 0, 0, 0
+
+    date_s = df["date"].fillna("").astype(str).str.strip()
+    store_s = df["store"].fillna("").astype(str).str.strip()
+    platform_s = df["platform"].fillna("").astype(str).str.strip()
+    mask = (
+        date_s.eq(str(date).strip())
+        & store_s.eq(str(store).strip())
+        & platform_s.isin(platforms)
+    )
+    if not mask.any():
+        return 0, 0, 0
+
+    total_price = pd.to_numeric(df.loc[mask, "price"], errors="coerce").fillna(0).sum()
+    order_cnt = pd.to_numeric(df.loc[mask, "receipts_num"], errors="coerce").fillna(0).sum()
+    return int(total_price), int(order_cnt), int(mask.sum())
+
+
+def delivery_baseline_summary(
+    date: str,
+    store: str,
+    platforms: set[str],
+    manual_source: str,
+) -> dict:
+    """수동수집 검증 기준 합계를 반환한다.
+
+    ToOrder/POS가 모두 있으면 더 낮은 금액을 기준으로 사용해 기준 과대로 인한
+    부분수집 오탐을 줄인다. 한쪽만 있으면 있는 쪽을 기준으로 사용한다.
+    """
+    toorder_total, toorder_order_cnt, toorder_rows = toorder_delivery_summary(
+        date,
+        store,
+        platforms,
+    )
+    pos_total, pos_order_cnt, pos_rows = pos_delivery_summary(
+        date,
+        store,
+        platforms,
+        manual_source,
+    )
+    has_toorder = toorder_rows > 0 and toorder_total > 0
+    has_pos = pos_rows > 0 and pos_total > 0
+    if has_pos and (not has_toorder or pos_total <= toorder_total):
+        baseline_label = "POS"
+        baseline_total = pos_total
+        baseline_order_cnt = pos_order_cnt
+        baseline_rows = pos_rows
+    elif has_toorder:
+        baseline_label = "ToOrder"
+        baseline_total = toorder_total
+        baseline_order_cnt = toorder_order_cnt
+        baseline_rows = toorder_rows
+    else:
+        baseline_label = "POS"
+        baseline_total = pos_total
+        baseline_order_cnt = pos_order_cnt
+        baseline_rows = pos_rows
+
+    return {
+        "baseline_label": baseline_label,
+        "baseline_total": int(baseline_total),
+        "baseline_order_cnt": int(baseline_order_cnt),
+        "baseline_rows": int(baseline_rows),
+        "pos_total": int(pos_total),
+        "pos_order_cnt": int(pos_order_cnt),
+        "pos_rows": int(pos_rows),
+        "toorder_total": int(toorder_total),
+        "toorder_order_cnt": int(toorder_order_cnt),
+        "toorder_rows": int(toorder_rows),
+    }
+
+
+def detect_manual_partial_collection(
+    date: str,
+    store: str,
+    platforms: set[str],
+    manual_source: str,
+    manual_total: int,
+) -> dict | None:
+    """수동수집 합계가 기준 배달 합계 대비 과소하면 이벤트를 반환한다.
+
+    ToOrder 기준이 있으면 우선 사용하고, 없을 때만 POS 계열 합계로 fallback한다.
+    """
+    baseline = delivery_baseline_summary(date, store, platforms, manual_source)
+    baseline_label = baseline["baseline_label"]
+    baseline_total = baseline["baseline_total"]
+    baseline_order_cnt = baseline["baseline_order_cnt"]
+    baseline_rows = baseline["baseline_rows"]
+
+    if baseline_rows <= 0 or baseline_total <= 0:
+        return None
+
+    manual_total = int(manual_total or 0)
+    gap = baseline_total - manual_total
+    if manual_total >= MANUAL_PARTIAL_MIN_RATIO * baseline_total:
+        return None
+    if gap < MANUAL_PARTIAL_MIN_GAP:
+        return None
+
+    return {
+        "date": date,
+        "store": store,
+        "platform": sorted(platforms)[0] if platforms else "",
+        "manual_total": manual_total,
+        "pos_total": int(baseline["pos_total"]),
+        "pos_order_cnt": int(baseline["pos_order_cnt"]),
+        "pos_rows": int(baseline["pos_rows"]),
+        "toorder_total": int(baseline["toorder_total"]),
+        "toorder_order_cnt": int(baseline["toorder_order_cnt"]),
+        "toorder_rows": int(baseline["toorder_rows"]),
+        "baseline_label": baseline_label,
+        "baseline_total": int(baseline_total),
+        "baseline_order_cnt": int(baseline_order_cnt),
+        "baseline_rows": int(baseline_rows),
+        "gap": int(gap),
+        "ratio": round(manual_total / baseline_total, 3) if baseline_total else 0.0,
+        "order_cnt": int(baseline_order_cnt),
+    }
+
+
+def _format_other_baseline(event: dict) -> str:
+    """선택되지 않은 기준 금액이 다르면 알림에 보조 기준으로 표시한다."""
+    baseline_label = str(event.get("baseline_label") or "").strip()
+    pos_total = int(event.get("pos_total") or 0)
+    pos_order_cnt = int(event.get("pos_order_cnt") or 0)
+    toorder_total = int(event.get("toorder_total") or 0)
+    toorder_order_cnt = int(event.get("toorder_order_cnt") or 0)
+
+    if pos_total <= 0 or toorder_total <= 0 or pos_total == toorder_total:
+        return ""
+    if baseline_label == "POS":
+        return f" (ToOrder {toorder_total:,}/{toorder_order_cnt}건)"
+    if baseline_label == "ToOrder":
+        return f" (POS {pos_total:,}/{pos_order_cnt}건)"
+    return ""
+
+
+def _record_marker(root, source: str, store: str, date: str, meta: dict) -> bool:
+    """마커를 기록하고 신규 생성 여부를 반환한다."""
+    try:
+        path = root / str(source).strip() / str(store).strip() / f"{date}.json"
         is_new = not path.exists()
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = dict(meta or {})
@@ -114,60 +363,327 @@ def record_manual_fallback_marker(
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return is_new
     except Exception as exc:
-        logger.warning("수동 폴백 마커 기록 실패: source=%s store=%s date=%s | %s", source, store, date, exc)
+        logger.warning(
+            "마커 기록 실패: root=%s source=%s store=%s date=%s | %s",
+            root,
+            source,
+            store,
+            date,
+            exc,
+        )
         return False
 
 
-def clear_manual_fallback_marker(source: str, store: str, date: str) -> bool:
-    """수동 복원 시 폴백 마커를 삭제한다."""
+def _clear_marker(root, source: str, store: str, date: str) -> bool:
     try:
-        path = MANUAL_FALLBACK_MARKER_ROOT / str(source).strip() / str(store).strip() / f"{date}.json"
+        path = root / str(source).strip() / str(store).strip() / f"{date}.json"
         if not path.exists():
             return False
         path.unlink()
         return True
     except Exception as exc:
-        logger.warning("수동 폴백 마커 삭제 실패: source=%s store=%s date=%s | %s", source, store, date, exc)
+        logger.warning(
+            "마커 삭제 실패: root=%s source=%s store=%s date=%s | %s",
+            root,
+            source,
+            store,
+            date,
+            exc,
+        )
         return False
 
 
+def record_manual_fallback_marker(
+    source: str,
+    store: str,
+    date: str,
+    meta: dict,
+) -> bool:
+    """폴백 마커를 기록하고 신규 생성 여부를 반환한다."""
+    return _record_marker(MANUAL_FALLBACK_MARKER_ROOT, source, store, date, meta)
+
+
+def clear_manual_fallback_marker(source: str, store: str, date: str) -> bool:
+    """수동 복원 시 폴백 마커를 삭제한다."""
+    return _clear_marker(MANUAL_FALLBACK_MARKER_ROOT, source, store, date)
+
+
+def record_manual_partial_marker(
+    source: str,
+    store: str,
+    date: str,
+    meta: dict,
+) -> bool:
+    return _record_marker(MANUAL_PARTIAL_MARKER_ROOT, source, store, date, meta)
+
+
+def clear_manual_partial_marker(source: str, store: str, date: str) -> bool:
+    return _clear_marker(MANUAL_PARTIAL_MARKER_ROOT, source, store, date)
+
+
+def record_manual_reingest_marker(
+    source: str,
+    store: str,
+    date: str,
+    meta: dict,
+) -> bool:
+    """재수집으로 원천이 교체된 매장·날짜를 기록한다."""
+    return _record_marker(MANUAL_REINGEST_MARKER_ROOT, source, store, date, meta)
+
+
+def clear_manual_reingest_marker(source: str, store: str, date: str) -> bool:
+    return _clear_marker(MANUAL_REINGEST_MARKER_ROOT, source, store, date)
+
+
+def list_manual_reingest_dates(source: str, stores: list[str]) -> set[str]:
+    """대상 매장들의 재수집 마커 날짜 합집합을 반환한다."""
+    dates: set[str] = set()
+    try:
+        source_root = MANUAL_REINGEST_MARKER_ROOT / str(source).strip()
+        if not source_root.exists():
+            return dates
+        for store in stores:
+            store_name = str(store).strip()
+            if not store_name:
+                continue
+            for path in (source_root / store_name).glob("*.json"):
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", path.stem):
+                    dates.add(path.stem)
+    except Exception as exc:
+        logger.warning(
+            "재수집 마커 조회 실패: source=%s stores=%s | %s",
+            source,
+            stores,
+            exc,
+        )
+        return set()
+    return dates
+
+
+def filter_manual_reingest_dates_outside_recent_window(
+    dates,
+    *,
+    recent_days: int,
+    now=None,
+) -> list[str]:
+    """최근 보호구간 밖의 재수집 마커 날짜만 반환한다.
+
+    recent_days=9이면 KST 기준 D-0~D-8은 제외하고 D-9 이전만 허용한다.
+    """
+    if recent_days < 0:
+        raise ValueError("recent_days는 0 이상이어야 합니다.")
+    ref = now or pendulum.now("Asia/Seoul")
+    cutoff = pendulum.instance(ref).in_timezone("Asia/Seoul").subtract(days=recent_days)
+    cutoff_str = cutoff.format("YYYY-MM-DD")
+
+    normalized_dates = []
+    for date in dates:
+        try:
+            normalized = pendulum.parse(str(date), strict=False).format("YYYY-MM-DD")
+        except Exception:
+            logger.warning("재수집 마커 날짜 형식 오류: date=%s", date)
+            continue
+        if normalized <= cutoff_str:
+            normalized_dates.append(normalized)
+    return sorted(set(normalized_dates))
+
+
 def notify_manual_fallback(source_label: str, events: list[dict]) -> None:
-    """수동 결측 POS 폴백 신규 이벤트를 Telegram으로 1회 알린다."""
+    """수동 결측 기준 매출 신규 이벤트를 Telegram으로 1회 알린다."""
     if not events:
         return
     try:
         from modules.transform.utility.notifier import send_telegram
 
-        lines = [f"[도리당] 배달 수동 결측→POS 대체({source_label})"]
+        lines = [f"[도리당] 배달 수동 결측→기준 대체({source_label})"]
         for event in events:
-            amount = int(event.get("total_price") or 0)
-            order_cnt = int(event.get("order_cnt") or 0)
+            baseline_label = str(event.get("baseline_label") or "POS").strip()
+            amount = int(
+                event.get("baseline_total")
+                if event.get("baseline_total") is not None
+                else event.get("total_price") or 0
+            )
+            order_cnt = int(
+                event.get("baseline_order_cnt")
+                if event.get("baseline_order_cnt") is not None
+                else event.get("order_cnt") or 0
+            )
             platform = str(event.get("platform") or "").strip()
+            other_baseline = _format_other_baseline(event)
             lines.append(
-                f"- {event.get('store')} {event.get('date')} {platform} {amount:,}/{order_cnt}건"
+                f"- {event.get('store')} {event.get('date')} {platform} "
+                f"{baseline_label} {amount:,}/{order_cnt}건{other_baseline}"
             )
         lines.append("재수집 요망")
         send_telegram("\n".join(lines))
     except Exception as exc:
         logger.warning("수동 폴백 알림 실패: source_label=%s | %s", source_label, exc)
 
+
+def notify_manual_partial(source_label: str, events: list[dict]) -> None:
+    """수동 부분수집 의심 신규 이벤트를 Telegram으로 1회 알린다."""
+    if not events:
+        return
+    try:
+        from modules.transform.utility.notifier import send_telegram
+
+        lines = [f"[도리당] 배달 수동 부분수집 의심({source_label})"]
+        for event in events:
+            baseline_label = str(event.get("baseline_label") or "POS").strip()
+            baseline_total = int(
+                event.get("baseline_total")
+                if event.get("baseline_total") is not None
+                else event.get("pos_total") or 0
+            )
+            other_baseline = _format_other_baseline(event)
+            lines.append(
+                f"- {event.get('store')} {event.get('date')} {event.get('platform')} "
+                f"수동 {int(event.get('manual_total') or 0):,} / "
+                f"{baseline_label} {baseline_total:,}{other_baseline} "
+                f"(부족 {int(event.get('gap') or 0):,}, "
+                f"{int(float(event.get('ratio') or 0) * 100)}%)"
+            )
+        lines.append("재수집 요망")
+        send_telegram("\n".join(lines))
+    except Exception as exc:
+        logger.warning("수동 부분수집 알림 실패: source_label=%s | %s", source_label, exc)
+
+
+def notify_manual_missing_all(source_label: str, events: list[dict]) -> None:
+    """수동·기준 모두 없어 매출이 0으로 남은 신규 일자를 Telegram으로 알린다."""
+    if not events:
+        return
+    try:
+        from modules.transform.utility.notifier import send_telegram
+
+        lines = [f"[도리당] 배달 수동·기준 모두 없음({source_label})"]
+        for event in events:
+            lines.append(
+                f"- {event.get('store')} {event.get('date')} "
+                f"{event.get('platform')} 매출 0"
+            )
+        lines.append("재수집 요망")
+        send_telegram("\n".join(lines))
+    except Exception as exc:
+        logger.warning("수동 무데이터 알림 실패: source_label=%s | %s", source_label, exc)
+
+
+def record_manual_item_detail_gap_marker(
+    source: str,
+    store: str,
+    date: str,
+    meta: dict,
+) -> bool:
+    """메뉴 상세 결손 마커를 기록하고 신규 생성 여부를 반환한다."""
+    return _record_marker(MANUAL_ITEM_DETAIL_GAP_MARKER_ROOT, source, store, date, meta)
+
+
+def notify_manual_item_detail_gap(label: str, event: dict) -> None:
+    """수동수집 메뉴 상세 결손을 소스·매장·날짜별 최초 한 번 알린다."""
+    try:
+        from modules.transform.utility.notifier import send_telegram
+
+        order_ids = [str(v).strip() for v in event.get("order_ids", []) if str(v).strip()]
+        order_text = ",".join(order_ids) if order_ids else "-"
+        omitted = int(event.get("omitted_order_id_count") or 0)
+        if omitted:
+            order_text = f"{order_text} 외 {omitted}건"
+        send_telegram(
+            "\n".join(
+                [
+                    f"[도리당] {label} 메뉴 상세 부분수집",
+                    f"- 매장: {event.get('store')}",
+                    f"- 날짜: {event.get('date')}",
+                    f"- 결손: {int(event.get('missing_count') or 0)}건",
+                    f"- 주문번호: {order_text}",
+                    "매출은 메뉴미상 플레이스홀더로 보존했습니다.",
+                ]
+            )
+        )
+    except Exception as exc:
+        logger.warning("수동 메뉴 상세 결손 알림 실패: label=%s | %s", label, exc)
+
+
+def fill_missing_manual_item_name(
+    item_name: pd.Series,
+    *,
+    source: str,
+    label: str,
+    store: str,
+    sale_date: pd.Series | str | None = None,
+    order_id: pd.Series | None = None,
+) -> pd.Series:
+    """부분수집으로 빈 수동배달 메뉴명을 채우고 결손 사실을 알린다."""
+    filled = item_name.fillna("").astype(str).str.strip()
+    missing = filled.eq("") | filled.str.lower().eq("nan")
+    if not missing.any():
+        return filled
+
+    placeholder = MANUAL_UNKNOWN_ITEM_NAME_FMT.format(label=label)
+    filled = filled.mask(missing, placeholder)
+
+    if isinstance(sale_date, pd.Series):
+        dates = sale_date.reindex(filled.index).fillna("").astype(str).str.strip()
+    else:
+        dates = pd.Series(str(sale_date or "").strip(), index=filled.index, dtype="object")
+    if order_id is not None:
+        order_ids = order_id.reindex(filled.index).fillna("").astype(str).str.strip()
+    else:
+        order_ids = pd.Series("", index=filled.index, dtype="object")
+
+    missing_dates = sorted({v for v in dates[missing].tolist() if v})
+    all_order_ids = sorted({v for v in order_ids[missing].tolist() if v})
+    log_order_ids = all_order_ids[:20]
+    remaining = max(0, len(all_order_ids) - len(log_order_ids))
+    order_label = ",".join(log_order_ids) if log_order_ids else "-"
+    if remaining:
+        order_label = f"{order_label} 외 {remaining}건"
+
+    logger.warning(
+        "%s 메뉴 상세 결손 행 플레이스홀더 처리: source=%s store=%s date=%s | %d건 order_id=%s",
+        label,
+        source,
+        store,
+        ",".join(missing_dates) if missing_dates else "-",
+        int(missing.sum()),
+        order_label,
+    )
+
+    for date in missing_dates:
+        date_mask = missing & dates.eq(date)
+        date_order_ids = sorted({v for v in order_ids[date_mask].tolist() if v})
+        shown_order_ids = date_order_ids[:20]
+        event = {
+            "store": str(store).strip(),
+            "date": date,
+            "missing_count": int(date_mask.sum()),
+            "order_ids": shown_order_ids,
+            "omitted_order_id_count": max(0, len(date_order_ids) - len(shown_order_ids)),
+            "placeholder": placeholder,
+        }
+        if record_manual_item_detail_gap_marker(source, store, date, event):
+            notify_manual_item_detail_gap(label, event)
+
+    return filled
+
 # 테스트매장
 _BASE_DELIVERY_MANUAL_TEST_STORES = [
-    "해운대중동점",
-    "법흥리점",
-    "송파삼전점",
-    "동탄영천점",
-    "중랑면목점",
-    "시흥배곧점",
-    "강원영월점",
-    "평택비전점",
-    "부산장림점",
-    "경북상주점",
-    "창원내서점",
-    "행신점",
-    "전주전북대점",
-    "구로디지털점",
-    "부천옥길점"
+    "해운대중동점", #08-12
+    "법흥리점",# 08-12
+    "동탄영천점", # 08-12
+    "중랑면목점",# 08-12
+    "시흥배곧점", # 08-12 쿠팡 확인해봐야함
+    "강원영월점", # 08-12
+    "평택비전점", # 08-12
+    "부산장림점", # 08-12 쿠팡 확인해야봐야함
+    "경북상주점", # 08-12
+    "창원내서점", # 08-12
+    "행신점", # 08-12
+    "전주전북대점", # 08-12 배민 06-24확인
+    "구로디지털점", # 08-12
+    "부천옥길점", # 08-12
+    "송파삼전점", # 08-12 쿠팡 06-02 0614확인
+
 ]
 
 # 사용법:
@@ -187,7 +703,18 @@ _BASE_DELIVERY_MANUAL_TEST_STORES = [
 #    - 운영 로직과 DAG는 이 최종 목록만 참조한다.
 
 # 임시추가
-ADD_TEST_STORES = [ "삼송점"
+ADD_TEST_STORES = [ "삼송점", # 쿠팡거절
+                   "청라점",  # 쿠팡거절
+                   "대전장대점", # 08-13
+                   "대전둔산점", 
+                   "기흥테라타워점", "천안성정점" , "교대점", "서울대입구역점", "광명철산점", "부산서면점", # 참여매장
+                   "미사점", "양주옥정점", "수유점"
+
+]
+
+# 기본 실행 범위는 유지하고, 지정 매장만 전체기간 추가 재계산하는 임시 운영 목록.
+# 복구 완료 후 비운다.
+FULL_RECALC_STORES = [
 ]
 
 # 제외시 사용
@@ -203,7 +730,7 @@ DELIVERY_MANUAL_TEST_STORES = [
 ]
 
 # POS 원천이 없어 나머지 채널을 toorder로 보충하는 매장.
-TOORDER_MANUAL_STORES = ["해운대중동점"]
+TOORDER_MANUAL_STORES = ["해운대중1점"]
 
 DELIVERY_PLATFORM_FAMILIES = {
     "배민수동": {"배달의민족", "배민1", "배민 포장", "배민 사장"},
@@ -692,7 +1219,7 @@ def _save_unified_daily(
         merged["total_price"] = pd.to_numeric(merged["total_price"], errors="coerce").fillna(0).astype(int)
     if "discount_amount" in merged.columns:
         merged["discount_amount"] = pd.to_numeric(merged["discount_amount"], errors="coerce").fillna(0).astype(int)
-    merged.to_parquet(daily_path, index=False, engine="pyarrow")
+    save_unified_parquet(merged, daily_path)
     logger.info("저장(일별): %s | 전체 %d행 (신규 %d행)", daily_path, len(merged), new_count)
     return new_count
 
@@ -851,6 +1378,66 @@ def resave_existing_unified_sales() -> str:
     return result
 
 
+def normalize_existing_unified_platforms(
+    *,
+    apply: bool = False,
+    rebuild_summary: bool = True,
+) -> str:
+    """기존 unified_sales parquet의 platform 표기를 소급 정규화한다."""
+    files = iter_unified_sales_files()
+    if not files:
+        msg = f"unified_sales parquet 없음, 스킵 | {UNIFIED_ROOT}"
+        logger.warning(msg)
+        return msg
+
+    changed_files = 0
+    changed_rows = 0
+    skipped = 0
+
+    for path in files:
+        try:
+            df = pd.read_parquet(path)
+        except Exception as exc:
+            logger.warning("platform 정규화 parquet 로드 실패, 스킵: %s | %s", path, exc)
+            skipped += 1
+            continue
+
+        if df.empty or "platform" not in df.columns:
+            continue
+
+        platform = df["platform"].fillna("").astype(str).str.strip()
+        mask = platform.isin(PLATFORM_NORMALIZE_MAP)
+        count = int(mask.sum())
+        if count == 0:
+            continue
+
+        changed_files += 1
+        changed_rows += count
+        if not apply:
+            continue
+
+        df_out = normalize_unified_platforms(df).reindex(columns=UNIFIED_COLUMNS, fill_value="")
+        for col in ("qty", "unit_price", "total_price", "discount_amount", "order_cnt"):
+            if col in df_out.columns:
+                df_out[col] = pd.to_numeric(df_out[col], errors="coerce").fillna(0).astype(int)
+        save_unified_parquet(df_out, path)
+        logger.info("platform 정규화 저장: %s | 변경=%d", path.name, count)
+
+    summary_msg = "요약 재생성 스킵"
+    if apply and rebuild_summary and changed_rows:
+        from modules.transform.pipelines.db.DB_UnifiedSales_validate import build_daily_summary
+
+        summary_msg = build_daily_summary()
+
+    mode = "apply" if apply else "dry-run"
+    result = (
+        f"unified_sales platform 정규화 {mode} 완료 | 파일={changed_files} "
+        f"행={changed_rows} 스킵={skipped} | {summary_msg}"
+    )
+    logger.info(result)
+    return result
+
+
 def repartition_unified_sales_by_sale_date() -> str:
     """Repartition existing unified_sales parquet by `sale_date` (YYYY-MM-DD).
 
@@ -858,8 +1445,11 @@ def repartition_unified_sales_by_sale_date() -> str:
     values. If you later read all files via glob and group by sale_date, those rows get double-counted.
 
     This function loads every unified_sales_*.parquet, globally deduplicates by `_pk`, then overwrites
-    per-sale_date files so filename date matches the sale_date.
+    per-sale_date files so filename date matches the sale_date. 수동 복구 전용으로만 실행한다.
     """
+    logger.warning(
+        "repartition: unified_sales 전체 재기록 시작 — OneDrive 동기화 중이면 충돌본 발생 위험"
+    )
     files = iter_unified_sales_files()
     if not files:
         msg = f"unified_sales parquet 없음, 스킵 | {UNIFIED_ROOT}"
@@ -1032,7 +1622,7 @@ def enforce_manual_delivery_sources_for_test_stores(
         for col in ("qty", "unit_price", "total_price", "discount_amount", "order_cnt"):
             if col in df_out.columns:
                 df_out[col] = pd.to_numeric(df_out[col], errors="coerce").fillna(0).astype(int)
-        df_out.to_parquet(path, index=False, engine="pyarrow")
+        save_unified_parquet(df_out, path)
         changed_files += 1
         total_removed += removed
         logger.warning("테스트 매장 배달 수동 source 강제: %s | 제거=%d", path.name, removed)
@@ -1077,7 +1667,7 @@ def purge_manual_delivery_sources_for_non_test_stores(
         for col in ("qty", "unit_price", "total_price", "discount_amount", "order_cnt"):
             if col in df_out.columns:
                 df_out[col] = pd.to_numeric(df_out[col], errors="coerce").fillna(0).astype(int)
-        df_out.to_parquet(path, index=False, engine="pyarrow")
+        save_unified_parquet(df_out, path)
         changed_files += 1
         total_removed += removed
         logger.warning("비테스트 매장 수동 배달 source 정리: %s | 제거=%d", path.name, removed)
@@ -1130,7 +1720,7 @@ def refresh_store_meta_in_unified_sales() -> str:
             continue
 
         df = df.reindex(columns=UNIFIED_COLUMNS, fill_value="")
-        df.to_parquet(path, index=False, engine="pyarrow")
+        save_unified_parquet(df, path)
         changed_files += 1
         total_rows += len(df)
 
@@ -1170,7 +1760,7 @@ def purge_source_from_unified_sales(source: str = "toorder") -> str:
 
         try:
             df = df[~mask].reset_index(drop=True)
-            df.to_parquet(path, index=False, engine="pyarrow")
+            save_unified_parquet(df, path)
         except Exception as exc:
             logger.warning("unified_sales parquet 저장 실패, 스킵: %s | %s", path, exc)
             continue

@@ -18,6 +18,40 @@ logger = logging.getLogger(__name__)
 _ALERT_EMAILS = [MAIL_CMJ_PM]
 HEAL_QUEUE_PATH = Path(os.getenv("HEAL_QUEUE_PATH", "/opt/airflow/logs/heal_queue.jsonl"))
 _TELEGRAM_TRIGGER = "해결해라"
+_TELEGRAM_ALLOW_PREFIXES = (
+    "[DAG 실패]",
+    "[DAG 미실행]",
+    "[Airflow 실패]",
+    "[Auto-Heal]",
+    "[도리당] unified_sales 월별 검증 알림",
+    "[도리당] unified_sales 일별 검증 알림",
+)
+_TELEGRAM_SUPPRESS_PREFIXES = (
+    "[DAG 완료]",
+    "[DAG 성공]",
+    "[Airflow 스케줄 미생성 보정]",
+    "[배민 최종 결과] 완료",
+    "[배민 upload inbox 적체]",
+    "[배민 inbox 잔해 회수]",
+    "[도리당] Today UnifiedSales 완료",
+    "[도리당] unified_sales 일별 검증 보류:",
+    "[도리당] 배달 수동 결측→기준 대체(",
+)
+
+NOT_RUN_FAILURE_CLASS = "executor_state_mismatch"
+NOT_RUN_REASON = "시계 역행/스택 재시작으로 태스크가 실행되지 않음"
+
+# 태스크가 한 번도 실행되지 않은 채 스케줄러가 강제 실패시킨 경우.
+# 코드 문제가 아니므로 Codex 자동수정 대상에서 제외하고 재실행으로 복구한다.
+_NOT_RUN_PATTERNS = [
+    r"reported that the task instance",
+    r"state attribute is queued",
+    r"dependencies not met",
+    r"is in the future \(the current date is",
+    r"task is not able to be run",
+    r"stuck in queued",
+    r"in queued state for longer than",
+]
 
 _TRANSIENT_PATTERNS = [
     r"timeout",
@@ -108,7 +142,19 @@ def _get_telegram_creds() -> tuple[str, str]:
     return token or os.getenv("TELEGRAM_BOT_TOKEN", ""), chat_id or os.getenv("TELEGRAM_CHAT_ID", "")
 
 
+def _should_send_telegram(text: str) -> bool:
+    normalized = str(text or "").lstrip()
+    if normalized.startswith(_TELEGRAM_ALLOW_PREFIXES):
+        return True
+    if normalized.startswith(_TELEGRAM_SUPPRESS_PREFIXES):
+        return False
+    return True
+
+
 def send_telegram(text: str) -> bool:
+    if not _should_send_telegram(text):
+        logger.info("Telegram suppressed by policy: %s", str(text or "").splitlines()[:1])
+        return True
     token, chat_id = _get_telegram_creds()
     if not token or not chat_id:
         logger.warning("Telegram credentials missing; skip send")
@@ -168,6 +214,10 @@ def _send_email_alert(subject: str, body: str) -> None:
 def classify_failure(text: str) -> str:
     """Classify failures for alerting and auto-heal routing."""
     normalized = (text or "").lower()
+    # 순서 주의: 미실행 문구에는 timeout 계열 단어가 섞여 있어 반드시 먼저 검사한다.
+    for pattern in _NOT_RUN_PATTERNS:
+        if re.search(pattern, normalized, re.IGNORECASE):
+            return NOT_RUN_FAILURE_CLASS
     for pattern in _DATA_FILE_PATTERNS:
         if re.search(pattern, normalized, re.IGNORECASE):
             return "data_file_error"
@@ -233,6 +283,9 @@ def enqueue_heal_task(context) -> bool:
         "ts": datetime.utcnow().isoformat(),
         "claimed_by": None,
     }
+    if failure_class == NOT_RUN_FAILURE_CLASS:
+        entry["auto_edit_allowed"] = False
+        entry["rerun_requested"] = True
     return _append_heal_queue(entry)
 
 
@@ -249,9 +302,11 @@ def _handle_failure_callback(context, *, telegram_enabled: bool) -> None:
     exception = context.get("exception", "알 수 없음")
     failure_class = classify_failure(str(exception))
 
-    subject = f"[Airflow 실패] {ti.dag_id} / {ti.task_id}"
+    not_run = failure_class == NOT_RUN_FAILURE_CLASS
+
+    subject = f"[Airflow {'미실행' if not_run else '실패'}] {ti.dag_id} / {ti.task_id}"
     body = (
-        "[DAG 실패]\n"
+        f"{'[DAG 미실행]' if not_run else '[DAG 실패]'}\n"
         f"dag_id={ti.dag_id}\n"
         f"task_id={ti.task_id}\n"
         f"run_id={ti.run_id}\n"
@@ -261,10 +316,13 @@ def _handle_failure_callback(context, *, telegram_enabled: bool) -> None:
         f"failure_class={failure_class}\n"
         f"error={exception}"
     )
+    if not_run:
+        body = f"{body}\n사유={NOT_RUN_REASON}"
 
     _send_email_alert(subject, body)
     if telegram_enabled:
-        send_telegram(f"{body}\n{_TELEGRAM_TRIGGER}")
+        # 미실행은 코드 문제가 아니므로 Codex 자동수정 트리거를 붙이지 않는다.
+        send_telegram(body if not_run else f"{body}\n{_TELEGRAM_TRIGGER}")
     if not enqueue_heal_task(context):
         if telegram_enabled:
             send_telegram(f"[Auto-Heal] heal_queue_write_failed=true\ndag_id={ti.dag_id}\ntask_id={ti.task_id}")

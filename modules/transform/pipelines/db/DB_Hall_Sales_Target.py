@@ -104,12 +104,19 @@ def classify_hall_time_slots(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=["_slot_pos", "_slot_seq"], errors="ignore")
 
 
+_HALL_SALES_COLUMNS = ["sale_date", "store", "platform", "total_price", "order_cnt", "order_time", "order_id"]
+
+
 def _load_hall_df() -> pd.DataFrame:
     files = iter_unified_sales_files()
     if not files:
         raise FileNotFoundError(f"unified_sales parquet 없음: {UNIFIED_ROOT}")
 
-    df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+    # 전체 이력(수백 개 파일)을 다 읽으면 OOM(Cannot allocate memory) 위험이 커서
+    # 필요한 컬럼만 선택해 메모리 사용량을 줄인다.
+    df = pd.concat(
+        [pd.read_parquet(f, columns=_HALL_SALES_COLUMNS) for f in files], ignore_index=True
+    )
 
     df["sale_date"]   = pd.to_datetime(df["sale_date"],   errors="coerce")
     df["total_price"] = pd.to_numeric(df["total_price"],  errors="coerce").fillna(0).astype(int)

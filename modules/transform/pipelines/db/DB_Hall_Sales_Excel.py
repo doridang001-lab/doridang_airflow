@@ -183,6 +183,16 @@ def _mkt_weekly_targets(ym, week_start, mkt_monthly):
     return {k: round(v / dim * cnt) for k, v in t.items()}
 
 
+def _mkt_weekly_targets_span(week_start, mkt_monthly):
+    """주가 걸친 모든 달의 일할 target을 합산."""
+    yms = {(week_start + timedelta(days=i)).strftime("%Y-%m") for i in range(7)}
+    out: dict[str, int] = {}
+    for ym in yms:
+        for k, v in _mkt_weekly_targets(ym, week_start, mkt_monthly).items():
+            out[k] = out.get(k, 0) + v
+    return out
+
+
 # ── Ollama 진단 ────────────────────────────────────────────────
 
 def _ai_diagnose(sale_ctx: str, mkt_ctx: str):
@@ -273,10 +283,12 @@ def build_weekly_report_excel(monthly_targets: dict,
     mkt_df  = _load_mkt()
 
     # ── 최신 주 결정 ──────────────────────────────────────────
-    latest    = sale_df.sort_values("입력날짜").iloc[-1]
-    ym        = latest["기준월"]          # "2026-05"
-    wk_label  = latest["기준주"]          # "5월5주차"
-    entry_dt  = latest["입력날짜"]        # 입력날짜(Timestamp)
+    sale_df    = sale_df.sort_values(["입력날짜", "기준월"])
+    entry_dt   = sale_df["입력날짜"].max()
+    week_rows  = sale_df[sale_df["입력날짜"] == entry_dt]
+    latest     = week_rows.iloc[-1]
+    ym         = latest["기준월"]
+    wk_label   = latest["기준주"]
     week_start = (entry_dt - timedelta(days=7)).date()
     week_end   = (entry_dt - timedelta(days=1)).date()
 
@@ -285,7 +297,7 @@ def build_weekly_report_excel(monthly_targets: dict,
     # ── 월 누계 (매출) ────────────────────────────────────────
     mrows = sale_df[sale_df["기준월"] == ym]
     ms = lambda c: int(mrows[c].sum())
-    ws = lambda c: int(latest[c])
+    ws = lambda c: int(week_rows[c].sum())
 
     mt = monthly_targets.get(ym, {})
 
@@ -307,7 +319,7 @@ def build_weekly_report_excel(monthly_targets: dict,
     mm  = lambda c: int(mkt_month[c].sum()) if c in mkt_month.columns else 0
     mw  = lambda c: int(mkt_week[c].sum())  if c in mkt_week.columns and not mkt_week.empty else 0
     mmt = marketing_monthly_targets.get(ym, {})
-    mwt = _mkt_weekly_targets(ym, week_start, marketing_monthly_targets)
+    mwt = _mkt_weekly_targets_span(week_start, marketing_monthly_targets)
 
     # ── AI 진단 ───────────────────────────────────────────────
     def pct(a, t): return f"{a/t*100:.1f}%" if t else "N/A"
@@ -362,23 +374,29 @@ def build_weekly_report_excel(monthly_targets: dict,
     _header_row(ws_, 5, HEADERS)
     ws_.row_dimensions[5].height = 18
 
-    def _ms_aov(prefix_매출, prefix_cnt):
-        """월 누계 테이블단가 = 누계매출/누계영수건수"""
-        total = ms(prefix_매출)
-        cnt   = ms(prefix_cnt)
+    def _aov(rows, col_매출, col_cnt):
+        """테이블단가 = 매출합/영수건수합."""
+        total = int(rows[col_매출].sum())
+        cnt   = int(rows[col_cnt].sum())
         return int(total / cnt) if cnt else 0
+
+    def _ms_aov(col_매출, col_cnt):
+        return _aov(mrows, col_매출, col_cnt)
+
+    def _ws_aov(col_매출, col_cnt):
+        return _aov(week_rows, col_매출, col_cnt)
 
     sale_rows = [
         # (label, m_tgt, m_act, w_tgt, w_act, num_fmt, show_m, show_w)
         ("전체 매출",    mt.get("sale",0),          ms("매출"),          wt_sale,   ws("매출"),         _FMT_KRW, True,  True),
         ("영수건수",     mt.get("orders",0),          ms("영수건수"),     wt_cnt,    ws("영수건수"),     _FMT_NUM, True,  True),
-        ("테이블단가",   mt.get("aov",0),             _ms_aov("매출","영수건수"), mt.get("aov",0), ws("테이블_객단가"), _FMT_KRW, True,  True),
+        ("테이블단가",   mt.get("aov",0),             _ms_aov("매출","영수건수"), mt.get("aov",0), _ws_aov("매출","영수건수"), _FMT_KRW, True,  True),
         ("점심 매출",    mt.get("lunch_sale",0),      ms("점심_매출"),     wt_lunch,  ws("점심_매출"),    _FMT_KRW, True,  True),
         ("점심 영수건수",mt.get("lunch_orders",0),    ms("점심_영수건수"), wt_l_cnt,  ws("점심_영수건수"),_FMT_NUM, True,  True),
-        ("점심 테이블단가",mt.get("lunch_aov",0),     _ms_aov("점심_매출","점심_영수건수"), mt.get("lunch_aov",0), ws("점심_테이블_객단가"), _FMT_KRW, True,  True),
+        ("점심 테이블단가",mt.get("lunch_aov",0),     _ms_aov("점심_매출","점심_영수건수"), mt.get("lunch_aov",0), _ws_aov("점심_매출","점심_영수건수"), _FMT_KRW, True,  True),
         ("저녁 매출",    mt.get("dinner_sale",0),     ms("저녁_매출"),     wt_dinner, ws("저녁_매출"),    _FMT_KRW, True,  True),
         ("저녁 영수건수",mt.get("dinner_orders",0),   ms("저녁_영수건수"), wt_d_cnt,  ws("저녁_영수건수"),_FMT_NUM, True,  True),
-        ("저녁 테이블단가",mt.get("dinner_aov",0),    _ms_aov("저녁_매출","저녁_영수건수"), mt.get("dinner_aov",0), ws("저녁_테이블_객단가"), _FMT_KRW, True,  True),
+        ("저녁 테이블단가",mt.get("dinner_aov",0),    _ms_aov("저녁_매출","저녁_영수건수"), mt.get("dinner_aov",0), _ws_aov("저녁_매출","저녁_영수건수"), _FMT_KRW, True,  True),
     ]
     r = 6
     for lbl, m_t, m_a, w_t, w_a, fmt, sm, sw in sale_rows:

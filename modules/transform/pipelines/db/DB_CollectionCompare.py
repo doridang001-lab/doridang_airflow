@@ -20,6 +20,7 @@ from modules.transform.utility.paths import (
 from modules.transform.pipelines.db.DB_UnifiedSales_common import (
     DELIVERY_PLATFORM_FAMILIES,
     filter_manual_delivery_sources_for_test_stores,
+    iter_unified_sales_files,
 )
 from modules.transform.utility.store_normalize import normalize_for_join
 
@@ -97,9 +98,7 @@ def load_toorder() -> pd.DataFrame:
 
 def load_unified() -> pd.DataFrame:
     root = MART_DB / "unified_sales_grp"
-    files = sorted(
-        path for path in root.glob("unified_sales_*.parquet") if ".bak_" not in path.name
-    ) if root.exists() else []
+    files = iter_unified_sales_files()
     if not files:
         logger.warning("unified_sales parquet 없음: %s", root)
         return _empty_long()
@@ -169,9 +168,7 @@ def load_baemin_macro() -> pd.DataFrame:
         df["총결제금액"].astype(str).str.replace(",", "", regex=False).str.strip(),
         errors="coerce",
     ).fillna(0)
-    grouped = df.groupby("주문번호", as_index=False).agg(
-        주문시각=("주문시각", "max"),
-        store=("store", "max"),
+    grouped = df.groupby(["store", "주문번호", "주문시각"], as_index=False).agg(
         총결제금액=("총결제금액", "max"),
     )
     grouped["date"] = _baemin_order_date(grouped["주문시각"])
@@ -225,9 +222,7 @@ def load_coupang_macro() -> pd.DataFrame:
         df["매출액"].astype(str).str.replace(",", "", regex=False).str.strip(),
         errors="coerce",
     ).fillna(0)
-    grouped = df.groupby("order_id", as_index=False).agg(
-        order_date=("order_date", "max"),
-        store=("store", "max"),
+    grouped = df.groupby(["store", "order_id", "order_date"], as_index=False).agg(
         매출액=("매출액", "max"),
     )
     grouped["date"] = _coupang_order_date(grouped["order_date"])

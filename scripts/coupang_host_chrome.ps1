@@ -14,6 +14,13 @@ Docker Airflow에서는 Chrome DevTools Host 헤더 제한 때문에 Docker Desk
 doridang 계정(doridang001@gmail.com)이 로그인된 기본 Chrome 프로필(Default)만 사용합니다.
 #>
 
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+} catch {
+    Write-Warning "콘솔 UTF-8 설정을 건너뜁니다: $($_.Exception.Message)"
+}
+
 $chrome = "C:\Program Files\Google\Chrome\Application\chrome.exe"
 if (-not (Test-Path $chrome)) {
     $chrome = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
@@ -26,18 +33,66 @@ if (-not (Test-Path $chrome)) {
 $userDataDir = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data"
 $profileDirectory = "Default"
 $port = 9222
-$extDir = "C:\airflow\coupang_extension_build"
+$defaultExtensionId = "ocpdgnoaajajnlehamcalfcpholjhfbe"
+$fallbackExtDir = "C:\airflow\coupang_extension_build"
 $requiredExtFiles = @("manifest.json", "runner.html", "runner.js")
 
-if (-not (Test-Path $extDir)) {
-    Write-Error "확장 경로가 존재하지 않습니다: $extDir"
-    exit 1
+function Test-CoupangExtensionDir {
+    param([string]$Path)
+
+    if (-not $Path -or -not (Test-Path $Path)) {
+        return $false
+    }
+    foreach ($file in $requiredExtFiles) {
+        if (-not (Test-Path (Join-Path $Path $file))) {
+            return $false
+        }
+    }
+    return $true
 }
 
 if (-not (Test-Path (Join-Path $userDataDir $profileDirectory))) {
     Write-Error "doridang Chrome 프로필을 찾을 수 없습니다: $userDataDir\$profileDirectory"
     exit 1
 }
+
+function Resolve-CoupangExtensionDir {
+    $profileDir = Join-Path $userDataDir $profileDirectory
+    $preferenceFiles = @(
+        (Join-Path $profileDir "Secure Preferences"),
+        (Join-Path $profileDir "Preferences")
+    )
+
+    foreach ($prefPath in $preferenceFiles) {
+        if (-not (Test-Path $prefPath)) {
+            continue
+        }
+        try {
+            $prefs = Get-Content -Path $prefPath -Encoding utf8 -Raw | ConvertFrom-Json
+            $settings = $prefs.extensions.settings
+            if ($settings -and ($settings.PSObject.Properties.Name -contains $defaultExtensionId)) {
+                $path = $settings.$defaultExtensionId.path
+                if (Test-CoupangExtensionDir -Path $path) {
+                    Write-Host "등록된 쿠팡 확장 경로 사용: $path" -ForegroundColor Cyan
+                    return $path
+                }
+                Write-Warning "등록된 쿠팡 확장 경로가 유효하지 않습니다: $path"
+            }
+        } catch {
+            Write-Warning "Chrome 확장 설정 확인을 건너뜁니다: $prefPath | $($_.Exception.Message)"
+        }
+    }
+
+    if (Test-CoupangExtensionDir -Path $fallbackExtDir) {
+        Write-Host "저장소 쿠팡 확장 경로 사용: $fallbackExtDir" -ForegroundColor Cyan
+        return $fallbackExtDir
+    }
+
+    Write-Error "쿠팡 확장 경로를 찾을 수 없습니다: Chrome 등록 확장 또는 $fallbackExtDir"
+    exit 1
+}
+
+$extDir = Resolve-CoupangExtensionDir
 
 $localStatePath = Join-Path $userDataDir "Local State"
 if (Test-Path $localStatePath) {
@@ -50,13 +105,6 @@ if (Test-Path $localStatePath) {
         }
     } catch {
         Write-Warning "Chrome Local State 프로필 확인을 건너뜁니다: $($_.Exception.Message)"
-    }
-}
-foreach ($file in $requiredExtFiles) {
-    $path = Join-Path $extDir $file
-    if (-not (Test-Path $path)) {
-        Write-Error "확장 필수 파일이 없습니다: $path"
-        exit 1
     }
 }
 
@@ -84,12 +132,102 @@ function Wait-DevToolsEndpoint {
     exit 1
 }
 
+function Ensure-ChromeDownloadPref {
+    param(
+        [string]$UserDataDir,
+        [string]$ProfileDirectory,
+        [string]$TargetDir
+    )
+
+    $prefPath = Join-Path $UserDataDir "$ProfileDirectory\Preferences"
+    if (-not (Test-Path $prefPath)) {
+        throw "Preferences 파일 없음, 다운로드 경로를 확인할 수 없습니다: $prefPath"
+    }
+
+    try {
+        $prefs = Get-Content -Path $prefPath -Raw -Encoding utf8 | ConvertFrom-Json
+    } catch {
+        throw "Preferences 파싱 실패, 다운로드 경로를 확인할 수 없습니다: $($_.Exception.Message)"
+    }
+
+    $current = $null
+    if ($prefs.PSObject.Properties.Name -contains "download") {
+        $current = $prefs.download.default_directory
+    }
+    if ($current -eq $TargetDir) {
+        Write-Host "다운로드 경로 pref 정상: $current" -ForegroundColor Green
+        return
+    }
+
+    $running = @(Get-Process chrome -ErrorAction SilentlyContinue)
+    if ($running.Count -gt 0) {
+        throw "다운로드 경로가 '$current' 로 잘못되어 있으나 Chrome이 실행 중이라 교정할 수 없습니다. Chrome을 완전히 종료한 뒤 다시 실행하세요."
+    }
+
+    if ($prefs.PSObject.Properties.Name -notcontains "download") {
+        $prefs | Add-Member -NotePropertyName "download" -NotePropertyValue ([pscustomobject]@{}) -Force
+    }
+    $prefs.download | Add-Member -NotePropertyName "default_directory" -NotePropertyValue $TargetDir -Force
+    $prefs.download | Add-Member -NotePropertyName "prompt_for_download" -NotePropertyValue $false -Force
+
+    if ($prefs.PSObject.Properties.Name -notcontains "savefile") {
+        $prefs | Add-Member -NotePropertyName "savefile" -NotePropertyValue ([pscustomobject]@{}) -Force
+    }
+    $prefs.savefile | Add-Member -NotePropertyName "default_directory" -NotePropertyValue $TargetDir -Force
+
+    $prefs | ConvertTo-Json -Depth 100 -Compress | Out-File -FilePath $prefPath -Encoding utf8 -NoNewline
+    Write-Host "다운로드 경로 pref 교정: '$current' -> '$TargetDir'" -ForegroundColor Yellow
+}
+
+function Resolve-CoupangCollectDownloadDir {
+    if ($env:COLLECT_DB) {
+        $candidate = Join-Path -Path $env:COLLECT_DB -ChildPath "영업관리부_수집"
+        if (Test-Path -Path $candidate) {
+            return $candidate
+        }
+    }
+
+    $userProfile = [Environment]::GetFolderPath("UserProfile")
+    $onedriveCandidates = @(
+        (Join-Path -Path $userProfile -ChildPath "OneDrive - 주식회사 도리당"),
+        (Join-Path -Path $userProfile -ChildPath "OneDrive - 도리당")
+    )
+    foreach ($base in $onedriveCandidates) {
+        $candidate = Join-Path -Path $base -ChildPath "Collect_Data\영업관리부_수집"
+        if (Test-Path -Path $candidate) {
+            return $candidate
+        }
+    }
+
+    $localDownloadDir = "E:\down"
+    if (Test-Path -Path $localDownloadDir) {
+        Write-Warning "영업관리부_수집 폴더를 찾지 못해 임시 다운로드 폴더를 사용합니다: $localDownloadDir"
+        return $localDownloadDir
+    }
+
+    throw "쿠팡 다운로드 대상 폴더를 찾을 수 없습니다: Collect_Data\영업관리부_수집 또는 E:\down"
+}
+
+# 다운로드 경로: 쿠팡 원본 CSV의 정식 수집 폴더와 일치시킨다.
+$collectDownloadDir = Resolve-CoupangCollectDownloadDir
+New-Item -ItemType Directory -Path $collectDownloadDir -Force | Out-Null
+Write-Host "다운로드 경로: $collectDownloadDir" -ForegroundColor Cyan
+
+Ensure-ChromeDownloadPref -UserDataDir $userDataDir -ProfileDirectory $profileDirectory -TargetDir $collectDownloadDir
+
 # 이미 같은 포트로 떠 있으면 중복 실행 방지
 $inUse = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
 if ($inUse) {
     Write-Host "이미 디버그 포트 $port 로 크롬이 떠 있습니다. 새로 띄우지 않습니다." -ForegroundColor Yellow
+    Write-Warning "이미 떠 있는 Chrome에는 실행 플래그(--download-default-directory 포함)가 적용되지 않습니다."
     Wait-DevToolsEndpoint -Port $port -TimeoutSeconds 10
     exit 0
+}
+
+$runningChrome = @(Get-Process chrome -ErrorAction SilentlyContinue)
+if ($runningChrome.Count -gt 0) {
+    Write-Error "Chrome이 이미 실행 중이지만 디버그 포트 $port 가 열려 있지 않습니다. Chrome을 완전히 종료한 뒤 다시 실행하세요."
+    exit 1
 }
 
 $chromeArgs = @(
@@ -99,7 +237,8 @@ $chromeArgs = @(
     "--user-data-dir=$userDataDir",
     "--profile-directory=$profileDirectory",
     "--no-first-run",
-    "--no-default-browser-check"
+    "--no-default-browser-check",
+    "--download-default-directory=$collectDownloadDir"
 )
 $chromeArgs += "--load-extension=$extDir"
 Write-Host "확장 로드: $extDir" -ForegroundColor Cyan

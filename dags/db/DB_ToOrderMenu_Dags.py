@@ -57,6 +57,7 @@ OPTION_ANALYSIS_KIND = "option"
 MENU_GROUP_LABEL = "메뉴별"
 OPTION_GROUP_LABEL = "옵션별"
 SKIP_RETRY_REASONS = {"button_not_found", "dialog_timeout", "download_timeout"}
+TOORDER_SELENIUM_POOL = "toorder_selenium_serial"
 
 
 def _build_date_key(target_date: str) -> str:
@@ -675,6 +676,7 @@ with DAG(
     start_date=pendulum.datetime(2026, 1, 1, tz="Asia/Seoul"),
     catchup=False,
     max_active_runs=1,
+    max_active_tasks=1,
     tags=["01_crawling", "toorder", "detail_analysis", "daily"],
     default_args={
         "retries": 5,
@@ -684,8 +686,16 @@ with DAG(
 ) as dag:
     t1 = PythonOperator(task_id="get_target_dates", python_callable=get_target_dates)
     t2 = BranchPythonOperator(task_id="select_analysis_type", python_callable=choose_analysis_type)
-    t3 = PythonOperator(task_id="crawl_menu", python_callable=crawl_menu)
-    t4 = PythonOperator(task_id="crawl_option", python_callable=crawl_option)
+    t3 = PythonOperator(
+        task_id="crawl_menu",
+        python_callable=crawl_menu,
+        pool=TOORDER_SELENIUM_POOL,
+    )
+    t4 = PythonOperator(
+        task_id="crawl_option",
+        python_callable=crawl_option,
+        pool=TOORDER_SELENIUM_POOL,
+    )
     t5 = PythonOperator(task_id="save_menu_detail_parquet", python_callable=save_menu_detail_parquet)
     t6 = PythonOperator(
         task_id="retry_missing_menu",

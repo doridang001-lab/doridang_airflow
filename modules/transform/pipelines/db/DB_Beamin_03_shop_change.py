@@ -1,14 +1,14 @@
-"""배민 매장 변경이력 수집 파이프라인.
+"""배민 매장 운영시간 수집 및 기존 변경이력 히스토리 helper.
 
 수집 흐름:
-  로그인 → 매장별 변경이력 페이지 조회 → 테이블 추출 → 로그아웃
+  로그인 → 매장 목록 확인 → 운영시간 페이지 조회 → 로그아웃
 
 수집 URL:
-  https://self.baemin.com/history/change/shop
+  https://self.baemin.com/shops/{store_id}/manage/operation
 
 저장 경로 (덮어쓰기):
-  analytics/baemin_macro/shop_change/
-    brand={brand}/store={store}/ym={YYYY-MM}/shop_change.csv
+  analytics/baemin_macro/shop_operation/
+    brand={brand}/store={store}/ym={YYYY-MM}/shop_operation.csv
 """
 
 import logging
@@ -130,7 +130,7 @@ def collect_shop_change(account_list: list[dict]) -> str:
                     fail += 1
                     break
 
-                collect_shop_change_for_driver(driver, store_list)
+                collect_shop_operation_for_driver(driver, store_list)
 
                 logout_baemin(driver, account_id)
                 logger.info("로그아웃 완료: %s", account_id)
@@ -293,7 +293,7 @@ def collect_shop_change(account_list: list[dict]) -> str:
                     if not login_baemin(driver, account_id, account["password"]):
                         raise RuntimeError(f"login failed for {target_label}")
 
-                    collect_shop_change_for_driver(driver, [store_info])
+                    collect_shop_operation_for_driver(driver, [store_info])
 
                     try:
                         logout_baemin(driver, account_id)
@@ -348,7 +348,7 @@ def collect_shop_change(account_list: list[dict]) -> str:
     return summary
 
 
-def collect_shop_change_for_driver(driver, store_list: list[dict]) -> None:
+def _dead_collect_shop_operation_for_driver(driver, store_list: list[dict]) -> None:
     """이미 로그인된 driver로 매장 변경이력을 수집한다 (login/logout 없음).
 
     combined 파이프라인에서 같은 브라우저 세션을 공유할 때 사용.
@@ -1229,7 +1229,7 @@ def collect_shop_change(account_list: list[dict], stability_profile: str | None 
 
             for index, store_info in enumerate(store_list, start=1):
                 try:
-                    collect_shop_change_for_driver(driver, [store_info])
+                    collect_shop_operation_for_driver(driver, [store_info])
                 except Exception as exc:
                     if _is_driver_crash_error(exc):
                         metrics["session_recovery_count"] += 1
@@ -1241,7 +1241,7 @@ def collect_shop_change(account_list: list[dict], stability_profile: str | None 
                         if not login_baemin(driver, account_id, account["password"]):
                             metrics["login_failure_count"] += 1
                             raise RuntimeError(f"session recovery login failed: {account_id}") from exc
-                        collect_shop_change_for_driver(driver, [store_info])
+                        collect_shop_operation_for_driver(driver, [store_info])
                     else:
                         store_fail += 1
                         metrics["failed_stores"].append(
@@ -1290,7 +1290,7 @@ def collect_shop_change(account_list: list[dict], stability_profile: str | None 
     return {"summary": summary, "metrics": metrics}
 
 
-def collect_shop_change_for_driver(driver, store_list: list[dict]) -> None:
+def collect_shop_operation_for_driver(driver, store_list: list[dict]) -> None:
     try:
         driver.set_page_load_timeout(5)
         driver.get("about:blank")
@@ -1302,10 +1302,10 @@ def collect_shop_change_for_driver(driver, store_list: list[dict]) -> None:
     except Exception as exc:
         if is_driver_crash_error(exc):
             raise
-        logger.info("변경이력 페이지 진입 지연: %s", _short_error(exc))
+        logger.info("매장 목록 페이지 진입 지연: %s", _short_error(exc))
 
     if not wait_for_page(driver, SELECT_CSS, timeout=30):
-        raise RuntimeError("shop_change select load failed")
+        raise RuntimeError("shop operation store select load failed")
 
     page_options = _get_page_options(driver)
     matched_stores = sorted(
@@ -1313,35 +1313,13 @@ def collect_shop_change_for_driver(driver, store_list: list[dict]) -> None:
         key=_store_collection_sort_key,
     )
     if not matched_stores:
-        logger.info("변경이력 대상 없음: %s", [s.get("store_id") for s in store_list])
+        logger.info("운영시간 대상 없음: %s", [s.get("store_id") for s in store_list])
         return
 
-    for index, store_info in enumerate(matched_stores):
-        store_id = store_info["store_id"]
-        target_label = _format_store_target(store_info)
-        logger.info("변경이력 수집 시작: %s", target_label)
-        if index > 0 and not _ensure_shop_change_page(driver, target_label):
-            raise RuntimeError(f"select reload failed: {target_label}")
-
-        sel_elem = driver.find_element(By.CSS_SELECTOR, SELECT_CSS)
-        Select(sel_elem).select_by_value(store_id)
-        time.sleep(1.0)
-        btn = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, QUERY_BTN_CSS))
-        )
-        human_click(driver, btn)
-        result_state = _wait_for_change_results(driver, target_label)
-        if result_state != "ready":
-            raise RuntimeError(f"query state={result_state}: {target_label}")
-
-        time.sleep(0.5)
-        full_name = _get_full_name(page_options.get(store_id, store_info["store"]))
-        rows = _extract_change_rows(driver, store_info, full_name)
-        if rows:
-            saved = _save_csv(rows, store_info["brand"], store_info["store"])
-            logger.info("저장 완료: %s -> %s (%d건)", target_label, saved, len(rows))
-        else:
-            logger.info("정상 빈값 신호: %s", target_label)
+    logger.info(
+        "운영시간 수집 대상 매장: %s",
+        [_format_store_target(store_info) for store_info in matched_stores],
+    )
 
     logger.info("운영시간 수집 시작: %d개 매장", len(matched_stores))
     for store_info in matched_stores:

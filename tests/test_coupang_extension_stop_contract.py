@@ -14,11 +14,14 @@ def test_runner_tracks_every_managed_work_tab_and_keeps_stop_fallbacks():
     source = _read(RUNNER)
 
     assert "const STOP_GRACE_MS = 10000;" in source
-    assert "const RUNNER_STOP_KEY = 'ce_runner_stop_requested';" in source
+    assert "const RUNNER_STOP_KEY = 'ce_coupang_runner_stop_requested';" in source
     assert "async function requestCurrentWorkStop()" in source
-    assert "chrome.tabs.sendMessage(tabId, { type: 'STOP' })" in source
+    assert "chrome.tabs.sendMessage(tabId, { type: 'STOP', runnerName: 'coupang' })" in source
     assert "Date.now() + STOP_GRACE_MS" in source
     assert "await chrome.storage.local.set({ [RUNNER_STOP_KEY]: true })" in source
+    assert "function isCurrentWorkTabMessage(sender)" in source
+    assert "if (!isCurrentWorkTabMessage(sender)) return;" in source
+    assert "runnerName:'coupang'" in source
     assert "if (!stopRequested && c.done > 0" in source
 
     managed_creates = "chrome.tabs.create({url:'about:blank', active:true})"
@@ -31,12 +34,17 @@ def test_runner_tracks_every_managed_work_tab_and_keeps_stop_fallbacks():
 def test_content_stop_contract_blocks_collect_and_reload_resume():
     source = _read(CONTENT_MAIN)
 
+    assert "const COUPANG_RUNNER_STOP_KEY = 'ce_coupang_runner_stop_requested';" in source
+    assert "const NAVERADS_RUNNER_STOP_KEY = 'naverads_runner_stop_requested';" in source
+    assert "function stopKeyForMessage(msg = {})" in source
     assert "if (msg?.type === 'STOP')" in source
     assert "Sites['coupangeats']._stopFlag = true" in source
     assert "Sites['baemin']._stopFlag = true" in source
     assert "sendResponse({ success: true, stopped: true })" in source
     assert "const RUNNER_RELOAD_KEYS" in source
     assert "const runnerManaged = source === 'batch' || msg.runnerManaged === true" in source
-    assert "runnerManaged && await isRunnerStopRequested()" in source
+    assert "runnerManaged && await isRunnerStopRequested(stopKey)" in source
     assert source.count("runRunnerCollectorUnlessStopped") == 4
     assert "if (await isRunnerStopRequested()) return;" in source
+    assert "if (!naverAdsCollect && source === 'batch' && targetStores && targetStores.length > 0)" in source
+    assert "} else if (!naverAdsCollect) {" in source

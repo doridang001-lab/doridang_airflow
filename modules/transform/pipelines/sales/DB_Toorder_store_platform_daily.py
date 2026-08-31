@@ -30,6 +30,11 @@ _STORE_COL_START = 5
 _STORE_COL_STRIDE = 4
 _DATA_ROW_START = 6
 _OUTPUT_COLUMNS = ["date", "store", "platform", "price", "receipts_num"]
+QUALITY_REF_DAYS = 7
+QUALITY_MIN_REF_DAYS = 3
+QUALITY_MIN_STORE_RATIO = 0.70
+QUALITY_MIN_ROW_RATIO = 0.70
+QUALITY_MIN_TOTAL_RATIO = 0.50
 
 
 def _get_airflow_variable(key: str) -> str:
@@ -75,6 +80,7 @@ def run_toorder_store_platform_daily(
     toorder_pw: str | None = None,
     manual_dir: str | Path | None = None,
     log_prefix: str = "",
+    force_download: bool = False,
     **_: object,
 ) -> str:
     """Collect datedetail data and upsert it into Parquet.
@@ -106,7 +112,7 @@ def run_toorder_store_platform_daily(
     missing_spans: list[tuple[str, str]] = []
     for month_start, month_end in month_spans:
         month_token = month_start[:7]
-        xlsx_path = _find_pending_datedetail_file(resolved_manual, month_token)
+        xlsx_path = None if force_download else _find_pending_datedetail_file(resolved_manual, month_token)
         if xlsx_path is None:
             missing_spans.append((month_start, month_end))
         else:
@@ -174,6 +180,12 @@ def run_toorder_store_platform_daily(
 
     if all_dfs:
         new_df = pd.concat(all_dfs, ignore_index=True)
+        quality_reason = _new_rows_quality_reason(new_df, parquet_path)
+        if quality_reason:
+            raise RuntimeError(
+                "ToOrder datedetail 부분수집 의심: "
+                f"{quality_reason}, range={resolved_from}~{resolved_to}, parquet={parquet_path}"
+            )
         _upsert_parquet(new_df, parquet_path)
     else:
         logger.warning("%sNo ToOrder datedetail rows collected: %s~%s", log_prefix, resolved_from, resolved_to)
@@ -345,6 +357,99 @@ def _coerce_int(value: object) -> int:
         return int(float(str(value).replace(",", "")))
     except (TypeError, ValueError):
         return 0
+
+
+def _daily_quality(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["date", "rows", "stores", "total"])
+    out = df.copy()
+    out["date"] = out["date"].astype(str).str[:10]
+    out = out[out["date"].str.match(r"\d{4}-\d{2}-\d{2}", na=False)]
+    if out.empty:
+        return pd.DataFrame(columns=["date", "rows", "stores", "total"])
+    out["store"] = out["store"].fillna("").astype(str).str.strip()
+    out["price"] = pd.to_numeric(out["price"], errors="coerce").fillna(0)
+    quality = (
+        out.groupby("date", as_index=False)
+        .agg(rows=("date", "size"), stores=("store", "nunique"), total=("price", "sum"))
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+    quality["total"] = quality["total"].round().astype(int)
+    return quality
+
+
+def _quality_reason_from_frame(quality: pd.DataFrame, target_date: str) -> str:
+    if quality.empty:
+        return ""
+    current_rows = quality[quality["date"].eq(target_date)]
+    if current_rows.empty:
+        return "missing_date"
+    refs = quality[quality["date"].lt(target_date)].tail(QUALITY_REF_DAYS)
+    if len(refs) < QUALITY_MIN_REF_DAYS:
+        return ""
+    current = current_rows.iloc[-1]
+    failed = []
+    for col, min_ratio in (
+        ("stores", QUALITY_MIN_STORE_RATIO),
+        ("rows", QUALITY_MIN_ROW_RATIO),
+        ("total", QUALITY_MIN_TOTAL_RATIO),
+    ):
+        ref_value = float(refs[col].median())
+        if ref_value <= 0:
+            continue
+        value = float(current[col])
+        ratio = value / ref_value
+        if ratio < min_ratio:
+            failed.append(f"{target_date} {col} {value:.0f}/{ref_value:.0f} ({ratio:.0%})")
+    return ", ".join(failed)
+
+
+def _new_rows_quality_reason(new_df: pd.DataFrame, parquet_path: Path) -> str:
+    if new_df.empty or not parquet_path.exists():
+        return ""
+    try:
+        existing = pd.read_parquet(parquet_path, columns=_OUTPUT_COLUMNS)
+    except Exception as exc:
+        logger.warning("기존 ToOrder parquet 품질 기준 로드 실패: %s | %s", parquet_path, exc)
+        return ""
+    if existing.empty:
+        return ""
+
+    new_dates = sorted(new_df["date"].astype(str).str[:10].dropna().unique())
+    existing = existing[~existing["date"].astype(str).str[:10].isin(new_dates)].copy()
+    combined = pd.concat([existing, new_df], ignore_index=True)
+    quality = _daily_quality(combined)
+    reasons = [_quality_reason_from_frame(quality, date_str) for date_str in new_dates]
+    return "; ".join(reason for reason in reasons if reason)
+
+
+def toorder_partial_dates(
+    parquet_path: str | Path,
+    *,
+    date_from: str,
+    date_to: str,
+) -> dict[str, str]:
+    path = Path(parquet_path)
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_parquet(path, columns=_OUTPUT_COLUMNS)
+    except Exception as exc:
+        logger.warning("ToOrder parquet 품질 조회 실패: %s | %s", path, exc)
+        return {}
+    quality = _daily_quality(df)
+    if quality.empty:
+        return {}
+    dates = quality[
+        (quality["date"].astype(str) >= date_from)
+        & (quality["date"].astype(str) <= date_to)
+    ]["date"].astype(str)
+    return {
+        date_str: reason
+        for date_str in dates
+        if (reason := _quality_reason_from_frame(quality, date_str))
+    }
 
 
 def _rename_to_raw(xlsx_path: Path) -> None:

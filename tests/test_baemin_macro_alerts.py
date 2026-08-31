@@ -2,8 +2,6 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from modules.transform.pipelines.db import DB_Beamin_03_shop_change as shop_change
@@ -20,16 +18,16 @@ def test_collect_shop_change_sends_partial_failure_alert():
          patch.object(shop_change, "logout_baemin"), \
          patch.object(shop_change, "time") as mock_time, \
          patch.object(shop_change, "_load_shop_change_store_list", return_value=stores), \
-         patch.object(shop_change, "collect_shop_change_for_driver", side_effect=RuntimeError("parse exploded")), \
+         patch.object(shop_change, "collect_shop_operation_for_driver", side_effect=RuntimeError("parse exploded")), \
          patch.object(shop_change, "_send_email_alert") as mock_email, \
          patch.object(shop_change, "send_telegram") as mock_telegram:
         mock_time.sleep.return_value = None
-        with pytest.raises(RuntimeError, match="partial failure"):
-            shop_change.collect_shop_change([account])
+        result = shop_change.collect_shop_change([account])
 
-    mock_email.assert_called_once()
+    assert result["summary"] == "성공 1/1 계정 / store_fail=1"
     mock_telegram.assert_called_once()
-    alert_body = mock_email.call_args.args[1]
+    mock_email.assert_not_called()
+    alert_body = mock_telegram.call_args.args[0]
     assert "collection_failures=1" in alert_body
     assert "parse exploded" in alert_body
 

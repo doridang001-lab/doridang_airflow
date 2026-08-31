@@ -1,7 +1,8 @@
 """
-fin_product_map 송파삼전점 표준화 DAG
+fin_product_map 대상 매장 표준화 DAG
 
-매일 자동 실행하며 송파삼전점 대상 fin_product_map CSV/JSON을 갱신한다.
+매일 자동 실행하며 송파삼전점·역삼점 및 전 매장 메뉴미상 대체 상품의
+fin_product_map CSV/JSON을 갱신한다.
 사람은 fin_product_map_review_input.csv를 검수하고, 전체 map은 파이프라인이 병합한다.
 수동 테스트 실행은 DAG 실행 conf에 {"dry_run": true}를 명시한다.
 """
@@ -86,6 +87,7 @@ def run_llm(**context) -> dict:
     new_pending = int(result.get("new_pending") or 0)
     if not dry_run and new_pending > 0:
         pending_count = int(result.get("pending") or 0)
+        llm_unresolved = int(result.get("llm_unresolved") or 0)
         samples = result.get("new_item_samples") or []
         sample_text = "\n".join(f"- {item}" for item in samples[:5])
         if sample_text:
@@ -94,6 +96,7 @@ def run_llm(**context) -> dict:
             "[상품 매핑] 신규 상품 검수 필요\n"
             f"신규 검수 필요: {new_pending}건\n"
             f"미검수(검수유무=0): {pending_count}건\n"
+            f"LLM 분류 실패: {llm_unresolved}건\n"
             f"{sample_text}"
             "fin_product_map_review_input.csv에서 표준명과 분류를 확인해주세요."
         )
@@ -107,7 +110,7 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     default_args=default_args,
-    tags=["db", "product", "llm", "manual", "songpa"],
+    tags=["db", "product", "llm", "manual", "product_map"],
 ) as dag:
 
     t1 = PythonOperator(
