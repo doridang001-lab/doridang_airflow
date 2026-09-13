@@ -12,11 +12,11 @@ from modules.transform.utility.paths import FLOW_VISIT_LOG_PARQUET
 
 logger = logging.getLogger(__name__)
 
-SEGMENTER_VERSION = "seg_v2_storefit"
+SEGMENTER_VERSION = "seg_v3_topic_boundary"
 
-_TOPIC_RE = re.compile(r"주제\s*(\d{1,2})(.*?)(?=주제\s*\d{1,2}|\Z)", re.S)
+_TOPIC_RE = re.compile(r"주제\s*(\d{1,2}?)(?=1인|\D)(.*?)(?=주제\s*\d{1,2}|\Z)", re.S)
 _MESSAGE_RE = re.compile(r"(전달\s*내용|내용)")
-_OWNER_RE = re.compile(r"(가맹점\s*의견|점주\s*의견|점주님\s*의견)")
+_OWNER_RE = re.compile(r"(가맹점\s*의견|점주\s*의견|점주님\s*의견)(?!\s*을\s*(?:반영|수렴|확인))")
 _TAIL_RE = re.compile(r"(\[내용\s*기입\]|\[담당자\s*최종\s*의견\]|담당자\s*의견|ALL\b)", re.S)
 _HEADER_RE = re.compile(
     r"(?m)^\s*(담당자\s*의견|점주님\s*요청사항|점주\s*개별\s*의견|건의사항|특이사항|매장\s*현황|"

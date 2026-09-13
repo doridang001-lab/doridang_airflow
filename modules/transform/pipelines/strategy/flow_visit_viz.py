@@ -9,7 +9,10 @@ from typing import Any
 
 import pandas as pd
 
-from modules.transform.pipelines.strategy.SMP_flow_store_collect import _write_parquet_atomic
+from modules.transform.pipelines.strategy.SMP_flow_store_collect import (
+    _strip_trailing_parens,
+    _write_parquet_atomic,
+)
 from modules.transform.pipelines.strategy import flow_visit_prompts as prompts
 from modules.transform.utility.paths import FLOW_VISIT_VIZ_PARQUET
 
@@ -75,8 +78,7 @@ def _as_text(value: Any) -> str:
 
 def _store_key(store_name: Any) -> str:
     value = re.sub(r"\s+", "", _as_text(store_name))
-    value = re.sub(r"\([^)]*\)$", "", value)
-    return value
+    return _strip_trailing_parens(value)
 
 
 def _rel_key(*parts: Any) -> str | None:

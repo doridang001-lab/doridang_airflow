@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import threading
+import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from modules.transform.utility.paths import DORIDANG_BOT_LOG_MD
@@ -11,8 +13,14 @@ from modules.transform.utility.paths import DORIDANG_BOT_LOG_MD
 _LOG_LOCK = threading.Lock()
 
 
+def _write_log_path() -> Path:
+    default = Path(__file__).resolve().parents[3] / "logs" / "doridang_bot_conversations.md"
+    return Path(os.getenv("DORIDANG_BOT_LOG_PATH") or default)
+
+
 def append_turn(user: str, question: str, answer: str, evidence: list[dict[str, Any]]) -> None:
-    DORIDANG_BOT_LOG_MD.parent.mkdir(parents=True, exist_ok=True)
+    log_path = _write_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     evidence_text = ", ".join(_format_evidence(item) for item in evidence) or "없음"
     payload = (
@@ -22,7 +30,7 @@ def append_turn(user: str, question: str, answer: str, evidence: list[dict[str, 
         f"**근거:** {evidence_text}\n"
     )
     with _LOG_LOCK:
-        with DORIDANG_BOT_LOG_MD.open("a", encoding="utf-8", newline="\n") as fp:
+        with log_path.open("a", encoding="utf-8", newline="\n") as fp:
             fp.write(payload)
 
 
@@ -63,4 +71,3 @@ def _excerpt(text: str, keyword: str, *, radius: int = 120) -> str:
     start = max(0, index - radius)
     end = min(len(text), index + len(keyword) + radius)
     return text[start:end].replace("\n", " ").strip()
-

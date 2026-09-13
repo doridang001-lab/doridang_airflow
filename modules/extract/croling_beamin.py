@@ -88,6 +88,9 @@ STAT_LABELS = [
     "조리시간준수율",
     "주문접수율",
     "최근별점",
+    "영업시간운영률",
+    "주문취소율",
+    "준비시간정확도",
 ]
 
 
@@ -314,6 +317,25 @@ def _ensure_xvfb_display() -> str:
 
 
 def launch_browser(account_id: str):
+    from modules.transform.utility.process_lock import named_lock
+    lock = named_lock("baemin_session:" + str(account_id), timeout=120)
+    lock.acquire()
+    try:
+        driver = _launch_browser_unlocked(account_id)
+    except BaseException:
+        lock.release()
+        raise
+    original_quit = driver.quit
+    def close_session():
+        try:
+            return original_quit()
+        finally:
+            lock.release()
+    driver.quit = close_session
+    return driver
+
+
+def _launch_browser_unlocked(account_id: str):
     """브라우저 실행 (Xvfb 가상 디스플레이 사용, 비-헤드리스).
 
     배민 봇 탐지가 headless 모드를 감지해 metrics API를 차단하므로
@@ -569,13 +591,42 @@ def login_baemin(driver, account_id: str, password: str) -> bool:
 # ============================================================================
 
 # 비율로 저장할 항목 (익스텐션과 동일: ÷100 소수 저장)
-RATIO_LABELS = {"조리시간준수율", "주문접수율", "최근재주문율"}
+RATIO_LABELS = {"조리시간준수율", "주문접수율", "최근재주문율", "영업시간운영률", "주문취소율"}
 
 _COLLECT_METRICS_JS = r"""
 return (function() {
-    const LABELS = ['조리소요시간','주문접수시간','최근재주문율','조리시간준수율','주문접수율','최근별점'];
-    const RATIO  = new Set(['조리시간준수율','주문접수율','최근재주문율']);
+    const LABELS = ['조리소요시간','주문접수시간','최근재주문율','조리시간준수율','주문접수율','최근별점','영업시간운영률','주문취소율','준비시간정확도'];
+    const STATUS_LABELS = ['영업시간운영률','주문취소율','준비시간정확도','주문접수시간','최근재주문율','최근별점'];
+    const RATIO  = new Set(['조리시간준수율','주문접수율','최근재주문율','영업시간운영률','주문취소율']);
     const result = {};
+    const textOf = el => (el && (el.innerText || el.textContent) || '').replace(/\s+/g, ' ').trim();
+    const normalizeLabel = value => String(value || '').replace(/\s+/g, '').trim();
+    const applyMetric = (label, rawVal, rawRank = '', status = '', detail = '') => {
+        if (!LABELS.includes(label)) return;
+        const numMatch = String(rawVal || '').match(/[\d.]+/);
+        let numStr = numMatch ? numMatch[0] : '';
+        if (numStr && RATIO.has(label)) numStr = String(parseFloat(numStr) / 100);
+        const rankMatch = String(rawRank || '').match(/^(상위|하위)\s*([\d.]+)%$/);
+        result[label] = numStr;
+        result[label + '_순위구분'] = rankMatch ? rankMatch[1] : '';
+        result[label + '_순위비율'] = rankMatch ? String(parseFloat(rankMatch[2]) / 100) : '';
+        if (STATUS_LABELS.includes(label)) result[label + '_상태'] = status || 'null';
+        if (label === '주문취소율') result['주문취소율_상세'] = detail || 'null';
+    };
+
+    const newItems = document.querySelectorAll('.WooriShopNowCard-module__rcFf .ShopNowListItem-module__XJ1P');
+    for (const item of newItems) {
+        const title = item.querySelector('.ShopNowListItem-module__Thvi')?.cloneNode(true);
+        title?.querySelectorAll('.ShopNowListItem-module__miOL, .Tooltip_c_qx9u_5wgk4r8, [data-atelier-component="NotificationBadge"]').forEach(el => el.remove());
+        const label = normalizeLabel(textOf(title));
+        applyMetric(
+            label,
+            textOf(item.querySelector('.ShopNowListItem-module__kLp1')),
+            '',
+            textOf(item.querySelector('[data-atelier-component="Badge"]')),
+            textOf(item.querySelector('.ShopNowListItem-module__qElw'))
+        );
+    }
 
     // 실제 DOM 구조 기반:
     // .WooriShopNowItem-module__TKcC
@@ -590,20 +641,12 @@ return (function() {
         const spans = item.querySelectorAll('span');
         if (spans.length < 2) continue;
 
-        const label = spans[0].textContent.trim();
+        const label = normalizeLabel(spans[0].textContent);
         if (!LABELS.includes(label)) continue;
 
         const rawVal  = spans[1].textContent.trim();
         const rawRank = spans.length > 2 ? spans[2].textContent.trim() : '';
-
-        const numMatch = rawVal.match(/[\d.]+/);
-        let numStr = numMatch ? numMatch[0] : '';
-        if (numStr && RATIO.has(label)) numStr = String(parseFloat(numStr) / 100);
-
-        const rankMatch = rawRank.match(/^(상위|하위)\s*([\d.]+)%$/);
-        result[label]               = numStr;
-        result[label + '_순위구분'] = rankMatch ? rankMatch[1] : '';
-        result[label + '_순위비율'] = rankMatch ? String(parseFloat(rankMatch[2]) / 100) : '';
+        applyMetric(label, rawVal, rawRank);
     }
     return result;
 })();
@@ -1089,7 +1132,10 @@ def _snapshot_now_metrics_state(driver) -> dict:
     """NOW 지표 DOM의 현재 상태를 loaded/no_data/missing으로 분류한다."""
     return driver.execute_script(r"""
         const LABELS = ['조리소요시간','주문접수시간','최근재주문율',
-                        '조리시간준수율','주문접수율','최근별점'];
+                        '조리시간준수율','주문접수율','최근별점',
+                        '영업시간운영률','주문취소율','준비시간정확도'];
+        const textOf = el => (el && (el.innerText || el.textContent) || '').replace(/\s+/g, ' ').trim();
+        const normalizeLabel = value => String(value || '').replace(/\s+/g, '').trim();
         const bodyText = (document.body && document.body.innerText || '').replace(/\s+/g, ' ').trim();
         const emptyTextMarkers = [
             '데이터가 없습니다', '데이터 없음', '조회된 데이터가 없습니다',
@@ -1099,18 +1145,30 @@ def _snapshot_now_metrics_state(driver) -> dict:
             return {status: 'no_data', reason: 'empty_text', itemCount: 0, labels: [], values: []};
         }
 
-        const items = Array.from(document.querySelectorAll('.WooriShopNowItem-module__TKcC'));
-        const rows = items.map(item => {
-            const spans = Array.from(item.querySelectorAll('span')).map(span => span.textContent.trim());
-            return {label: spans[0] || '', value: spans[1] || ''};
-        }).filter(row => LABELS.includes(row.label));
-        const values = rows.map(row => row.value).filter(Boolean);
+        const newItems = Array.from(document.querySelectorAll('.WooriShopNowCard-module__rcFf .ShopNowListItem-module__XJ1P'));
+        const oldItems = Array.from(document.querySelectorAll('.WooriShopNowItem-module__TKcC'));
+        const rows = [
+            ...newItems.map(item => {
+                const title = item.querySelector('.ShopNowListItem-module__Thvi')?.cloneNode(true);
+                title?.querySelectorAll('.ShopNowListItem-module__miOL, .Tooltip_c_qx9u_5wgk4r8, [data-atelier-component="NotificationBadge"]').forEach(el => el.remove());
+                return {
+                    label: normalizeLabel(textOf(title)),
+                    value: textOf(item.querySelector('.ShopNowListItem-module__kLp1'))
+                };
+            }),
+            ...oldItems.map(item => {
+                const spans = Array.from(item.querySelectorAll('span')).map(span => textOf(span));
+                return {label: normalizeLabel(spans[0] || ''), value: spans[1] || ''};
+            })
+        ].filter(row => LABELS.includes(row.label));
+        const values = rows.map(row => row.value).filter(value => /[\d.]/.test(value));
+        const itemCount = newItems.length + oldItems.length;
 
         if (values.length > 0) {
             return {
                 status: 'loaded',
                 reason: 'metric_values',
-                itemCount: items.length,
+                itemCount: itemCount,
                 labels: rows.map(row => row.label),
                 values: values
             };
@@ -1119,12 +1177,12 @@ def _snapshot_now_metrics_state(driver) -> dict:
             return {
                 status: 'no_data',
                 reason: 'metric_labels_without_values',
-                itemCount: items.length,
+                itemCount: itemCount,
                 labels: rows.map(row => row.label),
                 values: []
             };
         }
-        return {status: 'missing', reason: 'metric_dom_missing', itemCount: items.length, labels: [], values: []};
+        return {status: 'missing', reason: 'metric_dom_missing', itemCount: itemCount, labels: [], values: []};
     """)
 
 
@@ -1347,20 +1405,101 @@ def _reap_zombie_children() -> int:
     return reaped
 
 
+def _descendant_pids(pid: int) -> list[int]:
+    """pid의 모든 자손 pid를 깊은 순서(손자 → 자식)로 반환한다. /proc 기반, 의존성 없음."""
+    children: dict[int, list[int]] = {}
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat", "r") as fh:
+                    stat = fh.read()
+                # comm에 공백/괄호가 올 수 있어 마지막 ')' 뒤에서 ppid를 읽는다.
+                ppid = int(stat[stat.rfind(")") + 2:].split()[1])
+            except Exception:
+                continue
+            children.setdefault(ppid, []).append(int(entry))
+    except Exception:
+        return []
+    out: list[int] = []
+    stack = [pid]
+    while stack:
+        cur = stack.pop()
+        for child in children.get(cur, []):
+            out.append(child)
+            stack.append(child)
+    return list(reversed(out))
+
+
 def _kill_pid_tree(pid) -> None:
-    """주어진 pid와 그 자식(렌더러 등)을 SIGKILL로 종료한다."""
+    """주어진 pid와 모든 자손(렌더러·GPU·crashpad 등)을 SIGKILL로 종료한다.
+
+    직계 자식만 죽이면(pkill -P) 손자인 렌더러들이 PID 1로 재부모돼 살아남는다.
+    2026-09-12 워커에서 고아 chrome 325개(12.6GiB)가 이렇게 쌓여 메모리가 고갈됐다.
+    """
     if not pid:
         return
     try:
-        subprocess.run(["pkill", "-9", "-P", str(pid)], capture_output=True, timeout=5)
-    except Exception:
-        pass
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return
+    for target in _descendant_pids(pid) + [pid]:
+        try:
+            os.kill(target, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        except Exception:
+            pass
+
+
+_ORPHAN_CHROME_COMMS = ("chrome", "chromedriver", "chrome_crashpad", "undetected_chromedriver", "Xvfb")
+
+
+def reap_orphan_chrome(min_age_sec: int = 120, account_id: str = "SYSTEM") -> int:
+    """부모를 잃고 PID 1에 재부모된 chrome 계열 프로세스 트리를 SIGKILL로 정리한다.
+
+    chromedriver가 죽으면 세션은 이미 못 쓰므로 PID 1 밑의 chrome 계열은 전부 고아다.
+    실행 중 세션의 chrome은 chromedriver 밑에 있어 대상이 아니다. 컨테이너(리눅스) 전용.
+    """
+    if not os.path.isdir("/proc"):
+        return 0
     try:
-        os.kill(int(pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, ValueError):
-        pass
+        clk = os.sysconf("SC_CLK_TCK")
+        with open("/proc/uptime") as fh:
+            uptime = float(fh.read().split()[0])
     except Exception:
-        pass
+        return 0
+    roots: list[int] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as fh:
+                stat = fh.read()
+            comm = stat[stat.find("(") + 1 : stat.rfind(")")]
+            rest = stat[stat.rfind(")") + 2 :].split()
+            ppid = int(rest[1])
+            start_ticks = int(rest[19])
+        except Exception:
+            continue
+        if ppid != 1 or not comm.startswith(_ORPHAN_CHROME_COMMS):
+            continue
+        if uptime - start_ticks / clk < min_age_sec:
+            continue
+        roots.append(int(entry))
+    killed = 0
+    for pid in roots:
+        for target in _descendant_pids(pid) + [pid]:
+            try:
+                os.kill(target, signal.SIGKILL)
+                killed += 1
+            except Exception:
+                pass
+    if killed:
+        log(f"고아 chrome 프로세스 {killed}개 정리 (루트 {len(roots)}개)", account_id)
+    _reap_zombie_children()
+    return killed
 
 
 def quit_driver_safely(driver, account_id: str = "SYSTEM") -> None:
@@ -1388,6 +1527,11 @@ def quit_driver_safely(driver, account_id: str = "SYSTEM") -> None:
     n = _reap_zombie_children()
     if n:
         log(f"좀비 프로세스 {n}개 회수", account_id)
+    # 세션 종료 때마다 다른 세션이 남긴 고아 chrome도 걷어낸다(안전망).
+    try:
+        reap_orphan_chrome(account_id=account_id)
+    except Exception:
+        pass
 
 
 # ============================================================================

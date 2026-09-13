@@ -58,7 +58,66 @@ _ORDER_LINE_KEY = [
     "결제금액",
 ]
 _KNOWN_BRANDS = ("나홀로", "도리당")
-_EMPTY_TOKENS = {"", "nan", "NaN", "None", "<NA>", "null", "NULL"}
+_EMPTY_TOKENS = {"", "nan", "none", "<na>", "null"}
+BAEMIN_NOW_SCHEMA_COLUMNS = [
+    "account_id",
+    "platform",
+    "collected_at",
+    "store_id",
+    "store_name",
+    "cardIndex",
+    "url",
+    "조리소요시간",
+    "조리소요시간_순위구분",
+    "조리소요시간_순위비율",
+    "주문접수시간",
+    "주문접수시간_순위구분",
+    "주문접수시간_순위비율",
+    "최근재주문율",
+    "조리시간준수율",
+    "조리시간준수율_순위구분",
+    "조리시간준수율_순위비율",
+    "주문접수율",
+    "주문접수율_순위구분",
+    "주문접수율_순위비율",
+    "최근별점",
+    "date",
+    "영업시간운영률",
+    "영업시간운영률_상태",
+    "주문취소율",
+    "주문취소율_상태",
+    "주문취소율_상세",
+    "준비시간정확도",
+    "준비시간정확도_상태",
+    "주문접수시간_상태",
+    "최근재주문율_상태",
+    "최근별점_상태",
+    "collection_note",
+    "brand",
+    "store",
+    "brand_store",
+]
+BAEMIN_NOW_NEW_COLUMNS = [
+    "영업시간운영률",
+    "영업시간운영률_상태",
+    "주문취소율",
+    "주문취소율_상태",
+    "주문취소율_상세",
+    "준비시간정확도",
+    "준비시간정확도_상태",
+    "주문접수시간_상태",
+    "최근재주문율_상태",
+    "최근별점_상태",
+]
+BAEMIN_NOW_STATUS_COLUMNS = [
+    "영업시간운영률_상태",
+    "주문취소율_상태",
+    "준비시간정확도_상태",
+    "주문접수시간_상태",
+    "최근재주문율_상태",
+    "최근별점_상태",
+]
+BAEMIN_NOW_ID_COLUMNS = ["brand", "store", "brand_store"]
 
 
 def _replace_manual_orders(
@@ -378,6 +437,86 @@ def _read_existing_csv(path: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def normalize_baemin_now_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep existing NOW values and guarantee new schema columns."""
+    out = df.fillna("").astype(str).copy()
+    out = out.drop(columns=["collection_status"], errors="ignore")
+    out = out.mask(out.apply(lambda col: col.str.strip().str.lower().isin(_EMPTY_TOKENS)))
+    out = out.fillna("")
+    for col in BAEMIN_NOW_SCHEMA_COLUMNS:
+        if col not in out.columns:
+            out[col] = ""
+    for col in BAEMIN_NOW_NEW_COLUMNS:
+        out.loc[out[col].fillna("").astype(str).str.strip().str.lower().isin(_EMPTY_TOKENS), col] = ""
+    out = _normalize_baemin_now_brand_store(out)
+
+    ordered = [
+        col
+        for col in BAEMIN_NOW_SCHEMA_COLUMNS
+        if col in out.columns and col not in BAEMIN_NOW_ID_COLUMNS
+    ]
+    extras = [col for col in out.columns if col not in ordered and col not in BAEMIN_NOW_ID_COLUMNS]
+    ids = [col for col in BAEMIN_NOW_ID_COLUMNS if col in out.columns]
+    return out[ordered + extras + ids]
+
+
+def _normalize_baemin_now_brand_store(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in ("brand", "store", "brand_store"):
+        if col not in out.columns:
+            out[col] = ""
+
+    if "store_name" in out.columns:
+        inferred = out["store_name"].map(_baemin_now_brand_store)
+        brand_blank = out["brand"].fillna("").astype(str).str.strip().eq("")
+        store_blank = out["store"].fillna("").astype(str).str.strip().eq("")
+        out.loc[brand_blank, "brand"] = inferred.loc[brand_blank].map(lambda item: item[0])
+        out.loc[store_blank, "store"] = inferred.loc[store_blank].map(lambda item: item[1])
+
+    brand = out["brand"].fillna("").astype(str).str.strip()
+    store = out["store"].fillna("").astype(str).str.strip()
+    combined = brand + "|" + store
+    out["brand_store"] = combined.where(brand.ne("") & store.ne(""), "")
+    return out
+
+
+def backfill_baemin_now_schema_only(dry_run: bool = True) -> dict:
+    """Add new NOW columns to stored baemin_now.csv files without changing rows."""
+    files = sorted(BAEMIN_METRICS_DB.glob("brand=*/store=*/ym=*/baemin_now.csv"))
+    scanned = len(files)
+    targets: list[str] = []
+    changed = 0
+    errors: list[str] = []
+
+    for path in files:
+        try:
+            df = pd.read_csv(path, dtype=str, encoding="utf-8-sig", keep_default_na=False)
+            normalized = normalize_baemin_now_schema(df)
+            missing = [col for col in BAEMIN_NOW_NEW_COLUMNS if col not in df.columns]
+            if not missing and list(normalized.columns) == list(df.columns):
+                continue
+            targets.append(str(path))
+            if dry_run:
+                continue
+            tmp = path.with_suffix(".csv.tmp")
+            normalized.to_csv(tmp, index=False, encoding="utf-8-sig")
+            tmp.replace(path)
+            changed += 1
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+            logger.warning("baemin_now schema backfill failed: %s / %s", path, exc)
+
+    result = {
+        "dry_run": dry_run,
+        "scanned": scanned,
+        "targets": len(targets),
+        "changed": changed,
+        "errors": errors,
+    }
+    logger.info("baemin_now schema backfill result: %s", result)
+    return result
+
+
 def _normalize_marketing_date(df: pd.DataFrame) -> pd.DataFrame:
     if "날짜" not in df.columns or df.empty:
         return df
@@ -429,7 +568,7 @@ def _save_metrics_groups(grouped_rows: dict[tuple[str, str, str], list[dict]]) -
             dates = set(new_df["date"].fillna("").astype(str))
             existing = existing[~existing["date"].fillna("").astype(str).isin(dates)]
         combined = pd.concat([existing, new_df], ignore_index=True) if not existing.empty else new_df
-        combined = combined.fillna("").astype(str)
+        combined = normalize_baemin_now_schema(combined)
         combined.to_csv(out_path, index=False, encoding="utf-8-sig")
         outputs.append(str(out_path))
         logger.info("manual baemin metrics saved: %s rows=%d", out_path, len(combined))

@@ -815,63 +815,49 @@ def _order_cross_daily_path(report_date: str) -> Path:
 
 
 def _recommended_menu_combo_lines(metrics: dict[str, Any]) -> list[str]:
-    path = _order_cross_daily_path(metrics["report_date"])
-    if not path.exists():
-        logger.warning("order_cross 추천 조합 파일 없음: %s", path)
-        return []
-
+    from modules.transform.pipelines.db.DB_OrderCrossAnalysis import load_validated_support
     try:
-        df = pd.read_parquet(path)
+        bundle = load_validated_support(metrics["report_date"], ORDER_CROSS_DIR)
     except Exception as exc:
-        logger.warning("order_cross 추천 조합 로드 실패: %s | %s", path, exc)
-        return []
-
-    required = {"store", "main_name", "pair_type", "pair_name", "co_order_cnt", "co_qty", "co_amount"}
-    missing = required - set(df.columns)
-    if missing:
-        logger.warning("order_cross 추천 조합 컬럼 누락: %s | %s", path, sorted(missing))
-        return []
-
-    target = df[
-        df["store"].fillna("").astype(str).str.strip().eq(STORE_DISPLAY_NAME)
-        & df["pair_type"].fillna("").astype(str).str.strip().isin(ORDER_CROSS_PAIR_TYPE_PRIORITY.keys())
-    ].copy()
+        logger.warning("교차분석 갱신 대기: %s | %s", metrics["report_date"], exc)
+        return ["교차분석 갱신 대기"]
+    df = bundle["standard_pairs"]
+    categories = [*ORDER_CROSS_PAIR_TYPE_PRIORITY, "리뷰"]
+    target = df[df.store.eq(STORE_DISPLAY_NAME) & df.pair_type.isin(categories)].copy()
     if target.empty:
         return []
-
-    for col in ("main_name", "pair_name", "pair_type"):
-        target[col] = target[col].fillna("").astype(str).str.strip()
-    target = target[target["main_name"].ne("") & target["pair_name"].ne("")]
-    target = target[target["main_name"].ne(target["pair_name"])]
     for excluded in ORDER_CROSS_EXCLUDED_COMBO_WORDS:
         target = target[
             ~target["main_name"].str.contains(excluded, regex=False)
             & ~target["pair_name"].str.contains(excluded, regex=False)
         ]
-    if target.empty:
-        return []
-
-    for col in ("co_order_cnt", "co_qty", "co_amount"):
-        target[col] = pd.to_numeric(target[col], errors="coerce").fillna(0)
-    target["_pair_type_rank"] = target["pair_type"].map(ORDER_CROSS_PAIR_TYPE_PRIORITY).fillna(99)
-    total_count = float(target["co_order_cnt"].sum())
-    if total_count <= 0:
-        return []
-
+    # 주문유형 간 합산 시, 상대 품목이 없는 유형의 메인 주문도 분모에 포함한다.
+    main_keys = ["sale_date", "brand", "store", "main_key"]
+    pair_keys = main_keys + ["main_name", "pair_type", "pair_key", "pair_name"]
+    target = target.groupby(pair_keys, as_index=False)[["co_order_cnt", "co_qty", "co_amount"]].sum()
+    mains = bundle["main_orders"]
+    denominators = mains[mains.level.eq("standard")].groupby(main_keys, as_index=False).main_order_cnt.sum()
+    target = target.merge(denominators, on=main_keys, validate="many_to_one")
+    target["selection_rate"] = target.co_order_cnt / target.main_order_cnt
     lines = []
-    for pair_type in ORDER_CROSS_PAIR_TYPE_PRIORITY:
+    for pair_type in categories:
         typed = target[target["pair_type"].eq(pair_type)]
         if typed.empty:
             continue
         top = typed.sort_values(
-            ["co_order_cnt", "co_qty", "co_amount"],
-            ascending=[False, False, False],
+            ["co_order_cnt", "selection_rate", "main_key", "pair_key"],
+            ascending=[False, False, True, True],
         ).iloc[0]
         count = int(top["co_order_cnt"])
-        pct = round(count / total_count * 100, 1)
+        total = int(top["main_order_cnt"])
+        pct = round(top["selection_rate"] * 100, 1)
+        label = "리뷰 혜택 선택" if pair_type == "리뷰" else f"메인+{pair_type}"
         lines.append(
-            f"메인+{pair_type}: {top['main_name']} + {top['pair_name']} ({count}건, 전체메뉴 조합 중 {pct:.1f}%)"
+            f"{label}: {top['main_name']} + {top['pair_name']} (메인 주문 {total}건 중 {count}건, {pct:.1f}%)"
         )
+    unresolved = sum(s.get("unresolved_main_orders", 0) for s in bundle["quality"]["stores"] if s["store"] == STORE_DISPLAY_NAME)
+    if unresolved:
+        lines.append(f"주문서에 유효한 기준 메뉴가 없는 {unresolved}건은 조합 분석에서 제외")
     return lines
 
 

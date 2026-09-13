@@ -40,12 +40,15 @@ SMP_SNS_SNAPSHOT_TIME       = "0 4 * * *"   # 매일 04:00 (SNS 팔로워/친구
 
 
 DB_COUPANG_MACRO_TIME = "30,50 * * * *"  # 매시 30분, 50분 실행 (KST)
+DB_UNIFIED_SALES_NIGHTLY_TIME = "0 22 * * *"  # 전체기간 계산 전용
 DB_UNIFIED_SALES_TIME        = "40 7 * * *"  # 매일 07:40 실행 (08:10 전 완료 목표)
 DB_UNIFIED_SALES_GUARD_TIME  = "15 8 * * *"  # 매일 08:15 실행 (07:40 미생성 감시/보정)
-DB_ORDER_CROSS_ANALYSIS_TIME = "0 9 * * *"  # 매일 09:00 실행 (전일 lookback/검증)
+DB_ORDER_CROSS_ANALYSIS_TIME = "10,40 8-23 * * *"  # 입력 변경 감지, 최근 3일 우선 + 과거 최대 10일
 DB_DAILY_CORPORATE_STORE_REPORT_TIME = "50 8 * * 1-5"  # 월~금 08:50 실행 (전일 직영점 보고 mart)
 DB_ITEM_MASTER_TIME          = "30 9 * * *" # 매일 09:30 실행 (UnifiedSales 빌드 후)
 DB_COLLECTION_COMPARE_TIME   = "20 8,12,15 * * *"  # 매일 08:20, 12:20, 15:20 실행
+DB_COLLECTION_FRESHNESS_TIME = "40 9 * * *"  # 매일 09:40 — 아침 수집(배민 07:20, 통합 07:40, 비교 08:20) 끝난 뒤 결손 점검
+DB_BAEMIN_NOW_GRP_TIME       = "0 12 * * *"  # 매일 07:25 실행 (배민 NOW 통합 mart)
 DB_DELIVERY_COMMISSION_TIME  = "10 8,12,14,16,19,21 * * *"  # 매일 08:10, 12:10, 14:10, 16:10, 19:10, 21:10 실행
 DB_FIN_PRODUCT_TIME          = "0 10 * * *"  # 매일 10:00 실행 (UnifiedSales 및 상품 map 완료 후)
 DB_FIN_PRODUCT_MAP_TIME      = "30 9 * * *"  # 매일 09:30 실행 (UnifiedSales 및 가드 이후)
@@ -57,6 +60,7 @@ DB_OKPOS_PRODUCT_TIME        = "40 6 * * *" # 매일 06:40 실행 (OKPOS 상품�
 DB_FOOD_GUIDE_ORDERS_TIME    = "0 5 * * *"  # 매일 05:00 실행 (Food Guide 주문 예정 목록 월별 parquet)
 DB_EASYPOS_SALES_TIME        = "45 4 * * *"  # 매일 04:45 실행
 DB_UNIONPOS_RECEIPT_TIME     = "20 6 * * *"  # 매일 06:20 실행
+DB_KAKAO_STORE_RAW_TIME      = "55 7 * * *"  # 매일 07:55 실행
 DB_OKPOS_SALES_TODAY_TIME            = "0 8,12,14,16,19,21 * * *"   # 당일 매출 목표 15분 전 통합용 원천 수집
 DB_EASYPOS_SALES_TODAY_TIME          = "5 8,12,14,16,19,21 * * *"   # 당일 매출 5분 스태거
 DB_UNIONPOS_RECEIPT_TODAY_TIME       = "10 8,12,14,16,19,21 * * *"  # 당일 매출 10분 스태거
@@ -86,6 +90,7 @@ SMD_BAEMIN_UPLOAD_PC2_TIME = "5,35 * * * *"  # 30분 간격 종일 하위 PC 도
 SMP_MORNING_BRIEFING_TIME = "50 6 * * 1,2,3,4,5"  # 매주 월~금 06:47 실행 (KST)
 
 SMD_STORE_SALES_TIME = "10 9 * * *"  # 매일 09:10 실행 (POS 수집 완료 후)
+SMD_STORE_MANAGER_MART_TIME = "35 2 * * *"  # 매일 02:35 실행 (직원 시트 수집 02:30 완료 5분 후)
 DB_HALL_SALES_TARGET_TIME = "0 11 * * 1,2,3,4,5"  # 매주 월~금 11:00 (DB_UnifiedSales grp 갱신 완료 후)
 
 DB_TOORDER_MENU_TIME = "0 7 * * *"  # 매일 07:00 실행 (메뉴별 판매량 분석)

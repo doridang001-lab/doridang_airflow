@@ -9,6 +9,12 @@
     {"id": "private", "patterns": ["dags/private/*.py"], "guidance": ["dags/CLAUDE.md"], "harness_docs": []}
   ],
   "overrides": [
+    {"dag": "dags/db/DB_OrderCrossAnalysis_Dags.py", "harness_docs": ["order_cross_analysis"]},
+    {"dag": "dags/db/DB_Beamin_Macro_Backfill_Dags.py", "harness_docs": ["baemin_macro"]},
+    {"dag": "dags/db/DB_Beamin_Macro_Backfill_Retry_Dags.py", "harness_docs": ["baemin_macro"]},
+    {"dag": "dags/db/DB_Beamin_Macro_Backfill_Upload_Dags.py", "harness_docs": ["baemin_macro"]},
+    {"dag": "dags/db/DB_Beamin_Macro_Backfill_Validate_Dags.py", "harness_docs": ["baemin_macro"]},
+    {"dag": "dags/db/DB_UnifiedSales_Nightly_Dags.py", "harness_docs": ["unified_sales_grp"]},
     {"dag": "dags/db/DB_Beamin_Macro_Dags.py", "harness_docs": ["baemin_macro"]},
     {"dag": "dags/db/DB_Beamin_Macro_Dags_Retry.py", "harness_docs": ["baemin_macro"]},
     {"dag": "dags/db/DB_Beamin_Macro_Upload_Pc2_Dags.py", "harness_docs": ["baemin_macro"]},

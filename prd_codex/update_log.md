@@ -1,5 +1,51 @@
 # update_log
 
+## 2026-09-08 자동복구 CMD 창 숨김 및 감시 프로그램 교체
+- 대상: `watch_heal_queue.py`, 자동복구 PowerShell/VBS 실행기, 숨김 실행 회귀 테스트.
+- 원인 및 변경: 자식 CMD/Git/Docker 실행의 창 숨김 누락을 수정하고 입력·로그를 유지. pythonw 생존 판정, 최근 상태 파일만으로 시작을 생략하던 VBS, 종료 코드 핸들 보존을 보완.
+- 검증: 테스트 41건 통과(CMD 실실행 3회 포함), PowerShell 구문/종료 코드 정상. 10:23 감시 PID 26744 및 잠금 일치, 대기 0/오류 없음, 표시 콘솔 창 0개, Airflow 웹/DB/scheduler 정상.
+- 전환 및 남은 위험: 기존 감시 프로그램은 잠금 해제 후 정상 종료, 새 예약 실행으로 교체. 점검 시 기존 CMD는 이미 종료되어 창 강제 종료/숨김 조작은 불필요했음. 향후 실제 복구 작업의 추가 하위 프로그램이 자체 창을 만드는지는 운영 관찰 필요. OneDrive 변경 없음.
+
+## 2026-09-08 Airflow 가상디스크 장애 복구 및 호스트 감시 보강
+- 대상: Docker Desktop, 호스트 watchdog, 시작 스크립트, 오늘 예정 DAG 복구 목록.
+- 변경: VM I/O 오류 후 엔진 종료 확인, 백엔드 재기동 및 미사용 블록 반환으로 C: 여유 약 4GB에서 56GB 확보. 5분 감시/연속 실패/재시작 제한/숨김 실행 stdin 및 timeout 처리 적용.
+- 검증: 웹/DB/scheduler 및 실제 worker ping 정상, import error 0건, 관련 테스트 22건 및 실제 예약 작업 성공. 고정 대상 53개는 09:42 기준 성공 34/진행 18/대기 1/실패 0. 정기/Today 상호 대기·UnionPOS 이동 중 날짜 입력 수정, 24시간 목록 추적 등록.
+- 남은 위험: DAG 일부 실행/재시도 중, 배민 과거 복구 대기 존재. 최초 저장장치 I/O 실패의 하위 원인은 미확정. 상세는 `prd_codex/airflow_outage_20260908.md` 참조.
+
+## 2026-09-04 쿠팡수동 중복 스냅샷 취소 반영 보정
+- 대상: `DB_UnifiedSales_coupang.py`, `test_unified_sales_coupang_amount.py`, OneDrive `unified_sales_260710.parquet`.
+- 원인: 같은 `order_id`가 정상/취소 스냅샷으로 함께 남을 때 행단위 dedupe만 적용되어 최신 취소 상태가 mart 합계에 반영되지 않았다.
+- 변경: `order_id`별 최신 `collected_at` 스냅샷만 남긴 뒤 기존 raw dedupe를 적용하도록 수정하고, 상태변경 회귀 테스트를 추가했다.
+- 검증 결과: 쿠팡 금액 테스트 12건 통과, `py_compile` 통과. `도리당/삼송점/2026-07-10` 재처리 후 문제 주문 `2X1AC1`은 `sale_type=취소`, 합계 `0원`, 해당 매장/일자 쿠팡수동 주문합 불일치 `0건` 확인.
+- 남은 위험: 이번 원인과 같은 혼합 스냅샷 주문은 원천 전체 점검 결과 `1건`만 확인됐다. 옵션 근거가 없는 잔여 몰림 주문은 별도 대응이 필요하다.
+
+## 2026-09-04 쿠팡수동 옵션 금액 배분 보정
+- 대상: `DB_UnifiedSales_coupang.py`, `test_unified_sales_coupang_amount.py`, `test_coupang_orders_validation.py`.
+- 변경: 쿠팡수동 주문 line 가격 기준을 posfeed 상세 우선, 관측 가격 카탈로그 fallback으로 보정하고 주문별 `total_price` 합계는 기존 매출액/fallback 총액과 일치하도록 유지했다.
+- 검증 결과: 쿠팡 금액 테스트 11건, 관련 unified 변환 테스트 3건, 수동 메뉴명 fallback 쿠팡 케이스, py_compile 통과. 행신점 2026-09-03 `22RHPT`는 `20,800+1,500=22,300`, 2026-09-03 전체 드라이런 777주문은 합계 불일치 0건 확인.
+- 남은 위험: 기존 `unified_sales_*` parquet 재처리는 OneDrive 수정 승인 후 별도 실행해야 하며, 근거 없는 주문은 자동 균등분배하지 않는다.
+
+## 2026-09-01 당근 광고 기간수집 선택완료/로딩 대기 보강
+- 대상: OneDrive 확장 `daangn_extension_build_1.0`의 `content/02_range.js`, `manifest.json`, `README.md`.
+- 원인: 기간수집에서 날짜가 화면에 보이더라도 같은 날짜 더블클릭 후 `calendarSubmit`의 `선택 완료`를 눌러야 실제 조회가 커밋되는 흐름이 단발 클릭 반복과 어긋났다.
+- 변경: 날짜 셀을 명시적 더블클릭으로 선택하고, `선택 완료` 버튼 fallback과 적용 후 0.3초 지연, 기간 칩/로딩/카드 1.2초 안정화 대기를 추가했다.
+- 검증 결과: `node --check` 대상 파일 5개 통과, UTF-8 읽기 확인 통과.
+- 남은 위험: 실제 당근 페이지에서 3일 기간수집으로 CSV 날짜와 지표가 서로 다른지 현장 확인 필요.
+
+## 2026-09-01 쿠팡이츠 CSV 마케팅_수집 오적재 회수 방어
+- 대상: `DB_CoupangMacro_load.py`, 쿠팡 자동수집 PowerShell 스크립트, `test_coupang_orders_validation.py`.
+- 원인: `coupangeats_*` 원천 CSV가 `Collect_Data/마케팅_수집`에 남으면 쿠팡 로더 스캔 대상(`E:\down`, `영업관리부_수집`) 밖이라 적재되지 않는다.
+- 변경: 로더 시작 시 `마케팅_수집/coupangeats_{orders,cmg,options}_*.csv`를 `영업관리부_수집`으로 회수하고, PowerShell 경로 결합을 한글 안전 방식으로 보강했다.
+- 검증 결과: 신규 오적재 회수 테스트 2건 통과, PowerShell 문법 확인 및 `coupang_boot_autostart.ps1 -CheckOnly` 경로 판정 성공.
+- 남은 위험: 현재 OneDrive에 남은 문제 CSV 1개는 별도 승인 후 이동하거나 다음 로더 실행에서 회수해야 한다.
+
+## 2026-09-01 네이버광고 플레이스 소재 요약행/공백 지표 파싱 보정 v46
+- 대상: OneDrive 개발용 확장 `doridang_collector_개발용/content/09_naverads.js`, `runner_naverads.js`.
+- 원인: 2026-08-07 수집에서 `✅ 플레이스#6_1km` 소재행의 `49 3 6.12 % 55원 165원` 지표가 공백 포함 CTR 때문에 `노출 6.12 / 클릭 55`로 밀려 `DEPTH3_GT_DEPTH2`가 재발했다.
+- 변경: content/runner 버전을 `creative-summary-v46`으로 올리고, 소재 요약행 차단을 유지하면서 공백 보존 지표 파서를 먼저 적용해 노출/클릭/CTR/평균CPC/총비용을 직접 분리하게 했다.
+- 검증 결과: 두 JS 파일 `node --check` 통과, Node 샘플에서 `49 3 6.12 % 55원 165원`, `2,400 28 1.17 % 550원 15,411원`, `0 0 0.00 % 0원 0원` 분리 확인.
+- 남은 위험: Chrome 확장 새로고침 후 2026-08-07을 재수집해 `✅ 플레이스#6_1km` 저장 통과와 전체 18/18 저장을 확인해야 한다.
+
 ## 2026-08-31 쿠팡이츠 원천 CSV 영업관리부 경로 전환
 - 대상: `scripts/coupang_host_chrome.ps1`, `scripts/coupang_boot_autostart.ps1`, `scripts/coupang_runner_autoclick.py`, OneDrive `Collect_Data`.
 - 변경: 쿠팡 자동수집 다운로드/감시 기준을 `Collect_Data/영업관리부_수집` 우선으로 바꾸고, 자동 클릭 기본 확장 경로를 현재 Chrome에 등록된 OneDrive 개발용 확장으로 맞췄다.
@@ -3399,3 +3445,596 @@
 - 변경: 당근은 사용자 제공 그룹별 전체 URL로 fallback을 갱신했고, 네이버는 원천 URL이 없을 때 `campaign_id` 기반 캠페인 상세 URL을 생성하도록 했다.
 - 검증: 당근 통합 CSV 875행 URL 공란 0건, 최종 `marketing_ads_daily.csv` 16,663행 URL 공란 0건(네이버 15,781/당근 882 모두 채움), `tests/test_marketing_ads_mart.py` 40개 및 `tests/test_daangn_ads_csv.py` 10개 통과.
 - 남은 위험: 네이버 중지 캠페인 4개는 원천 URL이 없어 생성 URL을 사용한다.
+
+## 2026-08-31 배민 NOW 지표 빈값 저장 방지
+- 대상: `modules/transform/pipelines/db/DB_Beamin_01_now.py`, `tests/test_baemin_now_no_data.py`, OneDrive `data/analytics/baemin_macro/metrics_now`.
+- 원인: NOW 로드 판정 후 실제 6개 지표가 모두 빈값이어도 `collection_status=ok`로 저장될 수 있었다.
+- 변경: loaded+전지표 빈값은 2회 재시도 후 실패로 올리고, 정상 no_data 지표/순위 공란은 `null`로 저장하도록 했다. 기존 산출물 23개 파일 502행의 지표 공란도 `null`로 보정했다.
+- 검증: `tests/test_baemin_now_no_data.py` 5개, `tests/test_baemin_macro_driver_recovery.py` 포함 13개 통과, 배민 Macro 3개 DAG import 통과.
+- 남은 위험: store/brand 파티션명이 비어 있는 과거 산출물 행은 원본 메타가 없어 지표 null 보정만 수행했다.
+
+## 2026-08-31 배민 NOW store_name 원본 백필
+- 대상: OneDrive `data/analytics/baemin_macro/metrics_now`.
+- 원인: 과거 NOW CSV 일부는 `store_name` 컬럼이 없거나 컬럼 값이 비어 있었고, 파티션 `brand/store` 메타만 존재했다.
+- 변경: `store_name` 누락/빈값 1,694행을 `brand + " " + store` 값으로 백필했다.
+- 검증: 원본 351개 CSV 재스캔 결과 `store_name` 누락/빈값 0행, 바탕화면 점검 CSV도 0행으로 갱신했다.
+- 남은 위험: 없음.
+
+## 2026-09-01 쿠팡 자동수집 runner 중복 탭 방지
+- 대상: `scripts/coupang_runner_autoclick.py`, `scripts/coupang_boot_autostart.ps1`, `scripts/coupang_host_chrome.ps1`.
+- 원인: query가 붙은 `runner.html?auto=1...` 탭을 기존 runner로 인식하지 못해 자동 클릭 실패 후 fallback이 새 runner 창을 열었고, 중복 로그인 시도로 쿠팡 권한 거절이 반복될 수 있었다.
+- 변경: runner URL 판정을 path 기준으로 바꾸고, fallback 전 기존 runner 탭을 재사용하게 했으며, host Chrome의 OneDrive/수집 폴더명은 인코딩과 무관하게 조립하도록 했다.
+- 검증: `py_compile` 통과, `tests/test_coupang_runner_autoclick.py` 4개 통과, boot/host PowerShell parse 통과, UTF-8 읽기 확인.
+- 남은 위험: OneDrive 개발용 확장 반영과 실제 Chrome 확장 새로고침은 별도 승인 후 운영 세션에서 확인해야 한다.
+
+## 2026-09-01 쿠팡 로그인 권한 문구 재클릭 정책 반영
+- 대상: `coupang_extension_build/runner.js`, OneDrive 개발용 확장 `runner.js`, `tests/test_coupang_extension_stop_contract.py`.
+- 원인: 쿠팡 로그인 화면의 권한 오류 문구가 계정 권한 확정 실패가 아니라 같은 페이지 ID/PW 재입력 후 로그인 클릭으로 통과되는 케이스가 관측됐다.
+- 변경: 권한 오류 문구 또는 비자격증명 로그인 에러는 F5 없이 같은 페이지에서 `AUTO_LOGIN`을 1회 더 호출하고, 재클릭 후에도 동일하면 기존처럼 다음 계정으로 넘기게 했다.
+- 검증: repo/OneDrive `runner.js` `node --check` 통과, UTF-8 읽기 확인, `tests/test_coupang_extension_stop_contract.py` 3개 통과.
+- 남은 위험: Chrome 확장 새로고침 후 실제 실패 계정 1개에서 재클릭 로그와 orders 도달 여부를 실측해야 한다.
+
+## 2026-09-01 DB_MenuHierarchy_Test 한우대창 중량별 수익키 분리
+- 대상: `modules/transform/pipelines/db/DB_MenuHierarchy_Test.py`, `tests/test_menu_hierarchy_no_model_classification.py`.
+- 원인: 수익률 품목명 생성에서 `한우 대창 75g`과 `한우 대창 150g`의 중량 표기가 제거되어 둘 다 `한우대창` 수익키로 합쳐졌다.
+- 변경: 수익률용 재료 품목명에서 한우대창 75g/150g만 중량을 보존해 `한우대창75g`, `한우대창150g`으로 분리하고, 일반 재료 중량 정규화는 유지했다.
+- 검증: `python -X utf8 -m pytest tests/test_menu_hierarchy_no_model_classification.py -q --basetemp=.tmp/pytest-menu-hierarchy` 205개 통과, `tests/test_menu_hierarchy_dag_defaults.py` 3개 통과. 승인 후 OneDrive `new_classification_orders` 재생성 완료, 합쳐진 `|한우대창` 수익키 0건 확인.
+- 남은 위험: 신규 75g/150g 수익키의 수기 원가/판매가 입력은 담당자 재입력이 필요하다.
+
+## 2026-09-01 ToOrder store/platform 원천 누락 복구
+- 대상: `DB_Toorder_store_platform_daily_Dags`, `DB_CollectionCompare_Dags`, OneDrive `data/analytics/toorder_daily_store_platform/toorder_store_platform_daily.parquet`, OneDrive `data/mart/collection_compare/collection_compare.parquet`.
+- 원인: `2026-08-29` 이후 스케줄 실행에서 ToOrder 일별상세 엑셀 다운로드가 생성되지 않아 원천 parquet max date가 `2026-08-28`에 머물렀고, 비교 마트가 `2026-08-29~2026-08-31`을 ToOrder 누락으로 표시했다.
+- 변경: `2026-08-29~2026-08-31` 범위로 ToOrder datedetail 수동 재수집 후 collection_compare 마트를 재생성했다.
+- 검증: ToOrder 원천 max date `2026-08-31`, 최근 3일 일별 행수/매장수/총액 정상 범위, collection_compare checked_at `2026-09-01 11:15:50` 갱신 확인.
+- 남은 위험: `중동점/쿠팡이츠` 3행은 ToOrder·통합 모두 0이고 쿠팡매크로만 존재해 별도 원천 차이로 남았다.
+
+## 2026-09-01 ToOrder 누락 재발 방지 가드
+- 대상: `modules/extract/crawling_toorder_sales_report.py`, `modules/transform/pipelines/db/DB_CollectionCompare.py`, `dags/db/DB_CollectionCompare_Dags.py`, `tests/test_collection_compare_freshness.py`.
+- 원인: ToOrder 원천이 stale이어도 collection_compare가 성공 상태로 갱신되어 최신일 전체 누락이 대시보드에 반영될 수 있었다.
+- 변경: ToOrder datedetail 다운로드 재시도를 3회로 늘리고 실패 디버그를 `TEMP_DIR/toorder_datedetail_debug`에 저장하도록 보정했으며, collection_compare 생성 전 ToOrder 원천 max date가 어제 이상인지 검증하는 fail-fast 가드와 DAG 실패 알림을 추가했다.
+- 검증: `pytest tests/test_collection_compare_freshness.py tests/test_toorder_store_platform_daily.py tests/test_toorder_store_platform_daily_dag.py` 17개 통과, `py_compile` 통과, 컨테이너 DAG 목록 인식 확인, 현재 freshness `2026-08-31` 통과.
+- 남은 위험: ToOrder 사이트 자체가 엑셀 다운로드를 생성하지 않는 장애는 계속 실패로 알림 처리되며, 자동 복구 실행은 별도 운영 DAG/센서 설계가 필요하다.
+
+## 2026-09-01 당근 광고 CSV 중복 진단 가드
+- 대상: `modules/transform/pipelines/sales/BSP_DaangnAds_CSV.py`, `tests/test_daangn_ads_csv.py`, OneDrive `data/analytics/Daangn_ads/daangn_ads.csv`.
+- 원인: 2026-08월 같은 광고명이 두 광고그룹에 다른 `campaign_id`로 존재해 중복처럼 보였으나, 실제 dedup 키(`시작일+종료일+campaign_id`) 기준 중복은 없었다.
+- 변경: 결과 JSON에 실제 키 중복 수와 같은 광고명/다른 그룹 진단값을 추가하고, 같은 광고명이라도 다른 소재 ID는 유지하는 회귀 테스트를 추가했다.
+- 검증: 당근 CSV 정규화 재작성 후 928행, dedup 키 중복 0건, 같은 광고명/다른 그룹 310행·155묶음 확인. `tests/test_daangn_ads_csv.py` 11개 통과.
+- 남은 위험: Windows 로컬 Airflow import는 `airflow.cfg` 인코딩 문제, 컨테이너 직접 `python` import는 `pendulum` 미설치 환경 문제로 별도 환경 정리가 필요하다.
+
+## 2026-09-01 unified_sales 2026-08 월별 오차 매장 재매칭
+- 대상: 2026-08 `unified_sales_grp`, ToOrder store/platform, 배민/쿠팡 수동 교정, 월별 검증 CSV.
+- 원인: ToOrder `2026-08-18` datedetail export가 150/215행 부분수집으로 반복 차단됐고, 일부 테스트 매장은 배민/쿠팡 수동 원천 부족 또는 POSFEED 배달 원천 잔존이 월 오차를 만들었다.
+- 변경: 16개 오차 매장에 대해 `2026-08-01~2026-08-31` unified_sales 원천 재매칭, 배민수동/쿠팡수동 월 교정, 수동 배달 source 최종 정리, 월별 검증 재생성 수행.
+- 검증: 배민 교정 제거 47,880행/추가 36,913행, 쿠팡 교정 제거 31,917행/추가 23,015행, `unified_sales_monthly_2026-08.csv` 알림 대상 16곳에서 12곳으로 감소.
+- 남은 위험: ToOrder 사이트/API 모두 `2026-08-18` 완전분 제공에 실패해 해당 일자는 검증 제외로 남았고, 남은 12곳은 먹깨비/땡겨요/홀 기준 및 일부 배민·쿠팡 부족 원천 확인이 필요하다.
+
+## 2026-09-01 Sales_Employee 전화번호 누락 수정
+- 대상: `dags/sales/Sales_Employee_Extract_Dags.py`.
+- 원인: 영업관리 시트의 전화번호 계열 컬럼이 표준 컬럼으로 매핑되지 않고 `BASE_FIELDS`에도 없어 `sales_employee.csv` 저장 및 토더 누락 알림에서 핸드폰번호가 비었다.
+- 변경: `전화번호/핸드폰번호/휴대폰번호/연락처`를 `전화번호`로 표준화하고, 중복 헤더는 행별 첫 유효값으로 병합한 뒤 저장 컬럼에 포함했다.
+- 검증: `py_compile` 통과, `tests/test_employee_toder_alert.py` 7개 통과, 중복 전화번호 컬럼 병합 재현 검증 통과, UTF-8 읽기 확인.
+- 남은 위험: 로컬 Windows Airflow import는 `airflow.cfg` UTF-8 디코딩 오류로 실패해 컨테이너 DAG import 검증은 별도 환경에서 필요하다.
+
+## 2026-09-01 Sales_Employee 전화번호 mobile 헤더 및 설치시간 보정
+- 대상: `dags/sales/Sales_Employee_Extract_Dags.py`, `modules/transform/pipelines/sales/employee_toder_alert.py`, `tests/test_employee_toder_alert.py`.
+- 원인: 구글시트 실제 헤더가 `전화번호(mobile)`로 정규화되어 기존 `전화번호` 정확 매핑에 걸리지 않았고, 설치 가능시간은 시트값이 없으면 공란으로 출력됐다.
+- 변경: `전화번호(...)` 형태의 헤더를 `전화번호`로 표준화하고, 토더 누락 알림의 `프로그램 설치 가능시간`을 항상 `asap`으로 고정했다.
+- 검증: `py_compile` 통과, `tests/test_employee_toder_alert.py` 8개 통과, `전화번호\n(mobile)`/`연락처` 중복 병합 재현 검증 통과, UTF-8 읽기 확인.
+- 남은 위험: OneDrive `sales_employee.csv`와 알림 본문 반영은 승인 후 DAG 재실행이 필요하다.
+
+## 2026-09-01 배민 매크로 orders-only 기본 전환
+- 대상: `DB_Beamin_Macro_Dags`, `DB_Beamin_Macro_Dags_Retry`, 배민 retry/upload validation 파이프라인.
+- 원인: 정기 배민 매크로에서 NOW·우가클·광고 funnel 수집을 멈추고 주문내역만 수집해야 했다.
+- 변경: 메인 DAG 기본값을 `orders_only=True`로 전환하고, 수동 `orders_only=false` override와 retry/upload handoff 전파, ad_funnel 검증 스킵을 추가했다.
+- 검증: 관련 `py_compile` 통과, `test_baemin_batch_split.py`, `test_beamin_retry_conf.py`, `test_baemin_pc2_upload_trigger.py` 55개 통과, 컨테이너 DAG 목록 인식 확인.
+- 남은 위험: `test_baemin_macro_validation.py` 1건은 기존 금액차이 재수집 제외 기대값 불일치로 실패해 별도 확인 필요.
+
+## 2026-09-02 Sales_Employee 임대료 컬럼 추가
+- 대상: `dags/sales/Sales_Employee_Extract_Dags.py`.
+- 원인: 영업관리 시트에는 `임대료` 헤더와 송파삼전점 값이 있으나 `sales_employee.csv` 출력 컬럼에서 누락됐다.
+- 변경: `임대료`를 시트 매핑에 추가하고 플랫폼별 계정 행의 `계정PW` 뒤에 저장되도록 반영했다.
+- 검증: `py_compile` 통과, Google Sheet dry-run에서 송파삼전점 5개 플랫폼 행 `5533000` 반영 확인, `tests/test_account.py`와 `tests/test_employee_toder_alert.py` 15개 통과, UTF-8 읽기 확인.
+- 남은 위험: OneDrive `sales_employee.csv` 실제 갱신은 승인 후 DAG 재실행이 필요하며, Windows 로컬 DAG import는 기존 `airflow.cfg` UTF-8 디코딩 오류로 확인하지 못했다.
+
+## 2026-09-02 배민 NOW 신규 스키마 적재 보정
+- 대상: `DB_BaeminManual_load.py`, `DB_Beamin_01_now.py`, `modules/extract/croling_beamin.py`, OneDrive `data/analytics/baemin_macro/metrics_now`.
+- 원인: 배민 NOW 화면 변경으로 수집 CSV에 신규 지표/상태 컬럼이 추가됐지만 적재 CSV 431개에는 스키마가 전파되지 않았다.
+- 변경: NOW 표준 스키마 보정 함수와 schema-only backfill을 추가하고, 자동 Selenium NOW 파서도 새 DOM/상태 컬럼을 읽도록 보강했다.
+- 검증: pending 수동 metrics 2개 재적재 및 보관, `metrics_now` 431개 신규 컬럼 누락 0건, 관련 모듈 `py_compile` 및 컨테이너 DAG import 통과.
+- 남은 위험: 작업 시점에 `DB_Beamin_Macro_Dags_Retry`의 `retry_collect_1/2`가 running 중이라, 해당 오래된 프로세스가 이후旧 스키마로 파일을 덮으면 backfill 재실행이 필요하다.
+
+## 2026-09-02 배민 NOW upload inbox 적재 경로 보완
+- 대상: `DB_Beamin_pc2_distribute.py`, `tests/test_beamin_upload_inbox_distribute.py`.
+- 원인: 메인 배민 수집의 staging/export 이후 `DB_Beamin_Macro_Upload_Dags`가 `metrics_now` CSV를 그대로 적재해 NOW 스키마 보정과 월별 date upsert 안전망이 빠져 있었다.
+- 변경: upload/PC2 inbox 적재에서 `metrics_now` subtype은 `date` 기준으로 기존 월 파일과 병합하고 신규 NOW 상태 컬럼을 `null`로 보정하도록 추가했다.
+- 검증: `py_compile`, `test_beamin_upload_inbox_distribute.py`, `test_baemin_now_no_data.py`, `test_baemin_manual_load.py`, 영향권 DAG 10개 컨테이너 import 통과.
+- 남은 위험: OneDrive 데이터 파일 재보정은 별도 승인 없이 추가 실행하지 않았다.
+
+## 2026-09-02 배민 NOW 대표 상태값 한글/빈칸 전환
+- 대상: `DB_BaeminManual_load.py`, `DB_Beamin_01_now.py`, NOW 관련 테스트.
+- 원인: `collection_status`와 신규 NOW 컬럼 결측값에 `ok`, `no_data`, 문자열 `null`이 저장되면 사용자 조회 기준과 맞지 않았다.
+- 변경: 저장되는 대표 상태는 `좋아요`/`개선해요`만 쓰고, no_data 및 결측 지표·상태값은 빈칸으로 저장하도록 정규화했다.
+- 검증: 관련 모듈 `py_compile`, 배민 NOW/manual/upload/PC2 테스트 89개 통과.
+- 남은 위험: 기존 OneDrive CSV에 이미 저장된 문자열 `null`/`ok`/`no_data` 실데이터 치환은 별도 승인 후 실행해야 한다.
+
+## 2026-09-02 배민 NOW brand_store 식별키 추가
+- 대상: `DB_BaeminManual_load.py`, `DB_Beamin_01_now.py`, NOW 관련 테스트.
+- 원인: NOW CSV에서 브랜드·매장을 한 컬럼으로 바로 필터링할 수 있는 끝 컬럼이 필요했다.
+- 변경: `brand`, `store`, `brand_store`를 마지막 3개 컬럼으로 고정하고 `brand_store`는 `브랜드|매장` 형식으로 자동 생성했다.
+- 검증: 유니코드 샘플에서 `나홀로|송파삼전점` 생성 확인, 관련 모듈 `py_compile`, 배민 NOW/manual/upload/PC2 테스트 89개 통과.
+- 남은 위험: 기존 OneDrive CSV 컬럼 추가/재정렬은 별도 승인 후 backfill 실행이 필요하다.
+## 2026-09-02 배민 NOW 통합 mart DAG 추가
+- 대상: `DB_Baemin_now_grp_dags`, `DB_Baemin_now_grp`, `paths`, `schedule`
+- 변경: `analytics/baemin_macro/metrics_now` 월별 CSV를 매일 스캔해 `data/mart/Baemin_now_grp/baemin_now_grp.parquet`로 통합 저장하는 mart를 추가했다.
+- 보정: 신규 NOW 스키마 정규화, 한글 상태값/빈칸 규칙, `brand|store` 식별키를 mart에도 동일 적용한다.
+- 검증: `test_baemin_now_grp.py`, 기존 NOW/manual 테스트, `py_compile`, 컨테이너 DAG import 통과.
+
+## 2026-09-02 배민 NOW 수동 metrics 실데이터 반영
+- 대상: OneDrive `Collect_Data/영업관리부_수집`, `analytics/baemin_macro/metrics_now`, `mart/Baemin_now_grp`.
+- 변경: 나홀로 경북상주점 `20260902` 수동 NOW 파일 1개를 적재하고 원본을 `_archived`로 이동한 뒤 통합 parquet mart를 재생성했다.
+- 보정: 월별 NOW CSV에도 `collection_status`를 포함하도록 스키마를 보강하고 기존 431개 CSV를 빈칸/한글 상태 규칙으로 재정규화했다.
+- 검증: 해당 행 `나홀로|경북상주점`, `2026-09-02T08:05:28.788Z`, `collection_status=개선해요` 반영 및 문자열 `null` 0건 확인.
+
+## 2026-09-02 배민 NOW collection_status 제거
+- 대상: `DB_BaeminManual_load.py`, `DB_Beamin_01_now.py`, NOW mart.
+- 변경: `collection_status` 파생 기본 컬럼을 NOW 월별 CSV와 통합 mart 출력 스키마에서 제거했다.
+- 기준: 화면에서 수집되는 상태는 지표별 `_상태` 컬럼에만 보존하고, 대표 상태 파생 컬럼은 만들지 않는다.
+- 검증: 관련 테스트 69개 통과, 월별 NOW CSV 431개와 통합 mart에서 `collection_status` 컬럼 0건 확인.
+
+## 2026-09-02 배민 Retry 최종 알림 누적 결과 보정
+- 대상: `DB_Beamin_Macro_upload.py`, `DB_Beamin_retry.py`, `DB_Beamin_Macro_validate.py`, 배민 최종 알림/Retry conf/brand coverage 테스트.
+- 원인: Retry가 해결한 ToOrder `missing_partition` 매장이 최초 알림 snapshot에 남아 최종 `[재수집 필요]`에 stale 항목으로 표시됐다.
+- 변경: retry attempt별 최신 ToOrder snapshot을 notification context에 누적 병합하고, 정상 rows가 있으면 stale `suspect_zero` marker를 무시하도록 수정했다.
+- 검증: `test_baemin_final_notification.py`, `test_beamin_retry_conf.py`, brand coverage marker 테스트 45개 통과 및 관련 DAG import 통과.
+- 남은 위험: 김해구산점·미사점의 잔존 금액 차이는 수집 fallback/ToOrder 기준 차이 여부를 운영 로그로 추가 확인해야 한다.
+
+## 2026-09-03 Marketing Ads Flow 당근 원천 누락시 비교 마트 실패 방지
+- 대상: `BSP_MarketingAds_Mart.py`, `test_marketing_ads_mart.py`.
+- 원인: 당근 광고 원천 CSV가 없는 상태에서 Flow 당근 하위업무 3건을 필수 매칭 대상으로 검증해 마트 태스크가 실패했다.
+- 변경: 캠페인 테이블에 원천 행이 전혀 없는 채널의 Flow 하위업무는 비교 대상에서 제외하고 경고만 남기도록 보정했다.
+- 검증: 마케팅 광고 마트 테스트 41개 통과, 컨테이너 DAG import 통과, 실패 함수 재실행 성공.
+- 남은 위험: 당근 광고 실적 자체는 원천 CSV 복구 전까지 비교 마트에 반영되지 않는다.
+
+## 2026-09-03 Marketing Ads Flow ID 미매칭 스킵
+- 대상: `BSP_MarketingAds_Mart.py`, `test_marketing_ads_mart.py`.
+- 원인: Flow 광고 하위업무 제목의 ID가 캠페인 매핑 CSV에 없으면 해당 row는 제외되지만 누적 오류로 DAG 태스크 전체가 실패했다.
+- 변경: Flow 하위업무의 ID 미매칭/필수 날짜 누락은 warning 로그 후 건너뛰고, 유효한 업무만 비교 마트에 반영하도록 보정했다.
+- 검증: 관련 마케팅 광고 마트 테스트 3개 통과, 컨테이너 DAG import 통과, 수정 파일 UTF-8 읽기 확인.
+- 남은 위험: 스킵된 Flow 업무는 캠페인 ID 매핑이 보강되기 전까지 비교/일별 태그 산출물에 반영되지 않는다.
+
+## 2026-09-03 쿠팡 확장 자동시작 Chrome 인자 차단 보정
+- 대상: `coupang_host_chrome.ps1`, `coupang_boot_autostart.ps1`, `coupang_runner_autoclick.py`.
+- 원인: 공백 포함 Chrome 실행 인자가 잘려 별도 `User` 프로필과 이상 URL 탭이 열리고, runner가 `ERR_BLOCKED_BY_CLIENT` 차단 페이지로 재사용됐다.
+- 변경: Chrome 인자 quoting을 명시하고 차단 runner 탭을 정상 runner로 보지 않도록 자동 클릭/자동시작 guard를 추가했다.
+- 검증: `py_compile`, runner autoclick 테스트, PowerShell `CheckOnly` 검증으로 확인했다.
+- 남은 위험: 이미 떠 있는 잘못된 Chrome 프로세스와 `User` 프로필 폴더 정리는 별도 수동/승인 절차가 필요하다.
+
+## 2026-09-03 Saleslab Power BI Chrome 자동실행 중지
+- 대상: Windows 작업 스케줄러 `SaleslabPowerBIChromeDaily`.
+- 원인: 평일 09:30에 Power BI 리포트 3개를 여는 Chrome 자동실행이 더 이상 필요하지 않다.
+- 변경: 작업은 삭제하지 않고 `Disabled`로 전환해 필요 시 재활성화 가능하게 보존했다.
+- 검증: `Get-ScheduledTask`와 `schtasks /Query /V` 모두 상태 `Disabled`, 다음 실행 `N/A` 확인.
+- 남은 위험: 현재 이미 열린 Power BI Chrome 창은 별도 종료하지 않았다.
+
+## 2026-09-03 당근 기간수집 chip 판정 보정
+- 대상: OneDrive `daangn_extension_build_1.0/content/01_daangn.js`, `README.md`.
+- 원인: 기간 루프는 하루 chip을 확인했지만 수집 본문이 stackflow 중복 DOM 첫 chip 또는 URL 폴백으로 전체 기간을 판정해 하루 수집을 차단했다.
+- 변경: 수집 본문 기간 판정을 보이는 날짜 chip/DOM 마지막 chip 기준으로 통일하고 URL `startAt/endAt` 폴백을 제거했다.
+- 검증: `node --check content/01_daangn.js`, `node --check content/02_range.js` 통과 및 수정 파일 UTF-8 읽기 확인.
+- 남은 위험: 크롬 확장 재로드 후 실제 광고그룹에서 3일 범위 수동 E2E가 필요하다.
+
+## 2026-09-03 당근 기간수집 스크롤 바닥 확인 보강
+- 대상: OneDrive `daangn_extension_build_1.0/content/01_daangn.js`, `README.md`.
+- 원인: 전체 광고 expected 건수에 도달하면 실제 스크롤 여지가 남아 있어도 조기 저장될 수 있었다.
+- 변경: 저장 성공 조건을 expected 도달, 스크롤 바닥 도달, 바닥에서 같은 누적 스냅샷 2회 확인으로 강화하고 페이지 스크롤 fallback/log를 추가했다.
+- 검증: `node --check content/01_daangn.js`, `node --check content/02_range.js` 통과 및 수정 파일 UTF-8 읽기 확인.
+- 남은 위험: 크롬 확장 재로드 후 실제 광고그룹에서 3일 범위 수동 E2E가 필요하다.
+
+## 2026-09-03 당근 기간수집 어제/custom 강제 갱신 추가
+- 대상: OneDrive `daangn_extension_build_1.0/content/02_range.js`, `README.md`.
+- 원인: 날짜 지정 직후 수집하면 이전 Relay/가상목록 스냅샷이 하루 CSV에 섞일 수 있었다.
+- 변경: 목표 날짜 확인 후 전체 스크롤, `어제 성과` 전환 대기, `직접 선택` 날짜 복귀 대기를 거친 뒤 수집하도록 강제 갱신 순서를 추가했다.
+- 검증: `node --check content/02_range.js`, `node --check content/01_daangn.js` 통과 및 수정 파일 UTF-8 읽기 확인.
+- 남은 위험: 크롬 확장 재로드 후 오염 날짜 재수집 및 합계 재검증이 필요하다.
+
+## 2026-09-03 Baemin NOW 매장별 전체 매출 추가
+- 대상: `DB_Baemin_now_grp.py`, `test_baemin_now_grp.py`.
+- 원인: Baemin NOW mart에 UnifiedSales 기준 매장별 전체 매출 컬럼이 없어 지표와 매출을 함께 볼 수 없었다.
+- 변경: NOW `date + store`에 UnifiedSales `sale_date + store`별 `sum(total_price)`를 `sales_total`로 left join하고 미매칭은 0으로 채우도록 추가했다.
+- 검증: `pytest tests/test_baemin_now_grp.py`, DAG import, 수정 파일 UTF-8 읽기 확인. 승인 후 OneDrive mart 재생성 결과 2,279행, `sales_total` 비영 1,954행/0원 325행, 합계 1,829,285,762원 확인.
+- 남은 위험: 0원 325행은 해당 `date + store` UnifiedSales 미매칭 또는 실제 0원 여부를 필요 시 별도 점검해야 한다.
+
+## 2026-09-03 도리당봇 리더 대화형 응답 개선
+- 대상: `modules/transform/doridang_bot/server.py`, `router.py`, `prompts.py`, `tests/test_doridang_bot_routing.py`.
+- 변경: 기본 현황 답변을 리더 브리핑형으로 압축하고, 상세/원인 질문에서만 직전 결과의 본문·댓글·하위업무 근거를 펼치도록 보강했다.
+- 검증: `py_compile`, `pytest tests/test_doridang_bot_routing.py` 86건, `scripts/eval_doridang_bot.py --mode rule` 38/38 통과.
+- 남은 위험: 실제 웹 서버는 실행 중인 프로세스 재시작 후 새 코드가 반영되며, `/api/chat` 실사용 검증은 OneDrive `log.md` append가 발생하므로 별도 승인 후 수행해야 한다.
+
+## 2026-09-03 도리당봇 추천 질문 MECE 토글화
+- 대상: `static/chat.js`, `static/chat.css`.
+- 변경: 추천 질문을 팀 전체/리스크/개인 담당 3축으로 나누고 카드 버튼을 토글 UI로 전환했다.
+- 검증: `node --check static/chat.js`, `pytest tests/test_doridang_bot_routing.py` 86건, UTF-8 읽기 확인.
+- 남은 위험: `/api/chat` 클릭 실사용 검증은 OneDrive `log.md` append가 발생하므로 별도 승인 후 수행해야 한다.
+## 2026-09-03 ddangyo_fee 월별 수수료율 수동 산출
+- 대상: `DB_DdangyoFee.py`, Ddangyo fee mart 경로 상수, OneDrive `data/mart/Ddangyo/Ddangyo_fee`.
+- 변경: 수동 다운로드 땡겨요 정산 `.xls`를 월별 `ym/store/fee_ratio` CSV로 집계하고, 신규 매장용 월별 기준치 `ym/fee_ratio` CSV도 함께 생성하는 수동 파이프라인을 추가했다. DAG는 운영 스케줄 대상이 아니어서 제거했다.
+- 검증 결과: py_compile 통과, `tests/test_ddangyo_fee.py` 7건 통과, 실제 322개 파일 빌드로 매장별 612행/51매장/12개월 및 기준치 12행 CSV 생성.
+- 남은 위험: 매장명 미확정 원천 35개는 QA CSV로 분리된다.
+
+## 2026-09-04 배민 orders 확장 collector 준비 실패 빠른 실패 처리
+- 대상: `DB_Beamin_04_orders.py`, `tests/test_baemin_orders_date_filter_abort.py`.
+- 원인: Airflow `execute_script` 주입 시 확장 content의 `Utils`, `Sites`가 전역으로 노출되지 않으면 orders 확장 collector 준비가 실패하고 느린 Selenium fallback으로 내려가 재시도 시간이 과도하게 늘어났다.
+- 변경: 확장 번들 마지막에 `window.Utils/window.Sites` bridge를 추가하고, 준비 실패·확장 timeout은 Selenium fallback을 생략해 빠르게 실패하도록 분리했으며 준비 상태 진단 로그를 남기도록 했다.
+- 검증 결과: `py_compile`, `test_baemin_orders_date_filter_abort.py` 12건, `test_baemin_macro_driver_recovery.py` 8건, DAG import, OneDrive 기준 JS `node --check` 3건 통과. 전체 지정 묶음 중 기존 `test_baemin_macro_validation.py` 1건은 별도 검증 로직 기대값 충돌로 실패.
+- 남은 위험: 실제 운영 계정에서 확장 collector가 정상 수집되는지 다음 DAG 실행 로그로 확인해야 하며, macro validation 실패 1건은 별도 작업으로 정리해야 한다.
+
+## 2026-09-04 배민 우가클 기간수집 URL 검증 강화
+- 대상: OneDrive 개발용 확장 `runner_baemin_now.js`, `content/02_baemin.js`.
+- 원인: 우가클 기간수집에서 매장 경로만 맞으면 월 쿼리 불일치나 stale 페이지의 빈값 안내도 정상 데이터 없음으로 처리될 수 있었다.
+- 변경: 우가클 렌더 대기와 content 수집 직전에 목표 store_id와 `initialMonth`를 함께 검증하도록 보강했다.
+- 검증 결과: `node --check runner_baemin_now.js`, `node --check content/02_baemin.js` 통과.
+- 남은 위험: 크롬 확장 재로드 후 도리당 강원영월점 `2026-05~2026-08` 기간수집 E2E로 실제 빈값 여부를 확인해야 한다.
+
+## 2026-09-04 배민 orders Retry 실패매장 수동 재실행
+- 대상: `DB_Beamin_04_orders.py`, `tests/test_baemin_orders_date_filter_abort.py`, `DB_Beamin_Macro_Dags_Retry`.
+- 원인: 확장 collector timeout 또는 검증 불일치 후 느린 Selenium 주문상세 fallback으로 내려가 `즉시할인 상세시트 닫기 실패` 경고가 반복되고 전체 Retry 종료가 지연됐다.
+- 변경: `HTTPConnectionPool/Read timed out`도 확장 collector 사용 불가로 분류하고, 검증 불일치 Selenium fallback은 `BAEMIN_EXTENSION_VALIDATION_SELENIUM_FALLBACK=1`일 때만 허용하도록 기본 비활성화했다.
+- 검증 결과: 기존 실행 run 중지 후 2026-09-03 실패 orders 16개만 `manual__failed_orders_only__20260903__20260904T1014`로 재실행했다. 수집/ToOrder/ad 검증은 완료했고 DAG run은 success로 종료했다.
+- 남은 위험: ToOrder 비교는 16개 중 8개 불일치가 남았다. 남은 매장은 다음 재수집 대상이며, 이번 조치는 장시간 Selenium 상세시트 루프 차단에 초점을 둔다.
+
+## 2026-09-04 delivery_commission 배민 정산 산식 교정
+- 대상: `DB_DeliveryCommission.py`, `tests/test_delivery_commission.py`.
+- 변경: 배민 `settlement_amount`를 주문서 `입금예정금액`에서 우가클 `광고지출`만 차감하도록 수정하고, 즉시할인/만나서결제금액 추가 차감을 제거.
+- 검증 결과: `py_compile` 통과, `tests/test_delivery_commission.py` 30건 통과, 컨테이너 `DB_DeliveryCommission_Dags` import 성공. 승인 후 OneDrive mart 29,742행 재빌드, 송파삼전점 2026-08-01 `diff_amt=33,426` 확인.
+- 남은 위험: 배민 정산예정금액 결측 106행은 기존 정책대로 null 유지되며, Power BI는 데이터 새로고침 후 반영된다.
+
+## 2026-09-04 배민 orders Retry 실패매장 round2 재수집
+- 대상: `DB_Beamin_Macro_Dags_Retry` run `manual__failed_orders_round2__20260903__20260904T1104`.
+- 실행: 2026-09-03 ToOrder 불일치 잔여 8개 매장만 재수집하고, 수집 완료 후 ToOrder/ad 검증과 cleanup까지 완료했다.
+- 검증 결과: DAG run은 success, `즉시할인 상세시트 닫기 실패` 재발 0건. 대전장대점, 김포풍무점, 김해구산점은 확장 collector 수집 및 parquet 저장 완료.
+- 남은 위험: ToOrder 비교는 8개 중 2개 일치/6개 불일치. 경북상주점은 날짜 필터 혼입, 구리다산점은 확장 collector read timeout, 교대점은 금액기준 차이로 재수집 제외 상태다.
+
+## 2026-09-04 delivery_revenue mart task 추가
+- 대상: `DB_DeliveryCommission_Dags`, `DB_DeliveryCommission.py`, `paths.py`, `tests/test_delivery_commission.py`.
+- 변경: `delivery_commission.parquet`를 소스로 `sale_date/brand/store/platform/total_price/settlement_price/revenue` parquet를 생성하는 `build_delivery_revenue` task와 경로 상수를 추가.
+- 검증 결과: `py_compile` 통과, `tests/test_delivery_commission.py` 31건 통과, 컨테이너 DAG task 목록에 `build_delivery_revenue` 연결 확인.
+- 남은 위험: OneDrive `delivery_revenue.parquet` 실제 생성은 별도 승인 후 실행 필요.
+
+## 2026-09-04 delivery_revenue UnifiedSales 플랫폼 확장
+- 대상: `DB_DeliveryCommission.py`, `tests/test_delivery_commission.py`.
+- 변경: revenue mart에 UnifiedSales 기반 `땡겨요`, `먹깨비`, `배달특급`, `인천이음` 플랫폼을 추가하고, 땡겨요는 월별/기준 수수료율 CSV, 나머지는 고정 수수료율로 `revenue`를 계산하도록 보강.
+- 검증 결과: `py_compile` 통과, `tests/test_delivery_commission.py` 32건 통과, 컨테이너 `DB_DeliveryCommission_Dags` task 목록 확인. 승인 후 OneDrive `delivery_revenue.parquet` 33,854행 생성, 플랫폼 6종과 중복 키 0건 확인.
+- 남은 위험: Power BI는 데이터 새로고침 후 신규 revenue mart가 반영된다.
+
+## 2026-09-04 store_cost_allocation 임대료 비용 mart 추가
+- 대상: `DB_DeliveryCommission.py`, `DB_DeliveryCommission_Dags`, `paths.py`, `tests/test_delivery_commission.py`.
+- 변경: `sales_employee.csv`의 매장 월 임대료를 dedupe한 뒤 UnifiedSales 전체 채널 일별 매출비율로 배부하는 `store_cost_allocation.parquet` mart와 `rent_cost` 컬럼을 추가.
+- 검증 결과: `py_compile` 통과, `tests/test_delivery_commission.py` 33건 통과, 컨테이너 `DB_DeliveryCommission_Dags` task 목록 확인. 승인 후 OneDrive mart 390행 생성, 송파삼전점 2026-08 `rent_cost=5,533,000`, 중복 키 0건 확인.
+- 남은 위험: 현재 임대료 원천은 송파삼전점만 입력되어 있으며, Power BI는 데이터 새로고침 후 신규 비용 mart가 반영된다.
+
+## 2026-09-04 delivery_revenue 요기요 monthly fee 적용
+- 대상: `DB_DeliveryCommission.py`, `paths.py`, `tests/test_delivery_commission.py`.
+- 변경: 요기요 revenue를 UnifiedSales `요기요/요기배달` 매출에 `yogiyo_settlement_monthly_fee.csv`의 `settlement_gap_rate`만 적용하도록 재설계하고, 음수 취소 매출과 음수 gap rate를 보존. `땡배달`은 `땡겨요`로 합산.
+- 검증 결과: `py_compile` 통과, `tests/test_delivery_commission.py` 34건 통과, 컨테이너 `DB_DeliveryCommission_Dags` task 목록 확인. 승인 후 OneDrive `delivery_revenue.parquet` 39,382행 재생성, 요기요 revenue 71,031,506원, 요기요 음수 매출 22행 보존, `요기배달/땡배달` 별도 platform 0건 확인.
+- 남은 위험: 배민은 `입금예정금액 - 우가클` 기준상 우가클/만나서결제 영향으로 일부 일자 settlement/revenue가 음수 또는 매출 초과로 보일 수 있어, Power BI 지표 해석 기준 확인이 필요하다.
+
+## 2026-09-04 delivery_revenue rent_cost 컬럼 추가
+- 대상: `DB_DeliveryCommission.py`, `tests/test_delivery_commission.py`.
+- 변경: 별도 `store_cost_allocation`에만 있던 임대료 배부액을 `delivery_revenue.parquet`에도 `rent_cost` 컬럼으로 붙이도록 보강.
+- 검증 결과: `py_compile` 통과, `tests/test_delivery_commission.py` 35건 통과, 컨테이너 DAG task 목록 확인. `.tmp` 드라이런 39,382행/8컬럼 생성, `rent_cost` 합계 9,479,166원, 중복 키 0건 확인.
+- 남은 위험: OneDrive `delivery_revenue.parquet` 실제 8컬럼 재생성은 별도 승인 후 실행 필요.
+
+## 2026-09-04 rent_cost 일별 균등 배부 전환
+- 대상: `DB_DeliveryCommission.py`, `tests/test_delivery_commission.py`.
+- 변경: 월 임대료를 월 전체 매출비율로 한 번에 배부하던 방식을 `월 임대료 / 달력 일수` 일별 균등 금액으로 먼저 나누고, 같은 날짜 안에서 플랫폼 매출비율로 배부하도록 변경.
+- 검증 결과: `py_compile` 통과, `tests/test_delivery_commission.py` 35건 통과, 컨테이너 DAG task 목록 확인. 승인 후 OneDrive `store_cost_allocation.parquet` 392행 재생성, 송파삼전점 2026-08 월 5,533,000원/일 178,484원 수준, 2026-09는 4일치 737,736원만 반영 확인.
+- 남은 위험: `delivery_revenue.parquet`는 배달 플랫폼 행만 보유하므로 홀 매출 몫 임대료는 제외되며, 전체 임대료 배부 확인은 `store_cost_allocation.parquet` 기준으로 봐야 한다.
+
+## 2026-09-04 delivery_revenue fin_revenue 컬럼 추가
+- 대상: `DB_DeliveryCommission.py`, `tests/test_delivery_commission.py`.
+- 변경: `delivery_revenue.parquet`에 `fin_revenue = revenue - 모든 *_cost 컬럼 합계` 계산 컬럼을 추가하고, 향후 비용 컬럼 확장 시 접미사 기준으로 자동 차감되도록 처리.
+- 검증 결과: `py_compile` 통과, `tests/test_delivery_commission.py` 36건 통과. 승인 후 OneDrive `delivery_revenue.parquet` 39,382행/9컬럼 재생성, `fin_revenue` 산식 불일치 0건, 중복 키 0건 확인.
+- 남은 위험: Power BI는 새 컬럼 반영을 위해 데이터 새로고침이 필요하다.
+
+## 2026-09-04 delivery_revenue 월 예상 순수익 모델 컬럼 추가
+- 대상: `DB_DeliveryCommission.py`, `requirements.txt`, `tests/test_delivery_commission.py`.
+- 변경: `store_expected_month_fin_revenue`를 추가하고, 진행월은 `RandomForestRegressor` 기반 `MTD 실제 + 잔여일 예측`, 완료월은 실제 월 합계로 계산하도록 보강. `_cost` 컬럼은 출력 맨 오른쪽으로 정렬.
+- 검증 결과: `py_compile` 통과, `tests/test_delivery_commission.py` 39건 통과, 컨테이너 DAG import 통과. 승인 후 OneDrive `delivery_revenue.parquet` 39,406행/10컬럼 재생성, 예상값 NULL 0건, 중복 키 0건, `fin_revenue` 산식 불일치 0건 확인.
+- 남은 위험: Airflow 컨테이너에서 모델 사용은 이미지 재빌드/패키지 설치 후 적용되며, 설치 전에는 통계 fallback으로 동작한다. Power BI는 새 컬럼 반영을 위해 데이터 새로고침이 필요하다.
+
+## 2026-09-04 delivery_revenue rent_cost 배달 플랫폼 재배부
+- 대상: `DB_DeliveryCommission.py`, `tests/test_delivery_commission.py`.
+- 변경: `store_cost_allocation`은 홀 포함 전체 채널 배부로 유지하고, `delivery_revenue.rent_cost`는 배달 플랫폼 행 안에서 일 임대료 100%가 배부되도록 변경.
+- 검증 결과: `py_compile` 통과, `tests/test_delivery_commission.py` 40건 통과, 컨테이너 DAG import 통과. 테스트에서 홀 매출이 있어도 `delivery_revenue` 일 임대료 합계가 전체 일 임대료와 일치함을 확인.
+- 남은 위험: OneDrive `delivery_revenue.parquet` 실제 재생성은 별도 승인 후 실행 필요하다.
+
+## 2026-09-04 작업 스케줄러 콘솔 창 깜빡임 완화
+- 대상: `run_airflow_scheduler_watchdog_hidden.vbs`, `run_baemin_acl_repair_wsl_hidden.vbs`, `run_baemin_acl_repair_wsl_hidden.ps1`, `start_codex_autoheal_wsl_hidden.vbs`, `start_codex_autoheal_hidden.ps1`.
+- 변경: scheduler watchdog은 `cmd.exe` 경유를 제거하고 `pythonw.exe`를 우선 사용하도록 변경. 배민 ACL repair는 미처리 request가 없으면 VBS 단계에서 바로 종료해 PowerShell/WSL을 실행하지 않도록 변경. autoheal은 heartbeat가 180초 이내면 VBS 단계에서 종료하고, fallback watcher는 `pythonw.exe`를 우선 사용하도록 변경.
+- 검증 결과: PS1 구문 점검 통과. 작업 스케줄러 수동 실행 샘플에서 watchdog은 `pythonw.exe`로 실행되고 기존 `cmd.exe /c airflow_scheduler_watchdog.py` 경유가 사라짐을 확인. 배민 ACL repair는 빈 queue에서 VBS가 exit `0`, `baemin ACL queue skipped` 로그만 갱신함을 확인. 17:55 자동 실행 구간 샘플에서 관련 신규 `cmd/wsl/conhost/Claude bash/MCP` 프로세스 0건 확인.
+- 남은 위험: 실제 ACL repair 요청이 쌓인 순간 또는 autoheal heartbeat가 stale한 순간에는 WSL/PowerShell 실행이 필요하므로 Windows/WSL 자체 콘솔 생성 여부를 추가 확인해야 한다. Windows Terminal/시작프로그램에서 별도 콘솔이 뜨는 경우 Startup `start_wsl.vbs`도 점검 대상이다.
+
+## 2026-09-04 delivery_revenue/store_cost_allocation 마트 재생성 + 컨테이너 sklearn 반영
+- 대상: `requirements.txt`(이미지 반영), OneDrive `store_cost_allocation.parquet`, `delivery_revenue.parquet`, Airflow 컨테이너 이미지.
+- 변경: `docker compose build`/`up -d`로 scikit-learn을 컨테이너에 설치(1.9.0, scheduler·worker 확인). 최신 `sales_employee.csv` 임대료(미사점 1,300,000 / 송파삼전점 5,533,000) 기준으로 두 마트를 재생성. 기존 마트에 없던 미사점이 신규 반영되고(392행→1,154행), 구 배부 로직 잔재였던 송파삼전점 8월 배달 rent_cost가 2,466,575→5,533,000으로 정정됨.
+- 검증 결과: store_cost_allocation 미사점·송파삼전점 2026-08 rent_cost 합계 각각 1,300,000/5,533,000, 키 중복 0. delivery_revenue 10컬럼·순서 일치, 키 중복 0, `fin_revenue = revenue - Σ(*_cost)` 불일치 0, `store_expected_month_fin_revenue` NULL 0, 완료월(8월) expected=실제합계 83/83 일치, 진행월(9월) 81개 매장 모두 expected>MTD. sklearn fallback 경고 없이 RandomForest 경로 사용. `tests/test_delivery_commission.py` 40건 통과, 컨테이너 DAG import에서 5개 task 확인.
+- 남은 위험: 배달 매출이 없는 날은 delivery_revenue에 행이 없어 그날 임대료가 배부되지 않는다(송파삼전점 2026-04-17~05-04는 홀 매출만 존재해 배달 월합계가 월 임대료에 미달, 의도된 동작). 진행월 expected는 당일 미수집분이 MTD에 빠진 상태로 계산되므로 수집 완료 후 값이 변동한다. 이미지 재빌드로 미고정 패키지가 갱신됨(sklearn 1.9.0, selenium 4.48.0) — 수집 DAG 첫 실행 시 회귀 여부 관찰 필요.
+
+## 2026-09-07 작업 스케줄러 PowerShell 창 팝업 추가 완화
+- 대상: Windows 작업 스케줄러 `Airflow_Codex_MD_Improver_Weekly`, `TaskSchedulerDashboardRefresh_0800`, `git 자동`.
+- 변경: 존재하지 않는 `C:\airflow\scripts\codex_md_improver_weekly.ps1`을 호출하던 `Airflow_Codex_MD_Improver_Weekly`를 비활성화하고, `TaskSchedulerDashboardRefresh_0800` 실행 인자에 `-WindowStyle Hidden`을 추가.
+- 검증 결과: `Airflow_Codex_MD_Improver_Weekly`는 `Disabled`, `TaskSchedulerDashboardRefresh_0800`은 숨김 실행 인자 적용 확인.
+- 남은 위험: `git 자동`은 `C:\airflow\scripts\auto_push.ps1`이 없고 매일 10:00 실행 예정이나 일반 권한에서 `Disable-ScheduledTask`/`schtasks /Change /DISABLE` 모두 Access denied로 실패해 관리자 권한 비활성화가 필요하다.
+
+## 2026-09-07 배민 Macro/Retry 장시간 실행·반복 재시도 완화
+- 대상: `DB_Beamin_Macro_Dags.py`, `DB_Beamin_Macro_Dags_Retry.py`, `DB_Beamin_04_orders.py`, `DB_Beamin_retry.py`.
+- 변경: Retry `max_attempts`를 내부 상한 3회로 고정하고, store별 retry_history 3회 초과 residual 재삽입을 차단. Retry DAG는 `cleanup_manual_baemin_orders` 뒤에 `notify_and_trigger_next`가 최종 leaf가 되도록 순서를 변경.
+- 변경: 날짜 필터/확장 collector timeout/validation mismatch 계열 실패는 메인 DAG의 120분 동기 retry를 생략하고 residual로 Retry DAG에 이월. DatePicker는 보이는 달 목록 기준으로 목표 월을 판정하고 목표 월 영역의 날짜 버튼을 우선 클릭하도록 보강.
+- 검증 결과: `py_compile` 통과, `tests/test_beamin_retry_conf.py`, `tests/test_baemin_final_notification.py`, `tests/test_baemin_orders_date_filter_abort.py`, `tests/test_baemin_batch_split.py` 총 79건 통과.
+- 남은 위험: 배민 UI DatePicker DOM 구조가 추가 변경되면 월 영역 판정이 다시 실패할 수 있어 다음 실수집 로그에서 `final_yms`와 target date 확인이 필요하다.
+
+## 2026-09-07 배민 orders 60일 룩백 누락 탐지
+- 대상: `DB_Beamin_Macro_Lookback_Trigger_Dags.py`, `tests/test_baemin_lookback_trigger.py`, `tests/test_baemin_macro_validation.py`.
+- 변경: 룩백 범위를 60일로 확대하고, ToOrder 배민 매출은 있으나 배민 orders 원천이 0/누락인 매장-날짜를 찾아 날짜별 `stores` 범위로 `DB_Beamin_Macro_Dags`를 `orders_only` 트리거하도록 변경. DAG 주기는 2시간, 1회 최대 5일, 날짜별 12시간 cooldown을 적용.
+- 검증 결과: `py_compile` 통과, 신규 룩백 테스트와 manual ingest wiring 테스트 6건 통과. 읽기 전용 실측 기준 후보 34일, 매장-날짜 누락 246건이며 2026-09-06 47개 매장이 최우선 후보.
+- 남은 위험: `tests/test_baemin_macro_validation.py` 전체 실행 중 기존 실데이터 의존 테스트 1건은 현재 로컬 데이터 상태 때문에 실패한다. 룩백 DAG가 실제 재수집 산출물을 만들면 OneDrive/원천 파일 변경이 발생하므로 운영 실행 후 큐와 수집 시간을 관찰해야 한다.
+
+## 2026-09-07 배민 룩백 다중 날짜 트리거 중복 보정
+- 대상: `DB_Beamin_Macro_Lookback_Trigger_Dags.py`, `tests/test_baemin_lookback_trigger.py`.
+- 변경: 한 번의 룩백 run에서 여러 날짜를 `trigger_dag()`할 때 Airflow가 같은 초의 `execution_date`를 재사용해 두 번째 날짜부터 `DagRunAlreadyExists`가 나던 문제를 보정. 날짜별 `execution_date`를 1초씩 분리하고 이미 존재하는 run은 실패가 아니라 skip 처리.
+- 검증 결과: `py_compile` 통과, `tests/test_baemin_lookback_trigger.py` 5건 통과. 운영 로그에서 기존 run은 2026-09-06 트리거 후 2026-09-05 생성 중 중복 오류로 멈춘 것을 확인.
+- 남은 위험: 현재 `lookback_recovery__20260906__20260907T010500`이 실행 중이라 다음 날짜들은 이 run 완료 후 다음 룩백 실행에서 큐에 들어간다.
+
+## 2026-09-07 Airflow watchdog 콘솔 팝업 완화
+- 대상: `scripts/airflow_scheduler_watchdog.py`, `scripts/run_airflow_space_cleanup_hidden.vbs`.
+- 변경: Windows에서 watchdog의 `subprocess.run()` 호출에 `CREATE_NO_WINDOW`와 hidden `STARTUPINFO`를 적용. 정상 상태 확인은 Docker CLI 대신 Python HTTP 요청으로 바꿔 평상시 `docker exec` 콘솔 생성을 제거. space cleanup VBS의 PowerShell 실행 인자에 `-WindowStyle Hidden` 명시.
+- 검증 결과: `scripts/airflow_scheduler_watchdog.py` `py_compile` 통과. VBS 수동 실행 감시에서 watchdog은 `wscript.exe`/`pythonw.exe`만 생성되고 기존 `docker exec -> conhost.exe` 흐름이 사라짐을 확인.
+- 남은 위험: 작업 스케줄러 자체 권한 또는 Docker Desktop 내부 프로세스가 만드는 독립 `conhost.exe`는 별도 시스템 이벤트 추적이 필요할 수 있다.
+
+## 2026-09-07 배민 룩백 4~6일 대량 누락 큐 보정
+- 대상: `DB_Beamin_Macro_Lookback_Trigger_Dags.py`, `tests/test_baemin_lookback_trigger.py`.
+- 변경: `DB_Beamin_Macro_Dags` active run 존재 시 룩백 트리거 전체를 보류하던 전역 가드를 제거해, 이미 2026-09-06 복구가 실행 중이어도 2026-09-05/2026-09-04 등 후속 누락 날짜를 큐에 넣을 수 있게 변경.
+- 검증 결과: `py_compile` 통과, `tests/test_baemin_lookback_trigger.py` 6건 통과. 운영 재실행 `manual__lookback_60d_queue_more_20260907T1435`에서 2026-09-05, 2026-09-04, 2026-07-15, 2026-07-12, 2026-07-11 복구 run이 queued됨을 확인.
+- 남은 위험: 2026-09-06 복구 run이 아직 실행 중이므로 2026-09-05/2026-09-04 복구는 Airflow 동시 실행 제한에 따라 순차 대기한다.
+
+## 2026-09-07 Posfeed 상세 전체탐색 skip 방지
+- 대상: `DB_Posfeed_Sales_Detail.py`.
+- 변경: `extract_order_codes`, `check_undetailed_orders`, `scrape_order_details`, `scrape_missing_order_details`가 전체 탐색 결과 0건일 때 skip 대신 성공 상태와 0건 메시지를 반환하도록 변경.
+- 검증 결과: DAG import, 대상 모듈 `py_compile`, 함수 단위 빈 XCom 경로 검증 통과.
+- 남은 위험: 실제 누락 코드가 발생하는 경우 Selenium 상세 수집은 기존 Posfeed 관리자 UI/로그인 상태에 의존한다.
+
+## 2026-09-08 OKPOS 상품 로그인 연결 종료 복구
+- 대상: DB_OKPOS_Product_Dags.download_okpos_product, DB_OKPOS_Product.py.
+- 변경: 로그인 전후 연결 종료에 한해 브라우저 정리 후 최대 3회 재시도. 작업 공간 검증 후 운영 소스에 동일한 최소 수정 반영, 기존 상품 검증 보존.
+- 검증 결과: 작업 공간 및 운영 코드 각각 회귀 검증 6건 통과, 운영 DAG import 및 UTF-8/문법 확인 통과.
+- 남은 위험: 브라우저 종료의 시스템 원인은 미확정. 전체 DAG는 OneDrive 상품 파일을 덮어쓰므로 승인 전 trigger_dag 호출 보류, 실제 수집 복구 미확인.
+
+## 2026-09-08 EasyPOS 상품 다운로드 복구
+- 대상: DB_EasyPOS_Sales_Dags의 상품 다운로드·저장 태스크, DB_EasyPOS_Product.py.
+- 원인: 대시보드 preload 미완료 상태에서 메뉴를 교체해 화면 생성이 멈춤. 엑셀 서버 생성은 성공해도 브라우저 다운로드 이벤트가 발생하지 않는 현상도 재현.
+- 변경: 로그인 대시보드의 preload 완료 후 실제 상품 메뉴 진입, 매출 수집의 Nexacro visibility 안정화 재사용, 조회 콜백 확인. 다운로드 이벤트 누락 시 서버 생성 엑셀을 같은 세션으로 수신하고 검증 후 XCom 전달·저장.
+- 검증 결과: Chrome DOM 포함 회귀 20건, 워커 DAG import 및 UTF-8/문법 확인 통과. 새 세션에서 상품 55건 다운로드·로컬 저장 2회 연속 성공(138.7초/142.3초), 저장 원본 일치 확인.
+- 남은 위험: OneDrive 운영 상품 파일 갱신과 실패한 두 태스크 재실행은 승인 대기. 사이트 UI·내보내기 응답 변경은 단계별 로그로 추적.
+
+
+## 2026-09-09 Airflow 메모리 고갈 완화
+- 대상: docker-compose.yaml, 실행 중 워커 Celery 풀 및 airflow.cfg.
+- 원인·변경: WSL 메모리 16GB와 스왑 4GB 소진에 따른 다중 DAG 실패 확인. 동시 실행 16개를 6개로 축소하고 재시작·재생성 설정에 반영. 진행 중 작업 종료 없음.
+- 검증 결과: Compose 검증, 현재 설정 6 및 실제 프로세스 6개 확인. DAG import 오류 0건, 장애 후 성공 태스크 61건 확인.
+- 남은 위험: 실패 10개 태스크의 OneDrive 산출물 재처리는 승인 대기. 상세 범위는 prd_codex/airflow_memory_20260909.md 및 .tmp/memory_incident_20260909.json 참조.
+
+
+## 2026-09-09 메모리 장애 후 승인된 DAG 재처리
+- 대상: OKPOS Today, 메뉴계층, 수수료, 배민 업로드 검증·룩백 총 5개 DAG. 사용자 OneDrive 갱신 승인 후 실패·차단 태스크 13개만 재개.
+- 검증 결과: 5개 DAG 모두 성공. OKPOS 600행, 메뉴계층 16,140행, 수수료 31,322행·배달매출 41,070행·매장비용 2,907행 실제 파일 읽기 확인. 승인 이후 새 최종 실패 0건 확인.
+- 남은 위험: 통합매출 전체기간 계산과 기존 배민 과거 재수집 큐는 진행·대기 중. 배민 09-07 강동점 금액 차이·브랜드 매핑 누락 잔존. 상세는 prd_codex/airflow_memory_20260909.md 참조.
+
+
+## 2026-09-09 쿠팡 로그인 자동 복구 수정본 검증
+- 대상: OneDrive 개발용 확장 runner.js, background.js, manifest.json의 로컬 수정본(.tmp/coupang-login-recovery-20260909).
+- 변경: 권한 오류 시 입력값 유지·브라우저 클릭 1회, 30초 성공 대기, 명시적 제한 분리 및 중단·중복 방지.
+- 검증 결과: 동작 테스트 36건, 가짜 로그인 Chromium 검증 7건, JS 문법·JSON·UTF-8·원본 해시 검사 통과.
+- 남은 위험: OneDrive 반영 승인 대기. 실제 계정 로그인 복구와 수집 날짜·다운로드 결과 미검증; 별도 확장 사본 변경 없음.
+
+## 2026-09-09 For_AI 매장·월 분석 메모리 오류 수정
+- 대상: Sales_For_AI_StoreMonthAnalysis_Dags가 호출하는 For_AI_store_month_analysis 파이프라인과 회귀 테스트.
+- 변경: 주문 Parquet 필요 컬럼·8,192행 배치 읽기, 매장 필터 후 정규화, 실행별 CSV 경로 재사용, 인덱스 요약만 보관, 메모리 오류 즉시 전달. 전체 기간·출력 형식 유지.
+- 검증 결과: 테스트 25개·워커/스케줄러 DAG 임포트·UTF-8 검사 통과. 기존 대비 산출물 26개, 실제 입력 516개 파일의 대상 750개 및 대표 3개 매장·월 주문 행 일치. 워커 전체 750건 저장 없는 검증 성공(38분 22초, 최대 249MiB), CSV 소스 5개 각각 탐색 1회·캐시 해제 확인.
+- 남은 위험: 시스템 전체 메모리 고갈은 별도 운영 요인. OneDrive 산출물 재생성 및 실패 실행 재개는 수행하지 않음.
+
+## 2026-09-09 쿠팡 로그인 복구 승인 반영 및 실제 6개 계정 검증
+- 대상: 승인된 OneDrive 개발용 확장 runner.js, background.js, manifest.json. 3파일 반영·확장 리로드·debugger 권한 로딩 확인.
+- 검증 결과: 로컬 동작 36건·Chromium 7건 통과. 사용자 선택 6개 실행 종료(성공 5, 경고 0, 실패 1), 로그인 권한 오류 미발생.
+- 실제 파일: 김해구산·부산서면·부산장림·미사점 주문일 2026-09-08 확인. 동인천점은 노출 매장이 생마차 치킨으로 대상명 불일치하여 미완료.
+- 남은 위험: 실제 권한 오류 후 복구 성공은 미재현; 별도 프로필은 HTTP 403 지속. 부산광안 주문 파일 미확인. 사용자 실행의 약 2시간 후 자동 재시도 예약 유지.
+
+## 2026-09-09 Airflow 메모리 재발 방지 운영 반영
+- 대상: 워커·스케줄러·메모리 감시·배민 과거 DAG 4개·통합매출 야간 DAG·안전 재처리.
+- 변경: 일반 5+과거 1, parallelism 12, 1분 감시 및 메모리 임계값 적용. 미실행 과거 33건 원자적 이전, 신규 상한·중복 방지·보류 보존·야간 체크포인트 추가.
+- 검증 결과: 관련 회귀 178건, 신규 DAG 5개 직렬화 왕복, harness 95개 분류 통과. 우선순위 설정으로 생긴 import 오류 4건 수정 후 운영 오류 0건, 워커 5+1 실측 확인.
+- 남은 위험: 24시간 관찰 및 과거 수집 완주 진행 중. 초기 배포 감시 간격 누락 1회 기록. 상세: prd_codex/airflow_resource_prevention_20260909.md.
+
+## 2026-09-09 웨일 배민 NOW·우가클 수집 복구
+- 대상: 승인된 OneDrive 개발용 확장의 runner_baemin_now.js, content/05_main.js, content/02_baemin.js.
+- 변경: 배민 중단 키 격리, 최상위 프레임·요청별 접수/완료 처리, 접수 5초 제한, 월 전달 복구, 준비 예외·저장 미확인 실패 처리. 웨일 확장 재로드 완료.
+- 검증 결과: 동작 26건·Chromium 저장 검증 5건 통과. 광명철산·강원영월·기흥테라타워 3계정(6매장) 정상 종료, NOW 3개·우가클 6개 CSV의 실제 저장·매장·기간 확인.
+- 남은 위험: 최초 장애 당시 실행 코드와 중단 키 상태는 직접 확인되지 않음. 전체 68계정 실행은 하지 않았으며, 실제 CSV는 E:\d_down에 저장됨.
+
+## 2026-09-09 네이버광고 이미지 URL 수집 추가
+- 대상: 승인된 OneDrive 개발용 확장의 content/09_naverads.js, runner_naverads.js.
+- 변경: 파워링크 확장 소재 첫 이미지를 depth2에, 플레이스 소재별 첫 배경 이미지를 depth3에 연결하고 CSV 끝에 image_url 추가. 이미지 조회 20초·1회 재시도, 실패 시 실적 저장 유지.
+- 검증 결과: JS 문법·구글 크롬 재현 검증 19건 통과. Chrome 152에서 파워링크 1행·플레이스 4행 실제 수집 및 다운로드 CSV 바이트·URL·기존 실적 일치 확인. 탭 전환 중 임시 빈 표 조기 판정 수정.
+- 남은 위험: 전체 캠페인 배치는 미실행. 이미지는 수집 시점 등록값이며 과거 이미지 이력은 복원하지 않음. 검증 산출물: .tmp/naverads_image/.
+
+## 2026-09-09 도리당봇 리더 대화 흐름 개선
+- 대상: modules/transform/doridang_bot, 대화 평가 스크립트와 회귀 검사.
+- 변경: Qwen 14B 기본·답변 1200토큰, 대화 대상/업무 순서 복원, 최대 4회 근거 조회와 본문·최근 댓글 연결, 미완료/기한경과 구분. 세션별 스트리밍·중단·재시도·한글 입력 보완. 새 대화 로그는 로컬 logs로 이전하고 OneDrive 원본은 읽기만 수행.
+- 검증 결과: 자동 검사 총 109건 통과, 설치 모델 2종 다중 턴 비교. 8788 재기동 후 실제 주소의 4턴 대화·출처·대상 유지 확인, 첫 글자 2.9~3.0초/후속 전체 5.6~7.7초, 초기 로딩 포함 첫 답변 12.7초. Chromium 데스크톱·모바일 확인.
+- 남은 위험: 수집 기록이 현장 완료 상태를 보장하지 않으며 기록에 없는 원인은 확인 필요로 안내. 모델 응답 품질 평가는 대표 질문 기준으로, 다른 표현에서도 같은 품질을 보장하지 않음. 검증 결과는 .tmp/doridang_live_results.json 및 .tmp/doridang_conversation_eval_final2.json.
+
+
+## 2026-09-09 도리당봇 후속 질문 조건·목록 보완
+- 대상: doridang_bot/dialogue.py, server.py 및 대화 회귀 검사.
+- 변경: 전체 목록 요청에서도 이번 질문의 상태·기한 조건 유지, 조건 전환 시 이전 업무 고정 해제, 1번 참조 지원·0번째 오인 방지, 선택 업무와 형제 업무 분리. 명시적인 전체 목록은 조회 결과로 직접 제공해 날짜 추측·항목 생략 방지.
+- 검증 결과: 관련 검사 총 121건 통과. 8788 재기동 후 실제 완료 16건 전체 표시, 1번 상세→왜 후속에서 동일 업무 유지 확인. 결과는 .tmp/doridang_followup_verification.json.
+- 남은 위험: 자유형 설명은 로컬 모델 품질에 영향을 받으며, 조회 한도를 넘는 목록은 일부임을 명시한다. OneDrive 수정 없음.
+
+## 2026-09-09 주문 교차분석 전체 수정
+- 대상: DB_OrderCrossAnalysis 파이프라인·DAG, 직영점 보고서, 로컬 검증 스크립트와 운영 문서.
+- 변경: 기존 18개 컬럼·상품번호 유지, 리뷰/참여/미선택 분리, 메인 반복 중복 제거, 전 매장 점검, 표준 메뉴 보조 집계·선택률·원자 저장·변경 감지·승인 전 쓰기 차단.
+- 검증 결과: 테스트 72개, 515일 원본 3,287,471행의 독립 조인/집계 대조 통과(실패 0일), 후보 223,231행. Windows/Airflow 결과 해시 일치, Harness 95개 DAG 검증 통과.
+- 남은 위험: 9/8 메인 미확정 주문 1,154건은 분류 검수 필요. OneDrive 반영·정기 쓰기 활성화는 승인 대기. 상세: prd_codex/order_cross_implementation_20260909.md.
+
+## 2026-09-09 네이버광고 확장 소재 탭 오인 회귀 수정(v48)
+- 대상: 승인된 OneDrive 개발용 확장의 content/09_naverads.js, runner_naverads.js.
+- 원인·수정: 확장 소재 없음 안내를 키워드 1행으로 오인해 탭 전환을 생략함. 확장 소재 화면 분리, 키워드 전환 확인 강제·중단 전달, 실제 빈 안내 이미지 없음 처리 및 전환 실패 재시도 반영.
+- 검증 결과: 구글 크롬 재현·회귀 26건 통과, 기존 실패 6그룹 연속 수집 성공. Chrome 152에서 2026-09-08 전체 배치 18/18 CSV 저장·실패 0, 실제 다운로드 63행·이미지 URL 40개·중복 없음 확인.
+- 남은 위험: 이미지 값은 수집 시점 기준이며 이후 네이버 화면 변경 시 재검증 필요. 증거: .tmp/naverads_image/regression_v48/verified_report.json 및 batch.log.
+
+## 2026-09-09 주문 교차분석 승인 후 운영 반영
+- 대상: 승인된 OneDrive order_cross_analysis 515일 결과·보조 자료 및 Airflow 정기 갱신.
+- 변경: 입력·매핑 변경 없음 확인 후 223,231행 반영, 기존 18개 컬럼 유지. order_cross_publish_enabled=true 설정, 08~23시 매시 10·40분 갱신 활성화.
+- 검증 결과: 515일 반영·최종 후보 대조 실패 0건, 임시 복구본 0개. 컨테이너에서 9/8 결과 843행과 보고서 선택률 확인. 최종 증거: .tmp/order_cross_live_verification_20260909.json.
+- 남은 위험: 메인 미확정 주문 1,154건(9/8)은 검수 필요. 원본 매출·상품 마스터·수기 검수표는 수정하지 않았고 외부 보고서는 재발송하지 않음.
+
+
+## 2026-09-09 도리당봇 대화 정확성·검증 후 응답 반영
+- 대상: doridang_bot의 tools/dialogue/router/integrity/llm_backend/server 및 웹 대화 화면.
+- 변경: 미완료 업무·모니터링 기한 분리, 댓글 작성자·원문 보존, 사람 변경 시 주제 유지와 전체 초기화, 기한 미등록·미완료 표현 처리. 요청별 표·날짜 고정, 사실값 서버 구성, 제안 검수·1회 재작성·60초 제한, 검증 전 초안 전송·저장 차단.
+- 검증 결과: 기능·브라우저 검사 150건 통과. 실제 로컬 Qwen 6흐름×3회·39응답에서 검사 오류 0, 초안 차단 3건 재작성 후 통과, 대체 응답 0. 평균 4.60초·최대 10.17초. 8789/8788 각각 사용자 사례 4턴 통과 및 운영 반영 확인.
+- 남은 위험: 현장 완료와 기록에 없는 원인은 추정하지 않음. 같은 모델 검수는 독립 사실 증명이 아니며 사실 참조·대체 응답으로 보완. OneDrive 수정 없음. 상세: prd_codex/doridang_dialogue_integrity_20260909.md.
+
+## 2026-09-09 주문 교차분석 주문서 기준 보정
+- 대상: OrderCrossAnalysis 핵심·독립검증·보고서, 승인된 OneDrive 515일 결과와 보조 자료.
+- 변경: 상품 메인 매핑을 필수 조건으로 둔 오류를 수정. 주문서 메뉴명과 실제 품목으로 기준 메뉴를 판단하고 18개 컬럼 유지. OneDrive 읽기 전용 구세대 폴더 정리 보완.
+- 검증 결과: 시험 80개·515일 독립 집계 통과, 1,545,550행 운영 반영 및 재읽기 대조 성공. 9/8 대상 1,456건 중 1,451건 분석, 4,948행. 정기 갱신 복원, 임시 복구본 0개.
+- 남은 위험: 9/8 나머지 5건은 주문서에 배달비/리뷰 증정품만 있어 기준 메뉴를 확인할 수 없음. 이전의 매핑 미확정 검수 필요 안내를 정정함. 상세: prd_codex/order_cross_implementation_20260909.md.
+
+## 2026-09-09 네이버광고 v49 depth 수집 원인 수정
+- 대상: 승인된 OneDrive 개발용 확장의 content/09_naverads.js, runner_naverads.js.
+- 변경: 날짜 확정 후 키워드 탭 생성으로 이전 7일 실적 잔존 해결, 일시적 빈 표 대기, 실제 확장검색 합산, 빈 열·병합 열·ID 없는 헤더 매핑 수정. 숫자 형식 및 전체 페이지·depth 합계 검증 강화.
+- 검증 결과: Chrome 152에서 2026-09-08 전체 18/18 CSV·42그룹 실패 0. 독립 집계 63행·이미지 40행·중복 0, 회귀 50건 및 JS 문법 통과. 파워링크 d1=d2=d3 1,490/3/704원. 증거: .tmp/naverads_image/regression_v49/검증결과.md.
+- 남은 위험: 플레이스 비용은 원본 d1 12,785원, d2·d3 12,786원의 1원 차이를 보존하고 허용오차로 표시. 실측 범위는 2026-09-08이며 운영 CSV 덮어쓰기 없음.
+
+## 2026-09-09 배민 본인부담 즉시할인 매출 반영 구현
+- 대상: DB_DeliveryCommission 파이프라인·회귀 테스트, delivery_commission 및 delivery_revenue 전체 기간 로컬 검증본.
+- 변경: 배민 본인부담 할인 1회 가산, 차액·최종수익·월 예상수익 재계산, 할인 전 매출로 임대료 배분. 반영 여부를 parquet 메타데이터에 기록해 구 마트 호환 처리.
+- 검증 결과: 43개 테스트·컨테이너 DAG import·메타데이터 왕복·UTF-8·전체 데이터 정합성 통과. 최신 31,340/41,096행, 배민 매출 +266,681,120원, 정산 확인 차액 +263,111,220원, 정산 누락 187행 유지.
+- 남은 위험: 16:10 실행과 코드 전환이 겹쳐 운영 임대료 1,645행 배분 변동 발생. 호환 수정 완료, 로컬 검증본에 기존 비중 복원 포함. 두 OneDrive 파일 교체 승인 대기이며 반영 전 원본 지문·실행 상태 재확인 필요. 검증본: .tmp/baemin_instant_discount_20260909/manifest.json.
+
+## 2026-09-09 배민 대기 반복·주문 실패 판정 수정
+- 대상: 배민 과거 DAG 자원 센서, lookback 등록·보류 재검증, 주문 수집 브리지 및 로컬 확장 후보.
+- 변경: 일반 작업 재예약 예외를 60초 센서로 전환, 완료 작업 전환 보정·후속 정리 허용, 생성/보류 합산 2건 제한. 확장 실패·기존 CSV 재사용·무매출 구분 및 시간 초과 수집 중단·중복 실행 방지.
+- 검증 결과: Python 회귀 141개, Chromium 회귀 8개 및 운영본 기반 후보 동일 검증 통과. 컨테이너 센서 17개 직렬화, 재확인 62~66초, 최근 10분 구방식 재예약 0건, harness 95 DAG 검증 통과.
+- 남은 위험: OneDrive 운영 확장 반영 승인 대기. 로컬 후보는 즉시할인 재렌더·재시도 전체 시간 제한·오류 원인 보존 수정 완료. 실제 매장 재수집 및 전체 반영 후 30분 관찰은 미완료. 자료: .tmp/baemin_queue_fix_20260909/review.md.
+
+### 2026-09-09 배민 백필 전체 실행 1건 제한
+- 대상: 백필 수집·재시도·업로드·검증 4개 DAG와 공통 배정기/자동 복구기.
+- 변경: 생산자 직접 생성 제거, DB 공통 잠금 안에서 전체 queued/running 1건 배정 및 요청 삭제를 원자 처리. 후속 작업 우선, 사용자 실패처리 및 후속 요청 자동 재개 차단.
+- 운영: 미시작 실행 6건을 입력/실행 기록을 보존해 내부 보류로 전환. 실제 수집 1건 유지, DAG 일시 정지 원상복구. 기존 자동 복구 감시기도 새 제한 코드로 재기동.
+- 검증: 관련 회귀 141건, 별도 센서/직렬화 포함 회귀 묶음 70건 통과(중복 포함). 격리 PostgreSQL 동시 요청·순차 인계·취소·장애 롤백·자동 복구 10건 통과. 하네스 95 DAG 검증 및 UTF-8/구문 검사 통과.
+- 남은 위험: 내부 보류 37건은 순차 처리 대상으로 보존하며 당일 전체 완료 보장은 없음. 실운영 후속 인계는 현재 수집 종료 후 관찰 필요. UI 직접 실행/clear는 공통 자동 등록 제한 밖이며 OneDrive/수집 확장 배포는 이번 변경에 포함하지 않음.
+
+### 2026-09-09 광주태전점 방문일지 분류 복구
+- 대상: Flow 방문일지 파이프라인·세그먼터·프롬프트·품질검사, 프로젝트 2548056/게시글 84849550.
+- 변경: 빈 본문 품질 차단, 명시 대상 우선, 1인 봉투 주제 경계 및 점주 의견 근거 보정, 실제 모델 호출 상한·캐시 갱신, 정책 탐지와 권리금 회수 분류 보정, 타 매장 JSONL 보존.
+- 검증: 로컬 방문 8건/이슈 37건 재생성, 분류 공백·최종 fallback 0건. 관련 회귀 및 DAG import/UTF-8 통과. 백필 격리 DB 동시성·취소·복구 테스트 10건 통과 후 테스트 DB 삭제.
+- 남은 위험: OneDrive 반영 9개 파일 승인 대기, 원본 해시 비교 및 타 매장 보존 후보 준비 완료. Flow API 간헐적 500 관찰. 검토: .tmp/flowvisit_gwangju_20260909_review.md.
+
+### 2026-09-09 광주태전점 방문일지 운영 반영
+- 대상: 사용자 승인한 OneDrive 원천·방문 마트 9개 파일, 광주태전점 로컬 분류 캐시.
+- 변경: 원본 해시 재확인 후 검증 후보 반영, 대상 캐시 56개 병합 및 기존 다른 캐시 229개 보존.
+- 검증: 호스트와 Airflow 컨테이너에서 본문 3,556자, 방문 8건·이슈 37건·최신 5건·분류 공백 0건 확인. 다른 파티션 139개 파일과 공용 파일의 타 매장 행 보존, 임시 백업 삭제 완료.
+- 남은 위험: 외부 화면의 자체 캐시는 새로고침이 필요할 수 있음. 반영 내역: C:/Local_DB/temp/flowvisit_gwangju_20260909/applied_result.json.
+
+### 2026-09-10 Airflow 메모리 장애 복구 및 오늘 작업 재개 준비
+- 대상: Docker 워커·자동 감시·메모리 알림·방문일지 DAG 의존성.
+- 변경: 워커 동시 실행 5→1, 시간 초과 ping 정상 오판 수정, 복구 시 초기화 의존 서비스 실행 제외, 메모리 상태 변경 알림을 로컬 로그로 전환, 크롤러 지연 import 및 setuptools 버전 명시.
+- 검증: 회귀 39개 통과, 웹 health 3회 정상, 전체 import 오류 0건, 실제 워커 동시 실행 1개 및 가용 메모리 약 12.35GiB 확인.
+- 남은 위험: 오늘 50개 DAG의 산출물 복구는 아직 미실행. OneDrive·외부 보고 승인 전 풀 0 유지 및 Docker 감시 일시 중지, 과거 배정 보류. 검토: .tmp/airflow_recovery_review_20260910.md.
+
+### 2026-09-10 쿠팡 개발용 확장 반복 실패 수정 작업본
+- 대상: .tmp/coupang-failures-20260910의 OneDrive 개발용 확장 격리 작업본(원본 미수정).
+- 변경: 서비스 워커 대기·로그인 복구 시간 누적 제거, 주문 불일치 백필, CMG 식별·날짜·저장 완료 판정 수정.
+- 검증: Node 실행 테스트 38개, JS 7개 문법, 격리 Chromium의 대기·워커 재시작·주문/CMG DOM 확인 통과.
+- 남은 위험: OneDrive 적용 승인 및 실제 최소화/잠금 10분·실계정 CSV 검증 대기. 검토: .tmp/coupang-failures-20260910/REVIEW.md.
+
+### 2026-09-10 승인 후 오늘 Airflow 순차 실행 재개
+- 대상: 승인된 오늘 정기 작업의 OneDrive 산출물 및 기존 보고·알림, Docker 자동 감시.
+- 변경: 09:17 메모리 안정 5회 확인 후 풀 복원, 워커와 스케줄러 배정 모두 1개로 제한. 후속 DAG 6개는 선행 실행 성공 뒤 자동 재개하도록 당일 감시를 구성. 과거 45건과 Nightly·저장소 정리는 보류.
+- 검증: 기존 회귀 39개 및 격리 단계 검증 2개 통과. 재개 후 태스크 10개 성공·새 실패 0, OKPOS 다운로드 파일 5개와 Excel 읽기, 가용 메모리 약 11.1GiB, 전체 import 오류 0 확인.
+- 남은 위험: 전체 산출물 처리는 진행 중이며 기존 배민 재시도 타임아웃 1건은 보존. 당일 단계 감시는 23:59까지 동작하고 미완료 선행 작업의 후속은 보류 유지. 상태: C:/Local_DB/airflow_ops/recovery_20260910/stages.json.
+
+### 2026-09-10 사용자 요청에 따른 3개 DAG 병행 처리
+- 대상: 일반 워커 및 스케줄러의 동시 작업 배정.
+- 변경: 실행 중 수집을 유지하며 워커 pool_grow로 처리 프로세스 1→3, 스케줄러 parallelism 1→3 적용. DAG별 기본 max_active_tasks=1로 설정하고 Compose의 일반 워커 명령·환경변수도 3으로 저장.
+- 검증: 워커 실제 프로세스 3개·prefetch 3, 스케줄러 설정 3/1, 서로 다른 DAG 3개 배정 및 메모리 정책 normal·가용 약 10.8GiB 확인. 과거 워커 설정 1 유지.
+- 남은 위험: 일반 워커는 실행 중 작업 보존을 위해 재생성하지 않았으며 현재 3개는 live pool 확장으로 적용. 다음 Compose 재생성에서 저장된 3개 설정 적용. 기존 단계별 선행 작업 대기는 유지.
+
+### 2026-09-10 fin_product 검수 매핑 즉시 반영
+- 대상: OneDrive `fin_product_map_review_input.csv`, `fin_product_map.csv`, `fin_product_map_join.csv`, `fin_product_mart.csv`; `DB_FinProduct_Map_Dags`, `DB_FinProduct_Dags` 반영 단계.
+- 변경: 승인된 검수값을 Map migrate 단계로 반영하고 join 859행 및 상품 마트 25,546행을 재생성했다. 대기 44행은 join에서 제외했다.
+- 검증: 승인행 누락 0건, review/join 표준명·분류 불일치 0건, 대기행 join 유입 0건, DAG import 통과, 관련 pytest 23건 통과.
+- 남은 위험: 기존 스케줄 Map DAG 실행은 executor 대기열에 남아 있으며 동일 입력을 재처리할 수 있다. worker 이미지에는 pytest 실행 파일이 없어 저장소 가상환경으로 테스트했다.
+
+### 2026-09-11 marketing_ads_flow_compare row_scope=task 행 제거
+- 대상: `modules/transform/pipelines/sales/BSP_MarketingAds_Mart.py`의 `_flow_compare_rows`, `tests/test_marketing_ads_mart.py`, OneDrive `mart/Marketing_Ads_Tracking/README.md`.
+- 변경: 업무 합산행(`row_scope="task"`)을 만들지 않고 광고 ID별 상세행(`row_scope="id"`)만 낸다. ID가 1개인 업무에서 `id` 값과 지표가 완전히 같은 행이 하나 더 생겨, Power BI에서 필터를 빠뜨리면 이중집계가 되던 문제를 없앴다. `row_scope` 컬럼과 `FLOW_COMPARE_COLS`는 하위 호환을 위해 유지하고 값은 항상 `id`다.
+- 검증: 손실 없음을 코드로 확인 — `base` dict 공유로 `channel_warning`·`ad_ids`·`std_title` 등 메타는 `id` 행에 전부 있고, `_flow_ad_tasks`가 ID 미매칭 업무를 이미 skip하므로 `task` 행만 있는 업무는 존재할 수 없으며, daily 행은 `(channel, _flow_match_id)` 쌍 하나에만 매칭되어 `flow_post_id` SUM으로 업무 합계가 정확히 재현된다. `marketing_ads_daily_flow_tasks.csv`를 만드는 `_expand_flow_tasks_by_date`는 원래부터 `id` 행만 써서 무영향. pytest `tests/test_marketing_ads_mart.py` 46 passed.
+- 남은 위험: 소비자(Power BI)에서 `ctr`/`cpc`/`pct_*`를 업무 단위로 보려면 measure 재계산이 필요하다(`SUM(clicks)/SUM(impressions)` 등). `id` 단독은 여전히 유니크 키가 아니며 `flow_post_id + id`를 써야 한다. 같은 파일의 `test_daily_mart_keeps_channel_hierarchy`는 이번 변경과 무관한 기존 미커밋 `image_url` 컬럼 추가 때문에 실패 중이다.
+
+### 2026-09-11 배민 매크로 "입금예정금액" 공란 근본원인 수정
+- 대상: `modules/transform/pipelines/db/DB_Beamin_04_orders.py`(`_block_low_settle_rate`), `dags/db/DB_Beamin_Macro_Dags.py`(알림 문구/부분성공 판정), `tests/test_baemin_orders_cancelled_filter.py`, `tests/test_baemin_macro_notify.py`.
+- 원인: 배민 셀러사이트가 전날 정산정보(입금예정금액)를 통상 09:00 KST 전후에 게시하는데, 자동 수집(00:15 KST)이 그보다 먼저 돌아 항상 settle_rate=0%였고, 기존 코드는 합계가 일치해도 이 경우 `matched=False`로 강제해 정상 수집분을 통째로 폐기 후 동기 2시간 재시도→Retry DAG로 계속 이월시켰다. 로그 실측(8/11~9/10 scheduled 28개 전수, Retry 다수)으로 09시 경계를 확인.
+- 변경: `_block_low_settle_rate`가 더 이상 `matched`/`save_partial`을 덮어쓰지 않고 `settlement_suspect` 플래그만 남긴다 → 합계 일치분은 그대로 저장. 알림에서 정산 미게시만으로는 "부분성공" 처리하지 않고 "정산정보 미게시(09시 이후 자동 재수집 예정)"로 안내만 한다. 기존 `DB_DeliveryCommission_Dags`(08:10부터 6회/일)의 `monitor_baemin_settlement_missing → trigger_baemin_orders_only_recollect`가 `총결제금액>0 & 입금예정금액 NULL` 행을 그대로 감지해 재수집을 자동 트리거하므로 별도 신규 파이프라인은 만들지 않았다.
+- 검증: 관련 pytest(`test_baemin_orders_date_filter_abort`, `test_delivery_commission`, `test_baemin_macro_notify`, `test_baemin_orders_cancelled_filter`) 73건 통과. `test_baemin_macro_notify`의 기존 "부분성공" 기대 테스트, `test_baemin_orders_cancelled_filter`의 차단 기대 테스트는 새 의도된 동작에 맞춰 갱신. 무관한 사전 실패(`test_baemin_woori_recovery`, `test_baemin_macro_validation`)는 미수정 베이스라인에서도 동일하게 실패함을 확인(무관 이슈).
+- 남은 위험: 다음 00:15 스케줄 런에서 실제 저장 유지 + 09시 이후 정산 컬럼 자동 채움을 운영 로그로 재확인 필요. `retry_failed`/Retry DAG의 `settle_rate` 기반 소모적 재시도는 이번 수정으로 애초에 "실패" 목록에 안 들어가 자연 해소되므로 별도 defer 패턴 추가는 하지 않았다.
+
+### 2026-09-12 Docker 데이터 이전 중단 → Airflow 메타DB 초기화 복구
+- 대상: Airflow 메타DB(`airflow_postgres-db-volume`), doridangdb, DAG paused 상태 74개, `scripts/backup_airflow_meta.ps1`(신규), 작업스케줄러 `DoridangAirflowMetaBackup`(신규).
+- 원인: 9/11 Docker 데이터를 E:\DockerData\wsl 로 옮기다 중단 → 9/12 00:16 Docker Desktop이 C에 빈 vhdx를 새로 만들어 기동. 메타DB(이력 27,026런·Variable 104·Pool 4·Connection 1)와 doridangdb가 빈 DB로 대체되고 DAG 90개가 paused, 배민 매크로는 `baemin_selenium_pool` 부재로 영구 대기.
+- 변경: Airflow 서비스만 정지 후 `E:\airflow_backup\20260911\airflow_meta.dump`(9/11 20:04)·`doridangdb.dump`를 pg_restore. 전부 paused로 잠근 뒤 수집(25) → 변환/상시(43) → OKPOS 의존 5개+ScheduleGuard 순으로 unpause. 놓친 당일 슬롯은 unpause 시 스케줄러가 자동 생성(수동 trigger 없음). 메타DB 일일 덤프(03:00, E:\airflow_backup\meta, 7일 보관) 상시화.
+- 검증: 복원 후 건수가 덤프와 1:1 일치, import error 0, unpaused 집합 == 덤프 집합(74). 오늘 수집 DAG 전부 success(EasyPOS·Food_Guide는 재시도 후 성공), 첫 일일 덤프 263.9MB 생성 확인.
+- 남은 위험: 옛 vhdx 사본 2벌(E:\DockerData\wsl, E:\airflow_backup\20260911\docker_wsl_before_move, 각 166GB)은 E: 여유 51GB 상태에서 삭제 승인 대기. E: 이전(Phase 2)은 미실행 — Docker Desktop 디스크 위치 변경으로 별도 진행 예정. `Strategy_ToOrderVoc_02_Transform_Dags`의 `upload_store_summary_to_gsheet`가 선행 태스크보다 먼저 실행되는 의존 edge 누락은 기존 문제로 미수정.
+
+### 2026-09-12 EasyPOS 영수증 8/30~9/11 전량 0건 원인 수정 + 백필
+- 대상: `modules/transform/pipelines/db/DB_EasyPOS_Sales.py` `collect_receipts` 재시도 루프.
+- 원인: 7/22 커밋(6df65b7)에서 `all_rows.extend(rows)`가 `for retry` 루프 안으로 들어가, 정상 경로(기준 없음/합계 일치 → `break`)가 누적을 건너뛰어 매일 "수집 완료: 0건 (데이터 없음)"으로 성공 처리됐다. 영수증은 실제로 그리드에서 읽혔고(로그에 row별 상품 수집 기록) 저장 직전에 버려졌다.
+- 변경: extend/로그를 루프 밖(원래 위치)으로 되돌림.
+- 검증: conf date_from=2026-08-30, date_to=2026-09-11 수동 런 success, 13일 292건 저장(ym=2026-08/09 파티션 2개), verify_missing 통과.
+- 남은 위험: DAG가 0건도 success로 끝내므로 같은 유형의 무증상 결손을 못 잡는다. `DB_CollectionFreshness_Dags` 감시 대상에 EasyPOS 추가 검토.
+
+### 2026-09-12 워커 메모리 고갈(고아 Chrome 325개) 긴급 회수
+- 대상: `airflow-airflow-worker-1` 컨테이너 프로세스, 12:00~12:45 실패 런(OKPOS/Posfeed Today, DeliveryCommission, OrderCross, CoupangLoad, Pc2, ScheduleGuard, Beamin Retry).
+- 원인: 오전 배민 매크로·정책 수집 등 Selenium 태스크가 끝난 뒤 Chrome/chromedriver/crashpad 프로세스가 PID 1로 재부모된 채 남아(고아 루트 95개, 총 325 프로세스) 워커 RSS 12.6GiB, 호스트 가용 0GB. Celery ping 헬스체크 타임아웃(unhealthy), 태스크는 import 단계에서 `No module named 'distutils'`/pandas circular import 같은 이상 오류로 실패, Docker API 500 1회.
+- 변경: PPID=1인 chrome 계열 루트를 서브트리째 kill(실행 중 태스크 2개 소유 브라우저는 보존) → 워커 1.35GiB, 가용 11GiB. Beamin Retry 런은 `tasks clear --only-failed`로 재개. Today 계열 실패는 14:xx 다음 슬롯이 대체하므로 별도 재실행 안 함.
+- 검증: 회수 직후 free 11GiB, 살아 있는 chrome 9개(진행 중 태스크 소유).
+- 남은 위험: 누수 자체는 미수정 — 드라이버 복구 시 기존 Chrome을 안 죽이거나 태스크 종료 훅이 없는 경로가 있다. 임시로 `DB_Storage_Cleanup_Dags`(04:20) 또는 별도 주기 태스크에 "PPID=1 chrome 정리"를 넣을지 결정 필요.
+
+### 2026-09-12 배민 Selenium 세션 종료 시 chrome 자손 트리 전체 종료 + 고아 reaper
+- 대상: `modules/extract/croling_beamin.py` `_kill_pid_tree`(자손 전체 SIGKILL, /proc 기반 `_descendant_pids`), 신규 `reap_orphan_chrome`(PPID=1 chrome 계열, 120초 이상 경과분 정리), `quit_driver_safely` 끝에서 reaper 호출.
+- 원인: 기존 `pkill -9 -P <pid>`는 직계 자식만 죽여 손자(렌더러·GPU·crashpad)가 PID 1로 재부모된 채 남았다. 크래시 복구가 잦은 날 수백 개가 쌓여 워커 메모리 고갈.
+- 검증: 워커에서 reaper 실측 51개 정리(루트 24), 실행 중 세션 chrome 16개는 보존. 관련 pytest 21건 통과.
+- 남은 위험: 컨테이너(/proc) 전용이라 Windows 로컬 실행에서는 no-op. Playwright(EasyPOS/OKPOS 등) 경로는 이 reaper를 안 거치므로 `chrome` comm이 같아도 세션 종료 시점에만 정리된다.
+
+### 2026-09-12 배민 확장 orders collector 호출 중 chromedriver HTTP timeout(90s) 초과 수정
+- 대상: `modules/transform/pipelines/db/DB_Beamin_04_orders.py` `_collect_all_pages_with_extension`(신규 `_run_extension_collect_script`, `_http_command_timeout`), `tests/test_baemin_extension_http_timeout.py`(신규 3건).
+- 원인: 드라이버 생성 시 `_apply_failfast_client(timeout=90s)`가 걸리는데 확장 수집기는 `execute_async_script` 300s를 허용한다. 낮 시간대 셀러사이트가 느릴 때 주문 100건 안팎 매장(미사·대화·김해구산·부산장림)은 90초를 넘겨 `HTTPConnectionPool Read timed out`으로 끊기고, 이 오류는 크래시로 분류돼 Selenium 폴백까지 생략 → Retry 3회 모두 동일 실패. 날짜 '적용' 클릭 자체는 정상(로그 "날짜 필터 설정 완료: 어제").
+- 변경: 확장 수집 호출 직전에 HTTP timeout을 `timeout_sec+60`(360s)으로 올리고 `finally`에서 원래 값으로 복원. 기존 `_apply_failfast_client` 재사용.
+- 검증: 신규 pytest 3건 + 기존 배민 20건 통과. 실제 4매장 재수집은 Retry 3회차 종료 후 `DB_Beamin_Macro_Dags` conf(stores/target_date/orders_only)로 실행 예정.
+- 남은 위험: URL 날짜 파라미터가 낮에는 첫 렌더에 반영되지 않아 'URL' 검증 경고가 매번 10초 소모(UI 보정으로 통과). 소음일 뿐이라 미수정.
+
+### 2026-09-12 쿠팡 확장 로그인 권한 오류 복구 — 디버거 클릭 제거, 재입력 재시도 복원
+- 대상: OneDrive 개발용 확장 `runner.js`(로그인 루프·`ensureLoggedIn`·`waitForLoginResult`·로그인 페이지 이동), `background.js`(`COUPANG_RETRY_LOGIN_CLICK` 핸들러 삭제), `manifest.json`(`debugger` 권한 제거). 승인 후 3파일 수정, `.bak`·repo 사본 미변경.
+- 원인: 권한 문구(로그인 API 403, Akamai)는 09/06~09/08에 "3초 후 ID/PW 재입력+재클릭"으로 71~94% 통과됐는데, 09/09 도입한 `chrome.debugger` 실제 클릭 1회 복구는 09/09~09/12 누적 154건 중 0건 성공(timeout 57·error 14/09-12). 계정당 45초 소모 후 백필로 넘겨 일일 배치 성공 25/34→11/34로 하락. 09/09 자체 진단도 신뢰 클릭 후 403 3연속이었다.
+- 변경: 권한 문구는 기존 "같은 페이지 재시도" 분기로 합류(`isRetryableLoginPermissionError`, 계정당 로그인 2회 캡 유지), 세션 소실 재로그인은 `retryLoginSamePage` 1회. 실패 후 로그인 URL에 남은 탭의 동일 URL 재진입 경합(`AUTO_LOGIN 연결 오류` 연쇄)은 `about:blank` 경유로 차단. 로그인 실패 시 `로그인 실패 상태 url/ready/err/idFilled` 진단 로그 1줄 추가.
+- 검증: `node --check` 2파일·manifest JSON·UTF-8 통과, 잔존 참조 0건. 실계정 검증은 확장 리로드 후 사용자 선택 실행으로 확인 예정(기대 로그: `권한 오류 문구 감지 — 같은 페이지 재입력 재시도 (1/2)` → `orders 페이지 도달`).
+- 남은 위험: 1차 403 발생률 자체는 Akamai 판정이라 그대로다(09/07 수준 ~5% 잔존 실패 예상). 추가 저감 후보는 로그인 폼 표시 후 정착 대기 또는 `_abck` 선택 보존(07/22 계획, 미적용). `.tmp/coupang-login-recovery-20260909/login_recovery.test.cjs`는 폐기 대상.
+- 결과(추가): 수정 후 `manual__orders_fix_20260911_3stores`·`_busanjangrim` 런에서 `Read timed out` 0건, timeout 360s↔90s 전환 로그 확인. 미사점 150행/22주문, 김해구산점 52행/6주문, 부산장림점 130행/18주문 적재 → 배민 9/11 최종 5,436행/63매장(9/10 4,692행). 부산장림·대화는 낮 재수집 시 완전 중복행이 2·9행 섞임(pk 병합에서 안 걸러짐) — 소량이라 방치, 병합 dedupe는 별도 검토.
+
+### 2026-09-12 Docker 데이터 E: 이전 완료 + 옛 vhdx 사본 삭제
+- 대상: Docker Desktop 4.55 `settings-store.json`, `E:\DockerData\wsl`, `E:\airflow_backup\20260911\docker_wsl_before_move`.
+- 변경: 16:22 메타DB 덤프 → compose stop → Docker 종료·`wsl --shutdown` → 현재 vhdx(disk 25.7GB, main 0.1GB)를 `E:\DockerData\wsl`로 복사 → **`CustomWslDistroDir` = `E:\DockerData\wsl`** 설정(4.55에서 `DataFolder`는 Hyper-V vm-data용이라 무시됨, 실측) → `wsl --unregister docker-desktop` 후 Docker 재시작 → distro BasePath·파일 잠금이 E:로 이동한 것 확인 → 컨테이너 자동 기동. 다운타임 약 6분, 놓친 스케줄 없음.
+- 검증: 9개 컨테이너 healthy, 웹 /health 200, dag_run 27,227·variable 118·unpaused 74·import error 0, doridangdb 7테이블. 옛 166GB 사본 2벌 삭제 → E: 여유 23.7GB → 348.5GB.
+- 남은 위험: `C:\Users\민준\AppData\Local\Docker\wsl\disk\docker_data.vhdx`(25.7GB, 미사용)는 롤백용으로 하루 두고 삭제 예정. Docker Desktop을 GUI에서 "Disk image location"으로 다시 바꾸면 이 설정과 충돌할 수 있음.

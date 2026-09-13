@@ -20,6 +20,7 @@ import pendulum
 from airflow import DAG
 from airflow.exceptions import AirflowException
 from airflow.models.dagrun import DagRun
+from airflow.models.taskinstance import TaskInstance
 from airflow.operators.python import PythonOperator
 from airflow.utils.session import create_session
 
@@ -137,6 +138,21 @@ def _assert_no_blocking_run_active() -> None:
             .order_by(DagRun.execution_date.desc())
             .all()
         )
+        blocking = []
+        for row in rows:
+            if row.dag_id == TODAY_DAG_ID:
+                gate = session.query(TaskInstance).filter_by(
+                    dag_id=row.dag_id, run_id=row.run_id, task_id="wait_for_safe_window"
+                ).first()
+                # Today waits for this regular run at its entry gate. Waiting
+                # is not a parquet writer; treating it as one deadlocks both DAGs.
+                if gate is not None and gate.state in (
+                    None, "scheduled", "queued", "up_for_retry", "up_for_reschedule",
+                    "failed", "upstream_failed", "skipped",
+                ):
+                    continue
+            blocking.append(row)
+        rows = blocking
     if not rows:
         return
     active = ", ".join(f"{dag_id}:{run_id}:{state}" for dag_id, run_id, state in rows)
@@ -178,6 +194,7 @@ def _is_full_backfill_requested(context) -> bool:
 def _has_full_recalc_targets(context) -> bool:
     return (
         bool(FULL_RECALC_TARGET_STORES)
+        and _truthy(_conf(context).get("include_full_recalc"))
         and not _is_partial_store_mode(context)
         and not _is_today_mode(context)
         and not _is_full_backfill_requested(context)

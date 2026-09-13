@@ -49,11 +49,16 @@ def test_unwrap_projects_dump():
     assert set(first) == set(flow._PROJECT_COLS)
 
 
-def test_project_store_inference_keeps_parenthesized_store_names():
+def test_project_store_inference_strips_trailing_parenthesized_suffixes():
     assert flow._infer_project_parts("경기_시흥장현점(양수)(68호점)")[:3] == (
         True,
         "경기",
-        "시흥장현점(양수)(68호점)",
+        "시흥장현점",
+    )
+    assert flow._infer_project_parts("경기_평택비전점(양수)")[:3] == (
+        True,
+        "경기",
+        "평택비전점",
     )
     assert flow._infer_project_parts("TF_송파삼전점 가맹 사업 모델 고도화")[0] is False
 

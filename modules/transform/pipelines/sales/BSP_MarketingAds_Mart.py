@@ -114,6 +114,8 @@ READ_ENCODINGS = ("utf-8-sig", "utf-8", "cp949")
 NAVER_ADS_FILE_PATTERNS = ("naver_ads_group_*.csv", NAVER_ADS_FILE_PATTERN)
 
 TITLE_CHANNEL_RE = re.compile(r"\[\s*(네이버|당근)\s*[_\s]*광고\s*\]")
+# _extract_flow_ad_ids에서 채널 태그 대괄호("[당근_광고]" 등)를 ID 후보로 오인하지 않도록 제외할 때 쓴다
+CHANNEL_TAG_ONLY_RE = re.compile(r"^(?:네이버|네ㅇ버|당근)\s*[_\s]*광고$")
 CAMPAIGN_ID_RE = re.compile(r"\[\s*campaign[_\s]*id\s*[:：]\s*([^\]]+?)\s*\]", re.IGNORECASE)
 BRACKET_RE = re.compile(r"\[[^\]]*\]")
 BODY_START_RE = re.compile(r"시작일\s*[:：]?\s*(\d{4})[-./]?(\d{2})[-./]?(\d{2})")
@@ -177,6 +179,7 @@ DAILY_COLS = [
     "FLOW_LINK",
     "FLOW_TITLE",
     "url",
+    "image_url",
 ]
 
 CAMPAIGN_COLS = [
@@ -192,6 +195,8 @@ CAMPAIGN_COLS = [
     "end_date",
 ]
 
+# row_scope는 항상 "id"다(광고 ID 1개 = 1행). 과거에는 업무 합산행 "task"도 같이 냈지만
+# 이중집계 때문에 제거했다. 컬럼 자체는 하위 호환을 위해 남긴다.
 FLOW_COMPARE_COLS = [
     "project_id",
     "project_name",
@@ -199,8 +204,11 @@ FLOW_COMPARE_COLS = [
     "parent_title",
     "flow_post_id",
     "flow_url",
+    "row_scope",
     "channel",
     "id",
+    "ad_ids",
+    "ad_id_count",
     "std_name",
     "std_title",
     "task_title",
@@ -233,6 +241,8 @@ DAILY_FLOW_TASK_COLS = [
     "stat_date",
     "channel",
     "id",
+    "ad_ids",
+    "ad_id_count",
     "std_name",
     "flow_post_id",
     "flow_url",
@@ -277,6 +287,7 @@ SOURCE_COLS = [
     "clicks",
     "cost",
     "url",
+    "image_url",
 ]
 
 MANUAL_LINK_COLS = [
@@ -793,6 +804,7 @@ def _load_naver_daily(
             "clicks": _to_number(row.get("클릭수")),
             "cost": _to_number(row.get("총비용")),
             "url": _naver_collect_url(row, campaign_id, stat_date),
+            "image_url": _text(row.get("image_url")),
         }
         source_row.update(depth_fields)
         rows.append(source_row)
@@ -852,6 +864,7 @@ def _load_daangn_daily(csv_path: Path | None = None) -> pd.DataFrame:
             "clicks": _to_number(row.get("클릭수")),
             "cost": _to_number(row.get("지출")),
             "url": _text(row.get("url")),
+            "image_url": _text(row.get("image_url")),
         }
         source_row.update(depth_fields)
         rows.append(source_row)
@@ -1119,20 +1132,22 @@ def build_flow_ad_performance_mart(
 
     tasks = _flow_ad_tasks(flow_posts, campaigns, project_id)
     rows = [
-        _flow_compare_row(task, campaigns[task["id"]], daily, collected_at)
+        row
         for task in tasks
+        for row in _flow_compare_rows(task, campaigns, daily, collected_at)
     ]
     table = pd.DataFrame(rows, columns=FLOW_COMPARE_COLS)
     if len(table):
-        table = table[FLOW_COMPARE_COLS].sort_values(["start_date", "channel", "id", "flow_post_id"])
+        table = table[FLOW_COMPARE_COLS].sort_values(["start_date", "channel", "row_scope", "id", "flow_post_id"])
     _write_csv_atomic(table, output_path)
 
+    id_rows = table[table["row_scope"] == "id"] if len(table) else table
     result = {
         "dataset_name": "marketing_ads_flow_compare",
         "output_path": str(output_path),
         "rows": len(table),
         "project_id": project_id,
-        "ids": int(table["id"].nunique()) if len(table) else 0,
+        "ids": int(id_rows["id"].nunique()) if len(id_rows) else 0,
     }
     logger.info("Flow 광고 성과 비교 마트 저장 완료: %s", json.dumps(result, ensure_ascii=False))
     return json.dumps(result, ensure_ascii=False)
@@ -1247,9 +1262,16 @@ def _flow_ad_tasks(
             f"parents={json.dumps(FLOW_AD_PARENT_BY_CHANNEL, ensure_ascii=False)}"
         )
 
-    errors: list[str] = []
+    skipped_invalid_tasks: list[str] = []
+    skipped_unavailable_channels: dict[str, int] = {}
+    unknown_id_samples: list[str] = []
     tasks: list[dict[str, Any]] = []
     valid_ids = set(campaigns)
+    available_channels = {
+        _text(campaign.get("channel"))
+        for campaign in campaigns.values()
+        if _text(campaign.get("channel"))
+    }
     for row in posts.to_dict("records"):
         parent_post_id = _text(row.get("parent_post_id"))
         channel = parent_channels.get(parent_post_id)
@@ -1257,26 +1279,40 @@ def _flow_ad_tasks(
             continue
 
         title = _text(row.get("title")) or _text(row.get("task_nm"))
-        ad_id, candidates = _extract_flow_ad_id(title, valid_ids)
+        ad_ids, candidates, unknown_tokens = _extract_flow_ad_ids(title, valid_ids)
+        if not ad_ids and available_channels and channel not in available_channels:
+            skipped_unavailable_channels[channel] = skipped_unavailable_channels.get(channel, 0) + 1
+            continue
         start_date = _to_date(row.get("start_dt"))
         end_date = _to_date(row.get("end_dt"))
         missing_fields = []
-        if not ad_id:
+        if not ad_ids:
             missing_fields.append(f"id 미매칭(candidates={candidates})")
-        elif _text(campaigns[ad_id].get("channel")) != channel:
-            missing_fields.append(f"id 채널 불일치(id={ad_id}, campaign_channel={_text(campaigns[ad_id].get('channel'))}, parent_channel={channel})")
         if not start_date:
             missing_fields.append("start_dt")
         if not end_date:
             missing_fields.append("end_dt")
         if missing_fields:
-            errors.append(
+            skipped_invalid_tasks.append(
                 f"post_id={_text(row.get('post_id'))} title={title!r} missing={','.join(missing_fields)}"
             )
             continue
+        if unknown_tokens:
+            unknown_id_samples.append(
+                f"post_id={_text(row.get('post_id'))} title={title!r} unknown={unknown_tokens}"
+            )
 
+        # 업무 안의 ID는 채널이 섞일 수 있다(예: 네이버 소재 + 당근 소재를 같이 묶은 테스트).
+        # 각 ID의 채널은 부모 업무가 아니라 marketing_ads_campaign.csv(campaigns)를 정답으로 삼는다.
         parent = parent_channels[parent_post_id]
+        ad_id_channels = {ad_id: _text(campaigns[ad_id].get("channel")) or channel for ad_id in ad_ids}
         channel_warning = _flow_channel_warning(title, parent)
+        mismatched = [ad_id for ad_id, ad_channel in ad_id_channels.items() if ad_channel != channel]
+        if mismatched:
+            mismatch_text = ", ".join(f"{ad_id}={ad_id_channels[ad_id]}" for ad_id in mismatched)
+            extra_warning = f"id 채널≠부모 채널({mismatch_text}, parent={channel})"
+            channel_warning = f"{channel_warning} | {extra_warning}" if channel_warning else extra_warning
+
         tasks.append(
             {
                 "project_id": project_id,
@@ -1286,8 +1322,10 @@ def _flow_ad_tasks(
                 "flow_post_id": _text(row.get("post_id")),
                 "flow_url": _text(row.get("post_url")),
                 "channel": channel,
-                "id": ad_id,
-                "std_title": _flow_std_title(title, ad_id),
+                "ad_ids": ad_ids,
+                "ad_id_channels": ad_id_channels,
+                "id": "&".join(ad_ids),
+                "std_title": _flow_std_title(title, ad_ids),
                 "task_title": title,
                 "channel_warning": channel_warning,
                 "start_date": start_date,
@@ -1295,9 +1333,26 @@ def _flow_ad_tasks(
             }
         )
 
-    if errors:
-        raise RuntimeError("Flow 광고 하위업무 필수값 오류: " + " | ".join(errors[:10]))
+    if skipped_invalid_tasks:
+        logger.warning(
+            "Flow 광고 하위업무 필수값 누락/미매칭으로 건너뜀: count=%s samples=%s",
+            len(skipped_invalid_tasks),
+            " | ".join(skipped_invalid_tasks[:10]),
+        )
+    if unknown_id_samples:
+        logger.warning(
+            "Flow 업무 제목의 ID 후보 중 일부가 campaign 매핑에 없어 제외됨: count=%s samples=%s",
+            len(unknown_id_samples),
+            " | ".join(unknown_id_samples[:10]),
+        )
+    if skipped_unavailable_channels:
+        logger.warning(
+            "원천 데이터가 없는 채널의 Flow 광고 하위업무를 건너뜀: %s",
+            json.dumps(skipped_unavailable_channels, ensure_ascii=False),
+        )
     if not tasks:
+        if skipped_unavailable_channels or skipped_invalid_tasks:
+            return tasks
         raise RuntimeError(f"Flow 광고 하위업무가 없습니다: project_id={project_id}")
     return tasks
 
@@ -1328,15 +1383,50 @@ def _flow_parent_title(posts: pd.DataFrame, parent_post_id: str) -> str:
     return _text(row.get("title")) or _text(row.get("task_nm"))
 
 
-def _extract_flow_ad_id(title: str, valid_ids: set[str]) -> tuple[str, list[str]]:
+def _extract_flow_ad_ids(title: str, valid_ids: set[str]) -> tuple[list[str], list[str], list[str]]:
+    """제목의 대괄호/괄호 그룹에서 광고 ID를 뽑는다. 한 업무에 ID를 여러 개 붙일 수 있다.
+
+    표기 규칙 (위치는 앞/뒤 무관, 둘 다 인식):
+        [네이버_광고] 결과 테스트 [code1&code2&code3]   (신규 표준: ID는 뒤, & 로 구분)
+        [네이버광고] [code1] 결과 테스트                (기존 표기: ID 대괄호 반복도 계속 인식)
+
+    그룹 안 구분자는 `&` 또는 `,`만 쓴다. 공백으로는 나누지 않는다 — 당근 광고그룹명처럼
+    공백을 포함한 ID가 실제로 존재해서, 공백 split을 허용하면 멀쩡한 ID가 쪼개진다.
+    순서를 유지하며 중복은 제거하고, valid_ids에 없는 토큰은 unknown_tokens로 따로 돌려준다.
+    """
     candidates = [_text(candidate) for candidate in re.findall(r"[\[(（]\s*([^\]\)）]+?)\s*[\])）]", title)]
+    ad_ids: list[str] = []
+    seen: set[str] = set()
+    unknown_tokens: list[str] = []
+
+    def _add(token: str) -> None:
+        if not token:
+            return
+        if token in valid_ids:
+            if token not in seen:
+                seen.add(token)
+                ad_ids.append(token)
+        elif token not in unknown_tokens:
+            unknown_tokens.append(token)
+
     for candidate in candidates:
+        if not candidate or CHANNEL_TAG_ONLY_RE.match(candidate):
+            continue
         if candidate in valid_ids:
-            return candidate, candidates
-    for ad_id in sorted(valid_ids, key=len, reverse=True):
-        if ad_id and ad_id in title:
-            return ad_id, candidates
-    return "", candidates
+            _add(candidate)
+            continue
+        tokens = candidate.split("&") if "&" in candidate else candidate.split(",") if "," in candidate else [candidate]
+        for token in tokens:
+            _add(token.strip())
+
+    if not ad_ids:
+        # 대괄호 없이 제목 본문에 ID가 그냥 박힌 과거 표기 fallback. 이 경로는 1개만 잡는다.
+        for ad_id in sorted(valid_ids, key=len, reverse=True):
+            if ad_id and ad_id in title:
+                ad_ids.append(ad_id)
+                break
+
+    return ad_ids, candidates, unknown_tokens
 
 
 def _flow_channel_warning(title: str, parent_channel: str) -> str:
@@ -1359,25 +1449,38 @@ def _normalize_flow_label(value: Any) -> str:
     return re.sub(r"[\s_\[\]\(\)（）]", "", _text(value))
 
 
-def _flow_compare_row(
+def _flow_compare_rows(
     task: dict[str, Any],
-    campaign: dict[str, Any],
+    campaigns: dict[str, dict[str, Any]],
     daily: pd.DataFrame,
     collected_at: str,
-) -> dict[str, Any]:
+) -> list[dict[str, Any]]:
+    """업무 1건(광고 ID 1개 이상)에서 광고 ID별 상세행(row_scope=id)만 만든다.
+
+    업무 단위 합산행(row_scope=task)은 만들지 않는다 — ID가 1개인 업무에서 id 행과
+    완전히 같은 행이 하나 더 생겨, 소비자(Power BI)가 필터를 빠뜨리면 그대로
+    이중집계가 됐기 때문이다.
+
+    업무 단위로 보려면 소비자 쪽에서 flow_post_id 기준으로 합산한다. daily 행 하나는
+    (channel, _flow_match_id) 쌍 하나에만 매칭되므로 id 행을 더하면 업무 합계가 정확히
+    재현된다. 단 ctr/cpc/pct_*는 비율이라 합산하지 말고
+    SUM(clicks)/SUM(impressions), SUM(cost)/SUM(clicks), SUM(diff_x)/SUM(prev_x)로
+    다시 계산해야 한다.
+    """
     prev_start, prev_end = _previous_period(task["start_date"], task["end_date"])
-    current = _summarize_flow_period(daily, task["channel"], task["id"], task["start_date"], task["end_date"])
-    previous = _summarize_flow_period(daily, task["channel"], task["id"], prev_start, prev_end)
-    return {
+    ad_ids: list[str] = task["ad_ids"]
+    ad_id_channels: dict[str, str] = task["ad_id_channels"]
+    ad_ids_display = "&".join(ad_ids)
+
+    base = {
         "project_id": task["project_id"],
         "project_name": task["project_name"],
         "parent_post_id": task["parent_post_id"],
         "parent_title": task["parent_title"],
         "flow_post_id": task["flow_post_id"],
         "flow_url": task["flow_url"],
-        "channel": task["channel"],
-        "id": task["id"],
-        "std_name": _text(campaign.get("std_name")),
+        "ad_ids": ad_ids_display,
+        "ad_id_count": len(ad_ids),
         "std_title": task["std_title"],
         "task_title": task["task_title"],
         "channel_warning": task["channel_warning"],
@@ -1385,6 +1488,30 @@ def _flow_compare_row(
         "end_date": task["end_date"],
         "prev_start_date": prev_start,
         "prev_end_date": prev_end,
+        "collected_at": collected_at,
+    }
+
+    rows: list[dict[str, Any]] = []
+
+    for ad_id in ad_ids:
+        channel = ad_id_channels[ad_id]
+        current = _summarize_flow_period(daily, [(channel, ad_id)], task["start_date"], task["end_date"])
+        previous = _summarize_flow_period(daily, [(channel, ad_id)], prev_start, prev_end)
+        rows.append(
+            {
+                **base,
+                "row_scope": "id",
+                "channel": channel,
+                "id": ad_id,
+                "std_name": _text(campaigns.get(ad_id, {}).get("std_name")),
+                **_flow_metric_fields(current, previous),
+            }
+        )
+    return rows
+
+
+def _flow_metric_fields(current: dict[str, Any], previous: dict[str, Any]) -> dict[str, Any]:
+    return {
         "impressions": current["impressions"],
         "clicks": current["clicks"],
         "ctr": current["ctr"],
@@ -1402,7 +1529,6 @@ def _flow_compare_row(
         "pct_clicks": _pct_change(current["clicks"], previous["clicks"]),
         "pct_cost": _pct_change(current["cost"], previous["cost"]),
         "matched_daily_rows": current["matched_daily_rows"],
-        "collected_at": collected_at,
     }
 
 
@@ -1415,43 +1541,73 @@ def _previous_period(start_date: str, end_date: str) -> tuple[str, str]:
     return previous_start.isoformat(), previous_end.isoformat()
 
 
-def _flow_std_title(title: str, ad_id: str) -> str:
+def _flow_std_title(title: str, ad_ids: list[str] | str) -> str:
+    """제목에서 채널 태그와 광고 ID 대괄호 그룹을 지우고 업무명만 남긴다.
+
+    ID 그룹은 제목 앞/뒤 어디에 와도 된다(신규 표준은 뒤, 기존 표기는 앞).
+    """
+    ids = [ad_ids] if isinstance(ad_ids, str) else [_text(item) for item in ad_ids]
+    ids = [item for item in ids if item]
     text = _text(title)
     text = re.sub(r"^[\s\[\(\（]*\s*(?:네이버|네ㅇ버|당근)\s*[_\s]*광고\s*[\]\)\）]*", "", text).strip()
-    text = re.sub(rf"^[\s\[\(\（]*\s*{re.escape(ad_id)}\s*[\]\)\）]*", "", text).strip()
+
+    def _strip_id_group(match: "re.Match[str]") -> str:
+        inner = _text(match.group(1))
+        if inner in ids:
+            return " "
+        tokens = [token.strip() for token in re.split(r"[&,]", inner) if token.strip()]
+        if tokens and all(token in ids for token in tokens):
+            return " "
+        return match.group(0)
+
+    if ids:
+        text = re.sub(r"[\[(（]\s*([^\]\)）]+?)\s*[\])）]", _strip_id_group, text)
+    text = re.sub(r"\s+", " ", text).strip()
+    # 앞머리에 남는 잔여 괄호만 정리한다. 뒤쪽은 건드리지 않는다 — 미매칭 토큰이 섞여
+    # 못 지운 ID 그룹이 제목 끝에 있을 수 있는데, 거기서 닫는 괄호까지 잘라내면 안 된다.
     text = re.sub(r"^[\s\[\]\(\)（）]+", "", text).strip()
     return text or _text(title)
 
 
-def _flow_task_label(start_date: str, end_date: str, ad_id: str, std_title: str) -> str:
+def _flow_task_label(start_date: str, end_date: str, ad_ids: list[str] | str, std_title: str) -> str:
     start = date.fromisoformat(start_date)
     end = date.fromisoformat(end_date)
     if start.year == end.year and start.month == end.month:
         period = f"{start:%d}-{end:%d}"
     else:
         period = f"{start:%m-%d}~{end:%m-%d}"
-    return f"{period} [{ad_id}] {_text(std_title)}".strip()
+    display_id = ad_ids if isinstance(ad_ids, str) else "&".join(ad_ids)
+    return f"{period} [{display_id}] {_text(std_title)}".strip()
 
 
 def _expand_flow_tasks_by_date(flow_compare: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     if flow_compare.empty:
         return pd.DataFrame(rows, columns=DAILY_FLOW_TASK_COLS)
+    # row_scope가 있으면 소재별 상세행(id)만 펼친다. 현재 생산 코드는 id 행만 내지만,
+    # 합산행(task)이 남아 있는 과거 CSV를 그대로 읽어도 날짜x소재가 중복되지 않게 필터를 유지한다.
+    # row_scope 자체가 없는(더 이전) 원본은 모든 행이 이미 소재 단위였으므로 그대로 쓴다.
+    has_row_scope = "row_scope" in flow_compare.columns
     flow_compare = flow_compare.reindex(columns=FLOW_COMPARE_COLS, fill_value="")
-    for row in flow_compare.fillna("").to_dict("records"):
+    id_rows = flow_compare[flow_compare["row_scope"] == "id"] if has_row_scope else flow_compare
+    for row in id_rows.fillna("").to_dict("records"):
         start_date = _to_date(row.get("start_date"))
         end_date = _to_date(row.get("end_date"))
         ad_id = _text(row.get("id"))
         if not start_date or not end_date or not ad_id:
             continue
-        std_title = _text(row.get("std_title")) or _flow_std_title(_text(row.get("task_title")), ad_id)
-        label = _flow_task_label(start_date, end_date, ad_id, std_title)
+        ad_ids_display = _text(row.get("ad_ids")) or ad_id
+        ad_id_list = ad_ids_display.split("&")
+        std_title = _text(row.get("std_title")) or _flow_std_title(_text(row.get("task_title")), ad_id_list)
+        label = _flow_task_label(start_date, end_date, ad_ids_display, std_title)
         for stat_date in pd.date_range(start_date, end_date, freq="D"):
             rows.append(
                 {
                     "stat_date": stat_date.strftime("%Y-%m-%d"),
                     "channel": _text(row.get("channel")),
                     "id": ad_id,
+                    "ad_ids": ad_ids_display,
+                    "ad_id_count": _text(row.get("ad_id_count")) or str(len(ad_id_list)),
                     "std_name": _text(row.get("std_name")),
                     "flow_post_id": _text(row.get("flow_post_id")),
                     "flow_url": _text(row.get("flow_url")),
@@ -1655,17 +1811,23 @@ def _flow_placeholder_row(
 
 def _summarize_flow_period(
     daily: pd.DataFrame,
-    channel: str,
-    ad_id: str,
+    pairs: list[tuple[str, str]],
     start_date: str,
     end_date: str,
 ) -> dict[str, Any]:
-    if daily.empty:
-        rows = daily
+    """(channel, id) 쌍 목록에 걸리는 daily 행을 기간으로 합산한다.
+
+    daily 행 하나는 channel 하나 + _flow_match_id 하나만 가지므로, 쌍을 OR로 합쳐도
+    한 행이 두 쌍에 동시에 걸릴 수 없다 — 여러 ID를 합산해도 이중집계가 나지 않는다.
+    """
+    if daily.empty or not pairs:
+        rows = daily.iloc[0:0]
     else:
+        mask = pd.Series(False, index=daily.index)
+        for channel, ad_id in pairs:
+            mask = mask | ((daily["channel"] == channel) & (daily["_flow_match_id"] == ad_id))
         rows = daily[
-            (daily["channel"] == channel)
-            & (daily["_flow_match_id"] == ad_id)
+            mask
             & (daily["stat_date"] >= start_date)
             & (daily["stat_date"] <= end_date)
         ]

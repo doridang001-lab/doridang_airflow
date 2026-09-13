@@ -2555,6 +2555,60 @@ def test_zero_price_cost_bearing_rice_counts_cost_and_stays_in_profit_master(mon
     assert summary.iloc[0]["수익률"] == ""
 
 
+def test_manual_profit_splits_hanwoo_daechang_by_weight(monkeypatch):
+    rows = []
+    for seq, line_role, kind, item_id, item_name, total_price in [
+        ("1", "main", menu_hierarchy.OPTION_KIND_MAIN, "MAIN", "1인분", "11900"),
+        ("2", "option", menu_hierarchy.OPTION_KIND_MATERIAL, "DAECHANG_75", "한우 대창 75g 추가", "4500"),
+        ("3", "option", menu_hierarchy.OPTION_KIND_MATERIAL, "DAECHANG_150", "한우 대창 150g 추가", "8900"),
+        ("4", "option", menu_hierarchy.OPTION_KIND_MATERIAL, "POTATO", "감자사리 150g 추가", "2000"),
+    ]:
+        row = {col: "" for col in menu_hierarchy.LEFT_JOINED_OUTPUT_COLUMNS}
+        row.update({
+            "source": "배민수동",
+            "brand": "도리당",
+            "store": "송파삼전점",
+            "sale_date": "2026-07-12",
+            "platform": "배달의민족",
+            "order_type": "배달",
+            "order_id": "O_DAECHANG_WEIGHT",
+            "menu_seq": "1",
+            "item_seq": seq,
+            "parent_item_seq": "1",
+            "line_role": line_role,
+            "option_kind": kind,
+            "item_id": item_id,
+            "menu_name": "1인 순살 닭도리탕(밥포함)",
+            "item_name": item_name,
+            "std_menu_name": "1인 순살 닭도리탕(밥포함)",
+            "qty": "1",
+            "total_price": total_price,
+            "닭유형": "순살",
+            "사이즈": "1인",
+        })
+        rows.append(row)
+    monkeypatch.setattr(menu_hierarchy, "_manual_profit_rate_attrs", lambda: pd.DataFrame(columns=menu_hierarchy.MANUAL_PROFIT_RATE_MASTER_COLUMNS))
+
+    master = menu_hierarchy._build_manual_profit_rate_master(pd.DataFrame(rows)).set_index("수익키")
+
+    assert "품목|배달의민족|1인 순살 닭도리탕(밥포함)|1인|순살|한우대창75g" in master.index
+    assert "품목|배달의민족|1인 순살 닭도리탕(밥포함)|1인|순살|한우대창150g" in master.index
+    assert "품목|배달의민족|1인 순살 닭도리탕(밥포함)|1인|순살|한우대창" not in master.index
+    assert "품목|배달의민족|1인 순살 닭도리탕(밥포함)|1인|순살|감자사리" in master.index
+    assert master.at[
+        "품목|배달의민족|1인 순살 닭도리탕(밥포함)|1인|순살|한우대창75g",
+        "대표품목명",
+    ] == "한우대창75g"
+    assert master.at[
+        "품목|배달의민족|1인 순살 닭도리탕(밥포함)|1인|순살|한우대창150g",
+        "대표품목명",
+    ] == "한우대창150g"
+    assert master.at[
+        "품목|배달의민족|1인 순살 닭도리탕(밥포함)|1인|순살|감자사리",
+        "대표품목명",
+    ] == "감자사리"
+
+
 def test_zero_price_non_cost_option_kinds_are_not_manual_profit_targets():
     rows = []
     for item_id, item_name, kind in [

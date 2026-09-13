@@ -29,6 +29,8 @@ Baemin macro DAG — 배달의민족 계정별 자동 수집
   주문내역: 어제 (upsert by 주문번호)
 '''
 
+from modules.transform.utility.workload import retry_dag_id, route_trigger
+
 import html
 import logging
 import os
@@ -91,6 +93,7 @@ from modules.transform.pipelines.db.DB_Beamin_Macro_validate import (
 from modules.transform.utility.paths import ANALYTICS_DB, COLLECT_DB
 from modules.transform.utility.store_normalize import normalize as normalize_store_names, strip_brand
 from modules.transform.utility.mail_recipients import MAIL_CMJ_PM
+from modules.transform.utility.dag_defaults import COLLECT_DAGRUN_TIMEOUT
 
 logger = logging.getLogger(__name__)
 dag_id = Path(__file__).stem
@@ -123,6 +126,7 @@ TARGET_STORES: list[str] = []  # empty list means all stores (전체매장 대�
 # ex ) COLLECT_RANGE="상위" → 가나다순 상위 절반만 수집
 COLLECT_RANGE: str | None = "상위" # 상위, 하위, None
 SCHEDULED_DEFAULT_STABILITY_PROFILE = "safe_daily"
+DEFAULT_ORDERS_ONLY = True
 _MACRO_ROLE_RAW = os.getenv("BAEMIN_MACRO_ROLE")
 _MACRO_ROLE = resolve_macro_role(_MACRO_ROLE_RAW)
 
@@ -132,6 +136,33 @@ MANUAL_BAEMIN_ORDERS_DIR = COLLECT_DB / "영업관리부_수집"
 def _current_run_id(context) -> str:
     dag_run = context.get("dag_run")
     return str(getattr(dag_run, "run_id", context.get("run_id", "manual")) if dag_run else context.get("run_id", "manual"))
+
+
+def _flag_enabled(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "none", "null"}:
+            return default
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+    return bool(value)
+
+
+def _orders_only_enabled(context) -> bool:
+    dag_run = context.get("dag_run")
+    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    params = context.get("params") or {}
+    if "orders_only" in conf:
+        return _flag_enabled(conf.get("orders_only"), default=DEFAULT_ORDERS_ONLY)
+    if "orders_only" in params:
+        return _flag_enabled(params.get("orders_only"), default=DEFAULT_ORDERS_ONLY)
+    return DEFAULT_ORDERS_ONLY
 
 
 def _main_stage_paths(context) -> tuple[Path, Path]:
@@ -278,6 +309,72 @@ def _filter_failed_to_loaded_accounts(failed: dict | None, allowed_ids: set[str]
             len(allowed_ids),
         )
     return filtered
+
+
+_SYNC_RETRY_DEFER_REASON_PATTERNS = (
+    "date_filter",
+    "date filtered",
+    "date_filtered_rows",
+    "날짜",
+    "validation_mismatch",
+    "suspect_no_data",
+    "extension collect timeout",
+    "httpconnectionpool",
+    "read timed out",
+    "connection refused",
+    "max retries exceeded",
+)
+
+
+def _failure_reason_texts(failed: dict | None) -> list[str]:
+    texts: list[str] = []
+    for key in ("accounts", "stores", "orders", "ads", "stages"):
+        for item in (failed or {}).get(key) or []:
+            if not isinstance(item, dict):
+                continue
+            for field in ("reason", "error", "message", "stage"):
+                value = item.get(field)
+                if value:
+                    texts.append(str(value).strip())
+            validation = item.get("validation")
+            if isinstance(validation, dict):
+                for field in ("reason", "error", "message"):
+                    value = validation.get(field)
+                    if value:
+                        texts.append(str(value).strip())
+            elif isinstance(validation, list):
+                for entry in validation:
+                    if isinstance(entry, dict):
+                        value = entry.get("reason") or entry.get("error") or entry.get("message")
+                        if value:
+                            texts.append(str(value).strip())
+            nested_values = []
+            if isinstance(item.get("store"), dict):
+                nested_values.append(item.get("store"))
+            if isinstance(item.get("stores"), list):
+                nested_values.extend(value for value in item.get("stores") if isinstance(value, dict))
+            for nested in nested_values:
+                for field in ("reason", "error", "message"):
+                    value = nested.get(field)
+                    if value:
+                        texts.append(str(value).strip())
+    return [text for text in texts if text]
+
+
+def _should_defer_sync_retry(failed: dict | None) -> bool:
+    """UI 날짜/확장 driver 계열 실패는 120분 동기 retry 대신 Retry DAG로 넘긴다."""
+    if count_failed_items(failed) == 0:
+        return False
+    if (failed or {}).get("accounts") or (failed or {}).get("stores") or (failed or {}).get("stages"):
+        return False
+    texts = _failure_reason_texts(failed)
+    if not texts:
+        return False
+    lowered = [text.lower() for text in texts]
+    return all(
+        any(pattern in text for pattern in _SYNC_RETRY_DEFER_REASON_PATTERNS)
+        for text in lowered
+    )
 
 
 def _save_validate_log(target_date: str, section: str, text: str) -> None:
@@ -562,6 +659,7 @@ def retry_failed(
     dag_run = context.get("dag_run")
     conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
     target_date = _target_date_from_context(context)
+    orders_only = _orders_only_enabled(context)
     profile = resolve_stability_profile(conf.get("stability_profile") or SCHEDULED_DEFAULT_STABILITY_PROFILE)
     logger.info("재시도 안정성 프로필: %s", profile["name"])
 
@@ -575,6 +673,18 @@ def retry_failed(
     if retry_all_types:
         immediate_failed = failed
         deferred_counts = {"stores": 0, "ads": 0}
+    elif orders_only:
+        immediate_failed = {
+            "accounts": failed.get("accounts") or [],
+            "stages": [],
+            "stores": failed.get("stores") or [],
+            "orders": failed.get("orders") or [],
+            "ads": [],
+        }
+        deferred_counts = {
+            "stores": 0,
+            "ads": 0,
+        }
     else:
         immediate_failed = {
             "accounts": failed.get("accounts") or [],
@@ -604,6 +714,22 @@ def retry_failed(
         context["ti"].xcom_push(key="residual_failed", value=residual_failed)
         return "재시도 없음"
 
+    if _should_defer_sync_retry(immediate_failed):
+        residual_failed = merge_failed_payloads(residual_failed, immediate_failed)
+        if not retry_all_types and not orders_only:
+            residual_failed["stores"].extend(failed.get("stores") or [])
+            residual_failed["ads"].extend(failed.get("ads") or [])
+        context["ti"].xcom_push(key="residual_failed", value=residual_failed)
+        logger.warning(
+            "동기 retry 생략: 날짜 필터/확장 collector 계열 실패는 Retry DAG로 이월 "
+            "(immediate=%d)",
+            count_failed_items(immediate_failed),
+        )
+        return (
+            "동기 retry 생략 "
+            f"(Retry DAG 이월: immediate={count_failed_items(immediate_failed)})"
+        )
+
     local_analytics, _local_baemin = _main_stage_paths(context)
     prog_path = progress_path(local_analytics, "retry")
     analytics_original, patched_paths = patch_baemin_staging_paths(local_analytics)
@@ -614,6 +740,7 @@ def retry_failed(
             stability_profile=profile["name"],
             progress_file=prog_path,
             progress_run_id=_current_run_id(context),
+            orders_only=orders_only,
         )
     finally:
         restore_baemin_staging_paths(analytics_original, patched_paths)
@@ -652,6 +779,7 @@ def export_to_upload_inbox(*, collect_task_ids=None, **context) -> str:
         logger.warning("retry_failed residual_failed XCom 없음: 원본 실패 payload를 upload meta failed로 사용")
     meta = {
         "target_date": _target_date_from_context(context),
+        "orders_only": _orders_only_enabled(context),
         "account_list": account_list,
         "validation": validation,
         "ad_stores": ad_stores,
@@ -699,9 +827,13 @@ def trigger_upload_after_export(**context) -> str:
         "skip_if_empty": True,
         "source": "main_top_collect_export",
         "target_date": _target_date_from_context(context),
+        "orders_only": _orders_only_enabled(context),
     }
     dag_run = context.get("dag_run")
     conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    from modules.transform.utility.workload import is_background
+    if is_background(conf, context["ti"].dag_id):
+        trigger_conf["workload"] = "history"
     if conf.get("manual_baemin_dir"):
         trigger_conf["manual_baemin_dir"] = conf["manual_baemin_dir"]
 
@@ -709,14 +841,17 @@ def trigger_upload_after_export(**context) -> str:
     from airflow.exceptions import DagRunAlreadyExists
 
     try:
-        trigger_dag(
-            dag_id=_UPLOAD_DAG_ID,
+        result = route_trigger(trigger_dag, history_context=context,
+            dag_id=("DB_Beamin_Macro_Backfill_Upload_Dags" if trigger_conf.get("workload") == "history" else _UPLOAD_DAG_ID),
             run_id=upload_run_id,
             conf=trigger_conf,
         )
     except DagRunAlreadyExists:
         logger.info("배민 upload DAG run 이미 존재: %s", upload_run_id)
         return f"upload DAG run 이미 존재: {upload_run_id}"
+
+    if result in ("deferred", "existing", "cancelled"):
+        return f"upload DAG 요청 상태={result}: {upload_run_id}"
 
     logger.info(
         "배민 upload DAG 트리거 완료: run_id=%s folder=%s",
@@ -990,7 +1125,10 @@ def _build_collection_notification(
     if mismatches:
         lines.append(f"orders 검증 불일치 {len(mismatches)}건")
     if settle_suspects:
-        lines.append(f"정산정보 수집 의심 {len(settle_suspects)}건")
+        lines.append(
+            f"정산정보 미게시(09시 이후 자동 재수집 예정) {len(settle_suspects)}건 "
+            "— 주문 합계는 정상 저장됨, 입금예정금액만 추후 채워짐"
+        )
         for item in settle_suspects[:12]:
             rate = item.get("settle_rate")
             rate_text = "-" if rate is None else f"{float(rate) * 100:.1f}%"
@@ -1013,7 +1151,9 @@ def _build_collection_notification(
             recovered_lines.append(f"- {task.task_id}:")
             recovered_lines.extend(f"  {line}" for line in task_recovered)
 
-    has_final_issue = bool(mismatches or settle_suspects or final_retry_count)
+    # settle_suspects(정산정보 미게시)는 배민이 정산 데이터를 09시 이후에 게시하는
+    # 정상 패턴이며 주문 합계는 이미 검증·저장됨 → 부분성공 판정에서 제외한다.
+    has_final_issue = bool(mismatches or final_retry_count)
     if hard_failures:
         status = "실패"
     elif has_final_issue:
@@ -1088,7 +1228,7 @@ def _build_collection_notification(
           </table>
           <h3 style="margin:20px 0 8px 0;">복구된 경고</h3>
           <ul>{recovered_html}</ul>
-          <h3 style="margin:20px 0 8px 0;">정산정보 수집 의심</h3>
+          <h3 style="margin:20px 0 8px 0;">정산정보 미게시(09시 이후 자동 재수집 예정)</h3>
           <ul>{settle_html}</ul>
           <h3 style="margin:20px 0 8px 0;">{html.escape(problem_title)}</h3>
           <ul>{problem_html}</ul>
@@ -1198,7 +1338,7 @@ def collect_batch(
     run_id = _current_run_id(context)
     progress_key = batch_range.replace(":", "_").replace("/", "_") if batch_range else None
     prog_path = progress_path(local_analytics, progress_key)
-    orders_only = bool(conf.get("orders_only"))
+    orders_only = _orders_only_enabled(context)
     resume_progress = None
     if not orders_only and not conf.get("force_restart"):
         resume_progress = load_progress(
@@ -1482,6 +1622,14 @@ def trigger_retry_if_needed(**context) -> str:
     residual_failed = ti.xcom_pull(task_ids="retry_failed", key="residual_failed")
     failed = residual_failed if residual_failed is not None else (ti.xcom_pull(task_ids="collect_all", key="failed") or {})
     failed = _filter_failed_to_loaded_accounts(failed, allowed_account_ids)
+    if _orders_only_enabled(context):
+        failed = {
+            "accounts": failed.get("accounts") or [],
+            "stores": failed.get("stores") or [],
+            "orders": failed.get("orders") or [],
+            "ads": [],
+            "stages": [],
+        }
     failed_count = count_failed_items(failed)
     if failed_count == 0:
         logger.info("Retry DAG 트리거 스킵: 원본 실패 없음")
@@ -1522,6 +1670,7 @@ def trigger_retry_if_needed(**context) -> str:
         stability_profile=conf.get("stability_profile") or SCHEDULED_DEFAULT_STABILITY_PROFILE,
         allowed_account_ids=sorted(allowed_account_ids),
         collect_range=scope_label,
+        orders_only=_orders_only_enabled(context),
     )
     run_id = (
         f"retry__{target_date.replace('-', '')}__attempt_1__"
@@ -1532,14 +1681,17 @@ def trigger_retry_if_needed(**context) -> str:
     from airflow.exceptions import DagRunAlreadyExists
 
     try:
-        trigger_dag(
-            dag_id="DB_Beamin_Macro_Dags_Retry",
+        result = route_trigger(trigger_dag, history_context=context,
+            dag_id=retry_dag_id(conf, context["ti"].dag_id),
             run_id=run_id,
             conf=retry_conf,
         )
     except DagRunAlreadyExists:
         logger.info("Retry DAG run 이미 존재: %s", run_id)
         return f"Retry DAG run 이미 존재: {run_id}"
+
+    if result in ("deferred", "existing", "cancelled"):
+        return f"Retry DAG 요청 상태={result}: {run_id}"
 
     logger.info(
         "Retry DAG 트리거 완료: run_id=%s range=%s allowed_accounts=%d failed_count=%d accounts=%d stores=%d orders=%d ads=%d stages=%d",
@@ -1571,6 +1723,7 @@ def _build_single_dag_parallel_lanes() -> DAG:
         schedule=SMD_BAEMIN_COLLECT_BATCH1_TIME,
         start_date=pendulum.datetime(2024, 1, 1, tz="Asia/Seoul"),
         catchup=False,
+        dagrun_timeout=COLLECT_DAGRUN_TIMEOUT,
         concurrency=2 if parallel_enabled else 1,
         max_active_runs=1,
         max_active_tasks=2 if parallel_enabled else 1,
@@ -1578,6 +1731,7 @@ def _build_single_dag_parallel_lanes() -> DAG:
         params={
             "collect_range": None,
             "batch_orchestration": "single_dag",
+            "orders_only": DEFAULT_ORDERS_ONLY,
         },
         is_paused_upon_creation=False,
         tags=["db", "baemin", "crawl"],

@@ -42,6 +42,8 @@ from modules.transform.pipelines.db.DB_Posfeed_Sales_Detail import (
     scrape_missing_order_details,
 )
 
+from modules.transform.utility.dag_defaults import DEFAULT_DAGRUN_TIMEOUT
+
 logger = logging.getLogger(__name__)
 
 dag_id = Path(__file__).stem
@@ -124,6 +126,7 @@ with DAG(
     schedule=DB_POSFEED_SALES_TIME,
     start_date=pendulum.datetime(2024, 1, 1, tz="Asia/Seoul"),
     catchup=False,
+    dagrun_timeout=DEFAULT_DAGRUN_TIMEOUT,
     max_active_runs=1,
     default_args=default_args,
     tags=['db', 'posfeed', 'excel', 'selenium'],

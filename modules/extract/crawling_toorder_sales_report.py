@@ -49,6 +49,13 @@ LOGIN_URL = "https://ceo.toorder.co.kr/auth/login?returnTo=%2Fdashboard"
 SALES_REPORT_URL = "https://ceo.toorder.co.kr/dashboard/sales-report/orderkinds"
 SALES_REPORT_DATE_URL = "https://ceo.toorder.co.kr/dashboard/sales-report/orderkinds"
 SALES_REPORT_DATEDETAIL_URL = "https://ceo.toorder.co.kr/dashboard/sales-report/datedetail"
+
+# 좌측 메뉴 라벨. SPA가 메뉴 클릭으로만 보고서 패널을 마운트한다.
+SALES_REPORT_MENU_LABEL = "채널별(일) 매출 보고서"
+# 날짜 입력 2개(시작/종료)를 식별하는 선택자.
+DATE_INPUT_SELECTOR = "input[placeholder='YY-MM-DD']"
+# 메뉴 클릭 후 보고서 폼이 뜨기까지 실측 20초 안팎이 걸린다(2026-09-11 측정).
+REPORT_RENDER_TIMEOUT_SEC = 60
 LOGIN_FAIL_URL_PATTERNS = ["/login", "/auth"]
 LOGIN_SUCCESS_URL_PATTERNS = ["/dashboard"]
 LOGIN_IS_COMPANY_ATTEMPTS = (True, False)
@@ -74,7 +81,7 @@ TIMING = {
 }
 
 BROWSER_LAUNCH_RETRIES = 3
-PIPELINE_RETRIES = 2
+PIPELINE_RETRIES = 3
 PIPELINE_RETRY_BASE_SEC = 6.0
 
 
@@ -178,6 +185,14 @@ def _save_login_debug(driver, account_id: str, tag: str) -> str | None:
     except Exception as exc:
         logger.warning("[%s] 디버그 저장 실패: %s", account_id, exc)
         return None
+
+
+def _toorder_debug_dir(name: str) -> Path:
+    try:
+        from modules.transform.utility.paths import TEMP_DIR
+        return TEMP_DIR / name
+    except Exception:
+        return Path(os.getenv("TEMP_DIR") or ".tmp") / name
 
 
 def _is_retriable_driver_error(message: str) -> bool:
@@ -859,9 +874,56 @@ def _do_login(
 # 보고서 페이지 제어
 # ============================================================
 
+def _click_report_menu(driver, account_id: str, label: str) -> bool:
+    """좌측 메뉴에서 정확히 일치하는 항목을 클릭한다.
+
+    부분매칭을 쓰면 '채널별(월) 매출 보고서', '시간별 채널 매출 보고서'가 같이 잡힌다.
+    """
+    xpath = "//*[not(*) and normalize-space(text())='%s']" % label
+    elements = [el for el in driver.find_elements(By.XPATH, xpath) if el.is_displayed()]
+    if not elements:
+        logger.error("[%s] 메뉴 항목을 찾지 못함: %s", account_id, label)
+        return False
+    if len(elements) > 1:
+        logger.warning("[%s] 메뉴 항목 %d개 매칭, 첫 번째 사용: %s", account_id, len(elements), label)
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", elements[0])
+        time.sleep(0.3)
+        driver.execute_script("arguments[0].click();", elements[0])
+        logger.info("[%s] 메뉴 클릭: %s", account_id, label)
+        return True
+    except Exception as exc:
+        logger.error("[%s] 메뉴 클릭 실패(%s): %s", account_id, label, exc)
+        return False
+
+
+def _wait_for_date_inputs(driver, account_id: str, timeout: int = REPORT_RENDER_TIMEOUT_SEC) -> bool:
+    """날짜 입력 2개가 렌더링될 때까지 기다린다."""
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: len(d.find_elements(By.CSS_SELECTOR, DATE_INPUT_SELECTOR)) >= 2
+        )
+        logger.info("[%s] 보고서 폼 렌더링 완료", account_id)
+        return True
+    except TimeoutException:
+        logger.error(
+            "[%s] 보고서 폼이 %d초 안에 렌더링되지 않음 (url=%s)",
+            account_id,
+            timeout,
+            driver.current_url,
+        )
+        return False
+
+
 def _navigate_to_sales_report(driver, account_id: str) -> bool:
     """
     채널별(일) 매출보고서 페이지로 이동한다.
+
+    URL 직접 이동만으로는 본문이 마운트되지 않는다. 2026-09-05~09-10 사이
+    매일 0/N 수집 실패한 원인이 이것이었다 - 좌측 메뉴는 그려지지만 본문은
+    로딩바 상태로 남아 날짜 입력이 영영 나타나지 않았고, 4초 고정 대기 뒤
+    선택자를 찾으니 항상 0개였다. 메뉴를 클릭해야 패널이 마운트되며,
+    마운트까지 20초 안팎이 걸리므로 고정 sleep 대신 조건 대기를 쓴다.
 
     Returns:
         True: 이동 성공, False: 실패
@@ -870,11 +932,17 @@ def _navigate_to_sales_report(driver, account_id: str) -> bool:
     try:
         driver.get(SALES_REPORT_URL)
         time.sleep(4.0)
-        if "sales-report/orderkinds" in driver.current_url:
-            logger.info("[%s] 보고서 페이지 도착", account_id)
-            return True
-        logger.error("[%s] 잘못된 페이지: %s", account_id, driver.current_url)
-        return False
+        if "sales-report/orderkinds" not in driver.current_url:
+            logger.error("[%s] 잘못된 페이지: %s", account_id, driver.current_url)
+            return False
+
+        if not _click_report_menu(driver, account_id, SALES_REPORT_MENU_LABEL):
+            return False
+        if not _wait_for_date_inputs(driver, account_id):
+            return False
+
+        logger.info("[%s] 보고서 페이지 도착", account_id)
+        return True
     except Exception as exc:
         logger.error("[%s] 페이지 이동 실패: %s", account_id, exc)
         return False
@@ -895,7 +963,7 @@ def _set_date_range(
         formatted_start = start_obj.strftime("%y-%m-%d")
         formatted_end = end_obj.strftime("%y-%m-%d")
 
-        date_inputs = driver.find_elements(By.CSS_SELECTOR, "input[placeholder='YY-MM-DD']")
+        date_inputs = driver.find_elements(By.CSS_SELECTOR, DATE_INPUT_SELECTOR)
         if len(date_inputs) < 2:
             date_inputs = driver.find_elements(
                 By.CSS_SELECTOR, ".MuiMultiInputDateRangeField-root input"
@@ -1161,7 +1229,7 @@ def _download_datedetail_month(
                 diagnostics,
             )
             try:
-                debug_dir = Path(r"C:\airflow\tmp\toorder_datedetail_debug")
+                debug_dir = _toorder_debug_dir("toorder_datedetail_debug")
                 debug_dir.mkdir(parents=True, exist_ok=True)
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 png = debug_dir / f"datedetail_no_download_{month_start[:7]}_{ts}.png"

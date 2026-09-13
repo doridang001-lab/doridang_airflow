@@ -759,6 +759,7 @@ def retry_once_failed(
     *,
     progress_file: Path | None = None,
     progress_run_id: str | None = None,
+    orders_only: bool = False,
 ) -> dict:
     """실패한 계정/매장만 1회 재시도."""
     n_accounts = len(failed.get("accounts", []))
@@ -788,19 +789,22 @@ def retry_once_failed(
         kwargs = {"target_date": target_date}
         if stability_profile is not None:
             kwargs["stability_profile"] = stability_profile
-        if progress_file is not None:
+        if progress_file is not None and not orders_only:
             kwargs["progress_file"] = progress_file
             kwargs["progress_run_id"] = progress_run_id
-        result = collect_now_and_woori(
-            failed["accounts"],
-            **kwargs,
-        )
+        if orders_only:
+            result = collect_orders_only(failed["accounts"], **kwargs)
+        else:
+            result = collect_now_and_woori(
+                failed["accounts"],
+                **kwargs,
+            )
         if isinstance(result, dict):
             extend_residual(result.get("failed"))
 
     # 1-2. 스테이지 레벨 실패 → 해당 계정의 해당 매장/스테이지만 재수집
     stage_groups: dict[str, dict] = {}
-    for item in failed.get("stages") or []:
+    for item in ([] if orders_only else failed.get("stages") or []):
         account = item.get("account") or {}
         store = item.get("store") or {}
         account_id = str(account.get("account_id") or "").strip()
@@ -905,7 +909,7 @@ def retry_once_failed(
             residual_failed["orders"].append(item)
 
     # 4. ads 레벨 실패 → 해당 계정+매장 광고 funnel만
-    for item in failed.get("ads", []):
+    for item in ([] if orders_only else failed.get("ads", [])):
         account = item["account"]
         stores = item["stores"]
         try:

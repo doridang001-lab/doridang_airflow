@@ -203,6 +203,38 @@ def test_meta_pull_prefers_xcom_and_falls_back_to_handoff(tmp_path):
     assert upload._meta_pull(context, "ingest_stats") == {"folders": 1, "cleaned": 1}
 
 
+def test_validate_ad_funnel_skips_for_orders_only_handoff(tmp_path, monkeypatch):
+    handoff = tmp_path / "handoff.json"
+    handoff.write_text(
+        json.dumps({"target_date": "2026-07-27", "orders_only": True, "ad_stores": [{"store_id": "s1"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        upload,
+        "_validate_and_retry_ad_funnel",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ad funnel should not run")),
+    )
+
+    class FakeTI:
+        def __init__(self):
+            self.pushed = {}
+
+        def xcom_pull(self, task_ids, key):
+            return None
+
+        def xcom_push(self, key=None, value=None):
+            self.pushed[key] = value
+
+    ti = FakeTI()
+    result = upload.validate_ad_funnel(
+        ti=ti,
+        dag_run=SimpleNamespace(conf={"handoff_path": str(handoff)}),
+    )
+
+    assert result == "orders_only: ad_funnel 검증 스킵"
+    assert ti.pushed["ad_funnel_result"] == {"empty_stores": [], "retried": [], "still_empty": []}
+
+
 def test_target_dates_uses_manual_ingest_order_dates_when_conf_absent():
     class FakeTI:
         def xcom_pull(self, task_ids, key):
@@ -674,6 +706,8 @@ def test_main_collect_triggers_exact_export_folder(monkeypatch):
             assert (task_ids, key) == ("export_to_upload_inbox", "upload_inbox_run")
             return "/inbox/manual__top__scheduled__2026-07-23T18_15_00_00_00"
 
+        dag_id = "DB_Beamin_Macro_Dags"
+
     result = main_collect.trigger_upload_after_export(
         ti=FakeTI(),
         dag_run=SimpleNamespace(
@@ -692,6 +726,7 @@ def test_main_collect_triggers_exact_export_folder(monkeypatch):
                 "skip_if_empty": True,
                 "source": "main_top_collect_export",
                 "target_date": "2026-07-23",
+                "orders_only": True,
             },
         }
     ]

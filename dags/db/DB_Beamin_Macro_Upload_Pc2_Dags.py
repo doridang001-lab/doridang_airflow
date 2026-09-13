@@ -13,6 +13,7 @@ from modules.transform.pipelines.db.DB_Beamin_Macro_upload import has_upload_inb
 from modules.transform.pipelines.db.DB_Beamin_pc2_distribute import BOTTOM_FOLDER_PATTERN
 from modules.transform.utility.notifier import on_failure_callback_no_telegram
 from modules.transform.utility.schedule import SMD_BAEMIN_UPLOAD_PC2_TIME
+from modules.transform.utility.dag_defaults import DEFAULT_DAGRUN_TIMEOUT
 
 dag_id = Path(__file__).stem
 TARGET_UPLOAD_DAG_ID = "DB_Beamin_Macro_Upload_Dags"
@@ -31,6 +32,7 @@ with DAG(
     schedule=SMD_BAEMIN_UPLOAD_PC2_TIME,
     start_date=pendulum.datetime(2024, 1, 1, tz="Asia/Seoul"),
     catchup=False,
+    dagrun_timeout=DEFAULT_DAGRUN_TIMEOUT,
     is_paused_upon_creation=False,
     max_active_runs=1,
     max_active_tasks=1,

@@ -6,6 +6,11 @@ import json
 import logging
 import mimetypes
 import re
+import threading
+import time
+import uuid
+import queue
+from collections import OrderedDict
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,15 +18,90 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from modules.transform.doridang_bot import conversation, llm_backend, tools
-from modules.transform.doridang_bot.prompts import SYSTEM_PROMPT
+from modules.transform.doridang_bot import conversation, dialogue, integrity, llm_backend, router, tools
+from modules.transform.utility import flow_task_status as status_rules
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8788
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-MAX_TOOL_LOOPS = 5
+ANSWER_TIMEOUT_SECONDS = 60
+
+
+# 봇이 "방금 무엇을 보여줬는지"를 몰라 후속 질문에 같은 리포트를 다시 주던 문제.
+# 구버전 클라이언트를 위한 메모리 캐시. 새 클라이언트는 마지막 완료 턴의 맥락을 함께 보낸다.
+SESSION_MEMORY_MAX = 50
+_SESSION_MEMORY: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_SESSION_LOCK = threading.Lock()
+
+# 직전 답변을 가리키는 표현. 조건이 붙은 질문은 정상 라우팅이 더 정확하므로 여기서 걸러낸다.
+REFERENCE_MARKERS = (
+    "그 ", "그중", "그 중", "그건", "그거", "그게", "저건", "방금", "위에", "아까",
+    "첫번째", "첫 번째", "두번째", "두 번째", "세번째", "세 번째", "마지막",
+    "자세히", "상세", "무슨 내용", "어떤 내용", "뭐야", "뭔데", "어떤 거", "어떤거",
+)
+_ORDINALS = (("첫", 1), ("두", 2), ("세", 3), ("네", 4), ("다섯", 5))
+_COUNT_REFERENCE_RE = re.compile(r"(\d+)\s*(?:건|개)")
+# 되묻는 표현. 새 조회 요청("보여줘","찾아줘")과 구분한다.
+ASK_MARKERS = ("뭐야", "뭔데", "뭐", "어떤", "무슨", "자세히", "상세", "설명", "알려줘", "원인", "이유", "왜", "그 ", "그거", "그건")
+
+
+def _remember_turn(session_id: str, payload: dict[str, Any]) -> None:
+    if not session_id:
+        return
+    with _SESSION_LOCK:
+        _SESSION_MEMORY[session_id] = payload
+        _SESSION_MEMORY.move_to_end(session_id)
+        while len(_SESSION_MEMORY) > SESSION_MEMORY_MAX:
+            _SESSION_MEMORY.popitem(last=False)
+
+
+def _recall_turn(session_id: str) -> dict[str, Any] | None:
+    if not session_id:
+        return None
+    with _SESSION_LOCK:
+        payload = _SESSION_MEMORY.get(session_id)
+        if payload is not None:
+            _SESSION_MEMORY.move_to_end(session_id)
+        return payload
+
+
+def _refers_to_last(question: str, last: dict[str, Any] | None) -> bool:
+    """직전 답변을 가리키는 질문인가. 애매하면 False — 정상 라우팅이 안전하다."""
+    if not last or not last.get("posts"):
+        return False
+    text = question or ""
+    if tools.detect_project_id(text):
+        return False                                   # 새 프로젝트를 지목
+    name = tools.detect_worker_name(text)
+    if name and tools.is_known_person(name):
+        return False                                   # 새 사람을 지목
+
+    # "진행2건은 뭐야?" — 건수가 방금 보여준 수와 맞고 되묻는 표현이면 직전 답변 이야기다.
+    # "보류 3건 보여줘" 처럼 수가 안 맞거나 되묻지 않으면 새 조회로 본다.
+    counted = _COUNT_REFERENCE_RE.search(text)
+    if counted and int(counted.group(1)) == len(last.get("posts") or []) and _is_asking_about(text):
+        return True
+
+    if router.status_due_filters(text):
+        return False                                   # "그 중 기한 지난 건" 은 filter_posts가 낫다
+    return any(marker in text for marker in REFERENCE_MARKERS)
+
+
+def _is_asking_about(question: str) -> bool:
+    return any(marker in (question or "") for marker in ASK_MARKERS)
+
+
+def _requested_ordinal(question: str) -> int | None:
+    text = (question or "").replace(" ", "")
+    matched = re.search(r"(\d+)\s*(번째|번쨰)", question or "")
+    if matched:
+        return int(matched.group(1))
+    for word, index in _ORDINALS:
+        if f"{word}번째" in text:
+            return index
+    return None
 
 
 def _safe_json(data: Any) -> bytes:
@@ -59,10 +139,12 @@ class DoridangBotHandler(BaseHTTPRequestHandler):
             question = str(payload.get("message") or payload.get("question") or "").strip()
             user = str(payload.get("user") or "사용자").strip()
             history = _normalize_history(payload.get("history"))
+            session_id = str(payload.get("session_id") or "").strip()[:128]
             if not question:
                 self._send_json({"error": "message is required"}, status=HTTPStatus.BAD_REQUEST)
                 return
-            self._stream_chat(user=user, question=question, history=history)
+            self._stream_chat(user=user, question=question, history=history, session_id=session_id,
+                              context=payload.get("context"), message_id=str(payload.get("message_id") or uuid.uuid4())[:128])
         except Exception as exc:
             logger.exception("채팅 처리 실패: %s", exc)
             if not self.wfile.closed:
@@ -71,176 +153,100 @@ class DoridangBotHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         logger.info("%s - %s", self.address_string(), fmt % args)
 
-    def _stream_chat(self, *, user: str, question: str, history: list[dict[str, str]] | None = None) -> None:
+    def _stream_chat(self, *, user: str, question: str, history=None, session_id="", context=None, message_id="") -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self._send_cors_headers()
         self.end_headers()
-
-        messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        project_hint = tools.detect_project_id(question)
-        if project_hint:
-            messages.append({
-                "role": "system",
-                "content": f"이 질문에서 감지된 project_id는 {project_hint} ({tools.ALLOWED_PROJECTS[project_hint]})입니다. 해당 프로젝트 인자로 tool을 호출하세요.",
-            })
-        if history:
-            messages.append({
-                "role": "system",
-                "content": "현재 웹 세션의 최근 대화입니다. 사용자가 짧게 이어서 질문하면 이 맥락을 우선 참고하세요.",
-            })
-            for item in history[-10:]:
-                role = "assistant" if item.get("role") == "assistant" else "user"
-                content = str(item.get("text") or "").strip()
-                if content and content != question:
-                    messages.append({"role": role, "content": content[:2000]})
-        messages.append({"role": "user", "content": question})
-        answer_parts: list[str] = []
-        evidence: list[dict[str, Any]] = []
-
+        started = time.monotonic()
+        history = history or []
+        # 브라우저의 마지막 완료 턴이 우선이다. 중단된 요청의 서버 메모리는 이어받지 않는다.
+        previous = context if isinstance(context, dict) else (_recall_turn(session_id) or {}).get("context", {})
         try:
-            if _is_light_chat(question):
-                answer = "안녕하세요. Flow 프로젝트 현황, 담당자 진행상황, 마케팅 실적 같은 내용을 물어보시면 수집 데이터를 기준으로 답변하겠습니다."
-                self._send_sse({"type": "delta", "text": answer})
-                conversation.append_turn(user, question, answer, evidence)
-                self._send_raw_sse("[DONE]")
-                self.close_connection = True
-                return
+            self._send_sse({"type": "status", "text": "업무와 최근 기록을 확인하고 있어요.", "message_id": message_id})
+            deadline = started + ANSWER_TIMEOUT_SECONDS
+            updates = queue.Queue()
+            cancelled = threading.Event()
 
-            if tools.detect_team_status_intent(question):
-                basis = _basis_for_question(question, default="author")
-                arguments: dict[str, Any] = {"basis": basis}
-                result = tools.get_team_status(basis=basis)
-                answer = _format_team_status(result)
-                evidence.append({"name": "get_team_status", "arguments": arguments})
-                self._send_sse({"type": "tool", "name": "get_team_status", "arguments": arguments})
-                self._send_sse({"type": "delta", "text": answer})
-                conversation.append_turn(user, question, answer, evidence)
-                self._send_raw_sse("[DONE]")
-                self.close_connection = True
-                return
-
-            if tools.detect_risk_intent(question):
-                filters = _status_due_filters(question)
-                if filters:
-                    if project_hint:
-                        filters["project_id"] = project_hint
-                    result = tools.filter_posts(**filters)
-                    answer = _format_filtered_posts(result)
-                    evidence.append({"name": "filter_posts", "arguments": filters})
-                    self._send_sse({"type": "tool", "name": "filter_posts", "arguments": filters})
-                    self._send_sse({"type": "delta", "text": answer})
-                    conversation.append_turn(user, question, answer, evidence)
-                    self._send_raw_sse("[DONE]")
-                    self.close_connection = True
-                    return
-
-                priority_only = _is_priority_status_question(question)
-                arguments = {"priority_only": priority_only}
-                if project_hint:
-                    arguments["project_id"] = project_hint
-                result = tools.get_risk_status(project_hint, priority_only=priority_only)
-                answer = _format_risk_status(result)
-                evidence.append({"name": "get_risk_status", "arguments": arguments})
-                self._send_sse({"type": "tool", "name": "get_risk_status", "arguments": arguments})
-                self._send_sse({"type": "delta", "text": answer})
-                conversation.append_turn(user, question, answer, evidence)
-                self._send_raw_sse("[DONE]")
-                self.close_connection = True
-                return
-
-            worker_hint = tools.detect_worker_name(question)
-            if worker_hint:
-                basis = _basis_for_question(question, default="author")
-                arguments = {"worker": worker_hint, "basis": basis}
-                result = tools.get_worker_status(worker_hint, basis=basis)
-                answer = _format_worker_status(result)
-                evidence.append({"name": "get_worker_status", "arguments": arguments})
-                self._send_sse({"type": "tool", "name": "get_worker_status", "arguments": arguments})
-                self._send_sse({"type": "delta", "text": answer})
-                conversation.append_turn(user, question, answer, evidence)
-                self._send_raw_sse("[DONE]")
-                self.close_connection = True
-                return
-
-            post_lookup = tools.find_posts(question)
-            if _should_answer_post_lookup(question, post_lookup):
-                arguments = {"keyword": question}
-                answer = _format_post_lookup(post_lookup)
-                evidence.append({"name": "find_posts", "arguments": arguments})
-                self._send_sse({"type": "tool", "name": "find_posts", "arguments": arguments})
-                self._send_sse({"type": "delta", "text": answer})
-                conversation.append_turn(user, question, answer, evidence)
-                self._send_raw_sse("[DONE]")
-                self.close_connection = True
-                return
-
-            topic_hint = tools.detect_topic_keyword(question)
-            if topic_hint:
-                arguments = {"keyword": topic_hint}
-                result = tools.get_topic_status(topic_hint)
-                answer = _format_topic_status(result)
-                evidence.append({"name": "get_topic_status", "arguments": arguments})
-                self._send_sse({"type": "tool", "name": "get_topic_status", "arguments": arguments})
-                self._send_sse({"type": "delta", "text": answer})
-                conversation.append_turn(user, question, answer, evidence)
-                self._send_raw_sse("[DONE]")
-                self.close_connection = True
-                return
-
-            if project_hint:
-                status = tools.get_project_status(project_hint)
-                arguments = {"project_id": project_hint}
-                answer = _format_project_status(status)
-                evidence.append({"name": "get_project_status", "arguments": arguments})
-                self._send_sse({"type": "tool", "name": "get_project_status", "arguments": arguments})
-                self._send_sse({"type": "delta", "text": answer})
-                conversation.append_turn(user, question, answer, evidence)
-                self._send_raw_sse("[DONE]")
-                self.close_connection = True
-                return
-
-            for _ in range(MAX_TOOL_LOOPS):
-                tool_calls: list[dict[str, Any]] = []
-                for event in llm_backend.chat_stream(messages, tools=tools.tool_schemas()):
-                    if event.get("type") == "delta":
-                        answer_parts.append(str(event.get("text") or ""))
-                        self._send_sse(event)
-                    elif event.get("type") == "tool_calls":
-                        tool_calls.extend(event.get("calls") or [])
+            def build_answer():
+                try:
+                    with tools.request_snapshot():
+                        current, evidence, direct = dialogue.gather(question, history, previous)
+                        note = _data_as_of_note() if evidence else ""
+                        prepared = integrity.fact_bank(question, current, evidence)
+                    updates.put(("prepared", (current, evidence, note, prepared)))
+                    if cancelled.is_set():
+                        return
+                    list_answer, ids = dialogue.requested_list_answer(question, evidence)
+                    if direct or list_answer:
+                        result = integrity.VerifiedAnswer(direct or list_answer,
+                            {"outcome": "direct", "attempts": 0}, ids)
                     else:
-                        self._send_sse(event)
+                        result = integrity.generate(question, current, evidence, deadline=deadline, prepared=prepared)
+                    updates.put(("result", result))
+                except Exception:
+                    logger.exception("근거 조회/검증 실패")
+                    updates.put(("failed", None))
 
-                if not tool_calls:
+            threading.Thread(target=build_answer, daemon=True).start()
+            current, evidence, note, prepared = {}, [], "", None
+            result = None
+            while time.monotonic() < deadline:
+                try:
+                    kind, value = updates.get(timeout=min(1, max(.001, deadline - time.monotonic())))
+                except queue.Empty:
+                    self._send_sse({"type": "status", "text": "답변의 건수와 근거를 검증하고 있어요."})
+                    continue
+                if kind == "prepared":
+                    current, evidence, note, prepared = value
+                elif kind == "result":
+                    result = value
                     break
-
-                assistant_message = {"role": "assistant", "content": "".join(answer_parts), "tool_calls": tool_calls}
-                messages.append(assistant_message)
-                for call in tool_calls:
-                    name, arguments = _tool_name_and_args(call)
-                    self._send_sse({"type": "tool", "name": name, "arguments": arguments})
-                    result = tools.execute_tool(name, arguments)
-                    evidence.append({"name": name, "arguments": arguments})
-                    messages.append({
-                        "role": "tool",
-                        "content": json.dumps(result, ensure_ascii=False),
-                        "tool_name": name,
-                    })
-                answer_parts.clear()
-            else:
-                self._send_sse({"type": "delta", "text": "\n\nTool 조회 반복 한도를 초과해 답변을 중단했습니다."})
-
-            answer = "".join(answer_parts).strip()
-            if answer:
-                conversation.append_turn(user, question, answer, evidence)
+                elif kind == "failed":
+                    break
+            cancelled.set()
+            if result is None:
+                if prepared:
+                    result = integrity.safe_answer(*prepared, reason="timeout_or_unavailable")
+                else:
+                    result = integrity.VerifiedAnswer("업무 기록을 시간 안에 확인하지 못했습니다. 잠시 후 다시 질문해 주세요.",
+                                                       {"outcome": "unavailable", "attempts": 0}, [])
+            answer = result.text
+            current, sources = dialogue.final_metadata(answer, current, evidence, listed_ids=result.post_ids)
+            # 링크는 조회 결과에서만 작성한다. 모델이 만든 URL은 완료 본문에서 제거한다.
+            answer = re.sub(r"\[([^\]]+)\]\(https?://[^)]+\)", r"\1", answer)
+            answer = re.sub(r"https?://\S+", "", answer)
+            if sources:
+                answer += "\n\n근거: " + " · ".join(f"[Flow {i + 1}]({s['url']})" for i, s in enumerate(sources))
+            if evidence:
+                answer += "\n\n" + note
+            # 구버전도 검증이 끝난 최종 본문만 한 번 받는다.
+            self._send_sse({"type": "delta", "text": answer})
+            self._send_sse({"type": "answer", "text": answer, "sources": sources,
+                            "validation": result.validation,
+                            "context": current, "message_id": message_id})
+            # 원천 데이터/OneDrive 로그는 변경하지 않는다. 로컬 로그만 기록한다.
+            conversation.append_turn(user, question, answer,
+                                     [{"name": e["name"], "arguments": e["arguments"]} for e in evidence])
+            _remember_turn(session_id, {"context": current})
             self._send_raw_sse("[DONE]")
-            self.close_connection = True
-        except Exception as exc:
-            logger.exception("SSE 스트리밍 실패: %s", exc)
-            self._send_sse({"type": "error", "message": str(exc)})
-            self._send_raw_sse("[DONE]")
+            logger.info("대화 완료: 조회=%d 검증=%s 시도=%d 차단=%d 전체=%.2fs", len(evidence),
+                        result.validation["outcome"], result.validation.get("attempts", 0),
+                        result.validation.get("blocked_drafts", 0), time.monotonic() - started)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            logger.info("클라이언트가 응답 수신을 중단했습니다.")
+        except Exception:
+            logger.exception("대화 생성 실패")
+            try:
+                self._send_sse({"type": "error", "message": "답변을 완료하지 못했습니다. 다시 시도해 주세요."})
+                self._send_raw_sse("[DONE]")
+            except OSError:
+                pass
+        finally:
+            if "cancelled" in locals():
+                cancelled.set()
             self.close_connection = True
 
     def _read_json(self) -> dict[str, Any]:
@@ -288,37 +294,253 @@ class DoridangBotHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
-    def _stream_grounded_gpt_answer(self, *, question: str, evidence_name: str, evidence_payload: Any) -> str:
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "당신은 도리당봇입니다. 반드시 한국어로 답합니다. "
-                    "아래 제공된 업무 현황 데이터만 사용해서 리더 보고용으로 답하세요. "
-                    "근거에 없는 수치, 원인, 일정, 결과는 추측하지 말고 '근거 없음' 또는 '확인 필요'라고 말하세요. "
-                    "답변은 결론부터 쓰고, 진행상황/피드백/리스크/다음 액션을 질문 의도에 맞게 정리하세요. "
-                    "JSON 템플릿, 코드, 일반적인 워크플로 설명을 출력하지 말고 최종 답변만 작성하세요. "
-                    "마지막 줄에는 반드시 Flow 원문 또는 프로젝트 URL을 '근거: [Flow 열기](URL)' 형식으로 적으세요."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"사용자 질문:\n{question}\n\n"
-                    f"사용 가능한 근거 tool: {evidence_name}\n"
-                    f"업무 현황 데이터:\n{json.dumps(_compact_evidence(evidence_payload), ensure_ascii=False)}"
-                ),
-            },
-        ]
-        answer_parts: list[str] = []
-        for event in llm_backend.chat_stream(messages, tools=None):
-            if event.get("type") == "delta":
-                text = str(event.get("text") or "")
-                answer_parts.append(text)
-                self._send_sse({"type": "delta", "text": text})
-            else:
-                self._send_sse(event)
-        return "".join(answer_parts).strip()
+# 기존 정형 포맷의 호환 검사에서 사용하는 보조 함수. 정상 대화 경로는 dialogue를 사용한다.
+INTERPRETATION_MARKERS = ("결론", "리스크", "제안", "왜 ", "이유", "원인", "분석", "브리핑", "평가", "요약해")
+SUMMARY_SEPARATOR = "\n\n---\n\n"
+
+
+def _wants_interpretation(question: str) -> bool:
+    text = question or ""
+    return any(marker in text for marker in INTERPRETATION_MARKERS)
+
+
+DETAIL_MARKERS = ("자세히", "상세", "전체", "전부", "목록", "다 보여", "모두 보여", "원문")
+CAUSE_MARKERS = ("원인", "이유", "왜", "막힌 이유", "지연 사유", "늦어진")
+
+
+def _wants_detail(question: str) -> bool:
+    text = question or ""
+    return any(marker in text for marker in DETAIL_MARKERS)
+
+
+def _wants_cause(question: str) -> bool:
+    text = question or ""
+    return any(marker in text for marker in CAUSE_MARKERS)
+
+
+def _data_as_of_note() -> str:
+    """답변 대상 데이터가 언제 수집된 것인지 밝힌다.
+
+    Flow는 하루 6회 수집되므로, 하루 넘게 갱신이 없으면 수집이 멈춘 것이다.
+    리더가 "왜 어제 올린 게 안 보이지"를 스스로 알 수 있어야 한다.
+    """
+    freshness = tools.data_freshness()
+    latest = freshness.get("latest")
+    if not latest:
+        return ""
+    if not freshness.get("stale"):
+        return f"\n\n_데이터 기준: {latest} 수집분 (Flow 수집은 하루 6회)_"
+    age = freshness.get("age_days")
+    age_text = f"{age}일 지났습니다" if age else "갱신이 멈춰 있습니다"
+    return (
+        f"\n\n_⚠ 이 답변의 데이터는 {latest} 수집분으로 {age_text}. "
+        "Flow는 하루 6회 수집되지만 이 프로젝트들은 갱신이 멈춰 있어 최신 내용이 빠져 있을 수 있습니다._"
+    )
+
+
+def _format_last_result_detail(question: str, last: dict[str, Any]) -> str:
+    """직전에 보여준 건들을 본문·댓글·하위 업무까지 붙여 다시 설명한다.
+
+    같은 줄을 반복하지 않으려면 새 정보가 있어야 한다. 본문이 있는 글은 243건 중 79건뿐이라
+    댓글과 하위 업무를 함께 보여준다. 전부 수집된 데이터라 지어내는 부분은 없다.
+    """
+    posts = list(last.get("posts") or [])
+    if _wants_cause(question):
+        return _format_last_result_causes(question, last, posts)
+
+    ordinal = _requested_ordinal(question)
+    if ordinal and 1 <= ordinal <= len(posts):
+        posts = [posts[ordinal - 1]]
+        heading = f"직전 답변의 {ordinal}번째 건"
+    else:
+        heading = f"직전 답변에서 보여드린 {len(posts)}건"
+
+    lines = [f"## {heading}", ""]
+    for index, post in enumerate(posts[:5], start=1):
+        lines.append(f"{index}. {_post_line(post, with_people=True).lstrip('- ')}")
+        lines.extend(_format_post_detail(post))
+        lines.append("")
+    if len(posts) > 5:
+        lines.append(f"- 외 {len(posts) - 5}건")
+
+    lines.append(f"_직전 질문 「{last.get('question', '')}」 의 결과를 자세히 본 것입니다._")
+    return "\n".join(lines)
+
+
+def _format_last_result_causes(question: str, last: dict[str, Any], posts: list[dict[str, Any]]) -> str:
+    """직전 결과에서 지연/기한/원인 질문에 답한다. 근거 없는 원인은 단정하지 않는다."""
+    target_posts = _cause_target_posts(question, posts)
+    lines = ["## 원인 확인", ""]
+    if not target_posts:
+        lines.extend([
+            "직전 답변 안에서 원인을 볼 만한 진행 중 또는 기한 경과 업무를 찾지 못했습니다.",
+            "",
+            f"_직전 질문 「{last.get('question', '')}」 기준입니다._",
+        ])
+        return "\n".join(lines)
+
+    for index, post in enumerate(target_posts[:5], start=1):
+        lines.append(f"{index}. {_post_line(post, with_people=True).lstrip('- ')}")
+        signals = _cause_signals_for_post(post)
+        if signals:
+            lines.append("   - 확인된 근거: " + " / ".join(signals[:3]))
+            lines.append(f"   - 추정되는 병목: {_infer_bottleneck(signals)}")
+        else:
+            lines.append("   - 확인된 근거: 본문·댓글에 원인이 직접 적혀 있지 않습니다.")
+            lines.append("   - 추정되는 병목: 근거 부족으로 단정할 수 없습니다.")
+        lines.append(f"   - 확인 질문: {_followup_question_for_post(post, signals)}")
+
+    if len(target_posts) > 5:
+        lines.append(f"- 외 {len(target_posts) - 5}건은 목록 요청 시 이어서 보여드리겠습니다.")
+    lines.extend([
+        "",
+        "※ 위 원인은 Flow 본문·댓글·하위업무에서 읽히는 근거 기반 추정입니다. 명시 근거가 없는 부분은 확인 질문으로 남겼습니다.",
+        f"_직전 질문 「{last.get('question', '')}」 기준입니다._",
+    ])
+    return "\n".join(lines)
+
+
+def _cause_target_posts(question: str, posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    text = question or ""
+    candidates = posts
+    if "기한" in text or "지연" in text or "늦" in text:
+        overdue = [post for post in candidates if _is_overdue_open_post(post)]
+        if overdue:
+            return overdue
+    open_posts = [post for post in candidates if status_rules.is_open(post.get("task_status"))]
+    return open_posts or candidates
+
+
+def _is_overdue_open_post(post: dict[str, Any]) -> bool:
+    end_dt = str(post.get("end_dt") or "").replace("-", "").strip()
+    return bool(re.fullmatch(r"\d{8}", end_dt)) and end_dt < datetime.now().strftime("%Y%m%d") and status_rules.is_open(post.get("task_status"))
+
+
+def _cause_signals_for_post(post: dict[str, Any]) -> list[str]:
+    signals: list[str] = []
+    for line in _content_excerpt(post, limit=420).splitlines():
+        picked = _signal_from_text(line)
+        if picked:
+            signals.append(picked)
+
+    post_id = str(post.get("post_id") or "").strip()
+    if post_id:
+        thread = tools.get_post_thread(post_id)
+        if isinstance(thread, dict) and thread.get("allowed") is not False:
+            for child in thread.get("posts") or []:
+                if str(child.get("post_id")) == post_id:
+                    continue
+                status = child.get("task_status") or "상태 없음"
+                title = child.get("title") or "(제목 없음)"
+                if status_rules.is_open(status):
+                    signals.append(f"하위업무 [{status}] {title}")
+            remarks = [
+                item for item in (thread.get("comments") or [])
+                if not item.get("is_system") and str(item.get("content_text") or "").strip()
+            ]
+            for comment in remarks[-4:][::-1]:
+                picked = _signal_from_text(str(comment.get("content_text") or ""))
+                if picked:
+                    author = comment.get("author_name") or "작성자"
+                    signals.append(f"{author} 댓글: {picked}")
+
+    deduped: list[str] = []
+    for signal in signals:
+        compact = " ".join(str(signal).split())[:150]
+        if compact and compact not in deduped:
+            deduped.append(compact)
+    return deduped
+
+
+def _signal_from_text(text: str) -> str:
+    compact = " ".join(str(text or "").split())
+    if not compact:
+        return ""
+    keywords = (
+        "확인", "컨펌", "문의", "답변", "연장", "미완료", "예정", "요청", "논의", "검토",
+        "수정", "등록", "보정", "제안", "대기", "완료", "진행", "반영",
+    )
+    if any(keyword in compact for keyword in keywords):
+        return compact[:150]
+    return ""
+
+
+def _infer_bottleneck(signals: list[str]) -> str:
+    joined = " ".join(signals)
+    if any(word in joined for word in ["컨펌", "확인", "승인", "답변"]):
+        return "확인 또는 의사결정 대기 가능성이 큽니다."
+    if any(word in joined for word in ["문의", "업체", "고객센터", "연장", "미완료"]):
+        return "외부 답변이나 업체 진행 일정에 묶였을 가능성이 있습니다."
+    if any(word in joined for word in ["수정", "보정", "등록", "반영", "제작"]):
+        return "제작·수정·등록 작업이 남아 진행이 멈춘 것으로 보입니다."
+    if any(word in joined for word in ["논의", "검토", "제안"]):
+        return "방향 검토 또는 실행안 확정이 필요한 상태로 보입니다."
+    return "근거는 있으나 병목 유형은 추가 확인이 필요합니다."
+
+
+def _followup_question_for_post(post: dict[str, Any], signals: list[str]) -> str:
+    owner = str(post.get("worker") or post.get("author_name") or "담당자").strip()
+    title = post.get("title") or "이 건"
+    if not signals:
+        return f"{owner}에게 '{title}'의 현재 막힌 지점과 새 완료 예정일을 확인하세요."
+    return f"{owner}에게 남은 의사결정, 외부 답변 대기 여부, 새 완료 예정일을 확인하세요."
+
+
+def _format_post_detail(post: dict[str, Any]) -> list[str]:
+    """본문 발췌 + 최근 댓글 + 하위 업무. 없으면 그 줄은 생략한다."""
+    lines: list[str] = []
+    progress = str(post.get("progress") or "").strip()
+    if progress and progress not in {"0", "nan"}:
+        lines.append(f"   - 진행률 {progress}%")
+
+    excerpt = _content_excerpt(post, limit=300)
+    if excerpt:
+        for row in excerpt.splitlines()[:5]:
+            lines.append(f"   > {row}")
+
+    post_id = str(post.get("post_id") or "").strip()
+    if not post_id:
+        return lines
+    thread = tools.get_post_thread(post_id)
+    if not isinstance(thread, dict) or thread.get("allowed") is False:
+        return lines
+
+    children = [
+        item for item in (thread.get("posts") or [])
+        if str(item.get("post_id")) != post_id
+    ]
+    if children:
+        lines.append(f"   - 하위 업무 {len(children)}건: " + ", ".join(
+            f"[{child.get('task_status') or '상태 없음'}] {child.get('title') or '(제목 없음)'}"
+            for child in children[:4]
+        ))
+
+    remarks = [
+        item for item in (thread.get("comments") or [])
+        if not item.get("is_system") and str(item.get("content_text") or "").strip()
+    ]
+    if remarks:
+        lines.append(f"   - 댓글 {len(remarks)}건 (최근순)")
+        for comment in remarks[-3:][::-1]:
+            text = " ".join(str(comment.get("content_text") or "").split())[:160]
+            when = str(comment.get("written_at") or "")[:8]
+            lines.append(f"     · {comment.get('author_name') or '작성자'} ({when}) {text}")
+    return lines
+
+
+def _format_route_answer(tool_name: str, result: Any, *, question: str = "") -> str:
+    formatter = {
+        "get_team_status": _format_team_status,
+        "get_worker_status": _format_worker_status,
+        "get_risk_status": _format_risk_status,
+        "filter_posts": _format_filtered_posts,
+        "find_posts": _format_post_lookup,
+        "get_topic_status": _format_topic_status,
+        "get_project_status": _format_project_status,
+    }.get(tool_name)
+    if formatter is None:
+        return json.dumps(result, ensure_ascii=False)
+    return formatter(result, detailed=_wants_detail(question)) + _data_as_of_note()
 
 
 def _tool_name_and_args(call: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -331,11 +553,6 @@ def _tool_name_and_args(call: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         except json.JSONDecodeError:
             arguments = {}
     return name, arguments
-
-
-def _is_light_chat(question: str) -> bool:
-    normalized = (question or "").strip().replace(" ", "")
-    return normalized in {"안녕", "안녕하세요", "하이", "ㅎㅇ"}
 
 
 def _normalize_history(value: Any) -> list[dict[str, str]]:
@@ -352,55 +569,6 @@ def _normalize_history(value: Any) -> list[dict[str, str]]:
     return normalized
 
 
-def _basis_for_question(question: str, *, default: str = "author") -> str:
-    if tools.detect_author_basis(question):
-        return "author"
-    if "담당자" in (question or "") or "담당 기준" in (question or ""):
-        return "worker"
-    return default
-
-
-def _is_priority_status_question(question: str) -> bool:
-    text = question or ""
-    normalized = text.replace(" ", "")
-    if normalized in {"상태", "상태확인", "피드백건확인용", "상태피드백건확인용"}:
-        return True
-    return any(keyword in text for keyword in ["피드백", "결제중", "결재중", "결제"])
-
-
-def _should_answer_post_lookup(question: str, result: dict[str, Any]) -> bool:
-    text = (question or "").strip()
-    if len(text) < 4:
-        return False
-    posts = result.get("posts") or []
-    if not posts:
-        return False
-    if len(posts) == 1:
-        return True
-    normalized = text.replace(" ", "")
-    return any(normalized == str(post.get("title") or "").replace(" ", "") for post in posts[:5])
-
-
-def _status_due_filters(question: str) -> dict[str, Any] | None:
-    text = question or ""
-    filters: dict[str, Any] = {}
-    for status in ["보류", "대기", "진행", "완료", "피드백", "결제중", "결재중", "보완", "액션"]:
-        if status in text:
-            filters["status"] = "결제중" if status == "결재중" else status
-            break
-    if "기한 없음" in text or "기한없음" in text:
-        filters["due"] = "none"
-    elif "기한 지난" in text or "기한 경과" in text:
-        filters["due"] = "overdue"
-    else:
-        matched = re.search(r"\b(20\d{6})\b", text)
-        if matched:
-            filters["due"] = matched.group(1)
-    if not filters:
-        return None
-    return filters
-
-
 def _compact_evidence(payload: Any) -> Any:
     if not isinstance(payload, dict):
         return payload
@@ -413,6 +581,17 @@ def _compact_evidence(payload: Any) -> Any:
     if isinstance(projects, list):
         compact["projects"] = [_compact_project(project) for project in projects]
     return compact
+
+
+def _memory_posts_for_result(result: Any) -> list[dict[str, Any]]:
+    """후속질문에서 다시 볼 대표 목록. 팀 현황은 우선 확인 건을 기억한다."""
+    if not isinstance(result, dict):
+        return []
+    for key in ("posts", "priority_posts", "risk_posts", "overdue_posts"):
+        posts = result.get(key)
+        if isinstance(posts, list) and posts:
+            return posts
+    return []
 
 
 def _compact_project(project: Any) -> Any:
@@ -459,7 +638,38 @@ def _compact_post(post: Any) -> Any:
     }
 
 
-def _format_project_status(status: dict[str, Any]) -> str:
+def _record_line(result: dict[str, Any]) -> str | None:
+    """업무단위/회의록/액션은 묶음·기록이고 모니터링은 관찰 항목이다.
+
+    진행 업무 집계에서 빼되 감추지는 않는다.
+    """
+    count = int(result.get("record_count") or 0)
+    if not count:
+        return None
+    counts = _format_counts(result.get("record_counts") or {})
+    return f"- 진행 업무 외: {count}건 ({counts}) — 진행 업무 집계에서 제외했습니다"
+
+
+def _due_text(post: dict[str, Any]) -> str:
+    end_dt = str(post.get("end_dt") or "")
+    if not end_dt:
+        return " / 기한 없음"
+    overdue = end_dt.replace("-", "") < datetime.now().strftime("%Y%m%d")
+    is_open = status_rules.is_open(post.get("task_status"))
+    return f" / 기한 {end_dt}{' ⚠지남' if overdue and is_open else ''}"
+
+
+def _post_line(post: dict[str, Any], *, with_people: bool = False) -> str:
+    status = post.get("task_status") or "상태 없음"
+    title = post.get("title") or "(제목 없음)"
+    people = f" / {_format_people(post)}" if with_people else ""
+    return (
+        f"- **[{status}]** {title}{people} / {_format_project_label(post)}"
+        f"{_due_text(post)}{_format_source_link(post)}"
+    )
+
+
+def _format_project_status(status: dict[str, Any], *, detailed: bool = False) -> str:
     project_id = status.get("project_id") or ""
     project_name = _short_project_name(status.get("project_name") or tools.ALLOWED_PROJECTS.get(str(project_id), "프로젝트"))
     if status.get("post_count") == 0:
@@ -468,21 +678,31 @@ def _format_project_status(status: dict[str, Any]) -> str:
     lines = [
         f"## 프로젝트 {project_name}",
         "",
-        f"- 게시글: {status.get('post_count', 0)}건",
+        f"- 업무: {status.get('task_count', 0)}건 (진행 중 {status.get('open_count', 0)}건)",
         f"- 상태: {_format_counts(status.get('status_counts') or {})}",
-        f"- 작성자: {_format_counts(status.get('author_counts') or {})}",
         f"- 기한 경과: {status.get('overdue_count', 0)}건",
     ]
+    if detailed:
+        lines.append(f"- 작성자: {_format_counts(status.get('author_counts') or {})}")
+    record_line = _record_line(status)
+    if record_line:
+        lines.append(record_line)
+
+    open_posts = status.get("posts") or []
+    lines.extend(["", "## 지금 볼 업무", ""])
+    if open_posts:
+        limit = 8 if detailed else 4
+        lines.extend(_post_line(post, with_people=True) for post in open_posts[:limit])
+        if not detailed and len(open_posts) > limit:
+            lines.append(f"- 외 {len(open_posts) - limit}건은 '전체 목록'이라고 물으면 보여드리겠습니다.")
+    else:
+        lines.append("- 진행 중인 업무가 없습니다.")
 
     overdue_posts = status.get("overdue_posts") or []
     if overdue_posts:
-        lines.extend(["", "## 기한 경과 게시글", ""])
-        for post in overdue_posts[:8]:
-            status_text = post.get("task_status") or "상태 없음"
-            title = post.get("title") or "(제목 없음)"
-            end_dt = post.get("end_dt") or ""
-            due_text = f" / 기한 {end_dt}" if end_dt else ""
-            lines.append(f"- **[{status_text}]** {title} / {_format_people(post)}{due_text}{_format_source_link(post)}")
+        lines.extend(["", "## 먼저 확인할 기한 경과", ""])
+        limit = 8 if detailed else 4
+        lines.extend(_post_line(post, with_people=True) for post in overdue_posts[:limit])
 
         lines.extend([
             "",
@@ -495,66 +715,82 @@ def _format_project_status(status: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _format_team_status(result: dict[str, Any]) -> str:
+def _format_team_status(result: dict[str, Any], *, detailed: bool = False) -> str:
     members = result.get("members") or []
     priority_posts = result.get("priority_posts") or []
     active_total = sum(int(member.get("active_count") or 0) for member in members)
     overdue_total = sum(int(member.get("overdue_count") or 0) for member in members)
-    total_posts = sum(int(member.get("post_count") or 0) for member in members)
+    total_tasks = sum(int(member.get("task_count") or 0) for member in members)
 
+    most_loaded = sorted(
+        members,
+        key=lambda item: (int(item.get("overdue_count") or 0), int(item.get("active_count") or 0)),
+        reverse=True,
+    )
+    lead = most_loaded[0] if most_loaded else {}
+    lead_text = (
+        f"{lead.get('worker')}님 쪽에 열린 업무 {lead.get('active_count', 0)}건, "
+        f"기한 경과 {lead.get('overdue_count', 0)}건이 몰려 있습니다."
+        if lead else "팀원별 집계 대상이 없습니다."
+    )
     lines: list[str] = [
         "## 결론",
         "",
-        f"- 허용 프로젝트 전체 게시글은 **{result.get('post_count', 0)}건**입니다.",
-        f"- 팀원별 작성자/참여 합산은 **{total_posts}건**입니다. 공동 참여 글은 팀원별로 중복 집계됩니다.",
-        f"- 진행·대기·보류·피드백·결제중 상태는 **{active_total}건**, 기한 경과는 **{overdue_total}건**입니다.",
-        f"- 피드백/결제중 즉시 확인 건은 **{len(priority_posts)}건**입니다.",
+        f"- 전체 업무 **{result.get('task_count', 0)}건** 중 열린 업무가 **{active_total}건**, 기한 경과가 **{overdue_total}건**입니다.",
+        f"- 바로 확인할 피드백/보완은 **{len(priority_posts)}건**입니다.",
+        f"- {lead_text}",
     ]
+    if detailed:
+        lines.insert(3, f"- 팀원별 합산은 **{total_tasks}건**입니다({result.get('basis_label') or tools.basis_label()} 기준). 공동 담당 글은 팀원별로 중복 집계됩니다.")
+    record_line = _record_line(result)
+    if record_line:
+        lines.append(record_line)
 
     priority_posts = result.get("priority_posts") or []
     if priority_posts:
-        lines.extend(["", "## 바로 처리할 건", ""])
-        for post in priority_posts[:8]:
-            status = post.get("task_status") or "상태 없음"
-            end_dt = post.get("end_dt") or "기한 없음"
-            title = post.get("title") or "(제목 없음)"
-            project = _format_project_label(post)
-            due_text = f" / 기한 {end_dt}" if post.get("end_dt") else ""
-            lines.append(f"- **[{status}]** {title} / {_format_people(post)} / {project}{due_text}{_format_source_link(post)}")
+        lines.extend(["", "## 바로 물어볼 건", ""])
+        limit = 8 if detailed else 3
+        lines.extend(_post_line(post, with_people=True) for post in priority_posts[:limit])
         lines.append("")
 
     lines.extend([
-        "## 팀원별 현황",
+        "## 팀원별 한눈에 보기",
         "",
-        f"- 분류 기준: **{result.get('basis_label', '작성자')}**",
+        f"- 분류 기준: **{result.get('basis_label') or tools.basis_label()}** — {result.get('basis_note') or tools.basis_note()}",
     ])
     for member in members[:12]:
         counts = member.get("status_counts") or {}
-        active = sum(int(counts.get(status) or 0) for status in ["진행", "대기", "보류", "피드백", "결제중"])
         done = int(counts.get("완료") or 0)
         projects = ", ".join(
-            f"{_format_project_label(project)} {project.get('post_count', 0)}건"
+            f"{_format_project_label(project)} {project.get('task_count', 0)}건"
             for project in (member.get("projects") or [])[:2]
         ) or "-"
-        lines.append(f"- **{member.get('worker')}**: 전체 {member.get('post_count', 0)}건 / 진행·대기·보류·피드백·결제중 {active}건 / 완료 {done}건 / 기한 경과 {member.get('overdue_count', 0)}건")
-        lines.append(f"  - 주요 프로젝트: {projects}")
+        record_count = int(member.get("record_count") or 0)
+        record_text = f" / 기록 {record_count}건" if record_count else ""
+        lines.append(
+            f"- **{member.get('worker')}**: 업무 {member.get('task_count', 0)}건 / "
+            f"진행 중 {member.get('active_count', 0)}건 / 완료 {done}건 / "
+            f"기한 경과 {member.get('overdue_count', 0)}건{record_text}"
+        )
+        if detailed:
+            lines.append(f"  - 주요 프로젝트: {projects}")
 
     lines.extend([
         "",
-        "## 다음 액션",
-        "- 피드백/결제중은 결제 또는 의사결정 지연을 막기 위해 먼저 확인합니다.",
-        "- 기한 경과 업무는 오늘 완료 가능 여부와 새 완료일을 확인합니다.",
-        "- 보류/대기 상세 목록은 이 화면에서 제외했습니다. 필요할 때 별도로 요청하면 됩니다.",
+        "## 다음에 바로 물어볼 질문",
+        f"- \"{lead.get('worker') or '담당자'} 기한 지난 건 뭐야?\"",
+        "- \"피드백/보완 3건 원인이 뭐야?\"",
+        "- \"차보령 대리는?\"처럼 이름만 물어도 개인 현황으로 이어서 보겠습니다.",
     ])
     lines.extend(["", _format_flow_evidence(result)])
     return "\n".join(lines)
 
 
-def _format_risk_status(result: dict[str, Any]) -> str:
+def _format_risk_status(result: dict[str, Any], *, detailed: bool = False) -> str:
     project_name = _short_project_name(result.get("project_name") or "전체 허용 프로젝트")
     posts = result.get("posts") or []
     priority_only = bool(result.get("priority_only"))
-    title = "피드백/결제중 확인" if priority_only else "위험 업무"
+    title = "피드백/보완 확인" if priority_only else "위험 업무"
     heading = title if not result.get("project_id") else f"{project_name} {title}"
     lines = [
         f"## {heading}",
@@ -563,11 +799,12 @@ def _format_risk_status(result: dict[str, Any]) -> str:
         f"- 상태: {_format_counts(result.get('status_counts') or {})}",
     ]
     if not posts:
-        empty_message = "현재 기준으로 피드백/결제중 업무가 없습니다." if priority_only else "현재 기준으로 기한 경과/보류/피드백/대기 위험 업무가 없습니다."
+        empty_message = "현재 기준으로 피드백/보완 업무가 없습니다." if priority_only else "현재 기준으로 기한 경과/보류/피드백/대기 위험 업무가 없습니다."
         lines.extend(["", empty_message])
     else:
         lines.extend(["", "## 확인 목록", ""])
-        for post in posts[:15]:
+        limit = 15 if detailed else 5
+        for post in posts[:limit]:
             if priority_only:
                 lines.extend(_format_priority_post_card(post))
                 continue
@@ -581,12 +818,12 @@ def _format_risk_status(result: dict[str, Any]) -> str:
         if priority_only:
             lines.extend([
                 "- 피드백 건은 필요한 의사결정 또는 보완 내용을 확인합니다.",
-                "- 결제중 건은 결제 가능 여부와 승인자를 먼저 확인합니다.",
+                "- 보완 건은 무엇을 보완해야 하는지와 담당자를 먼저 확인합니다.",
             ])
         else:
             lines.extend([
                 "- 기한이 지난 업무만 완료 가능 여부와 새 완료일을 확인합니다.",
-                "- 피드백/결제중은 필요한 의사결정 또는 승인자를 확인합니다.",
+                "- 피드백/보완은 필요한 의사결정 또는 승인자를 확인합니다.",
                 "- 보류/대기는 별도 요청이 있을 때만 실행 대기 사유를 정리합니다.",
             ])
 
@@ -601,7 +838,7 @@ def _format_risk_status(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _format_post_lookup(result: dict[str, Any]) -> str:
+def _format_post_lookup(result: dict[str, Any], *, detailed: bool = False) -> str:
     keyword = result.get("keyword") or "검색어"
     posts = result.get("posts") or []
     if not posts:
@@ -614,7 +851,8 @@ def _format_post_lookup(result: dict[str, Any]) -> str:
         f"- 확인된 게시글: **{result.get('count', len(posts))}건**",
     ]
 
-    for post in posts[:5]:
+    limit = 5 if detailed else 3
+    for post in posts[:limit]:
         status = post.get("task_status") or "상태 없음"
         title = post.get("title") or "(제목 없음)"
         end_dt = post.get("end_dt") or ""
@@ -628,13 +866,16 @@ def _format_post_lookup(result: dict[str, Any]) -> str:
         ])
         excerpt = _content_excerpt(post, limit=520)
         if excerpt:
-            lines.extend(["", "본문 일부:", excerpt])
+            if detailed:
+                lines.extend(["", "본문 일부:", excerpt])
+    if not detailed and len(posts) > limit:
+        lines.append(f"- 외 {len(posts) - limit}건은 '자세히'라고 물으면 보여드리겠습니다.")
 
     lines.extend(["", _format_flow_evidence(result)])
     return "\n".join(lines)
 
 
-def _format_filtered_posts(result: dict[str, Any]) -> str:
+def _format_filtered_posts(result: dict[str, Any], *, detailed: bool = False) -> str:
     project_name = _short_project_name(result.get("project_name") or "전체 허용 프로젝트")
     status_filter = result.get("status_filter") or ""
     due_filter = result.get("due_filter") or ""
@@ -648,30 +889,35 @@ def _format_filtered_posts(result: dict[str, Any]) -> str:
     elif re.fullmatch(r"\d{8}", str(due_filter)):
         labels.append(f"기한 {due_filter}")
     label_text = " · ".join(labels) or "필터"
-    heading = f"{label_text} 업무" if not result.get("project_id") else f"{project_name} {label_text} 업무"
+    # 회의록/업무단위/액션/모니터링은 진행 업무가 아니므로 "업무"라고 부르지 않는다
+    noun = " 업무" if status_rules.is_task(status_filter) else ""
+    heading = f"{label_text}{noun}" if not result.get("project_id") else f"{project_name} {label_text}{noun}"
 
     posts = result.get("posts") or []
+    # 기록만 조회한 경우 업무 집계가 비어 있으므로 기록 쪽 수치를 보여준다
+    is_record_query = not status_rules.is_task(status_filter)
+    counts = result.get("record_counts") if is_record_query else result.get("status_counts")
+    total = result.get("record_count") if is_record_query else result.get("task_count", result.get("post_count", 0))
     lines = [
         f"## {heading}",
         "",
-        f"- 확인 대상: **{result.get('post_count', 0)}건**",
-        f"- 상태: {_format_counts(result.get('status_counts') or {})}",
+        f"- 확인 대상: **{total or 0}건**",
+        f"- 상태: {_format_counts(counts or {})}",
     ]
+    if not is_record_query:
+        record_line = _record_line(result)
+        if record_line:
+            lines.append(record_line)
     if not posts:
         lines.extend(["", "해당 조건의 업무가 없습니다."])
     else:
         lines.extend(["", "## 확인 목록", ""])
-        for post in posts[:15]:
-            status = post.get("task_status") or "상태 없음"
-            title = post.get("title") or "(제목 없음)"
-            end_dt = post.get("end_dt") or ""
-            due_text = f" / 기한 {end_dt}" if end_dt else ""
-            lines.append(
-                f"- **[{status}]** {title} / {_format_people(post)} / "
-                f"{_format_project_label(post)}{due_text}{_format_source_link(post)}"
-            )
-        if len(posts) > 15:
-            lines.append(f"- 외 {len(posts) - 15}건")
+        # 다른 목록과 같은 형식을 쓴다. 기한 경과에는 표시가 붙는다
+        limit = 15 if detailed else 5
+        lines.extend(_post_line(post, with_people=True) for post in posts[:limit])
+        if len(posts) > limit:
+            prompt = "전체 목록" if not detailed else "이어서"
+            lines.append(f"- 외 {len(posts) - limit}건은 '{prompt}'이라고 물으면 보여드리겠습니다.")
 
     args = []
     if status_filter:
@@ -684,50 +930,61 @@ def _format_filtered_posts(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _format_worker_status(result: dict[str, Any]) -> str:
+def _format_worker_status(result: dict[str, Any], *, detailed: bool = False) -> str:
     worker = result.get("worker") or "작성자"
-    basis_label = result.get("basis_label", "작성자")
+    basis_label = result.get("basis_label") or tools.basis_label()
     if not result.get("post_count"):
         return (
             f"{worker} {basis_label} 기준 게시글은 허용된 3개 프로젝트의 수집 데이터에서 찾지 못했습니다.\n\n"
             f"{_format_flow_evidence(result)}"
         )
 
+    open_count = int(result.get("open_count") or 0)
+    overdue_count = int(result.get("overdue_count") or 0)
     lines = [
-        f"## {worker} {basis_label} 기준 진행상황",
+        f"## {worker} 진행상황",
         "",
-        f"- 분류 기준: **{basis_label}**",
-        f"- 전체 게시글: {result.get('post_count', 0)}건",
+        f"- 분류 기준: **{basis_label}** — {result.get('basis_note') or tools.basis_note()}",
+        f"- 결론: 업무 **{result.get('task_count', 0)}건** 중 열린 업무가 **{open_count}건**, 기한 경과가 **{overdue_count}건**입니다.",
         f"- 상태: {_format_counts(result.get('status_counts') or {})}",
-        f"- 기한 경과: {result.get('overdue_count', 0)}건",
-        "",
-        "프로젝트별:",
     ]
-    for project in result.get("projects", []):
+    record_line = _record_line(result)
+    if record_line:
+        lines.append(record_line)
+
+    lines.extend(["", "## 프로젝트별"])
+    project_limit = None if detailed else 3
+    for project in (result.get("projects", [])[:project_limit]):
         lines.append(
             f"- {_format_project_label(project)} ({project.get('project_id')}): "
-            f"{project.get('post_count', 0)}건, 상태 {_format_counts(project.get('status_counts') or {})}, "
+            f"업무 {project.get('task_count', 0)}건, 상태 {_format_counts(project.get('status_counts') or {})}, "
             f"기한 경과 {project.get('overdue_count', 0)}건"
         )
 
     posts = result.get("posts") or []
+    lines.extend(["", "## 지금 볼 업무"])
     if posts:
-        lines.extend(["", "주요 게시글:"])
-        for post in posts[:8]:
-            status = post.get("task_status") or "상태 없음"
-            end_dt = post.get("end_dt") or ""
-            due_text = f" / 기한 {end_dt}" if end_dt else ""
-            title = post.get("title") or "(제목 없음)"
-            lines.append(
-                f"- **[{status}]** {title} / {_format_project_label(post)}"
-                f"{due_text}{_format_source_link(post)}"
-            )
+        limit = 8 if detailed else 5
+        lines.extend(_post_line(post) for post in posts[:limit])
+        if not detailed and len(posts) > limit:
+            lines.append(f"- 외 {len(posts) - limit}건은 '전체 목록'이라고 물으면 보여드리겠습니다.")
+    else:
+        lines.append("- 진행 중인 업무가 없습니다.")
+
+    if posts:
+        first = posts[0].get("title") or "첫 번째 건"
+        lines.extend([
+            "",
+            "## 다음에 바로 물어볼 질문",
+            f"- \"{first} 왜 지났어?\"",
+            f"- \"{worker} 기한 지난 건만 보여줘\"",
+        ])
 
     lines.extend(["", _format_flow_evidence(result)])
     return "\n".join(lines)
 
 
-def _format_topic_status(result: dict[str, Any]) -> str:
+def _format_topic_status(result: dict[str, Any], *, detailed: bool = False) -> str:
     keyword = result.get("keyword") or "주제"
     if not result.get("post_count"):
         return (
@@ -738,15 +995,18 @@ def _format_topic_status(result: dict[str, Any]) -> str:
     lines = [
         f"{keyword} 관련 Flow 진행상황 요약입니다.",
         "",
-        f"- 관련 게시글: {result.get('post_count', 0)}건",
+        f"- 관련 업무: {result.get('task_count', 0)}건",
         f"- 상태: {_format_counts(result.get('status_counts') or {})}",
-        "",
-        "프로젝트별:",
     ]
+    record_line = _record_line(result)
+    if record_line:
+        lines.append(record_line)
+
+    lines.extend(["", "프로젝트별:"])
     for project in result.get("projects", []):
         lines.append(
             f"- {project.get('project_name')} ({project.get('project_id')}): "
-            f"{project.get('post_count', 0)}건, 상태 {_format_counts(project.get('status_counts') or {})}"
+            f"업무 {project.get('task_count', 0)}건, 상태 {_format_counts(project.get('status_counts') or {})}"
         )
 
     posts = result.get("posts") or []
@@ -766,15 +1026,18 @@ def _format_topic_status(result: dict[str, Any]) -> str:
 
     if posts:
         lines.extend(["", "주요 근거 게시글:"])
-        for post in posts[:10]:
+        limit = 10 if detailed else 5
+        for post in posts[:limit]:
             status = post.get("task_status") or "상태 없음"
             title = post.get("title") or "(제목 없음)"
             project_id = post.get("project_id") or ""
             content = str(post.get("content_text") or "").replace("\n", " ").strip()
             excerpt = content[:120] + ("..." if len(content) > 120 else "")
             lines.append(f"- [{status}] {title} ({project_id})")
-            if excerpt:
+            if excerpt and detailed:
                 lines.append(f"  {excerpt}")
+        if not detailed and len(posts) > limit:
+            lines.append(f"- 외 {len(posts) - limit}건은 '자세히'라고 물으면 이어서 보겠습니다.")
 
     lines.extend(["", _format_flow_evidence(result)])
     return "\n".join(lines)

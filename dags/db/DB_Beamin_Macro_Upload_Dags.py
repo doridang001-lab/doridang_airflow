@@ -55,18 +55,21 @@ def trigger_validate(**context) -> str:
         "source": "upload_ingest",
         "source_run_id": source_run_id,
     }
-    for key in ("target_date", "target_dates", "manual_baemin_dir"):
+    for key in ("target_date", "target_dates", "manual_baemin_dir", "workload"):
         if conf.get(key):
             trigger_conf[key] = conf[key]
 
     from airflow.api.common.trigger_dag import trigger_dag
     from airflow.exceptions import DagRunAlreadyExists
+    from modules.transform.utility.workload import route_trigger
 
     try:
-        trigger_dag(dag_id=VALIDATE_DAG_ID, run_id=run_id, conf=trigger_conf)
+        result = route_trigger(trigger_dag, history_context=context, dag_id=("DB_Beamin_Macro_Backfill_Validate_Dags" if conf.get("workload") == "history" else VALIDATE_DAG_ID), run_id=run_id, conf=trigger_conf)
     except DagRunAlreadyExists:
         logger.info("배민 upload validate DAG run 이미 존재: %s", run_id)
         return f"validate DAG run 이미 존재: {run_id}"
+    if result in ("deferred", "existing", "cancelled"):
+        return f"validate DAG 요청 상태={result}: {run_id}"
     logger.info("배민 upload validate DAG 트리거 완료: run_id=%s", run_id)
     return f"validate DAG 트리거 완료: {run_id}"
 

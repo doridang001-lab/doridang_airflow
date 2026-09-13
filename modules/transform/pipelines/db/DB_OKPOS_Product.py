@@ -19,6 +19,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from modules.transform.pipelines.db.DB_OKPOS_Sales import (  # noqa: E402
     DOWNLOAD_TIMEOUT,
     WAIT_TIMEOUT,
+    _is_transient_connection_error,
     _launch_browser,
     _login,
     _setup_download_dir,
@@ -149,16 +150,37 @@ def _wait_for_product_search_results(driver, timeout: int = OKPOS_PRODUCT_SEARCH
     )
 
 
+def _launch_product_session(download_dir: Path):
+    for attempt in range(1, 4):
+        driver = None
+        try:
+            driver = _launch_browser(download_dir=download_dir)
+            wait = WebDriverWait(driver, WAIT_TIMEOUT)
+            _setup_download_dir(driver, download_dir)
+            _login(driver, wait)
+            return driver, wait
+        except Exception as exc:
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+            if not _is_transient_connection_error(exc) or attempt == 3:
+                raise
+            delay = 5 * (3 ** (attempt - 1))
+            logger.warning(
+                "OKPOS 상품 로그인 중 브라우저 연결 종료: %s/3, %s초 후 재시도",
+                attempt, delay,
+            )
+            time.sleep(delay)
+
+
 def download_okpos_product(**context) -> str:
     download_dir = TEMP_DIR / "okpos_product_download"
     _cleanup_product_downloads(download_dir)
 
-    driver = _launch_browser(download_dir=download_dir)
+    driver, wait = _launch_product_session(download_dir)
     try:
-        wait = WebDriverWait(driver, WAIT_TIMEOUT)
-        _setup_download_dir(driver, download_dir)
-        _login(driver, wait)
-
         logger.info("Open OKPOS product page: %s", OKPOS_PRODUCT_URL)
         driver.get(OKPOS_PRODUCT_URL)
         time.sleep(2)

@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -43,6 +44,8 @@ def _patch_coupang_allocator(monkeypatch) -> None:
             index=df.index,
         ),
     )
+    monkeypatch.setattr(unified_coupang, "_load_posfeed_order_price_lines", lambda *args, **kwargs: {})
+    monkeypatch.setattr(unified_coupang, "_lookup_observed_price", lambda *args, **kwargs: 0)
 
 
 def test_single_day_range_label_matches_target():
@@ -662,6 +665,78 @@ def test_move_coupang_down_to_collect_moves_extra_download_dirs(tmp_path, monkey
     assert (collect_dir / "coupangeats_orders_down_20260818.csv").exists()
     assert (collect_dir / "coupangeats_orders_downloads_20260818.csv").exists()
     assert (collect_dir / "coupangeats_orders_existing_20260818.csv").exists()
+
+
+def test_misplaced_coupang_marketing_file_moves_to_collect(tmp_path, monkeypatch):
+    collect_dir = tmp_path / "collect"
+    marketing_dir = tmp_path / "marketing"
+    collect_dir.mkdir()
+    marketing_dir.mkdir()
+
+    misplaced = marketing_dir / "coupangeats_orders_store_20260818.csv"
+    misplaced.write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(macro_load, "COLLECT_SRC", collect_dir)
+    monkeypatch.setattr(macro_load, "MISPLACED_MARKETING_SRC", marketing_dir)
+
+    moved = macro_load.move_misplaced_coupang_marketing_to_collect()
+
+    assert moved == [{"source": str(misplaced), "dest": str(collect_dir / misplaced.name)}]
+    assert not misplaced.exists()
+    assert (collect_dir / misplaced.name).exists()
+
+
+def test_load_coupang_partition_ingests_misplaced_marketing_file(tmp_path, monkeypatch):
+    down_dir = tmp_path / "down"
+    collect_dir = tmp_path / "collect"
+    marketing_dir = tmp_path / "marketing"
+    orders_root = tmp_path / "orders"
+    cmg_root = tmp_path / "cmg"
+    options_root = tmp_path / "options"
+    for path in (down_dir, collect_dir, marketing_dir):
+        path.mkdir()
+
+    csv_path = marketing_dir / "coupangeats_orders_닭도리탕_전문_도리당_삼송점_932290_20260901.csv"
+    pd.DataFrame(
+        [
+            {
+                "collected_at": "2026-09-01T11:14:57",
+                "store_id": "932290",
+                "store_name": "닭도리탕 전문 도리당 삼송점",
+                "order_date": "2026.05.06 19:29",
+                "order_id": "ORDER1",
+                "delivery_type": "배달",
+                "order_status": "",
+                "order_summary": "테스트메뉴",
+                "total_price": "12000",
+                "is_cancelled": "N",
+                "menu_name": "테스트메뉴",
+                "menu_qty": "1",
+                "menu_price": "12000",
+                "menu_options": "",
+            }
+        ]
+    ).to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    monkeypatch.setattr(macro_load, "DOWN_DIR", down_dir)
+    monkeypatch.setattr(macro_load, "COLLECT_SRC", collect_dir)
+    monkeypatch.setattr(macro_load, "MISPLACED_MARKETING_SRC", marketing_dir)
+    monkeypatch.setattr(macro_load, "COUPANG_ORDERS_DB", orders_root)
+    monkeypatch.setattr(macro_load, "CMG_DIR", cmg_root)
+    monkeypatch.setattr(macro_load, "OPTIONS_DIR", options_root)
+    monkeypatch.delenv(macro_load.COUPANG_EXTRA_DOWNLOAD_DIRS_ENV, raising=False)
+    monkeypatch.setattr(macro_load, "record_manual_reingest_marker", lambda *args, **kwargs: None)
+
+    result = json.loads(macro_load._load_coupang_macro_partition_unlocked())
+
+    assert result["orders"]["files_found"] == 1
+    assert result["orders"]["files_loaded"] == 1
+    assert result["orders"]["rows_loaded"] == 1
+    assert result["misplaced_moved_count"] == 1
+    assert result["misplaced_moved_files"][0]["source"] == str(csv_path)
+    assert not csv_path.exists()
+    assert not list(collect_dir.glob("coupangeats_orders_*.csv"))
+    assert (orders_root / "brand=도리당" / "store=삼송점" / "ym=2026-05" / "orders_2026-05.parquet").exists()
 
 
 def test_repair_coupang_orders_duplicates_removes_normalized_store_partition_duplicate(

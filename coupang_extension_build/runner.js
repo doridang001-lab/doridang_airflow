@@ -1016,8 +1016,16 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
           loginErrorDetected = true;
           const throttleErr = isLoginThrottleText(lastLoginErrText);
           const permissionErr = isLoginPermissionError(lastLoginErrText);
+          if ((permissionErr || (!isLoginCredError(lastLoginErrText) && !throttleErr)) && attempt < MAX_LOGIN) {
+            loginErrorDetected = false;
+            const retryReason = permissionErr ? '권한 오류 문구' : '로그인 에러 문구';
+            lastLoginErrText = '';
+            retryLoginWithoutReload = true;
+            log(`[${acc.id}] ${retryReason} 감지 — 같은 페이지 마우스형 재클릭으로 확인 (${attempt}/${MAX_LOGIN})`, 'info');
+            continue;
+          }
           if (permissionErr) {
-            log(`[${acc.id}] 로그인 권한 거절 — 재시도 없이 다음 계정 진행 (${attempt}/${MAX_LOGIN})`,'err');
+            log(`[${acc.id}] 로그인 권한 거절 — 재클릭 후에도 동일 문구, 다음 계정 진행 (${attempt}/${MAX_LOGIN})`,'err');
             break;
           }
           if (throttleErr && attempt < MAX_LOGIN) {

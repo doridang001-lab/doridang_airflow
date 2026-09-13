@@ -9,7 +9,16 @@ def _write_daangn_csv(path, rows):
     pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8-sig")
 
 
-def _row(collected_at, start_date, campaign_id, impressions, group="도리당 송파삼전점 #5", url=None):
+def _row(
+    collected_at,
+    start_date,
+    campaign_id,
+    impressions,
+    group="도리당 송파삼전점 #5",
+    url=None,
+    ad_name="테스트 광고",
+    image_url=None,
+):
     row = {
         "collected_at": collected_at,
         "시작일": start_date,
@@ -17,7 +26,7 @@ def _row(collected_at, start_date, campaign_id, impressions, group="도리당 �
         "campaign_id": campaign_id,
         "광고그룹명": group,
         "상태": "운영중",
-        "광고명": "테스트 광고",
+        "광고명": ad_name,
         "게재위치": "비즈프로필 홈",
         "노출수": str(impressions),
         "클릭수": "0",
@@ -25,6 +34,8 @@ def _row(collected_at, start_date, campaign_id, impressions, group="도리당 �
         "지출": "0",
         "스위치": "ON",
     }
+    if image_url is not None:
+        row["image_url"] = image_url
     if url is not None:
         row["url"] = url
     return row
@@ -100,6 +111,9 @@ def test_load_daangn_ads_csv_skips_when_no_new_files_and_output_exists(tmp_path)
     assert result["cleaned_files"] == []
     assert result["input_rows"] == 0
     assert result["output_rows"] == 1
+    assert result["duplicate_key_rows"] == 0
+    assert result["same_name_cross_group_rows"] == 0
+    assert result["same_name_cross_group_groups"] == 0
     assert len(saved) == 1
     assert saved.iloc[0]["노출수"] == "100"
     assert result["telegram_sent"] is None
@@ -158,6 +172,44 @@ def test_load_daangn_ads_csv_keeps_latest_collected_at_for_duplicate_key(tmp_pat
     assert saved.iloc[0]["노출수"] == "100"
     assert saved.iloc[0]["collected_at"] == "2026-08-26T12:00:00.000Z"
     assert list(source_dir.glob("daangn_ads_*.csv")) == []
+
+
+def test_load_daangn_ads_csv_keeps_same_ad_name_when_campaign_id_differs(tmp_path):
+    source_dir = tmp_path / "source"
+    output_path = tmp_path / "analytics" / "Daangn_ads" / "daangn_ads.csv"
+    source_dir.mkdir()
+
+    _write_daangn_csv(
+        source_dir / "daangn_ads_same_name.csv",
+        [
+            _row(
+                "2026-09-01T03:46:48.534Z",
+                "2026-08-01",
+                "dg_group5",
+                10,
+                group="도리당 송파삼전점 #5",
+                ad_name="오늘만 벌써 214명이 다녀갔습니다",
+            ),
+            _row(
+                "2026-09-01T03:53:28.398Z",
+                "2026-08-01",
+                "dg_place1",
+                20,
+                group="웹사이트 - 도리당 송파삼전점 플레이스 #1(08.06)",
+                ad_name="오늘만 벌써 214명이 다녀갔습니다",
+            ),
+        ],
+    )
+
+    result = json.loads(load_daangn_ads_csv(source_dir=source_dir, output_path=output_path))
+    saved = pd.read_csv(output_path, dtype=str, encoding="utf-8-sig").fillna("")
+
+    assert len(saved) == 2
+    assert set(saved["campaign_id"]) == {"dg_group5", "dg_place1"}
+    assert result["deduplicated_rows"] == 0
+    assert result["duplicate_key_rows"] == 0
+    assert result["same_name_cross_group_rows"] == 2
+    assert result["same_name_cross_group_groups"] == 1
 
 
 def test_load_daangn_ads_csv_is_idempotent_with_existing_output(tmp_path):
@@ -404,3 +456,103 @@ def test_load_daangn_ads_csv_keeps_unknown_group_url_blank(tmp_path):
     saved = pd.read_csv(output_path, dtype=str, encoding="utf-8-sig").fillna("")
 
     assert saved.iloc[0]["url"] == ""
+
+
+def test_load_daangn_ads_csv_merges_image_url_with_legacy_rows_missing_column(tmp_path):
+    """image_url 컬럼이 없던 기존 통합본과, image_url 이 있는 신규 CSV 를 합쳐도
+    안전해야 한다: 신규 행은 값이 보존되고, 옛 행은 빈 문자열로 채워지며,
+    url 컬럼은 여전히 맨 뒤에 남는다."""
+    source_dir = tmp_path / "source"
+    output_path = tmp_path / "analytics" / "Daangn_ads" / "daangn_ads.csv"
+    source_dir.mkdir()
+    output_path.parent.mkdir(parents=True)
+
+    # 기존 통합본: image_url 컬럼 자체가 없는 과거 스키마
+    _write_daangn_csv(
+        output_path,
+        [_row("2026-08-27T12:00:00.000Z", "2026-08-27", "dg_old", 10)],
+    )
+
+    thumbnail = "https://img.kr.gcp-karroter.net/business-profile/thumb.jpeg?q=82&s=300x300&t=crop&service=ads-bff"
+    _write_daangn_csv(
+        source_dir / "daangn_ads_account_unknown_20260828.csv",
+        [
+            _row(
+                "2026-08-28T12:00:00.000Z",
+                "2026-08-28",
+                "dg_new",
+                20,
+                image_url=thumbnail,
+            )
+        ],
+    )
+
+    load_daangn_ads_csv(
+        source_dir=source_dir,
+        output_path=output_path,
+        cleanup_source=False,
+        alert_sender=lambda message: True,
+        email_sender=lambda subject, html, recipients: "메일 발송 완료: 1명",
+    )
+    saved = pd.read_csv(output_path, dtype=str, encoding="utf-8-sig").fillna("")
+
+    assert saved.columns[-1] == "url"
+    assert "image_url" in saved.columns
+    old_row = saved[saved["campaign_id"] == "dg_old"].iloc[0]
+    new_row = saved[saved["campaign_id"] == "dg_new"].iloc[0]
+    assert old_row["image_url"] == ""
+    assert new_row["image_url"] == thumbnail
+
+
+def test_load_daangn_ads_csv_backfills_image_url_by_campaign_id(tmp_path):
+    """같은 campaign_id(같은 광고)가 예전 날짜엔 image_url 없이, 최근 날짜엔 image_url과
+    함께 수집되면, 예전 날짜 행에도 같은 image_url이 채워져야 한다."""
+    source_dir = tmp_path / "source"
+    output_path = tmp_path / "analytics" / "Daangn_ads" / "daangn_ads.csv"
+    source_dir.mkdir()
+
+    thumbnail = "https://img.kr.gcp-karroter.net/business-profile/thumb.jpeg?q=82&s=300x300&t=crop&service=ads-bff"
+
+    _write_daangn_csv(
+        source_dir / "daangn_ads_account_unknown_20260827.csv",
+        [_row("2026-08-27T08:00:00.000Z", "2026-08-27", "dg_same", 10)],
+    )
+    _write_daangn_csv(
+        source_dir / "daangn_ads_account_unknown_20260828.csv",
+        [_row("2026-08-28T08:00:00.000Z", "2026-08-28", "dg_same", 20, image_url=thumbnail)],
+    )
+
+    load_daangn_ads_csv(source_dir=source_dir, output_path=output_path)
+    saved = pd.read_csv(output_path, dtype=str, encoding="utf-8-sig").fillna("")
+
+    assert len(saved) == 2
+    old_row = saved[saved["시작일"] == "2026-08-27"].iloc[0]
+    new_row = saved[saved["시작일"] == "2026-08-28"].iloc[0]
+    assert old_row["image_url"] == thumbnail
+    assert new_row["image_url"] == thumbnail
+
+
+def test_load_daangn_ads_csv_does_not_cross_fill_different_campaign_id(tmp_path):
+    """campaign_id가 다르면 image_url을 서로 채우지 않는다 (그룹 단위가 아니라
+    광고(campaign_id) 단위로만 채워짐을 고정)."""
+    source_dir = tmp_path / "source"
+    output_path = tmp_path / "analytics" / "Daangn_ads" / "daangn_ads.csv"
+    source_dir.mkdir()
+
+    thumbnail = "https://img.kr.gcp-karroter.net/business-profile/thumb.jpeg?q=82&s=300x300&t=crop&service=ads-bff"
+
+    _write_daangn_csv(
+        source_dir / "daangn_ads_account_unknown_20260828.csv",
+        [
+            _row("2026-08-28T08:00:00.000Z", "2026-08-28", "dg_a", 10, image_url=thumbnail),
+            _row("2026-08-28T08:00:00.000Z", "2026-08-28", "dg_b", 20),
+        ],
+    )
+
+    load_daangn_ads_csv(source_dir=source_dir, output_path=output_path)
+    saved = pd.read_csv(output_path, dtype=str, encoding="utf-8-sig").fillna("")
+
+    row_a = saved[saved["campaign_id"] == "dg_a"].iloc[0]
+    row_b = saved[saved["campaign_id"] == "dg_b"].iloc[0]
+    assert row_a["image_url"] == thumbnail
+    assert row_b["image_url"] == ""

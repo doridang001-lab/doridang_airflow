@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from modules.transform.utility.workload import retry_dag_id, route_trigger
+
 import logging
 import json
 import re
@@ -31,6 +33,7 @@ from modules.transform.pipelines.db.DB_Beamin_retry import (
     build_retry_conf,
     count_failed_items,
     merge_failed_payloads,
+    merge_toorder_notification_context,
     restore_meta_credentials,
     retry_needed,
 )
@@ -56,6 +59,7 @@ STALE_ALERT_MARKER_DIR = LOCAL_DB / "baemin_upload_stale_alert"
 _HANDOFF_KEYS = (
     "target_date",
     "target_dates",
+    "orders_only",
     "account_list",
     "validation",
     "ad_stores",
@@ -127,11 +131,30 @@ def _meta_pull(context, key: str):
     return _load_handoff(context).get(key)
 
 
+def _orders_only_context(context) -> bool:
+    dag_run = context.get("dag_run")
+    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    if conf.get("orders_only") is True:
+        return True
+    return bool(_meta_pull(context, "orders_only"))
+
+
 def _residual_failed_from_meta(context) -> dict:
     residual_failed = _meta_pull(context, "residual_failed")
     if residual_failed is not None:
         return residual_failed or {}
     return _meta_pull(context, "failed") or {}
+
+
+def _orders_only_failed(failed: dict | None) -> dict:
+    data = failed or {}
+    return {
+        "accounts": data.get("accounts") or [],
+        "stores": data.get("stores") or [],
+        "orders": data.get("orders") or [],
+        "ads": [],
+        "stages": [],
+    }
 
 
 def _save_validate_log(target_date: str, section: str, text: str) -> None:
@@ -530,6 +553,11 @@ def validate_orders(**context) -> str:
 
 
 def validate_ad_funnel(**context) -> str:
+    if _orders_only_context(context):
+        result = {"empty_stores": [], "retried": [], "still_empty": []}
+        context["ti"].xcom_push(key="ad_funnel_result", value=result)
+        logger.info("orders_only=true: ad_funnel 검증 스킵")
+        return "orders_only: ad_funnel 검증 스킵"
     target_date = _target_date(context)
     ad_stores = _meta_pull(context, "ad_stores") or []
     if not ad_stores:
@@ -914,6 +942,7 @@ def build_upload_notification_context(context) -> dict:
         "residual_failed": failed,
         "hard_failures": hard_failures,
         "metrics": _meta_pull(context, "metrics") or {},
+        "orders_only": _orders_only_context(context),
     }
 
 
@@ -927,22 +956,22 @@ def build_final_notification_message(
     max_attempts: int = 3,
     hard_failure: str | None = None,
 ) -> str:
-    root_toorder = notification_context.get("toorder") or {}
+    final_context = (
+        merge_toorder_notification_context(notification_context, final_toorder_result)
+        if final_toorder_result is not None
+        else dict(notification_context or {})
+    )
+    root_toorder = final_context.get("toorder") or {}
     merged_store_results = dict(root_toorder.get("store_results") or {})
-    final_toorder = _toorder_snapshot(final_toorder_result) if final_toorder_result is not None else root_toorder
-    merged_store_results.update(final_toorder.get("store_results") or {})
+    final_toorder = root_toorder
     unresolved_stores = {
         store
         for store, item in merged_store_results.items()
         if not (item or {}).get("matched") and not (item or {}).get("source_mismatch")
     }
-    if final_toorder_result is not None:
-        unresolved_stores.update(final_toorder.get("gap_stores") or [])
-        unresolved_stores.update(final_toorder.get("missing_brand_stores") or [])
-    else:
-        unresolved_stores.update(root_toorder.get("gap_stores") or [])
-        unresolved_stores.update(root_toorder.get("missing_brand_stores") or [])
-    compared = max(int(root_toorder.get("compared") or 0), int(final_toorder.get("compared") or 0))
+    unresolved_stores.update(root_toorder.get("gap_stores") or [])
+    unresolved_stores.update(root_toorder.get("missing_brand_stores") or [])
+    compared = int(root_toorder.get("compared") or 0)
     toorder_matched = max(compared - len(unresolved_stores), 0)
     source_mismatch_stores = {
         store
@@ -985,10 +1014,12 @@ def build_final_notification_message(
     if hard_failure:
         hard_failures.append(hard_failure)
 
+    orders_has_partial = final_toorder_result is None and bool(
+        int(orders.get("mismatched") or 0) or int(orders.get("unknown") or 0)
+    )
     has_partial = bool(
         residual_count
-        or int(orders.get("mismatched") or 0)
-        or int(orders.get("unknown") or 0)
+        or orders_has_partial
         or ad_still
         or unresolved_stores
         or int(ingest_stats.get("failed") or 0)
@@ -1109,6 +1140,7 @@ def trigger_retry_if_needed(**context) -> str:
     toorder_result = ti.xcom_pull(task_ids="validate_toorder", key="toorder_result")
     toorder_results_by_date = ti.xcom_pull(task_ids="validate_toorder", key="toorder_results_by_date") or {}
     ad_funnel_result = ti.xcom_pull(task_ids="validate_ad_funnel", key="ad_funnel_result")
+    orders_only = _orders_only_context(context)
     failed_by_date: dict[str, dict] = {}
     for target_date in target_dates:
         date_toorder_result = toorder_results_by_date.get(target_date) or toorder_result
@@ -1117,6 +1149,8 @@ def trigger_retry_if_needed(**context) -> str:
             base_failed,
             _toorder_retry_failed_payload(context, date_toorder_result),
         )
+        if orders_only:
+            failed = _orders_only_failed(failed)
         failed_by_date[target_date] = filter_ad_funnel_zero_sales_failures(failed, target_date)
 
     failed = {}
@@ -1141,6 +1175,7 @@ def trigger_retry_if_needed(**context) -> str:
     from airflow.api.common.trigger_dag import trigger_dag
     from airflow.exceptions import DagRunAlreadyExists
 
+    deferred: list[str] = []
     triggered: list[str] = []
     existing: list[str] = []
     for target_date in target_dates:
@@ -1158,27 +1193,37 @@ def trigger_retry_if_needed(**context) -> str:
             attempt=1,
             max_attempts=int(conf.get("max_attempts", 3)),
             stability_profile=conf.get("stability_profile") or SCHEDULED_DEFAULT_STABILITY_PROFILE,
+            orders_only=orders_only,
         )
         retry_conf["notification_context"] = {**notification_context, "target_date": target_date}
         if conf.get("manual_baemin_dir"):
             retry_conf["manual_baemin_dir"] = conf["manual_baemin_dir"]
         run_id = f"retry__{target_date.replace('-', '')}__attempt_1__{_safe_run_id_part(str(source_run_id))}"
         try:
-            trigger_dag(
-                dag_id="DB_Beamin_Macro_Dags_Retry",
+            result = route_trigger(trigger_dag, history_context=context,
+                dag_id=retry_dag_id(conf, ti.dag_id),
                 run_id=run_id,
                 conf=retry_conf,
             )
-            triggered.append(run_id)
+            if result == "cancelled":
+                logger.info("사용자 취소로 Retry 요청 제외: %s", run_id)
+            elif result == "existing":
+                existing.append(run_id)
+            elif result == "deferred":
+                deferred.append(run_id)
+            else:
+                triggered.append(run_id)
         except DagRunAlreadyExists:
             existing.append(run_id)
             logger.info("Retry DAG run 이미 존재: %s", run_id)
 
-    retry_triggered = bool(triggered or existing)
+    retry_triggered = bool(triggered or existing or deferred)
     ti.xcom_push(key="retry_triggered", value=retry_triggered)
     if not retry_triggered:
         logger.info("Retry DAG 트리거 스킵: 날짜별 재시도 대상 없음")
         return "Retry DAG 트리거 스킵: 날짜별 재시도 대상 없음"
     msg = f"Retry DAG 트리거 완료: 신규 {len(triggered)}개 / 기존 {len(existing)}개"
+    if deferred:
+        msg = f"Retry DAG 요청 접수: 신규 {len(triggered)}개 / 기존 {len(existing)}개 / 보류 {len(deferred)}개"
     logger.info("%s triggered=%s existing=%s failed_count=%d", msg, triggered, existing, failed_count)
     return msg

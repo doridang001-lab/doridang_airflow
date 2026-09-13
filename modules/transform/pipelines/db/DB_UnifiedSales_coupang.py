@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from modules.transform.utility.process_lock import unified_writer
 import logging
 import re
+from collections import Counter
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -41,7 +43,12 @@ COUPANG_SOURCE = "쿠팡수동"
 COUPANG_PLATFORM = "쿠팡이츠"
 COUPANG_PLATFORMS = DELIVERY_PLATFORM_FAMILIES[COUPANG_SOURCE]
 COUPANG_OPTIONS_DB = COUPANG_ORDERS_DETAIL_DB / "options"
+POSFEED_ORDERS_DB = COUPANG_ORDERS_DETAIL_DB.parent / "posfeed_sales"
+POSFEED_DETAIL_DB = COUPANG_ORDERS_DETAIL_DB.parent / "posfeed_sales_detail"
 _RAW_DEDUP_NUMERIC_COLS = {"total_price", "menu_qty", "menu_price"}
+_ITEM_NAME_OVERRIDE_COL = "_coupang_item_name_override"
+_OBSERVED_PRICE_CATALOG: dict[tuple[str, str, str], int] | None = None
+_SCOPED_PRICE_CATALOG: dict[tuple[str, str], dict[str, int]] = {}
 
 
 def reconcile_coupang_for_test_stores(
@@ -373,6 +380,24 @@ def _parse_order_time(value: str) -> str:
 
 
 def _deduplicate_raw(df: pd.DataFrame, store: str, ym: str) -> pd.DataFrame:
+    if {"order_id", "collected_at"}.issubset(df.columns):
+        order_key = _clean_text_series(df["order_id"], df.index)
+        collected_at = pd.to_datetime(df["collected_at"], errors="coerce", utc=True)
+        valid = order_key.ne("") & collected_at.notna()
+        if valid.any():
+            latest_by_order = collected_at[valid].groupby(order_key[valid]).transform("max")
+            keep_latest = ~valid
+            keep_latest.loc[valid] = collected_at.loc[valid].eq(latest_by_order)
+            latest_dropped = int((~keep_latest).sum())
+            if latest_dropped:
+                logger.warning(
+                    "쿠팡 원천 최신 주문 스냅샷 적용: store=%s ym=%s 제거=%d행",
+                    store,
+                    ym,
+                    latest_dropped,
+                )
+            df = df.loc[keep_latest].copy()
+
     cols = [
         "_src_path",
         "order_date",
@@ -472,6 +497,227 @@ def _load_option_parent_map(brand: str, store: str, ym: str) -> dict[str, str]:
     }
 
 
+def _read_csv_utf8_sig(path) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, dtype=str, encoding="utf-8-sig").fillna("")
+    except UnicodeDecodeError:
+        return pd.read_csv(path, dtype=str, encoding="cp949").fillna("")
+
+
+def _strip_posfeed_item_name(value: str) -> str:
+    return re.sub(r"^'\+\s*", "", str(value or "").strip())
+
+
+def _posfeed_order_paths(brand: str, store: str, ym: str) -> list:
+    candidates = [
+        POSFEED_ORDERS_DB / f"brand={brand}" / f"store={brand} {store}".strip() / f"ym={ym}" / "posfeed_orders.csv",
+        POSFEED_ORDERS_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}" / "posfeed_orders.csv",
+    ]
+    seen = set()
+    paths = []
+    for path in candidates:
+        if path not in seen and path.exists():
+            paths.append(path)
+            seen.add(path)
+    if paths:
+        return paths
+    return sorted(POSFEED_ORDERS_DB.glob(f"brand={brand}/store=*/ym={ym}/posfeed_orders.csv"))
+
+
+def _load_posfeed_order_price_lines(
+    brand: str,
+    store: str,
+    ym: str,
+    order_ids: set[str],
+) -> dict[str, list[dict]]:
+    if not order_ids:
+        return {}
+
+    order_frames = []
+    for path in _posfeed_order_paths(brand, store, ym):
+        try:
+            orders = _read_csv_utf8_sig(path)
+        except Exception as exc:
+            logger.warning("쿠팡수동 posfeed 주문 로드 실패: %s | %s", path, exc)
+            continue
+        required = {"외부 주문 번호", "주문 코드"}
+        if not required.issubset(orders.columns):
+            continue
+        mask = orders["외부 주문 번호"].fillna("").astype(str).str.strip().isin(order_ids)
+        if not mask.any():
+            continue
+        part = orders.loc[mask, ["외부 주문 번호", "주문 코드"]].copy()
+        detail_path = POSFEED_DETAIL_DB / path.relative_to(POSFEED_ORDERS_DB)
+        part["_detail_path"] = str(detail_path.parent / "posfeed_order_item.csv")
+        order_frames.append(part)
+
+    if not order_frames:
+        return {}
+
+    order_map = pd.concat(order_frames, ignore_index=True)
+    order_map["외부 주문 번호"] = order_map["외부 주문 번호"].astype(str).str.strip()
+    order_map["주문 코드"] = order_map["주문 코드"].astype(str).str.strip()
+    result: dict[str, list[dict]] = {}
+    for detail_path, group in order_map.groupby("_detail_path", sort=False):
+        path = pd.io.common.stringify_path(detail_path)
+        try:
+            items = _read_csv_utf8_sig(path)
+        except Exception as exc:
+            logger.warning("쿠팡수동 posfeed 상세 로드 실패: %s | %s", path, exc)
+            continue
+        required = {"주문코드", "상품명", "수량", "단품가격", "합계"}
+        if not required.issubset(items.columns):
+            continue
+        code_to_order = group.drop_duplicates("주문 코드").set_index("주문 코드")["외부 주문 번호"].to_dict()
+        items = items[items["주문코드"].astype(str).str.strip().isin(code_to_order)].copy()
+        if items.empty:
+            continue
+        items["_order_id"] = items["주문코드"].astype(str).str.strip().map(code_to_order)
+        items["_item_name"] = items["상품명"].map(_strip_posfeed_item_name)
+        items = items[
+            items["_item_name"].ne("")
+            & ~items["_item_name"].eq("배달비")
+        ].copy()
+        if items.empty:
+            continue
+        items["_qty"] = _numeric_series(items["수량"], items.index, default=1).astype(int).clip(lower=1)
+        items["_unit_price"] = _numeric_series(items["단품가격"], items.index).astype(int)
+        items["_line_sum"] = _numeric_series(items["합계"], items.index).astype(int)
+        for order_id, order_items in items.groupby("_order_id", sort=False):
+            paid_count = int(order_items["_line_sum"].ne(0).sum())
+            if paid_count < 2:
+                continue
+            result[str(order_id).strip()] = [
+                {
+                    "item_name": row["_item_name"],
+                    "qty": int(row["_qty"]),
+                    "unit_price": int(row["_unit_price"]),
+                }
+                for _, row in order_items.iterrows()
+            ]
+    return result
+
+
+def _stable_observed_price(values: list[int]) -> int:
+    prices = [int(v) for v in values if int(v) > 0]
+    if not prices:
+        return 0
+    counts = Counter(prices)
+    price, count = counts.most_common(1)[0]
+    if len(counts) == 1 or (count >= 3 and count / len(prices) >= 0.9):
+        return int(price)
+    return 0
+
+
+def _build_observed_price_catalog() -> dict[tuple[str, str, str], int]:
+    observations: dict[tuple[str, str, str], list[int]] = {}
+
+    def add(brand: str, store: str, name: str, price: int) -> None:
+        name = str(name or "").strip()
+        price = int(price or 0)
+        if not name or name == "배달비" or price <= 0:
+            return
+        for key in ((brand, store, name), (brand, "", name), ("", "", name)):
+            observations.setdefault(key, []).append(price)
+
+    for path in sorted(POSFEED_DETAIL_DB.glob("brand=*/store=*/ym=*/posfeed_order_item.csv")):
+        try:
+            items = _read_csv_utf8_sig(path)
+        except Exception:
+            continue
+        if not {"상품명", "단품가격"}.issubset(items.columns):
+            continue
+        brand = next((part.split("=", 1)[1] for part in path.parts if part.startswith("brand=")), "")
+        store = next((part.split("=", 1)[1] for part in path.parts if part.startswith("store=")), "")
+        prices = _numeric_series(items["단품가격"], items.index).astype(int)
+        for name, price in zip(items["상품명"].map(_strip_posfeed_item_name), prices):
+            add(brand, store, name, int(price))
+
+    for path in sorted(COUPANG_OPTIONS_DB.glob("brand=*/store=*/ym=*/options.csv")):
+        try:
+            options = _read_csv_utf8_sig(path)
+        except Exception:
+            continue
+        if not {"옵션명", "옵션가격"}.issubset(options.columns):
+            continue
+        brand = next((part.split("=", 1)[1] for part in path.parts if part.startswith("brand=")), "")
+        store = next((part.split("=", 1)[1] for part in path.parts if part.startswith("store=")), "")
+        prices = _numeric_series(options["옵션가격"], options.index).astype(int)
+        for name, price in zip(options["옵션명"].astype(str).str.strip(), prices):
+            add(brand, store, name, int(price))
+
+    return {
+        key: price
+        for key, values in observations.items()
+        if (price := _stable_observed_price(values)) > 0
+    }
+
+
+def _observed_price_catalog() -> dict[tuple[str, str, str], int]:
+    global _OBSERVED_PRICE_CATALOG
+    if _OBSERVED_PRICE_CATALOG is None:
+        _OBSERVED_PRICE_CATALOG = _build_observed_price_catalog()
+    return _OBSERVED_PRICE_CATALOG
+
+
+def _lookup_observed_price(brand: str, store: str, item_name: str) -> int:
+    item_name = str(item_name or "").strip()
+    if not item_name:
+        return 0
+    catalog = _scoped_observed_price_catalog(brand, store)
+    price = catalog.get(item_name, 0)
+    if price:
+        return int(price)
+    return 0
+
+
+def _scoped_observed_price_catalog(brand: str, store: str) -> dict[str, int]:
+    key = (str(brand or "").strip(), str(store or "").strip())
+    if key in _SCOPED_PRICE_CATALOG:
+        return _SCOPED_PRICE_CATALOG[key]
+
+    observations: dict[str, list[int]] = {}
+
+    def add(name: str, price: int) -> None:
+        name = str(name or "").strip()
+        price = int(price or 0)
+        if not name or name == "배달비" or price <= 0:
+            return
+        observations.setdefault(name, []).append(price)
+
+    store_candidates = [store, f"{brand} {store}".strip()]
+    for store_name in dict.fromkeys(s for s in store_candidates if s):
+        for path in sorted(POSFEED_DETAIL_DB.glob(f"brand={brand}/store={store_name}/ym=*/posfeed_order_item.csv")):
+            try:
+                items = _read_csv_utf8_sig(path)
+            except Exception:
+                continue
+            if not {"상품명", "단품가격"}.issubset(items.columns):
+                continue
+            prices = _numeric_series(items["단품가격"], items.index).astype(int)
+            for name, price in zip(items["상품명"].map(_strip_posfeed_item_name), prices):
+                add(name, int(price))
+
+        for path in sorted(COUPANG_OPTIONS_DB.glob(f"brand={brand}/store={store_name}/ym=*/options.csv")):
+            try:
+                options = _read_csv_utf8_sig(path)
+            except Exception:
+                continue
+            if not {"옵션명", "옵션가격"}.issubset(options.columns):
+                continue
+            prices = _numeric_series(options["옵션가격"], options.index).astype(int)
+            for name, price in zip(options["옵션명"].astype(str).str.strip(), prices):
+                add(name, int(price))
+
+    result = {
+        name: price
+        for name, values in observations.items()
+        if (price := _stable_observed_price(values)) > 0
+    }
+    _SCOPED_PRICE_CATALOG[key] = result
+    return result
+
+
 def _resolve_parent_menu(df: pd.DataFrame, brand: str, store: str) -> pd.Series:
     index = df.index
     parent = _clean_text_series(df.get("item_menu", ""), index)
@@ -502,6 +748,122 @@ def _resolve_parent_menu(df: pd.DataFrame, brand: str, store: str) -> pd.Series:
     ).str.strip()
     parent = parent.mask(parent.eq(""), summary)
     return parent
+
+
+def _copy_order_base_row(group: pd.DataFrame) -> pd.Series:
+    price = _numeric_series(group.get("menu_price", 0), group.index).astype(int)
+    if price.gt(0).any():
+        return group.loc[price[price.gt(0)].index[0]].copy()
+    return group.iloc[0].copy()
+
+
+def _rows_from_posfeed_lines(group: pd.DataFrame, lines: list[dict], parent_menu: str) -> list[pd.Series]:
+    base = _copy_order_base_row(group)
+    rows = []
+    for seq, line in enumerate(lines):
+        row = base.copy()
+        item_name = str(line.get("item_name") or "").strip()
+        row["menu_name"] = parent_menu or item_name
+        row["item_menu"] = parent_menu or item_name
+        row["menu_options"] = item_name
+        row["menu_qty"] = int(line.get("qty") or 1)
+        row["menu_price"] = int(line.get("unit_price") or 0)
+        row[_ITEM_NAME_OVERRIDE_COL] = item_name
+        if seq > 0:
+            row["매출액"] = None
+            row["total_price"] = None
+        rows.append(row)
+    return rows
+
+
+def _apply_catalog_prices_to_order(group: pd.DataFrame, brand: str, store: str) -> list[pd.Series]:
+    rows = [row.copy() for _, row in group.iterrows()]
+    if not rows:
+        return rows
+
+    index = group.index
+    parent_menu = _resolve_parent_menu(group, brand, store)
+    menu_price = _numeric_series(group.get("menu_price", 0), index).astype(int)
+    option_name = _clean_text_series(group.get("menu_options", ""), index)
+    catalog_price = option_name.map(lambda value: _lookup_observed_price(brand, store, value)).astype(int)
+
+    original_to_pos = {idx: pos for pos, idx in enumerate(index)}
+    added_option_by_parent: dict[str, int] = {}
+    extra_rows: list[pd.Series] = []
+
+    for idx in index:
+        pos = original_to_pos[idx]
+        price = int(menu_price.loc[idx])
+        option = str(option_name.loc[idx]).strip()
+        observed = int(catalog_price.loc[idx])
+        parent = str(parent_menu.loc[idx]).strip()
+
+        rows[pos][_ITEM_NAME_OVERRIDE_COL] = ""
+        if price <= 0 and observed > 0:
+            rows[pos]["menu_price"] = observed
+            rows[pos][_ITEM_NAME_OVERRIDE_COL] = option
+            added_option_by_parent[parent] = added_option_by_parent.get(parent, 0) + observed
+            continue
+
+        if price > 0 and observed > 0 and option:
+            rows[pos]["menu_price"] = max(price - observed, 0)
+            option_row = rows[pos].copy()
+            option_row["menu_price"] = observed
+            option_row["menu_options"] = option
+            option_row["item_menu"] = parent
+            option_row["menu_name"] = parent
+            option_row[_ITEM_NAME_OVERRIDE_COL] = option
+            option_row["매출액"] = None
+            option_row["total_price"] = None
+            extra_rows.append(option_row)
+
+    if added_option_by_parent:
+        for parent, added_sum in added_option_by_parent.items():
+            candidate_indices = [
+                idx
+                for idx in index
+                if str(parent_menu.loc[idx]).strip() == parent and int(menu_price.loc[idx]) > 0
+            ]
+            if not candidate_indices:
+                continue
+            target_pos = original_to_pos[candidate_indices[0]]
+            current = int(_numeric_series(pd.Series([rows[target_pos].get("menu_price", 0)]), pd.Index([0])).iloc[0])
+            rows[target_pos]["menu_price"] = max(current - int(added_sum), 0)
+
+    rows.extend(extra_rows)
+    return rows
+
+
+def _prepare_coupang_price_lines(df: pd.DataFrame, brand: str, store: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out_rows = []
+    df = df.copy()
+    if _ITEM_NAME_OVERRIDE_COL not in df.columns:
+        df[_ITEM_NAME_OVERRIDE_COL] = ""
+    df["_order_id_key"] = df["order_id"].fillna("").astype(str).str.strip()
+    df["_ym_key"] = df["sale_date"].fillna("").astype(str).str[:7]
+
+    posfeed_by_order: dict[str, list[dict]] = {}
+    for ym, ym_df in df.groupby("_ym_key", sort=False):
+        if not ym:
+            continue
+        order_ids = set(ym_df["_order_id_key"].dropna().astype(str).str.strip())
+        posfeed_by_order.update(_load_posfeed_order_price_lines(brand, store, ym, order_ids))
+
+    for order_id, group in df.groupby("_order_id_key", sort=False):
+        parent = _resolve_parent_menu(group, brand, store).replace("", pd.NA).dropna()
+        parent_name = str(parent.iloc[0]).strip() if not parent.empty else ""
+        posfeed_lines = posfeed_by_order.get(order_id)
+        if posfeed_lines:
+            out_rows.extend(_rows_from_posfeed_lines(group, posfeed_lines, parent_name))
+        else:
+            out_rows.extend(_apply_catalog_prices_to_order(group, brand, store))
+
+    if not out_rows:
+        return df.drop(columns=["_order_id_key", "_ym_key"], errors="ignore")
+    out = pd.DataFrame(out_rows).reset_index(drop=True)
+    return out.drop(columns=["_order_id_key", "_ym_key"], errors="ignore")
 
 
 def _allocate_order_amount(
@@ -548,6 +910,7 @@ def _transform_to_unified(
     brand: str,
     store_map: dict,
 ) -> pd.DataFrame:
+    df = _prepare_coupang_price_lines(df, brand, store)
     out = pd.DataFrame(index=df.index)
     out["sale_date"] = df["sale_date"]
     out["ym"] = df["sale_date"].str[:7]
@@ -568,6 +931,9 @@ def _transform_to_unified(
         raw_menu_price.ne("") & raw_menu_price.str.lower().ne("nan")
     )
     item_name = option_name.mask(priced_menu | option_name.eq(""), parent_menu)
+    if _ITEM_NAME_OVERRIDE_COL in df.columns:
+        override = _clean_text_series(df[_ITEM_NAME_OVERRIDE_COL], df.index)
+        item_name = item_name.mask(override.ne(""), override)
     out["item_name"] = fill_missing_manual_item_name(
         item_name,
         source=COUPANG_SOURCE,
@@ -576,8 +942,8 @@ def _transform_to_unified(
         sale_date=out["sale_date"],
         order_id=out["order_id"],
     )
-    out["qty"] = pd.to_numeric(df.get("menu_qty", 1), errors="coerce").fillna(1).astype(int)
-    out["unit_price"] = pd.to_numeric(df.get("menu_price", 0), errors="coerce").fillna(0).astype(int)
+    out["qty"] = _numeric_series(df.get("menu_qty", 1), df.index, default=1).astype(int)
+    out["unit_price"] = _numeric_series(df.get("menu_price", 0), df.index).astype(int)
     out["total_price"] = 0
     out["discount_amount"] = 0
     out["sale_type"] = df.get("is_cancelled", "").fillna("").astype(str).str.strip().str.upper().map(
@@ -624,6 +990,7 @@ def _transform_to_unified(
     return out.reindex(columns=UNIFIED_COLUMNS, fill_value="")
 
 
+@unified_writer
 def _upsert_daily(df_new: pd.DataFrame, date: str, store: str) -> tuple[int, int]:
     UNIFIED_ROOT.mkdir(parents=True, exist_ok=True)
     path = _unified_daily_path(date)

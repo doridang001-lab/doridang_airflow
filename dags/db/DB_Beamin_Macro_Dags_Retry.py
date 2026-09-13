@@ -13,7 +13,9 @@ from airflow.operators.python import PythonOperator
 from airflow.utils.trigger_rule import TriggerRule
 
 from modules.transform.pipelines.db.DB_Beamin_retry import (
+    PER_STORE_MAX_RETRY,
     build_next_retry_conf,
+    clamp_retry_attempts,
     merge_retry_payloads as merge_retry_payloads_from_lanes,
     retry_needed,
     retry_collect_from_conf,
@@ -214,6 +216,8 @@ def _reconcile_order_residuals(residual_orders: list, retry_payload: dict | None
 
 
 def _is_orders_only_retry(conf: dict | None) -> bool:
+    if (conf or {}).get("orders_only") is True:
+        return True
     text = " ".join(
         str(value or "")
         for value in (
@@ -245,7 +249,28 @@ def _reconcile_residual_failed_after_validation(
     return reconciled
 
 
-def _append_residual_to_next_conf(next_conf: dict, residual_failed: dict) -> None:
+def _store_key_from_payload(account_id: str, store: dict | None) -> str:
+    store_id = str((store or {}).get("store_id") or "").strip()
+    return f"{str(account_id or '').strip()}::{store_id}" if account_id and store_id else ""
+
+
+def _store_retry_exhausted(account_id: str, store: dict | None, retry_history: dict | None) -> bool:
+    key = _store_key_from_payload(account_id, store)
+    if not key:
+        return False
+    try:
+        attempts = int((retry_history or {}).get(key) or 0)
+    except (TypeError, ValueError):
+        attempts = 0
+    return attempts >= PER_STORE_MAX_RETRY
+
+
+def _append_residual_to_next_conf(
+    next_conf: dict,
+    residual_failed: dict,
+    *,
+    retry_history: dict | None = None,
+) -> None:
     account_ids: list[str] = []
     residual_accounts = residual_failed.get("accounts") or []
     for account in residual_accounts:
@@ -269,7 +294,16 @@ def _append_residual_to_next_conf(next_conf: dict, residual_failed: dict) -> Non
             payload_value = item.get(payload_key)
             if not account_id or not payload_value:
                 continue
-            items.append({"account_id": account_id, payload_key: payload_value})
+            stores = _stores_from_residual_item(item, payload_key)
+            stores = [
+                store
+                for store in stores
+                if not _store_retry_exhausted(account_id, store, retry_history)
+            ]
+            if not stores:
+                continue
+            value = stores if payload_key == "stores" else stores[0]
+            items.append({"account_id": account_id, payload_key: value})
             ids.append(account_id)
         if items:
             next_conf[conf_key] = [*(next_conf.get(conf_key) or []), *items]
@@ -291,6 +325,8 @@ def _append_residual_to_next_conf(next_conf: dict, residual_failed: dict) -> Non
         store = item.get("store") or {}
         stage = str(item.get("stage") or "").strip()
         if not account_id or not store or not stage:
+            continue
+        if _store_retry_exhausted(account_id, store, retry_history):
             continue
         stage_items.append({"account_id": account_id, "store": store, "stage": stage})
         stage_account_ids.append(account_id)
@@ -341,6 +377,7 @@ def retry_collect(
         payload = sanitize_retry_payload(
             {
                 "target_date": conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD"),
+                "orders_only": bool(conf.get("orders_only")),
                 "retry_result": "재시도 대상 없음",
                 "store_info_per_account": [],
                 "ad_store_infos": [],
@@ -411,6 +448,7 @@ def retry_collect(
             partial_payload = sanitize_retry_payload(
                 {
                     "target_date": conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD"),
+                    "orders_only": bool(conf.get("orders_only")),
                     "retry_result": "재시도 중 예외 발생: 부분 결과 없음",
                     "store_info_per_account": [],
                     "ad_store_infos": [],
@@ -512,7 +550,7 @@ def notify_and_trigger_next(**context) -> str:
     conf = _conf(context)
     attempt = int(ti.xcom_pull(task_ids="load_failed_and_accounts", key="attempt") or conf.get("attempt", 1))
     target_date = ti.xcom_pull(task_ids="load_failed_and_accounts", key="target_date") or conf.get("target_date")
-    max_attempts = int(conf.get("max_attempts", MAX_ATTEMPTS))
+    max_attempts = clamp_retry_attempts(conf.get("max_attempts", MAX_ATTEMPTS), default=MAX_ATTEMPTS)
     notification_context = conf.get("notification_context") or {
         "source_dag_id": conf.get("source_dag_id") or dag_id,
         "source_run_id": conf.get("source_run_id") or context.get("run_id") or "?",
@@ -610,7 +648,11 @@ def notify_and_trigger_next(**context) -> str:
         attempt=attempt + 1,
         max_attempts=max_attempts,
     )
-    _append_residual_to_next_conf(next_conf, residual_failed)
+    _append_residual_to_next_conf(
+        next_conf,
+        residual_failed,
+        retry_history=next_conf.get("retry_history") or {},
+    )
 
     next_target_count = sum(
         len(next_conf.get(key) or [])
@@ -625,8 +667,10 @@ def notify_and_trigger_next(**context) -> str:
     run_id = f"retry__{str(target_date).replace('-', '')}__attempt_{attempt + 1}__{root}"
     from airflow.api.common.trigger_dag import trigger_dag
 
+    result = "existing"
     try:
-        trigger_dag(dag_id=dag_id, run_id=run_id, conf=next_conf)
+        from modules.transform.utility.workload import retry_dag_id, route_trigger
+        result = route_trigger(trigger_dag, history_context=context, dag_id=retry_dag_id(conf, context["ti"].dag_id), run_id=run_id, conf=next_conf)
     except DagRunAlreadyExists:
         logger.info("다음 Retry DAG run 이미 존재: %s", run_id)
 
@@ -637,7 +681,8 @@ def notify_and_trigger_next(**context) -> str:
         f"orders={len(next_conf.get('failed_orders') or [])}, "
         f"ads={len(next_conf.get('failed_ads') or [])}, "
         f"stages={len(next_conf.get('failed_stages') or [])}\n"
-        f"Retry DAG attempt {attempt + 1} 트리거: {run_id}"
+        f"Retry DAG attempt {attempt + 1} "
+        f"{('요청 상태=' + result) if result in ('deferred', 'existing', 'cancelled') else '트리거'}: {run_id}"
     )
     logger.info(msg)
     return msg
@@ -718,4 +763,4 @@ with DAG(
         trigger_rule=TriggerRule.ALL_DONE,
     )
 
-    t_ingest_manual >> t1 >> retry_tasks >> t_merge >> t3 >> t4 >> t5 >> t_cleanup_manual
+    t_ingest_manual >> t1 >> retry_tasks >> t_merge >> t3 >> t4 >> t_cleanup_manual >> t5

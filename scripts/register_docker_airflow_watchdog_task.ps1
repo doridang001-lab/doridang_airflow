@@ -7,29 +7,20 @@ $ErrorActionPreference = "Stop"
 
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $LauncherScript = Join-Path $ProjectRoot "scripts\run_docker_airflow_watchdog_hidden.vbs"
-$TaskRun = "wscript.exe `"$LauncherScript`""
 
 if (-not (Test-Path $LauncherScript)) {
     throw "Launcher script not found: $LauncherScript"
 }
 
-$Exists = $false
-try {
-    & schtasks.exe /Query /TN $TaskName *> $null
-    $Exists = ($LASTEXITCODE -eq 0)
-} catch {
-    $Exists = $false
+$action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$LauncherScript`""
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
+$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 4) `
+    -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($existing) {
+    Set-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings | Out-Null
+} else {
+    $principal = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null
 }
-
-if ($Exists) {
-    & schtasks.exe /Delete /TN $TaskName /F | Out-Null
-}
-
-& schtasks.exe /Create `
-    /TN $TaskName `
-    /SC DAILY `
-    /ST $StartTime `
-    /TR $TaskRun `
-    /F | Out-Null
-
-& schtasks.exe /Query /TN $TaskName /FO LIST
+Get-ScheduledTaskInfo -TaskName $TaskName

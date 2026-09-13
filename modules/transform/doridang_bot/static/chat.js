@@ -13,10 +13,12 @@ const sessionTitle = document.querySelector("#session-title");
 const STORAGE_KEY = "doridangBotSessions";
 const MAX_SESSIONS = 40;
 const SUGGESTED_PROMPTS = [
-  "팀원 별 프로젝트 진행상황",
-  "상태 피드백건 확인용",
+  {label: "팀 전체", prompt: "팀원 별 프로젝트 진행상황"},
+  {label: "리스크", prompt: "이번에 리더가 확인해야 할 위험 업무만 알려줘"},
+  {label: "개인 담당", prompt: "차보령 대리는?"},
 ];
 
+let pendingRequest = null;
 let sessions = loadSessions();
 const initialSessionId = new URLSearchParams(window.location.search).get("session");
 let activeSessionId = sessions.some((session) => session.id === initialSessionId)
@@ -62,6 +64,7 @@ function escapeHtml(value) {
 function inlineMarkdown(value) {
   return escapeHtml(value)
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|\s)_([^_\n]+)_(?=\s|$)/g, "$1<em>$2</em>")
     .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
     .replace(/`(.+?)`/g, "<code>$1</code>");
 }
@@ -129,6 +132,10 @@ function renderMarkdown(text) {
       && !/^\|.+\|$/.test(lines[index].trim())
     ) {
       paragraph.push(lines[index].trim());
+      index += 1;
+    }
+    if (!paragraph.length) {
+      paragraph.push(lines[index]);
       index += 1;
     }
     html.push(`<p>${paragraph.map(inlineMarkdown).join("<br>")}</p>`);
@@ -270,7 +277,20 @@ function renderSessions() {
 function renderActiveSession() {
   const session = activeSession();
   messages.textContent = "";
-  session.messages.forEach((message) => appendMessage(message.role, message.text));
+  session.messages.forEach((message) => {
+    const bubble = appendMessage(message.role, message.text);
+    bubble.dataset.messageId = message.id || "";
+    if (message.status === "failed" || message.status === "cancelled") {
+      const note = document.createElement("p");
+      note.textContent = message.status === "cancelled" ? "답변을 중단했습니다." : "답변이 완료되지 않았습니다.";
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "retry-button";
+      retry.textContent = "다시 시도";
+      retry.addEventListener("click", () => sendMessage(message.question, {retryId: message.id}));
+      bubble.parentElement.append(note, retry);
+    }
+  });
   if (!session.messages.length) renderEmptyState();
   sessionTitle.textContent = session.title === "새 대화" ? "Flow 프로젝트 현황" : session.title;
 }
@@ -282,22 +302,30 @@ function renderEmptyState() {
   const copy = document.createElement("div");
   copy.className = "empty-copy";
   copy.innerHTML = `
-    <span>리더용 빠른 질문</span>
+    <span>추천 질문</span>
     <h2>무엇을 확인할까요?</h2>
-    <p>팀원별 진행상황, 마케팅 실적, 기한 경과 업무를 Flow 데이터 기준으로 바로 정리합니다.</p>
+    <p>담당자의 상황부터 막힌 이유, 지금 결정할 일까지 편하게 이어서 물어보세요.</p>
   `;
 
   const grid = document.createElement("div");
-  grid.className = "prompt-grid";
-  SUGGESTED_PROMPTS.forEach((prompt) => {
+  grid.className = "prompt-toggle-group";
+  SUGGESTED_PROMPTS.forEach((item) => {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "prompt-card";
-    button.textContent = prompt;
+    button.className = "prompt-toggle";
+    button.textContent = item.label;
+    button.setAttribute("aria-pressed", "false");
+    button.title = item.prompt;
     button.addEventListener("click", () => {
+      grid.querySelectorAll(".prompt-toggle").forEach((node) => {
+        node.classList.remove("active");
+        node.setAttribute("aria-pressed", "false");
+      });
+      button.classList.add("active");
+      button.setAttribute("aria-pressed", "true");
       messages.textContent = "";
-      input.value = "";
-      sendMessage(prompt).catch((error) => {
+      input.value = item.prompt;
+      sendMessage(item.prompt).catch((error) => {
         const errorText = `오류: ${error.message}`;
         appendMessage("assistant", errorText);
         addSessionMessage("assistant", errorText);
@@ -325,32 +353,12 @@ function addSessionMessage(role, text) {
   sessionTitle.textContent = session.title === "새 대화" ? "Flow 프로젝트 현황" : session.title;
 }
 
-function updateLastAssistantMessage(text) {
-  const session = activeSession();
-  for (let index = session.messages.length - 1; index >= 0; index -= 1) {
-    if (session.messages[index].role === "assistant") {
-      session.messages[index].text = text;
-      session.messages[index].at = Date.now();
-      session.updatedAt = Date.now();
-      saveSessions();
-      renderSessions();
-      return;
-    }
-  }
-}
-
-function requestHistory() {
-  const session = activeSession();
-  return session.messages
-    .slice(-12)
-    .map((message) => ({role: message.role, text: message.text}))
-    .filter((message) => message.text && message.text !== "(생각중)..");
-}
-
 function setBusy(isBusy, label = "대기") {
   state.textContent = label;
-  sendButton.disabled = isBusy;
-  input.disabled = isBusy;
+  sendButton.disabled = false;
+  sendButton.textContent = isBusy ? "■" : "↑";
+  sendButton.setAttribute("aria-label", isBusy ? "응답 중단" : "전송");
+  input.disabled = false;
 }
 
 function parseSse(buffer, onEvent) {
@@ -363,91 +371,138 @@ function parseSse(buffer, onEvent) {
   return rest;
 }
 
-async function sendMessage(text) {
-  appendMessage("user", text);
-  addSessionMessage("user", text);
-  const thinkingText = "(생각중)..";
-  const assistant = appendMessage("assistant", thinkingText);
-  addSessionMessage("assistant", thinkingText);
-  let isThinking = true;
-  setBusy(true, thinkingText);
-
-  const response = await fetch(`${API_BASE}/api/chat`, {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({message: text, user: "웹", history: requestHistory()}),
-  });
-
-  if (!response.ok || !response.body) {
-    setBubbleContent(assistant, "assistant", `요청 실패: ${response.status}`);
-    updateLastAssistantMessage(assistant.dataset.raw || "");
-    setBusy(false);
-    return;
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder("utf-8");
-  let buffer = "";
-  let toolNote = "";
-
-  const handleEvent = (payload) => {
-    if (payload === "[DONE]") {
-      setBusy(false);
+async function sendMessage(text, {retryId = null} = {}) {
+  if (pendingRequest || !text) return;
+  const session = activeSession();
+  const sessionId = session.id;
+  let historyEnd = session.messages.length;
+  let reply;
+  if (retryId) {
+    const index = session.messages.findIndex((m) => m.id === retryId);
+    if (index < 0) return;
+    historyEnd = Math.max(0, index - 1);
+    // 같은 가지에서 재시도한다. 이후 대화를 암묵적으로 삭제하지 않는다.
+    if (index !== session.messages.length - 1) {
+      input.value = text;
+      input.focus();
       return;
     }
-    const event = JSON.parse(payload);
-    if (event.type === "delta") {
-      if (isThinking) {
-        setBubbleContent(assistant, "assistant", "");
-        isThinking = false;
-      }
-      appendAssistantText(assistant, event.text || "");
-      updateLastAssistantMessage(assistant.dataset.raw || "");
-      messages.scrollTop = messages.scrollHeight;
-    } else if (event.type === "tool") {
-      toolNote = `${event.name} 조회 중...`;
-      state.textContent = toolNote;
-    } else if (event.type === "status") {
-      state.textContent = event.text || "대기 중";
-    } else if (event.type === "error") {
-      appendAssistantText(assistant, `\n오류: ${event.message}`);
-      updateLastAssistantMessage(assistant.dataset.raw || "");
-    }
+    reply = session.messages[index];
+    reply.text = "";
+    reply.status = "pending";
+    delete reply.context;
+  } else {
+    session.messages.push({id: crypto.randomUUID?.() || String(Date.now()), role: "user", text, at: Date.now()});
+    reply = {id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, role: "assistant", text: "", question: text, status: "pending", at: Date.now()};
+    session.messages.push(reply);
+  }
+  const previous = session.messages.slice(0, historyEnd);
+  const history = previous.filter((m) => !m.status || m.status === "complete")
+    .filter((m) => m.text && m.text !== "(생각중)..")
+    .slice(-10).map((m) => ({role: m.role, text: m.text}));
+  const priorReply = [...previous].reverse().find((m) => m.role === "assistant" && m.status === "complete" && m.context);
+  const controller = new AbortController();
+  pendingRequest = {controller, sessionId, messageId: reply.id};
+  if (session.title === "새 대화") session.title = titleFrom(text);
+  session.updatedAt = Date.now();
+  saveSessions();
+  renderActiveSession();
+  renderSessions();
+  setBusy(true, "업무를 확인하고 있어요.");
+  let completed = false;
+  let gotAnswer = false;
+  let waitingText = "업무를 확인하고 있어요.";
+  let error = null;
+  let reader;
+  const paint = () => {
+    if (activeSessionId !== sessionId) return;
+    const bubble = [...messages.querySelectorAll(".bubble")].find((node) => node.dataset.messageId === reply.id);
+    if (!bubble) return;
+    const follow = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 90;
+    // 출처는 완료 이벤트에서 서버가 검증한 링크만 활성화한다.
+    const shown = gotAnswer ? reply.text : reply.text.replace(/\[([^\]]+)\]\(https?:\/\/[^)]+\)/g, "$1");
+    setBubbleContent(bubble, "assistant", shown || waitingText);
+    if (follow) messages.scrollTop = messages.scrollHeight;
   };
-
   try {
+    const response = await fetch(`${API_BASE}/api/chat`, {
+      method: "POST", signal: controller.signal,
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({message: text, user: "웹", session_id: sessionId, message_id: reply.id,
+        history, context: priorReply?.context || {}}),
+    });
+    if (!response.ok || !response.body) throw new Error(`요청 실패: ${response.status}`);
+    reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    const handleEvent = (payload) => {
+      if (payload === "[DONE]") { completed = (gotAnswer || Boolean(reply.text.trim())) && !error; return; }
+      const event = JSON.parse(payload);
+      if (event.type === "delta") reply.text += event.text || "";
+      else if (event.type === "answer") {
+        reply.text = event.text || "";
+        reply.context = event.context;
+        reply.sources = event.sources;
+        reply.validation = event.validation;
+        gotAnswer = true;
+      } else if (event.type === "error") {
+        error = new Error(event.message || "답변 생성 실패");
+      } else if (event.type === "status") {
+        waitingText = event.text || "확인 중";
+        state.textContent = waitingText;
+      }
+      paint();
+    };
     while (true) {
       const {value, done} = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, {stream: true});
-      buffer = parseSse(buffer, handleEvent);
+      buffer = parseSse(buffer.replace(/\r\n/g, "\n"), handleEvent);
     }
+    buffer += decoder.decode();
+    if (buffer.trim()) parseSse(buffer + "\n\n", handleEvent);
+    if (error) throw error;
+    if (!completed) throw new Error("답변 연결이 종료되었습니다.");
+    reply.status = "complete";
+  } catch (failure) {
+    reply.status = failure.name === "AbortError" ? "cancelled" : "failed";
+    if (!reply.text) reply.text = failure.name === "AbortError" ? "" : "답변을 완료하지 못했습니다.";
+    delete reply.context;
   } finally {
-    if (isThinking && assistant.dataset.raw === thinkingText) {
-      setBubbleContent(assistant, "assistant", "응답이 종료됐지만 표시할 답변이 없습니다.");
-      updateLastAssistantMessage(assistant.dataset.raw || "");
+    if (reader) { try { await reader.cancel(); } catch {} }
+    pendingRequest = null;
+    reply.at = Date.now();
+    saveSessions();
+    if (activeSessionId === sessionId) {
+      const follow = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 90;
+      const top = messages.scrollTop;
+      renderActiveSession();
+      if (!follow) messages.scrollTop = top;
     }
+    renderSessions();
     setBusy(false);
   }
 }
 
 form.addEventListener("submit", (event) => {
   event.preventDefault();
+  if (pendingRequest) { pendingRequest.controller.abort(); return; }
   const text = input.value.trim();
   if (!text) return;
   input.value = "";
-  sendMessage(text).catch((error) => {
-    const errorText = `오류: ${error.message}`;
-    appendMessage("assistant", errorText);
-    addSessionMessage("assistant", errorText);
-    setBusy(false);
-  });
+  input.style.height = "auto";
+  sendMessage(text);
 });
 
+input.addEventListener("input", () => {
+  input.style.height = "auto";
+  input.style.height = `${Math.min(input.scrollHeight, 180)}px`;
+});
 input.addEventListener("keydown", (event) => {
+  if (event.isComposing || event.keyCode === 229) return;
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
-    form.requestSubmit();
+    if (!pendingRequest) form.requestSubmit();
   }
 });
 
@@ -475,6 +530,9 @@ window.addEventListener("popstate", (event) => {
   renderSessions();
 });
 
+sessions.forEach((session) => session.messages.forEach((message) => {
+  if (message.status === "pending") message.status = "failed";
+}));
 sessions.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 saveSessions();
 setActiveSession(activeSessionId, {push: false});

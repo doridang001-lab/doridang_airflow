@@ -278,29 +278,40 @@ p {
   line-height: 1.6;
 }
 
-.prompt-grid {
-  display: grid;
-  grid-template-columns: 1fr;
+.prompt-toggle-group {
+  display: flex;
+  flex-wrap: wrap;
   gap: 8px;
-}
-
-.prompt-card {
-  width: 100%;
-  min-height: 48px;
-  padding: 12px 14px;
+  padding: 4px;
   border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--panel-strong);
-  color: var(--text);
-  text-align: left;
-  font-size: 14px;
-  font-weight: 600;
-  line-height: 1.35;
 }
 
-.prompt-card:hover {
+.prompt-toggle {
+  flex: 1 1 112px;
+  width: auto;
+  min-height: 42px;
+  padding: 0 13px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  text-align: center;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.prompt-toggle:hover {
   background: #f2ede5;
-  border-color: var(--line-strong);
+}
+
+.prompt-toggle.active,
+.prompt-toggle[aria-pressed="true"] {
+  background: var(--accent);
+  border-color: var(--accent-strong);
+  color: #ffffff;
 }
 
 .message {
@@ -555,4 +566,23 @@ button:hover:not(:disabled) {
   button {
     width: 100%;
   }
+}
+
+/* 대화 목록만 스크롤하고 입력창은 화면 아래 유지한다. */
+.shell { height: 100dvh; min-height: 0; overflow: hidden; }
+.sidebar { min-height: 0; overflow: auto; }
+.app { height: 100%; min-height: 0; overflow: hidden; }
+.messages { width: min(880px, 100%); }
+.assistant .bubble { max-width: 100%; width: 100%; }
+.message.assistant { flex-wrap: wrap; }
+.retry-button { width: auto; padding: 8px 14px; margin: 8px 0; }
+.markdown em { color: var(--muted); font-size: 12px; font-style: normal; }
+textarea { max-height: 180px; resize: none; }
+@media (max-width: 760px) {
+  .shell { grid-template-rows: minmax(0, auto) minmax(0, 1fr); }
+  .sidebar { max-height: 170px; }
+}
+@media (max-width: 460px) {
+  .composer { grid-template-columns: minmax(0, 1fr) 42px; }
+  .composer button { width: 42px; }
 }

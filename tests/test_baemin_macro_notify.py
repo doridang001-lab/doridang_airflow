@@ -236,7 +236,10 @@ def test_notify_keeps_partial_success_for_unrecovered_problem():
     assert "문제 로그" in html_body
 
 
-def test_notify_marks_low_settle_rate_as_partial_success():
+def test_notify_treats_low_settle_rate_as_informational_success():
+    # 배민 정산정보(입금예정금액)는 통상 09:00 KST 전후에 게시된다. 00시대 자동
+    # 수집은 rate=0%가 정상 패턴이고 주문은 이미 정상 저장되므로, 이 신호만으로
+    # 부분성공 처리하지 않는다(별도 정산 재수집 파이프라인이 이후 채운다).
     namespace = _load_helpers()
     returns = {
         "load_accounts": "계정 1개",
@@ -267,9 +270,10 @@ def test_notify_marks_low_settle_rate_as_partial_success():
 
     subject, body, html_body, should_email = namespace["_build_collection_notification"](context)
 
-    assert "부분성공" in subject
-    assert "정산정보 수집 의심 1건" in body
+    assert "부분성공" not in subject
+    assert "성공" in subject
+    assert "정산정보 미게시" in body
     assert "역삼점" in body
     assert "50.0%" in body
-    assert should_email is True
-    assert "정산정보 수집 의심" in html_body
+    assert should_email is False
+    assert "정산정보 미게시" in html_body

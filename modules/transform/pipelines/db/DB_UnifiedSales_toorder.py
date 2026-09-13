@@ -244,7 +244,8 @@ def backfill_toorder_manual_stores(stores=None) -> str:
     total = 0
     for date_str in dates:
         try:
-            result = run_toorder_manual_stores(date_str, stores=stores, overwrite=True)
+            from modules.transform.pipelines.db.DB_UnifiedSales_nightly import backfill_unit
+            result = backfill_unit(run_toorder_manual_stores, date_str, stores=stores, overwrite=True)
             logger.info(result)
             if result.startswith("toorder(수동매장)"):
                 try:

@@ -6,15 +6,19 @@ JSON files instead of scanning raw CSV/parquet sources.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
 import re
+import time
+from contextvars import ContextVar
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 from modules.transform.utility.paths import (
     ANALYTICS_DB,
@@ -90,6 +94,10 @@ SPLIT_JSON_FILES = {
     "ads": "ads.json",
     "visit_log": "visit_log.json",
 }
+PARQUET_BATCH_SIZE = 8192
+_CSV_PATH_CACHE: ContextVar[dict[tuple[Path, str], list[Path]] | None] = ContextVar(
+    "for_ai_csv_path_cache", default=None
+)
 
 
 def build_for_ai_store_month_analysis(
@@ -124,31 +132,38 @@ def build_for_ai_store_month_analysis(
         return "SKIP: 생성 대상 없음"
 
     target_df = _load_target()
-    payloads: list[dict[str, Any]] = []
-    written_files: list[Path] = []
-    for item in targets:
-        split_payloads = build_store_month_payloads(
-            brand=item["brand"],
-            ym=item["ym"],
-            store=item["store"],
-            daily=daily,
-            target=target_df,
-        )
-        payload = split_payloads["analysis"]
-        payloads.append(payload)
-        if write:
-            path = _analysis_path(output_dir, item["brand"], item["ym"], item["store"])
-            _write_json(path, split_payloads["analysis"])
-            _write_json(path.with_name(SPLIT_JSON_FILES["orders"]), split_payloads["orders"])
-            _write_json(path.with_name(SPLIT_JSON_FILES["ads"]), split_payloads["ads"])
-            _write_json(path.with_name(SPLIT_JSON_FILES["visit_log"]), split_payloads["visit_log"])
-            _write_store_readme(path.with_name("README.md"), payload)
-            written_files.append(path)
+    index_items: list[dict[str, Any]] = []
+    started = time.monotonic()
+    logger.info("For_AI 분석 시작: 대상 %d개, write=%s", len(targets), write)
+    cache_token = _CSV_PATH_CACHE.set({})
+    try:
+        for count, item in enumerate(targets, 1):
+            split_payloads = build_store_month_payloads(
+                brand=item["brand"],
+                ym=item["ym"],
+                store=item["store"],
+                daily=daily,
+                target=target_df,
+            )
+            payload = split_payloads["analysis"]
+            if write:
+                path = _analysis_path(output_dir, item["brand"], item["ym"], item["store"])
+                _write_json(path, payload)
+                _write_json(path.with_name(SPLIT_JSON_FILES["orders"]), split_payloads["orders"])
+                _write_json(path.with_name(SPLIT_JSON_FILES["ads"]), split_payloads["ads"])
+                _write_json(path.with_name(SPLIT_JSON_FILES["visit_log"]), split_payloads["visit_log"])
+                _write_store_readme(path.with_name("README.md"), payload)
+                index_items.append(_index_item(output_dir, payload))
+            del payload, split_payloads
+            if count == 1 or count % 25 == 0 or count == len(targets):
+                logger.info("For_AI 분석 진행: %d/%d, %.1f초", count, len(targets), time.monotonic() - started)
+    finally:
+        _CSV_PATH_CACHE.reset(cache_token)
 
     if write:
-        _write_indexes(output_dir, payloads)
-        return f"OK: For_AI JSON {len(written_files)}개 생성 -> {output_dir}"
-    return f"OK: For_AI JSON payload {len(payloads)}개 생성(dry-run)"
+        _write_indexes(output_dir, index_items)
+        return f"OK: For_AI JSON {len(index_items)}개 생성 -> {output_dir}"
+    return f"OK: For_AI JSON payload {len(targets)}개 생성(dry-run)"
 
 
 def build_store_month_payload(
@@ -387,6 +402,24 @@ def _target_keys(daily: pd.DataFrame, *, brand: str | None, ym: str | None, stor
     ]
 
 
+def _raise_if_memory_error(exc: Exception) -> None:
+    if isinstance(exc, MemoryError) or isinstance(exc, OSError) and exc.errno == errno.ENOMEM:
+        raise exc
+
+
+def _unified_batches(path: Path, *, keys_only: bool = False) -> Iterator[pd.DataFrame]:
+    columns = ["brand", "ym", "store", "sale_date"]
+    if not keys_only:
+        columns += ["source", "platform", "order_type", "order_id", "total_price", "order_cnt"]
+        columns += MENU_NAME_COL_CANDIDATES
+    with pq.ParquetFile(path) as parquet:
+        selected = [name for name in parquet.schema_arrow.names if name.strip() in columns]
+        for batch in parquet.iter_batches(batch_size=PARQUET_BATCH_SIZE, columns=selected, use_threads=False):
+            df = batch.to_pandas(use_threads=False)
+            df.columns = df.columns.map(lambda name: str(name).strip())
+            yield df
+
+
 def _target_keys_from_orders(
     *,
     brand: str | None,
@@ -397,27 +430,29 @@ def _target_keys_from_orders(
     files = sorted(UNIFIED_SALES_DIR.glob("unified_sales_*.parquet")) if UNIFIED_SALES_DIR.exists() else []
     if not files:
         return []
-    parts = []
+    all_keys: set[tuple[str, str, str]] = set()
     for path in files:
         try:
-            df = pd.read_parquet(path)
+            file_keys: set[tuple[str, str, str]] = set()
+            for df in _unified_batches(path, keys_only=True):
+                for col in ["brand", "ym", "store", "sale_date"]:
+                    if col not in df.columns:
+                        df[col] = ""
+                work = _normalize_text_cols(df, ["ym", "brand", "store", "sale_date"])
+                missing_ym = work["ym"].eq("")
+                if missing_ym.any():
+                    work.loc[missing_ym, "ym"] = _parse_dates(work.loc[missing_ym, "sale_date"]).dt.strftime("%Y-%m")
+                keys = work[["brand", "ym", "store"]].replace("", pd.NA).dropna().drop_duplicates()
+                file_keys.update(keys.itertuples(index=False, name=None))
+            all_keys.update(file_keys)
         except Exception as exc:
+            _raise_if_memory_error(exc)
             logger.warning("unified_sales 대상 키 읽기 실패: %s | %s", path, exc)
             continue
-        if df.empty:
-            continue
-        work = _ensure_unified_sales_cols(df)
-        work = _normalize_text_cols(work, ["ym", "brand", "store", "sale_date"])
-        missing_ym = work["ym"].eq("")
-        if missing_ym.any():
-            work.loc[missing_ym, "ym"] = _parse_dates(work.loc[missing_ym, "sale_date"]).dt.strftime("%Y-%m")
-        keys = work[["brand", "ym", "store"]].replace("", pd.NA).dropna().drop_duplicates()
-        if not keys.empty:
-            parts.append(keys)
-    if not parts:
+    if not all_keys:
         return []
 
-    work = pd.concat(parts, ignore_index=True).drop_duplicates()
+    work = pd.DataFrame(sorted(all_keys), columns=["brand", "ym", "store"])
     if brand:
         work = work[work["brand"].eq(_clean_text(brand))]
     if ym:
@@ -464,15 +499,20 @@ def _load_unified_month(*, brand: str, ym: str, store: str) -> pd.DataFrame:
     parts = []
     for path in files:
         try:
-            df = pd.read_parquet(path)
+            file_parts = []
+            for df in _unified_batches(path):
+                df = _ensure_unified_sales_cols(df)
+                df = _normalize_text_cols(df, ["ym", "brand", "store"])
+                matched = df[df["brand"].eq(brand) & df["ym"].eq(ym) & df["store"].eq(store)].copy()
+                if not matched.empty:
+                    file_parts.append(_normalize_text_cols(matched, ["source", "platform", "order_type", "sale_date", "order_id", "menu_name"]))
+            # Preserve file-wide numeric inference and all-or-nothing read failures.
+            if file_parts:
+                parts.append(_parse_numeric_cols(pd.concat(file_parts, ignore_index=True), ["total_price", "order_cnt"]))
         except Exception as exc:
+            _raise_if_memory_error(exc)
             logger.warning("unified_sales 읽기 실패: %s | %s", path, exc)
             continue
-        df = _ensure_unified_sales_cols(df)
-        df = _normalize_text_cols(df, ["ym", "brand", "store", "source", "platform", "order_type", "sale_date", "order_id", "menu_name"])
-        matched = df[df["brand"].eq(brand) & df["ym"].eq(ym) & df["store"].eq(store)].copy()
-        if not matched.empty:
-            parts.append(_parse_numeric_cols(matched, ["total_price", "order_cnt"]))
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
 
@@ -483,6 +523,7 @@ def _load_review_month(*, ym: str, store: str) -> pd.DataFrame:
         try:
             df = pd.read_parquet(path)
         except Exception as exc:
+            _raise_if_memory_error(exc)
             logger.warning("unified_review 읽기 실패: %s | %s", path, exc)
             continue
         store_col = "매장명" if "매장명" in df.columns else "store" if "store" in df.columns else None
@@ -501,6 +542,7 @@ def _load_delivery_commission_month(*, brand: str, ym: str, store: str) -> pd.Da
     try:
         df = pd.read_parquet(DELIVERY_COMMISSION_PATH)
     except Exception as exc:
+        _raise_if_memory_error(exc)
         logger.warning("delivery_commission 읽기 실패: %s | %s", DELIVERY_COMMISSION_PATH, exc)
         return pd.DataFrame()
     if df.empty:
@@ -517,6 +559,7 @@ def _load_flow_visit_month(*, ym: str, store: str) -> pd.DataFrame:
     try:
         df = pd.read_parquet(FLOW_VISIT_VIZ_PARQUET)
     except Exception as exc:
+        _raise_if_memory_error(exc)
         logger.warning("flow_visit_viz 읽기 실패: %s | %s", FLOW_VISIT_VIZ_PARQUET, exc)
         return pd.DataFrame()
     if df.empty or "store_name" not in df.columns:
@@ -541,9 +584,17 @@ def _load_partitioned_csv(root: Path, *, brand: str, ym: str, store: str, filena
     path = root / f"brand={brand}" / f"store={store}" / f"ym={ym}" / filename
     candidates = [path] if path.exists() else []
     if not candidates and root.exists():
+        cache = _CSV_PATH_CACHE.get()
+        key = (root, filename)
+        if cache is not None:
+            if key not in cache:
+                cache[key] = list(root.rglob(filename))
+            paths = cache[key]
+        else:
+            paths = root.rglob(filename)
         candidates = [
             candidate
-            for candidate in root.rglob(filename)
+            for candidate in paths
             if f"ym={ym}" in str(candidate) and _store_matches_path(candidate, store)
         ]
     parts = []
@@ -553,6 +604,7 @@ def _load_partitioned_csv(root: Path, *, brand: str, ym: str, store: str, filena
         except UnicodeDecodeError:
             df = pd.read_csv(candidate, encoding="cp949", dtype=str)
         except Exception as exc:
+            _raise_if_memory_error(exc)
             logger.warning("CSV 읽기 실패: %s | %s", candidate, exc)
             continue
         df["_source_path"] = str(candidate)
@@ -1204,28 +1256,31 @@ def _recommended_prompt() -> str:
     )
 
 
-def _write_indexes(output_root: Path, payloads: list[dict[str, Any]]) -> None:
+def _index_item(output_root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    meta = payload["meta"]
+    return {
+        "brand": meta["brand"],
+        "ym": meta["ym"],
+        "store": meta["store"],
+        "path": str(_analysis_path(output_root, meta["brand"], meta["ym"], meta["store"]).relative_to(output_root)),
+        "readme_path": str(_analysis_path(output_root, meta["brand"], meta["ym"], meta["store"]).with_name("README.md").relative_to(output_root)),
+        "files": {
+            name: str(_analysis_path(output_root, meta["brand"], meta["ym"], meta["store"]).with_name(info["path"]).relative_to(output_root))
+            for name, info in (meta.get("files") or {}).items()
+            if isinstance(info, dict) and info.get("path")
+        },
+        "actual_sales": payload["month_summary"].get("actual_sales"),
+        "achievement_rate": payload["month_summary"].get("achievement_rate"),
+        "missing_sources": meta.get("missing_sources", []),
+    }
+
+
+def _write_indexes(output_root: Path, items: list[dict[str, Any]]) -> None:
     root_items = _read_index_items(output_root / "index.json")
     by_month: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for payload in payloads:
-        meta = payload["meta"]
-        item = {
-            "brand": meta["brand"],
-            "ym": meta["ym"],
-            "store": meta["store"],
-            "path": str(_analysis_path(output_root, meta["brand"], meta["ym"], meta["store"]).relative_to(output_root)),
-            "readme_path": str(_analysis_path(output_root, meta["brand"], meta["ym"], meta["store"]).with_name("README.md").relative_to(output_root)),
-            "files": {
-                name: str(_analysis_path(output_root, meta["brand"], meta["ym"], meta["store"]).with_name(info["path"]).relative_to(output_root))
-                for name, info in (meta.get("files") or {}).items()
-                if isinstance(info, dict) and info.get("path")
-            },
-            "actual_sales": payload["month_summary"].get("actual_sales"),
-            "achievement_rate": payload["month_summary"].get("achievement_rate"),
-            "missing_sources": meta.get("missing_sources", []),
-        }
+    for item in items:
         root_items = _upsert_index_item(root_items, item)
-        by_month.setdefault((meta["brand"], meta["ym"]), []).append(item)
+        by_month.setdefault((item["brand"], item["ym"]), []).append(item)
     root_items = sorted(root_items, key=lambda x: (str(x.get("brand")), str(x.get("ym")), str(x.get("store"))))
     _write_json(output_root / "index.json", {"generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "items": root_items})
     for (brand, ym), items in by_month.items():
@@ -1243,6 +1298,7 @@ def _read_index_items(path: Path) -> list[dict[str, Any]]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
+        _raise_if_memory_error(exc)
         logger.warning("index 읽기 실패, 새로 생성합니다: %s | %s", path, exc)
         return []
     items = payload.get("items") if isinstance(payload, dict) else None
@@ -1415,6 +1471,8 @@ def _normalize_ym(value: Any) -> str:
 
 
 def _clean_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
     if pd.isna(value):
         return ""
     return str(value).strip()

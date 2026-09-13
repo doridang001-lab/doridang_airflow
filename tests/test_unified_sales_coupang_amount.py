@@ -32,6 +32,8 @@ def _patch_allocator(monkeypatch) -> None:
             index=df.index,
         ),
     )
+    monkeypatch.setattr(coupang, "_load_posfeed_order_price_lines", lambda *args, **kwargs: {})
+    monkeypatch.setattr(coupang, "_lookup_observed_price", lambda *args, **kwargs: 0)
 
 
 def test_full_cancel_books_zero(monkeypatch) -> None:
@@ -215,6 +217,122 @@ def test_discounted_order_allocates_rounding_difference_to_largest_menu(monkeypa
     assert out["order_cnt"].astype(int).sum() == 1
 
 
+def test_posfeed_detail_splits_coupang_manual_amount_without_changing_order_total(monkeypatch) -> None:
+    _patch_allocator(monkeypatch)
+    monkeypatch.setattr(
+        coupang,
+        "_load_posfeed_order_price_lines",
+        lambda *args, **kwargs: {
+            "POSFEED_SPLIT": [
+                {"item_name": "도리당 닭도리탕", "qty": 1, "unit_price": 20800},
+                {"item_name": "[소] 반마리", "qty": 1, "unit_price": 0},
+                {"item_name": "뼈", "qty": 1, "unit_price": 0},
+                {"item_name": "기본맛", "qty": 1, "unit_price": 0},
+                {"item_name": "흑미 공기밥", "qty": 1, "unit_price": 1500},
+            ]
+        },
+    )
+    raw = _raw([
+        {
+            "order_id": "POSFEED_SPLIT",
+            "menu_name": "도리당 닭도리탕",
+            "item_menu": "도리당 닭도리탕",
+            "menu_price": "22300",
+            "menu_options": "[소] 반마리",
+            "매출액": None,
+            "total_price": "22300",
+        },
+        {
+            "order_id": "POSFEED_SPLIT",
+            "menu_name": "도리당 닭도리탕",
+            "item_menu": "도리당 닭도리탕",
+            "menu_price": "",
+            "menu_options": "흑미 공기밥",
+            "매출액": None,
+            "total_price": "22300",
+        },
+    ])
+
+    out = coupang._transform_to_unified(raw, "행신점", "도리당", {})
+
+    assert out["item_name"].tolist() == ["도리당 닭도리탕", "[소] 반마리", "뼈", "기본맛", "흑미 공기밥"]
+    assert out["unit_price"].astype(int).tolist() == [20800, 0, 0, 0, 1500]
+    assert out["total_price"].astype(int).tolist() == [20800, 0, 0, 0, 1500]
+    assert int(out["total_price"].sum()) == 22300
+    assert out["order_cnt"].astype(int).sum() == 1
+
+
+def test_catalog_price_splits_option_and_preserves_order_total(monkeypatch) -> None:
+    _patch_allocator(monkeypatch)
+    monkeypatch.setattr(
+        coupang,
+        "_lookup_observed_price",
+        lambda brand, store, item_name: 1500 if item_name == "흑미 공기밥" else 0,
+    )
+    raw = _raw([
+        {
+            "order_id": "CATALOG_SPLIT",
+            "menu_name": "도리당 닭도리탕",
+            "item_menu": "도리당 닭도리탕",
+            "menu_price": "22300",
+            "menu_options": "[소] 반마리",
+            "매출액": None,
+            "total_price": "22300",
+        },
+        {
+            "order_id": "CATALOG_SPLIT",
+            "menu_name": "도리당 닭도리탕",
+            "item_menu": "도리당 닭도리탕",
+            "menu_price": "",
+            "menu_options": "흑미 공기밥",
+            "매출액": None,
+            "total_price": "22300",
+        },
+    ])
+
+    out = coupang._transform_to_unified(raw, "행신점", "도리당", {})
+
+    assert out["item_name"].tolist() == ["도리당 닭도리탕", "흑미 공기밥"]
+    assert out["unit_price"].astype(int).tolist() == [20800, 1500]
+    assert out["total_price"].astype(int).tolist() == [20800, 1500]
+    assert int(out["total_price"].sum()) == 22300
+
+
+def test_catalog_price_expands_priced_option_row_and_preserves_total(monkeypatch) -> None:
+    _patch_allocator(monkeypatch)
+    monkeypatch.setattr(
+        coupang,
+        "_lookup_observed_price",
+        lambda brand, store, item_name: 100 if item_name == "분모자 추가" else 0,
+    )
+    raw = _raw([
+        {
+            "order_id": "PRICED_OPTION",
+            "menu_name": "1인 닭도리탕",
+            "item_menu": "1인 닭도리탕",
+            "menu_price": "18000",
+            "menu_options": "분모자 추가",
+            "매출액": None,
+            "total_price": "19000",
+        },
+        {
+            "order_id": "PRICED_OPTION",
+            "menu_name": "쿨피스",
+            "item_menu": "쿨피스",
+            "menu_price": "1000",
+            "menu_options": "기본",
+            "매출액": None,
+            "total_price": "19000",
+        },
+    ])
+
+    out = coupang._transform_to_unified(raw, "교대점", "나홀로", {})
+
+    assert out["item_name"].tolist() == ["1인 닭도리탕", "쿨피스", "분모자 추가"]
+    assert out["unit_price"].astype(int).tolist() == [17900, 1000, 100]
+    assert int(out["total_price"].sum()) == 19000
+
+
 def test_raw_dedup_normalizes_numeric_and_null_text_variants() -> None:
     raw = _raw([
         {
@@ -240,3 +358,32 @@ def test_raw_dedup_normalizes_numeric_and_null_text_variants() -> None:
     out = coupang._deduplicate_raw(raw, "부산서면점", "2026-06")
 
     assert len(out) == 1
+
+
+def test_raw_dedup_keeps_latest_order_snapshot_when_cancel_status_changes() -> None:
+    raw = _raw([
+        {
+            "collected_at": "2026-07-10T18:14:43.048Z",
+            "order_id": "2X1AC1",
+            "is_cancelled": "N",
+            "menu_price": "37000",
+            "menu_options": "중간매운맛",
+            "매출액": 37000,
+            "취소금액": None,
+        },
+        {
+            "collected_at": "2026-07-11T18:13:38.995Z",
+            "order_id": "2X1AC1",
+            "is_cancelled": "Y",
+            "menu_price": "37000",
+            "menu_options": "중간매운맛",
+            "매출액": 0,
+            "취소금액": 37000,
+        },
+    ])
+
+    out = coupang._deduplicate_raw(raw, "삼송점", "2026-07")
+
+    assert len(out) == 1
+    assert out["is_cancelled"].iloc[0] == "Y"
+    assert int(out["매출액"].iloc[0]) == 0

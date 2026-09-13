@@ -78,14 +78,14 @@ def _build_store_block(rows: list[pd.Series]) -> str:
         "[신규 매장 / 양도양수 매장 / 해지 매장]",
         f"- 매장명 : {_value_from_rows(rows, '매장명')}",
         f"- 사업자명의 : {_value_from_rows(rows, '점주명', '사업자명의')}",
-        f"- 핸드폰번호 : {_value_from_rows(rows, '전화번호', '핸드폰번호', '휴대폰번호', '연락처')}",
+        f"- 핸드폰번호 : {_value_from_rows(rows, '전화번호', '전화번호(mobile)', '핸드폰번호', '휴대폰번호', '연락처')}",
         f"- 매장주소 : {_value_from_rows(rows, '상세주소', '매장주소', '주소')}",
         f"- 발주매장코드 : {_value_from_rows(rows, '발주매장코드')}",
         f"- 배민 계정 : {_account_from_rows(rows, ('배민ID', '배달의민족ID', '배달의 민족ID'), ('배민PW', '배달의민족PW', '배달의 민족PW'))}",
         f"- 요기요 계정 : {_account_from_rows(rows, ('요기요ID',), ('요기요PW',))}",
         f"- 쿠팡 계정 : {_account_from_rows(rows, ('쿠팡ID', '쿠팡이츠ID'), ('쿠팡PW', '쿠팡이츠PW'))}",
         f"- 오픈일 : {_value_from_rows(rows, '실오픈일', '오픈일')}",
-        f"- 프로그램 설치 가능시간 : {_value_from_rows(rows, '프로그램설치가능시간', '프로그램 설치 가능시간', '설치가능시간', '설치 가능시간')}",
+        "- 프로그램 설치 가능시간 : asap",
     ]
     return "\n".join(lines)
 

@@ -67,6 +67,17 @@ def test_incomplete_duplicate_store_alerts_once_and_prefers_latest_managed_row()
     assert "- 사업자명의 : 최신 점주" in result.message
     assert "- 핸드폰번호 : 01011112222" in result.message
     assert "- 매장주소 : 이전 주소" in result.message
+    assert "- 프로그램 설치 가능시간 : asap" in result.message
+
+
+def test_mobile_suffix_phone_column_is_supported():
+    df = pd.DataFrame([_row(**{"전화번호(mobile)": "010-7455-7840"})])
+
+    result = build_toder_missing_alert(df)
+
+    assert result.missing_store_count == 1
+    assert "- 핸드폰번호 : 010-7455-7840" in result.message
+    assert "- 프로그램 설치 가능시간 : asap" in result.message
 
 
 def test_managerless_store_is_not_an_alert_target():

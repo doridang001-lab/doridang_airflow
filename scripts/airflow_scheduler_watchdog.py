@@ -9,9 +9,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,18 +42,43 @@ def setup_logging() -> None:
 logger = logging.getLogger(__name__)
 
 
+def subprocess_window_kwargs() -> dict:
+    if sys.platform != "win32":
+        return {}
+
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
+    return {
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+        "startupinfo": startupinfo,
+    }
+
+
 def run_cmd(args: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
     logger.info("실행: %s", " ".join(args))
-    return subprocess.run(
-        args,
-        cwd=PROJECT_ROOT,
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            args,
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            encoding="utf-8",
+            errors="replace",
+            text=True,
+            timeout=timeout,
+            check=False,
+            **subprocess_window_kwargs(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        logger.error("Command timed out after %ss: %s", timeout, args)
+        output = exc.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        return subprocess.CompletedProcess(args, 124, output, "timeout")
+    except OSError as exc:
+        logger.error("Command unavailable: %s", exc)
+        return subprocess.CompletedProcess(args, 127, "", str(exc))
 
 
 def log_result(result: subprocess.CompletedProcess[str]) -> None:
@@ -80,44 +108,51 @@ def airflow_jobs_check() -> bool:
 
 
 def web_health() -> tuple[bool, dict]:
-    result = run_cmd(
-        [
-            "docker",
-            "exec",
-            WEBSERVER_CONTAINER,
-            "bash",
-            "-lc",
-            "curl -s http://localhost:8080/health",
-        ],
-        timeout=30,
-    )
-    log_result(result)
-    if result.returncode != 0:
+    try:
+        with urllib.request.urlopen("http://localhost:8080/health", timeout=5) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except (OSError, urllib.error.URLError) as exc:
+        logger.warning("health 요청 실패: %s", exc)
         return False, {}
 
     try:
-        payload = json.loads(result.stdout)
+        payload = json.loads(body)
     except json.JSONDecodeError:
         logger.warning("health 응답 JSON 파싱 실패")
         return False, {}
 
-    scheduler = payload.get("scheduler") or {}
-    return scheduler.get("status") == "healthy", payload
+    if not isinstance(payload, dict):
+        return False, {}
+    return all((payload.get(key) or {}).get("status") == "healthy"
+               for key in ("scheduler", "metadatabase")), payload
 
 
 def heartbeat_age_seconds(payload: dict) -> float | None:
     raw = ((payload.get("scheduler") or {}).get("latest_scheduler_heartbeat"))
     if not raw:
         return None
-    heartbeat = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    try:
+        heartbeat = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if heartbeat.tzinfo is None:
+            return None
+    except (ValueError, TypeError, AttributeError):
+        return None
     now = datetime.now(timezone.utc)
     return max(0.0, (now - heartbeat).total_seconds())
 
 
+def recovery_lock():
+    from filelock import FileLock
+    root = PROJECT_ROOT / ".tmp"
+    root.mkdir(parents=True, exist_ok=True)
+    return FileLock(str(root / "airflow_recovery.lock"), timeout=0)
+
+
 def restart_scheduler() -> bool:
-    result = run_cmd(["docker", "compose", "restart", SCHEDULER_SERVICE], timeout=180)
-    log_result(result)
-    return result.returncode == 0
+    with recovery_lock():
+        result = run_cmd(["docker", "compose", "restart", SCHEDULER_SERVICE], timeout=180)
+        log_result(result)
+        return result.returncode == 0
 
 
 def wait_until_healthy(wait_seconds: int, poll_seconds: int) -> bool:
@@ -159,19 +194,34 @@ def main() -> int:
     args = parser.parse_args()
 
     setup_logging()
-    jobs_ok = airflow_jobs_check()
+    engine = run_cmd(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=15)
+    if engine.returncode != 0:
+        logger.error("Docker engine unavailable; scheduler restart cannot recover this failure")
+        return 3
     health_ok, payload = web_health()
     age = heartbeat_age_seconds(payload)
     stale = age is None or age > args.stale_minutes * 60
-    logger.info("판정: jobs_ok=%s health_ok=%s stale=%s heartbeat_age=%s", jobs_ok, health_ok, stale, age)
+    logger.info("1차 판정: health_ok=%s stale=%s heartbeat_age=%s", health_ok, stale, age)
 
     if health_ok and not stale:
         logger.info("scheduler 정상")
         return 0
 
+    jobs_ok = airflow_jobs_check()
+    logger.info("2차 판정: jobs_ok=%s health_ok=%s stale=%s heartbeat_age=%s", jobs_ok, health_ok, stale, age)
+
     if args.dry_run:
         logger.warning("dry-run: scheduler 재시작 필요")
         return 2
+
+    free_gb = shutil.disk_usage(PROJECT_ROOT).free / (1024 ** 3)
+    if free_gb < 10:
+        logger.error("Insufficient host disk space: %.2f GiB; automatic restart withheld", free_gb)
+        return 4
+
+    if jobs_ok and not payload:
+        logger.error("Scheduler job healthy but webserver unavailable; defer to host watchdog")
+        return 3
 
     logger.warning("scheduler 비정상 감지, %s만 재시작", SCHEDULER_SERVICE)
     if not restart_scheduler():

@@ -1,8 +1,11 @@
+import errno
 import json
 import sys
+import weakref
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -405,3 +408,137 @@ def test_for_ai_visit_records_omit_generic_issue_label():
 
     assert "issue_label" not in records[0]
     assert records[0]["key_concerns"] == "- 도리당만 분리 계산"
+
+
+def test_unified_batches_preserve_keys_and_sales_across_boundaries(monkeypatch, tmp_path):
+    monkeypatch.setattr(for_ai, "UNIFIED_SALES_DIR", tmp_path)
+    monkeypatch.setattr(for_ai, "PARQUET_BATCH_SIZE", 2)
+    rows = [
+        {" brand ": " 도리당 ", "store": "매장", "ym": "2026-08", "sale_date": "2026-08-01",
+         "product_name": "탕", "total_price": value, "irrelevant": "x" * 1000}
+        for value in ["1,000", "2000", "3.5", "4"]
+    ]
+    rows.append({" brand ": "도리당", "store": "다른매장", "ym": "", "sale_date": "2026-07-01"})
+    path = tmp_path / "unified_sales_260801.parquet"
+    pd.DataFrame(rows).to_parquet(path, index=False)
+
+    batches = list(for_ai._unified_batches(path, keys_only=True))
+    assert [len(df) for df in batches] == [2, 2, 1]
+    assert set(batches[0].columns) == {"brand", "store", "ym", "sale_date"}
+    keys = for_ai._target_keys_from_orders(brand=None, ym=None, store=None, lookback=None)
+    assert keys == [
+        {"brand": "도리당", "ym": "2026-07", "store": "다른매장"},
+        {"brand": "도리당", "ym": "2026-08", "store": "매장"},
+    ]
+    assert for_ai._target_keys_from_orders(brand=None, ym=None, store=None, lookback=1) == keys[1:]
+    assert for_ai._target_keys_from_orders(brand=None, ym="2026-07", store="다른", lookback=1) == keys[:1]
+
+    raw = for_ai._ensure_unified_sales_cols(pd.read_parquet(path))
+    raw = for_ai._normalize_text_cols(raw, ["ym", "brand", "store", "source", "platform", "order_type", "sale_date", "order_id", "menu_name"])
+    expected = for_ai._parse_numeric_cols(raw[raw["ym"].eq("2026-08")].copy(), ["total_price", "order_cnt"])
+    actual = for_ai._load_unified_month(brand="도리당", ym="2026-08", store="매장")
+    pd.testing.assert_frame_equal(actual, expected.reset_index(drop=True))
+    assert actual["menu_name"].tolist() == ["탕"] * 4
+
+
+@pytest.mark.parametrize("error", [MemoryError("memory"), OSError(errno.ENOMEM, "memory")])
+@pytest.mark.parametrize("source", ["keys", "orders", "review", "commission", "visits", "csv", "scan", "index"])
+def test_memory_failures_are_not_treated_as_missing_data(monkeypatch, tmp_path, error, source):
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(for_ai, "UNIFIED_SALES_DIR", tmp_path)
+    monkeypatch.setattr(for_ai, "UNIFIED_REVIEW_DIR", tmp_path)
+    for name in ["unified_sales_260801.parquet", "unified_review_260801.parquet", "data.parquet"]:
+        (tmp_path / name).touch()
+    monkeypatch.setattr(for_ai, "DELIVERY_COMMISSION_PATH", tmp_path / "data.parquet")
+    monkeypatch.setattr(for_ai, "FLOW_VISIT_VIZ_PARQUET", tmp_path / "data.parquet")
+    monkeypatch.setattr(for_ai, "_unified_batches", fail)
+    monkeypatch.setattr(for_ai.pd, "read_parquet", fail)
+    monkeypatch.setattr(for_ai.pd, "read_csv", fail)
+    path = tmp_path / "brand=B" / "store=S" / "ym=2026-08" / "data.csv"
+    if source == "csv":
+        path.parent.mkdir(parents=True)
+        path.touch()
+    elif source == "scan":
+        monkeypatch.setattr(Path, "rglob", fail)
+    elif source == "index":
+        monkeypatch.setattr(Path, "read_text", fail)
+    calls = {
+        "keys": lambda: for_ai._target_keys_from_orders(brand=None, ym=None, store=None, lookback=None),
+        "orders": lambda: for_ai._load_unified_month(brand="B", ym="2026-08", store="S"),
+        "review": lambda: for_ai._load_review_month(ym="2026-08", store="S"),
+        "commission": lambda: for_ai._load_delivery_commission_month(brand="B", ym="2026-08", store="S"),
+        "visits": lambda: for_ai._load_flow_visit_month(ym="2026-08", store="S"),
+        "csv": lambda: for_ai._load_partitioned_csv(tmp_path, brand="B", ym="2026-08", store="S", filename="data.csv"),
+        "scan": lambda: for_ai._load_partitioned_csv(tmp_path, brand="B", ym="2026-08", store="S", filename="data.csv"),
+        "index": lambda: for_ai._read_index_items(tmp_path / "data.parquet"),
+    }
+    with pytest.raises(type(error)) as caught:
+        calls[source]()
+    assert caught.value is error
+
+
+@pytest.mark.parametrize("write", [False, True])
+def test_build_reuses_paths_releases_payloads_and_resets_cache(monkeypatch, tmp_path, write):
+    root = tmp_path / "csv"
+    for store in ["가 매장", "나 매장"]:
+        path = root / "brand=B" / "ym=2026-08" / f"store={store}" / "data.csv"
+        path.parent.mkdir(parents=True)
+        pd.DataFrame([{"value": store}]).to_csv(path, index=False, encoding="cp949")
+    scans = []
+    original_rglob = Path.rglob
+
+    def scan(path, pattern):
+        scans.append((path, pattern))
+        return original_rglob(path, pattern)
+
+    monkeypatch.setattr(Path, "rglob", scan)
+    monkeypatch.setattr(for_ai, "_load_daily_actuals", pd.DataFrame)
+    monkeypatch.setattr(for_ai, "_load_target", pd.DataFrame)
+    monkeypatch.setattr(for_ai, "_target_keys_from_orders", lambda **kwargs: [
+        {"brand": "B", "ym": "2026-08", "store": store} for store in ["가매장", "나매장"]
+    ])
+    references = []
+
+    class Payload(dict):
+        pass
+
+    def build(*, brand, ym, store, **kwargs):
+        assert all(ref() is None for ref in references)
+        rows = for_ai._load_partitioned_csv(root, brand=brand, ym=ym, store=store, filename="data.csv")
+        assert len(rows) == 1
+        assert rows.iloc[0]["value"].replace(" ", "") == store
+        payload = Payload(meta={"brand": brand, "ym": ym, "store": store}, month_summary={"actual_sales": 10})
+        references.append(weakref.ref(payload))
+        return {"analysis": payload, "orders": {}, "ads": {}, "visit_log": {}}
+
+    monkeypatch.setattr(for_ai, "build_store_month_payloads", build)
+    monkeypatch.setattr(for_ai, "_write_store_readme", lambda *args: None)
+    output = tmp_path / "output"
+    for _ in range(2):
+        assert "2개" in for_ai.build_for_ai_store_month_analysis(target_source="orders", write=write, output_root=output)
+        assert for_ai._CSV_PATH_CACHE.get() is None
+        assert all(ref() is None for ref in references)
+    assert scans == [(root, "data.csv")] * 2
+    if write:
+        index = json.loads((output / "index.json").read_text(encoding="utf-8"))
+        assert len(index["items"]) == 2
+    else:
+        assert not output.exists()
+
+    monkeypatch.setattr(for_ai, "build_store_month_payloads", lambda **kwargs: (_ for _ in ()).throw(MemoryError()))
+    with pytest.raises(MemoryError):
+        for_ai.build_for_ai_store_month_analysis(target_source="orders", write=write, output_root=output)
+    assert for_ai._CSV_PATH_CACHE.get() is None
+
+
+def test_index_upsert_preserves_unprocessed_stores(tmp_path):
+    old = {"brand": "B", "ym": "2026-08", "store": "old", "actual_sales": 30}
+    changed = {"brand": "B", "ym": "2026-08", "store": "new", "actual_sales": 10}
+    for_ai._write_indexes(tmp_path, [old, changed])
+    changed = dict(changed, actual_sales=20)
+    for_ai._write_indexes(tmp_path, [changed])
+    for path in [tmp_path / "index.json", tmp_path / "brand=B" / "ym=2026-08" / "index.json"]:
+        rows = json.loads(path.read_text(encoding="utf-8"))["items"]
+        assert rows == [changed, old]

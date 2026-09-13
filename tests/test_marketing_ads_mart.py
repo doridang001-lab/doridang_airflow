@@ -4,6 +4,9 @@ import pandas as pd
 import pytest
 
 from modules.transform.pipelines.sales.BSP_MarketingAds_Mart import (
+    _extract_flow_ad_ids,
+    _flow_std_title,
+    _flow_task_label,
     annotate_ads_daily_with_flow_tasks,
     build_ads_daily_mart,
     build_campaign_table,
@@ -898,9 +901,12 @@ def test_flow_ad_performance_mart_compares_current_and_previous_period(tmp_path,
         )
     )
     compare = pd.read_csv(output_path, encoding="utf-8-sig").fillna("")
-    by_id = compare.set_index("id")
 
+    # 업무당 ID별 상세행(id)만 나온다 — 합산행(task)은 이중집계 때문에 만들지 않는다
     assert result["rows"] == 2
+    assert set(compare["row_scope"]) == {"id"}
+    by_id = compare[compare["row_scope"] == "id"].set_index("id")
+
     assert by_id.loc[naver_ad_id, "channel"] == "네이버"
     assert by_id.loc[naver_ad_id, "std_name"] == "플레이스 문구"
     assert by_id.loc[naver_ad_id, "start_date"] == "2026-08-17"
@@ -910,12 +916,17 @@ def test_flow_ad_performance_mart_compares_current_and_previous_period(tmp_path,
     assert by_id.loc[naver_ad_id, "ctr"] == 10.0
     assert by_id.loc[naver_ad_id, "cpc"] == 100.0
     assert by_id.loc[naver_ad_id, "pct_cost"] == 100.0
+    assert by_id.loc[naver_ad_id, "ad_ids"] == naver_ad_id
+    assert by_id.loc[naver_ad_id, "ad_id_count"] == 1
 
     assert by_id.loc["dg_a", "channel"] == "당근"
     assert by_id.loc["dg_a", "parent_title"] == "당근광고"
     assert by_id.loc["dg_a", "impressions"] == 100
     assert by_id.loc["dg_a", "prev_impressions"] == 497
     assert by_id.loc["dg_a", "std_title"] == "광고 위치 교체 Test"
+
+    # 업무 1건당 행 1개 — 같은 id가 두 번 나오지 않는다
+    assert compare.duplicated(subset=["flow_post_id", "id"]).sum() == 0
 
 
 def test_flow_ad_performance_mart_allows_channel_typos_from_parent(tmp_path, sources):
@@ -963,9 +974,10 @@ def test_flow_ad_performance_mart_allows_channel_typos_from_parent(tmp_path, sou
     assert row["channel_warning"] == "제목 채널=네이버, 부모 채널=당근"
 
 
-def test_flow_ad_performance_mart_fails_on_unknown_id_or_missing_dates(tmp_path, sources):
+def test_flow_ad_performance_mart_skips_unknown_id_or_missing_dates(tmp_path, sources):
     daily_path = tmp_path / "mart" / "marketing_ads_daily.csv"
     campaign_path = tmp_path / "mart" / "marketing_ads_campaign.csv"
+    output_path = tmp_path / "out.csv"
     flow_post_dir = tmp_path / "flow_post"
 
     build_ads_daily_mart({"campaigns": []}, naver_dir=sources["naver_dir"], daangn_csv=sources["daangn_csv"], output_path=daily_path)
@@ -1004,13 +1016,372 @@ def test_flow_ad_performance_mart_fails_on_unknown_id_or_missing_dates(tmp_path,
         ],
     )
 
-    with pytest.raises(RuntimeError, match="Flow 광고 하위업무 필수값 오류"):
+    result = json.loads(
         build_flow_ad_performance_mart(
             flow_post_dir=flow_post_dir,
             campaign_path=campaign_path,
             daily_path=daily_path,
-            output_path=tmp_path / "out.csv",
+            output_path=output_path,
         )
+    )
+    compare = pd.read_csv(output_path, encoding="utf-8-sig").fillna("")
+
+    assert result["rows"] == 0
+    assert list(compare.columns) == [
+        "project_id",
+        "project_name",
+        "parent_post_id",
+        "parent_title",
+        "flow_post_id",
+        "flow_url",
+        "row_scope",
+        "channel",
+        "id",
+        "ad_ids",
+        "ad_id_count",
+        "std_name",
+        "std_title",
+        "task_title",
+        "channel_warning",
+        "start_date",
+        "end_date",
+        "prev_start_date",
+        "prev_end_date",
+        "impressions",
+        "clicks",
+        "ctr",
+        "cpc",
+        "cost",
+        "prev_impressions",
+        "prev_clicks",
+        "prev_ctr",
+        "prev_cpc",
+        "prev_cost",
+        "diff_impressions",
+        "diff_clicks",
+        "diff_cost",
+        "pct_impressions",
+        "pct_clicks",
+        "pct_cost",
+        "matched_daily_rows",
+        "collected_at",
+    ]
+    assert compare.empty
+
+
+def test_flow_ad_performance_mart_skips_channel_without_source_rows(tmp_path, sources):
+    daily_path = tmp_path / "mart" / "marketing_ads_daily.csv"
+    campaign_path = tmp_path / "mart" / "marketing_ads_campaign.csv"
+    output_path = tmp_path / "mart" / "marketing_ads_flow_compare.csv"
+    flow_post_dir = tmp_path / "flow_post"
+    missing_daangn_csv = tmp_path / "analytics" / "Daangn_ads" / "missing.csv"
+
+    build_ads_daily_mart(
+        {"campaigns": []},
+        naver_dir=sources["naver_dir"],
+        daangn_csv=missing_daangn_csv,
+        output_path=daily_path,
+    )
+    build_campaign_table({"campaigns": []}, daily_path=daily_path, output_path=campaign_path)
+    _write_flow_posts(
+        flow_post_dir,
+        [
+            _flow_post(
+                "84107459",
+                "네이버광고",
+                project_id="2960298",
+                project_name="DB 광고 프로젝트 성과",
+                post_url="https://flow.team/l/QqxSN",
+                child_cnt=1,
+            ),
+            _flow_post(
+                "84107449",
+                "당근광고",
+                project_id="2960298",
+                project_name="DB 광고 프로젝트 성과",
+                post_url="https://flow.team/l/QqxSI",
+                child_cnt=1,
+            ),
+            _flow_post(
+                "naver-child",
+                "[네이버광고] [grp-1] 문구 교체 Test",
+                "20260807",
+                "20260807",
+                project_id="2960298",
+                project_name="DB 광고 프로젝트 성과",
+                parent_post_id="84107459",
+                depth=1,
+            ),
+            _flow_post(
+                "daangn-child",
+                "[당근광고] [dg_missing] 광고 위치 교체 Test",
+                "20260807",
+                "20260807",
+                project_id="2960298",
+                project_name="DB 광고 프로젝트 성과",
+                parent_post_id="84107449",
+                depth=1,
+            ),
+        ],
+    )
+
+    result = json.loads(
+        build_flow_ad_performance_mart(
+            flow_post_dir=flow_post_dir,
+            campaign_path=campaign_path,
+            daily_path=daily_path,
+            output_path=output_path,
+        )
+    )
+    compare = pd.read_csv(output_path, encoding="utf-8-sig").fillna("")
+
+    # ID 1개짜리 업무는 id 행 1개만 나온다
+    assert result["rows"] == 1
+    assert set(compare["channel"]) == {"네이버"}
+    assert "dg_missing" not in set(compare["id"])
+
+
+# ------------------------------------------------------------------
+# 다중 광고 ID 지원: 제목 파싱 (& / 대괄호 반복 / 쉼표, 위치 무관)
+# ------------------------------------------------------------------
+def test_extract_flow_ad_ids_accepts_new_and_legacy_formats():
+    valid_ids = {"dg_a", "dg_b", "grp-1", DAANGN_GROUP}
+
+    # 신규 표준: 업무명 먼저, ID 그룹은 뒤에 &로 구분
+    ad_ids, _, unknown = _extract_flow_ad_ids("[당근_광고] 결과 테스트 [dg_a&dg_b]", valid_ids)
+    assert ad_ids == ["dg_a", "dg_b"]
+    assert unknown == []
+
+    # 기존 표기: 대괄호를 반복
+    ad_ids, _, unknown = _extract_flow_ad_ids("[당근광고] [dg_a] [dg_b] 반복 대괄호", valid_ids)
+    assert ad_ids == ["dg_a", "dg_b"]
+
+    # 쉼표 구분
+    ad_ids, _, unknown = _extract_flow_ad_ids("[당근광고] [dg_a, dg_b] 쉼표구분", valid_ids)
+    assert ad_ids == ["dg_a", "dg_b"]
+
+    # 기존 단일 ID 표기는 그대로 동작한다 (회귀 방지)
+    ad_ids, _, unknown = _extract_flow_ad_ids("[당근광고] [dg_a] 문구교체 Test", valid_ids)
+    assert ad_ids == ["dg_a"]
+
+    # 공백을 포함한 ID(당근 광고그룹명)는 공백으로 쪼개지지 않는다 (회귀 방지의 핵심)
+    ad_ids, _, unknown = _extract_flow_ad_ids(f"[당근광고] [{DAANGN_GROUP}] 그룹명 통째로", valid_ids)
+    assert ad_ids == [DAANGN_GROUP]
+
+    # 미매칭 토큰은 조용히 사라지지 않고 unknown_tokens로 보고되며, 나머지 유효 ID는 살아남는다
+    ad_ids, _, unknown = _extract_flow_ad_ids("[당근광고] [dg_a&모르는id] 일부 미매칭", valid_ids)
+    assert ad_ids == ["dg_a"]
+    assert unknown == ["모르는id"]
+
+    # 순서 유지 + 중복 제거
+    ad_ids, _, unknown = _extract_flow_ad_ids("[당근광고] [dg_b&dg_a&dg_a] 순서유지", valid_ids)
+    assert ad_ids == ["dg_b", "dg_a"]
+
+
+def test_flow_std_title_strips_id_group_regardless_of_position():
+    assert _flow_std_title("[당근_광고] 결과 테스트 [dg_a&dg_b]", ["dg_a", "dg_b"]) == "결과 테스트"
+    assert _flow_std_title("[당근광고] [dg_a] 문구교체 Test", ["dg_a"]) == "문구교체 Test"
+    assert _flow_std_title("[당근광고] [dg_a] [dg_b] 반복 대괄호", ["dg_a", "dg_b"]) == "반복 대괄호"
+    # 미매칭 토큰이 섞인 그룹은 정보 손실 방지를 위해 지우지 않고 그대로 남긴다
+    assert _flow_std_title("[당근광고] 미확인 섞임 [dg_a&모르는id]", ["dg_a"]) == "미확인 섞임 [dg_a&모르는id]"
+
+
+def test_flow_task_label_joins_multiple_ids():
+    assert _flow_task_label("2026-08-17", "2026-08-19", ["nad-x", "dg_y"], "문구 교체test") == (
+        "17-19 [nad-x&dg_y] 문구 교체test"
+    )
+    assert _flow_task_label("2026-08-17", "2026-08-19", "nad-x", "문구 교체test") == "17-19 [nad-x] 문구 교체test"
+
+
+# ------------------------------------------------------------------
+# 다중 광고 ID 지원: 성과 비교 mart (row_scope=task/id)
+# ------------------------------------------------------------------
+def test_flow_ad_performance_mart_emits_id_rows_only_for_multi_id_task(tmp_path, sources):
+    daily_path = tmp_path / "mart" / "marketing_ads_daily.csv"
+    campaign_path = tmp_path / "mart" / "marketing_ads_campaign.csv"
+    output_path = tmp_path / "mart" / "marketing_ads_flow_compare.csv"
+    flow_post_dir = tmp_path / "flow_post"
+
+    build_ads_daily_mart({"campaigns": []}, naver_dir=sources["naver_dir"], daangn_csv=sources["daangn_csv"], output_path=daily_path)
+    build_campaign_table({"campaigns": []}, daily_path=daily_path, output_path=campaign_path)
+    _write_flow_posts(
+        flow_post_dir,
+        [
+            _flow_post(
+                "84107449",
+                "당근광고",
+                project_id="2960298",
+                project_name="DB 광고 프로젝트 성과",
+                post_url="https://flow.team/l/QqxSI",
+                child_cnt=1,
+            ),
+            _flow_post(
+                "multi-id",
+                "[당근_광고] 결과 테스트 [dg_a&dg_b]",
+                "20260806",
+                "20260807",
+                project_id="2960298",
+                project_name="DB 광고 프로젝트 성과",
+                parent_post_id="84107449",
+                depth=1,
+                post_url="https://flow.team/l/multi-id",
+            ),
+        ],
+    )
+
+    result = json.loads(
+        build_flow_ad_performance_mart(
+            flow_post_dir=flow_post_dir,
+            campaign_path=campaign_path,
+            daily_path=daily_path,
+            output_path=output_path,
+        )
+    )
+    compare = pd.read_csv(output_path, encoding="utf-8-sig").fillna("")
+
+    assert result["rows"] == 2  # id(dg_a, dg_b) 2행만 — 합산행(task)은 만들지 않는다
+    assert result["ids"] == 2
+    assert set(compare["row_scope"]) == {"id"}
+
+    id_rows = compare[compare["row_scope"] == "id"].set_index("id")
+
+    # 묶음 식별 정보는 합산행 없이도 id 행에 그대로 실려 있다
+    assert set(id_rows["ad_ids"]) == {"dg_a&dg_b"}
+    assert set(id_rows["ad_id_count"]) == {2}
+    assert set(id_rows["std_title"]) == {"결과 테스트"}
+
+    # dg_a: 08-06(825) + 08-07(150), dg_b: 08-06(339)만 (sources 픽스처 기준)
+    assert id_rows.loc["dg_a", "cost"] == 975
+    assert id_rows.loc["dg_b", "cost"] == 339
+    # 업무 합산은 flow_post_id 기준 SUM으로 재현된다 — 이중집계 없음
+    by_task = compare.groupby("flow_post_id")[["impressions", "clicks", "cost"]].sum()
+    assert len(by_task) == 1
+    assert by_task.iloc[0]["cost"] == 975 + 339
+
+
+def test_flow_ad_performance_mart_allows_cross_channel_ids_with_warning(tmp_path, sources):
+    daily_path = tmp_path / "mart" / "marketing_ads_daily.csv"
+    campaign_path = tmp_path / "mart" / "marketing_ads_campaign.csv"
+    output_path = tmp_path / "mart" / "marketing_ads_flow_compare.csv"
+    flow_post_dir = tmp_path / "flow_post"
+
+    build_ads_daily_mart({"campaigns": []}, naver_dir=sources["naver_dir"], daangn_csv=sources["daangn_csv"], output_path=daily_path)
+    build_campaign_table({"campaigns": []}, daily_path=daily_path, output_path=campaign_path)
+    _write_flow_posts(
+        flow_post_dir,
+        [
+            _flow_post(
+                "84107459",
+                "네이버광고",
+                project_id="2960298",
+                project_name="DB 광고 프로젝트 성과",
+                post_url="https://flow.team/l/QqxSN",
+                child_cnt=1,
+            ),
+            _flow_post(
+                "cross-channel",
+                "[네이버광고] 교차채널 [grp-1&dg_a]",
+                "20260806",
+                "20260806",
+                project_id="2960298",
+                project_name="DB 광고 프로젝트 성과",
+                parent_post_id="84107459",
+                depth=1,
+            ),
+        ],
+    )
+
+    result = json.loads(
+        build_flow_ad_performance_mart(
+            flow_post_dir=flow_post_dir,
+            campaign_path=campaign_path,
+            daily_path=daily_path,
+            output_path=output_path,
+        )
+    )
+    compare = pd.read_csv(output_path, encoding="utf-8-sig").fillna("")
+
+    # 채널이 섞인 ID 묶음도 skip되지 않고 살아남는다 - 경고만 남긴다
+    assert result["rows"] == 2
+    id_rows = compare[compare["row_scope"] == "id"].set_index("id")
+    assert id_rows.loc["grp-1", "channel"] == "네이버"
+    assert id_rows.loc["dg_a", "channel"] == "당근"
+
+    # channel_warning은 업무 단위 값이라 합산행 없이도 모든 id 행에 실린다
+    assert "dg_a=당근" in id_rows.loc["grp-1", "channel_warning"]
+    assert "dg_a=당근" in id_rows.loc["dg_a", "channel_warning"]
+
+
+# ------------------------------------------------------------------
+# 다중 광고 ID 지원: 일별 Flow 업무 태그 (long mart / daily.csv 라벨)
+# ------------------------------------------------------------------
+def test_annotate_ads_daily_with_flow_tasks_expands_and_labels_multi_id_task(tmp_path, sources):
+    daily_path = tmp_path / "mart" / "marketing_ads_daily.csv"
+    campaign_path = tmp_path / "mart" / "marketing_ads_campaign.csv"
+    compare_path = tmp_path / "mart" / "marketing_ads_flow_compare.csv"
+    daily_flow_tasks_path = tmp_path / "mart" / "marketing_ads_daily_flow_tasks.csv"
+    flow_post_dir = tmp_path / "flow_post"
+
+    build_ads_daily_mart({"campaigns": []}, naver_dir=sources["naver_dir"], daangn_csv=sources["daangn_csv"], output_path=daily_path)
+    build_campaign_table({"campaigns": []}, daily_path=daily_path, output_path=campaign_path)
+    _write_flow_posts(
+        flow_post_dir,
+        [
+            _flow_post(
+                "84107449",
+                "당근광고",
+                project_id="2960298",
+                project_name="DB 광고 프로젝트 성과",
+                post_url="https://flow.team/l/QqxSI",
+                child_cnt=1,
+            ),
+            _flow_post(
+                "multi-id",
+                "[당근_광고] 결과 테스트 [dg_a&dg_b]",
+                "20260806",
+                "20260807",
+                project_id="2960298",
+                project_name="DB 광고 프로젝트 성과",
+                parent_post_id="84107449",
+                depth=1,
+                post_url="https://flow.team/l/multi-id",
+            ),
+        ],
+    )
+    build_flow_ad_performance_mart(
+        flow_post_dir=flow_post_dir,
+        campaign_path=campaign_path,
+        daily_path=daily_path,
+        output_path=compare_path,
+    )
+
+    annotate_ads_daily_with_flow_tasks(
+        daily_path=daily_path,
+        flow_compare_path=compare_path,
+        campaign_path=campaign_path,
+        daily_flow_tasks_path=daily_flow_tasks_path,
+    )
+    daily = pd.read_csv(daily_path, encoding="utf-8-sig").fillna("")
+    tasks = pd.read_csv(daily_flow_tasks_path, encoding="utf-8-sig").fillna("")
+
+    # ID 2개 x 기간 2일 = 4행 (task 합산행은 fan-out 대상이 아니다)
+    assert len(tasks) == 4
+    assert set(tasks["id"]) == {"dg_a", "dg_b"}
+    assert set(tasks["ad_ids"]) == {"dg_a&dg_b"}
+    assert set(tasks["ad_id_count"].astype(str)) == {"2"}
+    assert set(tasks["flow_task_label"]) == {"06-07 [dg_a&dg_b] 결과 테스트"}
+
+    # daily.csv에서도 dg_a 행과 dg_b 행이 같은 라벨을 공유한다 -> 필터 하나로 두 소재가 같이 잡힌다
+    day6_dg_a = daily[(daily["channel"] == "당근") & (daily["stat_date"] == "2026-08-06") & (daily["ad_id"] == "dg_a")].iloc[0]
+    day6_dg_b = daily[(daily["channel"] == "당근") & (daily["stat_date"] == "2026-08-06") & (daily["ad_id"] == "dg_b")].iloc[0]
+    assert day6_dg_a["flow_task_label"] == "06-07 [dg_a&dg_b] 결과 테스트"
+    assert day6_dg_b["flow_task_label"] == day6_dg_a["flow_task_label"]
+
+    # dg_b는 08-07 실적이 없으므로 flow_schedule_only 0원 placeholder 행이 생긴다
+    day7_dg_b = daily[(daily["channel"] == "당근") & (daily["stat_date"] == "2026-08-07") & (daily["ad_id"] == "dg_b")].iloc[0]
+    assert day7_dg_b["status_class"] == "flow_schedule_only"
+    assert day7_dg_b["flow_task_label"] == "06-07 [dg_a&dg_b] 결과 테스트"
+    assert day7_dg_b["cost"] == 0
 
 
 def test_annotate_ads_daily_with_flow_tasks_adds_labels_and_long_mart(tmp_path, sources):

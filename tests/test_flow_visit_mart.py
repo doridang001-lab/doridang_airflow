@@ -97,7 +97,7 @@ def test_flow_visit_target_project_ids_accepts_conf_targets():
     assert flow_visit._target_project_ids(df, context=context) == {"2548064"}
 
 
-def test_flow_visit_target_project_ids_accepts_dag_top_targets():
+def test_flow_visit_target_project_ids_conf_overrides_dag_defaults():
     df = pd.DataFrame([
         {"project_id": "1", "store_name": "용인동천점", "project_name": "경기_용인동천점"},
     ])
@@ -114,7 +114,7 @@ def test_flow_visit_target_project_ids_accepts_dag_top_targets():
         }),
     }
 
-    assert flow_visit._target_project_ids(df, context=context) == {"2466857", "2742104", "2548064"}
+    assert flow_visit._target_project_ids(df, context=context) == {"9999999"}
 
 
 def test_flow_visit_target_project_ids_matches_conf_store_name():
@@ -1887,6 +1887,51 @@ def _one_issue_payload(**issue_overrides):
             }
         ]
     }
+
+
+def test_parse_topic_table_separates_transfer_opinion_and_answer():
+    content = (
+        "방문일자25.12.18 (목) 방문목적브랜드 정책 안내 및 정기 방문\n"
+        "주제1토더 공지 확인 방법 현장 교육\n"
+        "전달내용토더 스마트 공지 재안내"
+        "가맹점의견솔직히 못할거 같지만 해보시겠다고 내용 전달 주셨음."
+        "답변사항평상시보다 더욱 신경써 확인 요청\n"
+    )
+
+    purpose, rows = flow_visit._parse_topic_table(content)
+
+    assert purpose == "브랜드 정책 안내 및 정기 방문"
+    assert rows and len(rows) == 1
+    assert rows[0]["topic"] == "토더 공지 확인 방법 현장 교육"
+    assert rows[0]["message"] == "토더 스마트 공지 재안내"
+    assert rows[0]["owner_opinion"] == "솔직히 못할거 같지만 해보시겠다고 내용 전달 주셨음."
+    assert rows[0]["answer_note"] == "평상시보다 더욱 신경써 확인 요청"
+
+
+def test_build_prompt_states_visit_journal_role_boundaries():
+    post = {
+        "store_name": "대화점",
+        "visit_date": "2026-08-12",
+        "visit_purpose": "정기 방문",
+        "author_name": "홍길동",
+        "content_clean": "본문",
+        "topic_table": [
+            {
+                "topic_no": "1",
+                "topic": "토더 공지 확인 방법 현장 교육",
+                "message": "토더 스마트 공지 재안내",
+                "owner_opinion": "솔직히 못할거 같지만 해보시겠다고 내용 전달 주셨음.",
+                "answer_note": "평상시보다 더욱 신경써 확인 요청",
+            }
+        ],
+    }
+
+    prompt = flow_visit._build_prompt(post, [])
+
+    assert "전달내용은 본사 전달·공지·요청" in prompt
+    assert "가맹점의견은 점주 의견·반응" in prompt
+    assert "답변사항은 본사 후속 회신" in prompt
+    assert "답변사항: 평상시보다 더욱 신경써 확인 요청" in prompt
 
 
 def test_flow_visit_summary_llm_writes_short_summary_and_caches(monkeypatch, tmp_path):

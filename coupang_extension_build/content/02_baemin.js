@@ -551,18 +551,23 @@ Sites['baemin'] = {
 
       this._manualOrdersLog(`적용 완료: ${filterResult.shopInfo?.store_name || label}`, 'ok');
       this._manualOrdersLog(`수집 시작: ${label}`);
-      const result = await window.BaeminPipelineSave.collectAndSaveOrders('', '', opt.value, opt.text);
-      if (result?.success) {
+      let result = null;
+      try {
+        result = await window.BaeminPipelineSave.collectAndSaveOrders('', '', opt.value, opt.text);
+      } catch (e) {
+        result = { success: false, error: e?.message || String(e) };
+      }
+      if (result?.partial) {
+        failCount++;
+        if (result.filename) files.push(result.filename);
+        this._manualOrdersLog(`부분 수집 저장 — 적재 금지: ${result.filename || label} / ${result.error || '부분 수집'}`, 'err');
+      } else if (result?.success) {
         okCount++;
         files.push(result.filename || '');
-        if (result.partial) {
-          this._manualOrdersLog(`부분 수집 저장 — 적재 금지: ${result.filename || label}`, 'err');
-        } else {
-          this._manualOrdersLog(`저장 완료: ${result.filename || label}`, 'ok');
-        }
+        this._manualOrdersLog(`저장 완료: ${result.filename || label}`, 'ok');
       } else {
         failCount++;
-        this._manualOrdersLog(`수집 실패: ${label} / ${result?.error || '알 수 없는 실패'}`, 'err');
+        this._manualOrdersLog(`수집/저장 실패: ${label} / ${result?.error || '알 수 없는 실패'}`, 'err');
       }
       await new Promise(resolve => setTimeout(resolve, 900));
     }
@@ -838,6 +843,24 @@ Sites['baemin'] = {
     return this._clickPage(currentPage + 1);
   },
 
+  async _reloadOrdersPageForRetry(currentPage, reason = '') {
+    if (reason) this._ordersLog(`${currentPage}페이지 재시작 사유: ${reason}`, 'warn');
+    const firstBefore = this._getFirstOrderId();
+    const awayPage = currentPage > 1 ? currentPage - 1 : currentPage + 1;
+
+    if (!this._clickPage(awayPage)) return false;
+    const awayLoaded = await this._waitForPageLoad(firstBefore, 10000);
+    if (!awayLoaded || this._stopFlag) return false;
+    await this._randomDelay(500, 800);
+
+    const firstAway = this._getFirstOrderId();
+    if (!this._clickPage(currentPage)) return false;
+    const backLoaded = await this._waitForPageLoad(firstAway, 10000);
+    if (!backLoaded || this._stopFlag) return false;
+    await this._randomDelay(500, 800);
+    return this._getCurrentPage() === currentPage && this._orderRows().length > 0;
+  },
+
   _orderRows() {
     return [...document.querySelectorAll('tr.Table_b_r4ax_1dwbr4on[data-index]')];
   },
@@ -920,17 +943,23 @@ Sites['baemin'] = {
     return true;
   },
 
+  // 즉시할인 상세는 PageSheet(바텀시트)로도, tooltip/popover 로도 뜬다.
+  // 둘 중 하나만 찾으면 나머지 형태에서 '시트없음'으로 실패한다.
+  _DISCOUNT_SHEET_SELECTOR:
+    '.InstantDiscountDetailPageSheet-module__IbXh,' +
+    '[role="dialog"],' +
+    '[data-atelier-component="PageSheet"],' +
+    '[class*="InstantDiscountDetailPageSheet-module__"],' +
+    '[role="tooltip"],' +
+    '[data-atelier-component="Tooltip"],' +
+    '[class*="Tooltip_"]',
+
   // 시트는 행마다 포털로 별도 mount 된다. 하나만 고르면 가장 오래된(이전 주문) 시트를 계속 읽게 된다.
   _findAllDiscountSheets() {
-    const candidates = [...document.querySelectorAll(
-      '.InstantDiscountDetailPageSheet-module__IbXh,' +
-      '[role="dialog"],' +
-      '[data-atelier-component="PageSheet"],' +
-      '[class*="InstantDiscountDetailPageSheet-module__"]'
-    )].filter((el) => {
+    const candidates = [...document.querySelectorAll(this._DISCOUNT_SHEET_SELECTOR)].filter((el) => {
       if (!this._isSheetVisible(el)) return false;
       const t = el.textContent || '';
-      return /즉시할인/.test(t)
+      return (/즉시할인/.test(t) || /총\s*할인금액/.test(t))
         && /(파트너\s*부담|가게\s*부담|점주\s*부담|배민\s*지원)/.test(t);
     });
     // 중첩된 후보는 바깥 것만 남긴다
@@ -946,15 +975,30 @@ Sites['baemin'] = {
   _resetDiscountStats() {
     this._discountSplitCount = 0;
     this._discountBlankCount = 0;
-    this._discountBlank = { 시트없음: 0, 내용미갱신: 0, 파싱실패: 0, 합계불일치: 0 };
+    this._discountMismatchCount = 0;
+    this._discountMismatchDetails = [];
+    this._discountBlankDetails = [];
+    this._discountBlank = { 시트없음: 0, 내용미갱신: 0, 파싱실패: 0 };
     this._lastAmountEl = null;
+    this._rowDumped = false;
   },
 
-  _countDiscountBlank(reason) {
+  _countDiscountBlank(reason, detail = '') {
     if (!this._discountBlank) this._resetDiscountStats();
     if (this._discountBlank[reason] === undefined) this._discountBlank[reason] = 0;
     this._discountBlank[reason]++;
     this._discountBlankCount++;
+    if (detail && this._discountBlankDetails.length < 10) {
+      this._discountBlankDetails.push(detail);
+    }
+  },
+
+  _countDiscountMismatch(detail) {
+    if (!this._discountBlank) this._resetDiscountStats();
+    this._discountMismatchCount++;
+    if (detail && this._discountMismatchDetails.length < 5) {
+      this._discountMismatchDetails.push(detail);
+    }
   },
 
   _sheetSignature(sheet) {
@@ -988,6 +1032,173 @@ Sites['baemin'] = {
     return { sheet: null, reason: sawSheet ? '내용미갱신' : '시트없음' };
   },
 
+  _findAllDiscountSheetShells() {
+    return [...document.querySelectorAll(this._DISCOUNT_SHEET_SELECTOR)].filter((el) => {
+      if (!this._isSheetVisible(el)) return false;
+      const t = el.textContent || '';
+      return /즉시할인\s*적용\s*내역/.test(t) || /총\s*할인금액/.test(t);
+    }).filter((el, _, arr) => !arr.some((o) => o !== el && o.contains(el)));
+  },
+
+  _discountSheetMatchesTotal(sheet, total) {
+    if (!sheet || total === '') return false;
+    const text = (sheet.textContent || '').replace(/\s+/g, '');
+    const totalMatch = text.match(/총할인금액([\d,]+)원/);
+    if (totalMatch && Utils.cleanPrice(totalMatch[1]) === String(total)) return true;
+    const instantMatch = text.match(/즉시할인([\d,]+)원/);
+    return !!instantMatch && Utils.cleanPrice(instantMatch[1]) === String(total);
+  },
+
+  async _waitDiscountSheetForOrder(before, prevSig, timeoutMs, total) {
+    const deadline = Date.now() + timeoutMs;
+    let sawSheet = false;
+    while (Date.now() < deadline) {
+      const all = this._findAllDiscountSheets();
+      const shells = this._findAllDiscountSheetShells();
+      if (all.length || shells.length) sawSheet = true;
+
+      const candidates = all.length ? all : shells;
+      const fresh = candidates.find((el) => !before.has(el));
+      if (fresh && (all.includes(fresh) || this._discountSheetMatchesTotal(fresh, total))) {
+        return { sheet: fresh, reason: '신규' };
+      }
+
+      if (prevSig?.el) {
+        const updated = candidates.find((el) =>
+          el === prevSig.el && this._sheetSignature(el).text !== prevSig.text
+        );
+        if (updated && (all.includes(updated) || this._discountSheetMatchesTotal(updated, total))) {
+          return { sheet: updated, reason: '갱신' };
+        }
+      } else if (candidates.length) {
+        const matched = candidates.find((el) => this._discountSheetMatchesTotal(el, total));
+        if (matched) return { sheet: matched, reason: '총액일치' };
+        if (all.length) return { sheet: all[all.length - 1], reason: '신규' };
+      }
+
+      const matched = all.find((el) => this._discountSheetMatchesTotal(el, total));
+      if (matched && !before.has(matched)) return { sheet: matched, reason: '총액일치' };
+
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return { sheet: null, reason: sawSheet ? '내용미갱신' : '시트없음' };
+  },
+
+  _findInstantDiscountClickTargets(amountEl) {
+    const targets = [];
+    const add = (el) => {
+      if (!el || targets.includes(el) || !el.isConnected) return;
+      if (!el.getClientRects?.().length) return;
+      const st = getComputedStyle(el);
+      if (st.visibility === 'hidden' || st.display === 'none' || parseFloat(st.opacity || '1') < 0.05) return;
+      targets.push(el);
+    };
+    const isLikelyTrigger = (el) => {
+      if (!el || el === document.body || el === document.documentElement) return false;
+      const role = el.getAttribute?.('role') || '';
+      const cls = String(el.className || '');
+      const atelier = el.getAttribute?.('data-atelier-component') || '';
+      const cursor = getComputedStyle(el).cursor;
+      return cursor === 'pointer'
+        || role === 'button'
+        || el.tagName === 'BUTTON'
+        || el.hasAttribute?.('tabindex')
+        || /Tooltip|InstantDiscount|Discount|Clickable|Button/i.test(cls)
+        || /Button|Tooltip|TextListItem/i.test(atelier);
+    };
+
+    add(amountEl);
+    add(amountEl?.closest('.Tooltip_c_qx9u_5wgk4r8'));
+    add(amountEl?.closest('.InstantDiscountDetailPageSheet-module__pcbZ'));
+    add(amountEl?.closest('.InstantDiscountDetailPageSheet-module__u8LB'));
+    add(amountEl?.closest('[data-atelier-component="TextListItem"], li'));
+    add(amountEl?.closest('[data-atelier-component], [role="button"], button, [tabindex]'));
+    add(amountEl?.closest('[style*="cursor"], [class*="Tooltip"], [class*="InstantDiscount"], [class*="Discount"]'));
+    add(amountEl?.closest('[tabindex]'));
+    add(amountEl?.closest('[role="button"], button'));
+
+    let parent = amountEl?.parentElement;
+    for (let depth = 0; depth < 6 && parent; depth++) {
+      if (isLikelyTrigger(parent)) add(parent);
+      if (depth < 3) add(parent);
+      parent = parent.parentElement;
+    }
+
+    const detail = amountEl?.closest('.DetailInfo-module__pZYe') || amountEl?.closest('td[colspan]');
+    const label = detail
+      ? [...detail.querySelectorAll('[data-atelier-component="Typography"], span, div')]
+        .find((el) => (el.textContent || '').trim() === '즉시할인')
+      : null;
+    let labelParent = label?.parentElement;
+    for (let depth = 0; depth < 4 && labelParent; depth++) {
+      if (isLikelyTrigger(labelParent) || labelParent.contains(amountEl)) add(labelParent);
+      labelParent = labelParent.parentElement;
+    }
+
+    return targets;
+  },
+
+  _describeInstantDiscountTarget(el) {
+    if (!el) return '-';
+    const cls = String(el.className || '').trim().split(/\s+/).filter(Boolean).slice(0, 3).join('.');
+    const parts = [el.tagName?.toLowerCase?.() || 'el'];
+    if (cls) parts.push(`.${cls}`);
+    const role = el.getAttribute?.('role');
+    const tabindex = el.getAttribute?.('tabindex');
+    const atelier = el.getAttribute?.('data-atelier-component');
+    if (role) parts.push(`[role=${role}]`);
+    if (tabindex !== null && tabindex !== undefined) parts.push(`[tabindex=${tabindex}]`);
+    if (atelier) parts.push(`[atelier=${atelier}]`);
+    const text = (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+    if (text) parts.push(`"${text}"`);
+    return parts.join('');
+  },
+
+  // hover 진입. _dispatchHoverExit 의 반대편이다.
+  // hover 로만 열리는 popover 가 있는데 여태 진입 이벤트를 한 번도 쏘지 않았다.
+  _dispatchHoverEnter(el, clientX, clientY) {
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const x = Number.isFinite(clientX) ? clientX : Math.round(r.left + r.width / 2);
+    const y = Number.isFinite(clientY) ? clientY : Math.round(r.top + r.height / 2);
+    const bubbling = { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y };
+    const direct = { ...bubbling, bubbles: false };
+    try { el.dispatchEvent(new PointerEvent('pointerover', { ...bubbling, pointerId: 1, isPrimary: true })); } catch (_) {}
+    try { el.dispatchEvent(new PointerEvent('pointerenter', { ...direct, pointerId: 1, isPrimary: true })); } catch (_) {}
+    el.dispatchEvent(new MouseEvent('mouseover', bubbling));
+    el.dispatchEvent(new MouseEvent('mouseenter', direct));
+    el.dispatchEvent(new MouseEvent('mousemove', bubbling));
+  },
+
+  _activateInstantDiscountTarget(target, mode) {
+    if (!target) return;
+    const r = target.getBoundingClientRect();
+    const x = Math.round(r.left + Math.max(2, Math.min(r.width - 2, r.width / 2)));
+    const y = Math.round(r.top + Math.max(2, Math.min(r.height - 2, r.height / 2)));
+
+    // 실제 사용자는 클릭 전에 반드시 포인터를 올린다. 어떤 모드든 hover 를 먼저 만든다.
+    this._dispatchHoverEnter(target, x, y);
+    // hover 전용 모드는 여기서 끝. (클릭이 오히려 popover 를 닫는 UI 대비)
+    if (mode === 'hover') return;
+
+    try { target.focus?.(); } catch (_) {}
+    if (mode === 'native') {
+      try { target.click?.(); } catch (_) {}
+      return;
+    }
+
+    this._dispatchPointerSequence(target, x, y);
+
+    if (mode === 'keyboard') {
+      for (const key of ['Enter', ' ']) {
+        try {
+          target.dispatchEvent(new KeyboardEvent('keydown', { key, code: key === ' ' ? 'Space' : key, bubbles: true, cancelable: true }));
+          target.dispatchEvent(new KeyboardEvent('keyup', { key, code: key === ' ' ? 'Space' : key, bubbles: true, cancelable: true }));
+        } catch (_) {}
+      }
+    }
+  },
+
   _isSheetGone(sheet) {
     return !sheet || !sheet.isConnected || !this._isSheetVisible(sheet);
   },
@@ -1006,9 +1217,43 @@ Sites['baemin'] = {
   _maxSheetCloseAttempt: -1,
   _discountSplitCount: 0,
   _discountBlankCount: 0,
+  _discountMismatchCount: 0,
+  _discountMismatchDetails: null,
   _discountBlank: null,
   _lastAmountEl: null,
+  _instantDiscountSplitByTotal: null,
   _sheetCloseHopeless: false,
+  _rowDumped: false,
+
+  // 재시작을 다 쓰고도 남은 즉시할인 공란 허용치.
+  // 공란 주문은 DB_DeliveryCommission 폴백에서 '전액 파트너부담'으로 처리되므로 소량만 허용한다.
+  // 그래도 1건 때문에 수백 건을 통째로 버리는 편이 더 큰 손해다.
+  _DISCOUNT_BLANK_MAX_PER_PAGE: 1,
+  _DISCOUNT_BLANK_MAX_RATIO: 0.005,
+  _DISCOUNT_BLANK_MIN_ALLOWANCE: 3,
+
+  _recordInstantDiscountSplit(total, partner, support) {
+    if (!this._instantDiscountSplitByTotal) this._instantDiscountSplitByTotal = new Map();
+    const T = parseInt(total, 10) || 0;
+    const p = parseInt(partner, 10);
+    const s = parseInt(support, 10);
+    if (!T || !Number.isFinite(p) || !Number.isFinite(s) || p < 0 || s < 0) return;
+    const key = String(T);
+    const value = `${p}:${s}`;
+    if (!this._instantDiscountSplitByTotal.has(key)) {
+      this._instantDiscountSplitByTotal.set(key, new Set());
+    }
+    this._instantDiscountSplitByTotal.get(key).add(value);
+  },
+
+  _getUniqueInstantDiscountSplit(total) {
+    const values = this._instantDiscountSplitByTotal?.get(String(parseInt(total, 10) || 0));
+    if (!values || values.size !== 1) return null;
+    const [value] = [...values];
+    const [partner, support] = value.split(':').map((v) => parseInt(v, 10));
+    if (!Number.isFinite(partner) || !Number.isFinite(support)) return null;
+    return { partner, support };
+  },
 
   // React 의 바깥클릭 닫기 핸들러는 대부분 mousedown/pointerdown 에 붙는다.
   // el.click() 은 click 이벤트 하나만 쏘므로 시트가 영원히 안 닫혔다.
@@ -1123,12 +1368,18 @@ Sites['baemin'] = {
       if (this._isSheetGone(sheet)) return true;
 
       if (attempt === 0) {
+        const btn = this._findSheetCloseButton(sheet);
+        if (btn) {
+          this._dispatchPointerSequence(btn);
+          try { btn.click?.(); } catch (_) {}
+        }
+      } else if (attempt === 1) {
         // 백드롭이 없는 팝오버/툴팁으로 확인됐다 -> 트리거 호버 이탈이 1순위
         if (amountEl?.isConnected) this._dispatchHoverExit(amountEl);
-      } else if (attempt === 1) {
+      } else if (attempt === 2) {
         // 트리거 재클릭 토글
         if (amountEl?.isConnected) this._dispatchPointerSequence(amountEl);
-      } else if (attempt === 2) {
+      } else if (attempt === 3) {
         // 문서 레벨 바깥클릭 리스너용
         this._dispatchPointerSequence(document.body);
         for (const type of ['pointerdown', 'mousedown']) {
@@ -1136,12 +1387,14 @@ Sites['baemin'] = {
             document.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, composed: true, clientX: 1, clientY: 1 }));
           } catch (_) {}
         }
-      } else if (attempt === 3) {
+        this._clickOutsideSheet(sheet)
+          || this._dispatchPointerSequence(this._findSheetOverlay(sheet) || document.documentElement);
+      } else {
         this._clickOutsideSheet(sheet)
           || this._dispatchPointerSequence(this._findSheetOverlay(sheet) || document.documentElement);
         const btn = this._findSheetCloseButton(sheet);
         if (btn) this._dispatchPointerSequence(btn);
-      } else {
+
         // 합성 ESC. 수집기 자신의 ESC 중단 리스너가 이걸 받아 멈추던 버그가 있어 억제 플래그로 감싼다.
         this._suppressEsc = true;
         try {
@@ -1159,7 +1412,8 @@ Sites['baemin'] = {
         }
       }
 
-      if (await this._waitSheetGone(sheet, 300)) {
+      const waitMs = attempt === 0 ? 900 : 650;
+      if (await this._waitSheetGone(sheet, waitMs)) {
         this._maxSheetCloseAttempt = Math.max(this._maxSheetCloseAttempt, attempt);
         return true;
       }
@@ -1172,12 +1426,22 @@ Sites['baemin'] = {
 
   // 행마다 시트가 쌓이면 DOM 이 무거워지고 화면을 가린다. 페이지 끝에서 한 번 훑어 닫는다.
   async _sweepDiscountSheets() {
-    const sheets = this._findAllDiscountSheets();
-    for (const sheet of sheets) {
-      if (this._stopFlag) break;
-      this._dispatchPointerSequence(document.body);
-      this._clickOutsideSheet(sheet);
-      await this._waitSheetGone(sheet, 200);
+    for (let pass = 0; pass < 3; pass++) {
+      const sheets = this._findAllDiscountSheets();
+      if (!sheets.length) break;
+      for (const sheet of sheets) {
+        if (this._stopFlag) break;
+        const btn = this._findSheetCloseButton(sheet);
+        if (btn) {
+          this._dispatchPointerSequence(btn);
+          try { btn.click?.(); } catch (_) {}
+        }
+        if (await this._waitSheetGone(sheet, 500)) continue;
+        this._dispatchPointerSequence(document.body);
+        this._clickOutsideSheet(sheet);
+        await this._waitSheetGone(sheet, 500);
+      }
+      if (this._stopFlag || !this._findAllDiscountSheets().length) break;
     }
     return this._findAllDiscountSheets().length;
   },
@@ -1270,30 +1534,211 @@ Sites['baemin'] = {
     });
   },
 
+  // 시트가 아예 안 열릴 때(시트없음)의 진단.
+  // _dumpDiscountSheet 는 시트가 있어야 동작하므로 이 경로에서는 아무 진단도 남지 않았다.
+  async _dumpDiscountRow(amountEl, orderNo) {
+    if (this._rowDumped || !amountEl?.isConnected) return;
+    this._rowDumped = true;
+
+    const cls = (el, take = 2) =>
+      String(el?.className || '').trim().split(/\s+/).filter(Boolean).slice(0, take).join('.')
+      || (el?.tagName || '?').toLowerCase();
+    const desc = (el) => {
+      const st = getComputedStyle(el);
+      return `${el.tagName.toLowerCase()}.${cls(el)}`
+        + ` cur=${st.cursor}`
+        + ` role=${el.getAttribute('role') || '-'}`
+        + ` atelier=${el.getAttribute('data-atelier-component') || '-'}`
+        + ` tabindex=${el.getAttribute('tabindex') ?? '-'}`;
+    };
+
+    this._ordersLog(`───── 즉시할인 시트없음 진단 (주문 ${orderNo || '-'}) ─────`, 'warn');
+
+    const section = amountEl.closest('.DetailInfo-module__pZYe') || amountEl.closest('td[colspan]');
+    this._ordersLog(
+      `컨테이너: u8LB=${!!section?.querySelector('.InstantDiscountDetailPageSheet-module__u8LB')}`
+      + ` siYJ=${!!section?.querySelector('.InstantDiscountDetailPageSheet-module__siYJ')}`
+      + ` (false 면 텍스트 폴백으로 잡은 금액 엘리먼트)`,
+      'warn'
+    );
+
+    const chain = [];
+    let node = amountEl;
+    for (let i = 0; i < 6 && node && node !== document.body; i++, node = node.parentElement) {
+      chain.push(`${'  '.repeat(i)}${desc(node)}`);
+    }
+    this._ordersLog(`금액엘 조상체인:\n${chain.join('\n')}`, 'warn');
+
+    // 무엇이 열리기는 하는지 본다. 아무것도 안 붙으면 이 요소는 트리거가 아니다.
+    const before = new Set(document.querySelectorAll('body *'));
+    const listNew = (label) => {
+      const added = [...document.querySelectorAll('body *')].filter((el) => !before.has(el));
+      const head = added.slice(0, 12).map((el) =>
+        `${el.tagName.toLowerCase()}.${cls(el)}[role=${el.getAttribute('role') || '-'}]`
+        + `[atelier=${el.getAttribute('data-atelier-component') || '-'}]`
+        + ` "${(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40)}"`
+      );
+      this._ordersLog(`${label} 새 요소 ${added.length}개\n${head.join('\n') || '없음'}`, 'warn');
+      return added;
+    };
+
+    this._activateInstantDiscountTarget(amountEl, 'hover');
+    await new Promise((r) => setTimeout(r, 900));
+    listNew('hover 후');
+
+    this._activateInstantDiscountTarget(amountEl, 'native');
+    await new Promise((r) => setTimeout(r, 1200));
+    const afterClick = listNew('click 후');
+
+    const popup = afterClick.find((el) =>
+      /파트너\s*부담|배민\s*지원|총\s*할인금액/.test(el.textContent || ''));
+    if (popup) {
+      this._ordersLog(
+        `부담 문구를 담은 새 요소: ${desc(popup)}\n`
+        + (popup.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+        'warn'
+      );
+      this._ordersLog(`HTML(800자): ${(popup.outerHTML || '').replace(/\s+/g, ' ').slice(0, 800)}`, 'warn');
+    }
+
+    this._dispatchHoverExit(amountEl);
+    this._ordersLog('───── 시트없음 진단 끝 ─────', 'warn');
+  },
+
   _parseDiscountSheet(sheet) {
     const out = { partner: null, support: null };
-    const items = sheet.querySelectorAll('[data-atelier-component="TextListItem"], li');
+    const sheetText = (sheet?.textContent || '').replace(/\s+/g, '');
+    const partnerLabelRe = /(?:파트너|가게|점주|업주|사장님)부담/;
+    const supportLabelRe = /(?:배민|배달의민족)(?:100%)?(?:지원|부담)/;
+    // 시트 하단 요약(총 할인금액 + 그 아래 부담 내역)만이 신뢰할 수 있는 합계다.
+    // 항목별 '파트너 부담' 과 요약의 '파트너 부담' 을 함께 더하면 총액을 넘는다.
+    // 배민 지원이 0원이면 '배민 지원' 줄 자체가 렌더되지 않으므로,
+    // 한쪽만 읽혀도 총액에서 나머지를 복원한다.
+    const readSummarySplit = () => {
+      const idx = sheetText.search(/총할인금액[\d,]+원/);
+      if (idx < 0) return null;
+      const tail = sheetText.slice(idx);
+      const totalMatch = tail.match(/총할인금액([\d,]+)원/);
+      const total = parseInt(Utils.cleanPrice(totalMatch ? totalMatch[1] : ''), 10);
+      if (!Number.isFinite(total)) return null;
+      const pick = (labelRe) => {
+        const m = tail.match(new RegExp(`${labelRe.source}[^\\d]{0,30}([\\d,]+)원`));
+        const v = m ? parseInt(Utils.cleanPrice(m[1]), 10) : NaN;
+        return Number.isFinite(v) ? v : null;
+      };
+      const p = pick(partnerLabelRe);
+      const s = pick(supportLabelRe);
+      if (p !== null && s !== null) return { partner: String(p), support: String(s) };
+      if (p !== null && p <= total) return { partner: String(p), support: String(total - p) };
+      if (s !== null && s <= total) return { partner: String(total - s), support: String(s) };
+      return null;
+    };
+    const summarySplit = readSummarySplit();
+    if (summarySplit) return summarySplit;
+    const amountsNearLabel = (labelRe) => {
+      const values = [];
+      for (const m of sheetText.matchAll(new RegExp(labelRe.source, 'g'))) {
+        const after = sheetText.slice(m.index + m[0].length, m.index + m[0].length + 80);
+        const afterAmount = after.match(/[^\d]{0,30}([\d,]+)원/);
+        if (afterAmount) values.push(Utils.cleanPrice(afterAmount[1]));
+      }
+      for (const m of sheetText.matchAll(new RegExp(`([\\d,]+)원[^\\d원]{0,30}${labelRe.source}`, 'g'))) {
+        const prev = sheetText.slice(Math.max(0, m.index - 20), m.index);
+        if (/(총할인금액|즉시할인)$/.test(prev)) continue;
+        values.push(Utils.cleanPrice(m[1]));
+      }
+      return [...new Set(values.filter((v) => v !== ''))];
+    };
+    const readCompactAmount = (labelRe) => {
+      const near = amountsNearLabel(labelRe);
+      if (near.length === 1) return near[0];
+      const after = sheetText.match(new RegExp(`${labelRe.source}[^\\d]{0,30}([\\d,]+)원`));
+      if (after) return Utils.cleanPrice(after[1]);
+      const before = sheetText.match(new RegExp(`([\\d,]+)원[^\\d원]{0,30}${labelRe.source}`));
+      if (before) return Utils.cleanPrice(before[1]);
+      return '';
+    };
+    const candidates = [...sheet.querySelectorAll('[data-atelier-component="TextListItem"], li')];
+    const items = candidates.filter((el) =>
+      !candidates.some((other) => other !== el && el.contains(other))
+    );
+    let partnerTotal = 0;
+    let supportTotal = 0;
+    let partnerCount = 0;
+    let supportCount = 0;
 
-    for (const item of items) {
-      const label = item.textContent || '';
-      const isPartner = /(파트너|가게|점주)\s*부담/.test(label);
-      const isSupport = /배민\s*지원/.test(label);
-      if (!isPartner && !isSupport) continue;
-      if (isPartner && out.partner !== null) continue;
-      if (isSupport && out.support !== null) continue;
+    const valueBoxOf = (item) =>
+      item.querySelector('.TextListItem_b_r4ax_n197m77')
+      || item.lastElementChild;
 
-      const valueBox = item.querySelector('.TextListItem_b_r4ax_n197m77') || item.lastElementChild;
-      if (!valueBox) continue;
+    const readValue = (valueBox) => {
+      if (!valueBox) return '';
       const spans = valueBox.querySelectorAll('span');
       let raw = spans.length ? spans[spans.length - 1].textContent : '';
       if (!/\d/.test(raw || '')) raw = valueBox.textContent || '';
-      const value = Utils.cleanPrice(raw);
-      if (value === '') continue;
+      return Utils.cleanPrice(raw);
+    };
 
-      if (isPartner) out.partner = value;
-      else out.support = value;
+    const labelOf = (item, valueBox) => {
+      const all = item.textContent || '';
+      const valueText = valueBox?.textContent || '';
+      return valueText ? all.replace(valueText, '') : all;
+    };
+
+    for (const item of items) {
+      const valueBox = valueBoxOf(item);
+      const label = labelOf(item, valueBox);
+      const compactLabel = label.replace(/\s+/g, '');
+      const isPartner = partnerLabelRe.test(compactLabel);
+      const isSupport = supportLabelRe.test(compactLabel);
+      if (!isPartner && !isSupport) continue;
+
+      const value = readValue(valueBox);
+      if (value === '') continue;
+      // 라벨과 금액이 같아도 서로 다른 할인 항목이면 각각 더해야 한다
+      // (배달팁할인 파트너부담 1,000원 + 주문금액할인 파트너부담 1,000원).
+      // items 는 이미 최말단 노드만 남긴 집합이라 같은 행이 두 번 잡히지 않는다.
+
+      const amount = parseInt(value, 10) || 0;
+      if (isPartner) {
+        partnerTotal += amount;
+        partnerCount++;
+      } else if (isSupport) {
+        supportTotal += amount;
+        supportCount++;
+      }
+    }
+    if (partnerCount > 0) out.partner = String(partnerTotal);
+    if (supportCount > 0) out.support = String(supportTotal);
+
+    if (out.partner === null) {
+      const partner = readCompactAmount(partnerLabelRe);
+      if (partner !== '') out.partner = partner;
+    }
+    if (out.support === null) {
+      const support = readCompactAmount(supportLabelRe);
+      if (support !== '') out.support = support;
+    }
+
+    const totalAmountMatch = sheetText.match(/총할인금액([\d,]+)원/);
+    const totalAmount = totalAmountMatch ? Utils.cleanPrice(totalAmountMatch[1]) : '';
+    if (out.partner === null && totalAmount !== '') {
+      const supportItems = amountsNearLabel(supportLabelRe)
+        .map((v) => parseInt(v, 10))
+        .filter((v) => Number.isFinite(v) && v >= 0);
+      const uniqueSupportItems = [...new Set(supportItems)];
+      const supportSum = supportItems.reduce((sum, v) => sum + v, 0);
+      const totalInt = parseInt(totalAmount, 10) || 0;
+      if (uniqueSupportItems.includes(totalInt) || supportSum === totalInt) {
+        out.partner = '0';
+        out.support = totalAmount;
+      }
     }
     return out;
+  },
+
+  _discountSheetDigest(sheet) {
+    return (sheet?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 500);
   },
 
   _findInstantDiscountAmountEl(detailSection) {
@@ -1327,7 +1772,7 @@ Sites['baemin'] = {
   async _readInstantDiscount(detailSection, orderNo) {
     const result = { 즉시할인: '', 파트너부담: '', 배민지원: '' };
 
-    const amountEl = this._findInstantDiscountAmountEl(detailSection);
+    let amountEl = this._findInstantDiscountAmountEl(detailSection);
     if (!amountEl) return result;
 
     const total = Utils.cleanPrice(amountEl.textContent || '');
@@ -1344,34 +1789,165 @@ Sites['baemin'] = {
 
     this._lastAmountEl = amountEl;
 
-
-    // 클릭 전 시트 집합. 이 안에 없는 시트가 이번 주문의 것이다.
-    const before = new Set(this._findAllDiscountSheets());
-    const prev = this._sheetSignature(before.size ? [...before][before.size - 1] : null);
-    // 여는 쪽은 기존대로 click. _dispatchPointerSequence 는 mousedown 까지 쏘므로
-    // 핸들러가 mousedown 이면 열자마자 click 으로 다시 닫힐 수 있다.
-    amountEl.click();
-    const found = await this._waitNewDiscountSheet(before, prev, 2500);
-    const sheet = found.sheet;
-
-    if (!sheet) {
-      console.warn(`[baemin] 즉시할인 시트 ${found.reason} order=${orderNo} total=${T}`);
-      this._countDiscountBlank(found.reason);
-      this._dumpDiscountSheet();
-      return result;
+    if (this._findAllDiscountSheets().length) {
+      await this._sweepDiscountSheets();
+      this._sheetCloseHopeless = false;
+      await new Promise((r) => setTimeout(r, 150));
     }
 
-    const { partner, support } = this._parseDiscountSheet(sheet);
+    const refreshAmount = () => {
+      // scrollIntoView가 가상 행을 재렌더하면 기존 클릭 대상은 분리된다.
+      if (!orderNo) return amountEl?.isConnected ? amountEl : null;
+      const header = this._orderRows().find(row => {
+        const cell = row.querySelector('td[data-td-index="1"]');
+        const badge = cell?.querySelector('.Badge_b_r4ax_19agxiso, [data-atelier-component="Badge"] span');
+        return (cell?.textContent || '').replace(badge?.textContent || '', '').trim() === orderNo;
+      });
+      if (!header) return amountEl?.isConnected ? amountEl : null;
+      let sibling = header.nextElementSibling;
+      while (sibling?.tagName === 'TR') {
+        if (sibling.querySelector('td[data-td-index="1"]')) break;
+        const detail = sibling.querySelector('td[colspan="9"] .DetailInfo-module__pZYe');
+        if (detail) return this._findInstantDiscountAmountEl(detail);
+        sibling = sibling.nextElementSibling;
+      }
+      return null;
+    };
 
-    // 닫기는 실패해도 무방하다. 다음 주문은 '신규 시트'로 구분되기 때문이다.
-    if (!this._sheetCloseHopeless) await this._closeDiscountSheet(sheet, amountEl);
+    const openSheet = async (timeoutMs, attemptNo) => {
+      const deadline = Date.now() + timeoutMs;
+      // 클릭 전 시트 집합. 이 안에 없는 시트가 이번 주문의 것이다.
+      const before = new Set([...this._findAllDiscountSheets(), ...this._findAllDiscountSheetShells()]);
+      const prev = this._sheetSignature(before.size ? [...before][before.size - 1] : null);
+      try { amountEl.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+      await new Promise((r) => setTimeout(r, 80));
+      amountEl = refreshAmount();
+      if (!amountEl) return { sheet: null, reason: '행재렌더', targetCount: 0 };
+      const targets = this._findInstantDiscountClickTargets(amountEl);
+      const modes = attemptNo === 0
+        ? ['hover', 'native']
+        : ['pointer', 'keyboard'];
+      const perTryWait = Math.max(500, Math.floor(timeoutMs / Math.max(1, Math.min(targets.length * modes.length, 8))));
+      let last = { sheet: null, reason: '시트없음', targetCount: targets.length, targetDesc: '-', mode: '-' };
+
+      for (const target of targets.length ? targets : [amountEl]) {
+        for (const mode of modes) {
+          if (this._stopFlag || Date.now() >= deadline) return last;
+          if (!target.isConnected) continue;
+          this._activateInstantDiscountTarget(target, mode);
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) return last;
+          const found = await this._waitDiscountSheetForOrder(before, prev, Math.min(perTryWait, remaining), T);
+          last = {
+            ...found,
+            targetCount: targets.length,
+            targetDesc: this._describeInstantDiscountTarget(target),
+            mode
+          };
+          if (found.sheet) return last;
+          this._dispatchHoverExit(target);
+          if (this._stopFlag) return last;
+        }
+      }
+      return last;
+    };
+
+    const canResolveSplit = (partner, support) => {
+      const p0 = partner === null ? null : (parseInt(partner, 10) || 0);
+      const s0 = support === null ? null : (parseInt(support, 10) || 0);
+      return (p0 !== null && s0 !== null)
+        || (p0 === null && s0 !== null && s0 >= 0 && s0 <= T)
+        || (s0 === null && p0 !== null && p0 >= 0 && p0 <= T);
+    };
+
+    let found = { sheet: null, reason: '시트없음' };
+    let sheet = null;
+    let partner = null;
+    let support = null;
+    let lastFailureReason = '시트없음';
+    let lastOpenDiag = null;
+    const attempts = [
+      { timeoutMs: 3500, delayMs: 0 },
+      { timeoutMs: 4000, delayMs: 250 }
+    ];
+
+    for (let i = 0; i < attempts.length && !this._stopFlag; i++) {
+      if (i > 0) {
+        this._ordersLog(`즉시할인 재시도: 주문 ${orderNo || '-'} 사유=${lastFailureReason} 시도 ${i + 1}/${attempts.length}`, 'warn');
+        await this._sweepDiscountSheets();
+        this._sheetCloseHopeless = false;
+        await new Promise((r) => setTimeout(r, attempts[i].delayMs));
+      }
+
+      found = await openSheet(attempts[i].timeoutMs, i);
+      lastOpenDiag = found;
+      sheet = found.sheet;
+      if (!sheet) {
+        lastFailureReason = found.reason;
+        continue;
+      }
+
+      ({ partner, support } = this._parseDiscountSheet(sheet));
+
+      // 닫기는 실패해도 무방하다. 다음 주문은 '신규 시트'로 구분되기 때문이다.
+      if (!this._sheetCloseHopeless) await this._closeDiscountSheet(sheet, amountEl);
+
+      if (canResolveSplit(partner, support)) {
+        if (i > 0) this._ordersLog(`즉시할인 재시도 성공: 주문 ${orderNo || '-'}`, 'warn');
+        break;
+      }
+
+      lastFailureReason = '파싱실패';
+      if (i < attempts.length - 1) {
+        console.warn(
+          `[baemin] 즉시할인 재시도 예정 order=${orderNo} total=${T} partner=${partner} support=${support} ` +
+          `sheet="${this._discountSheetDigest(sheet)}"`
+        );
+      }
+    }
+
+    if (!sheet) {
+      const shellCount = this._findAllDiscountSheetShells().length;
+      const sheetCount = this._findAllDiscountSheets().length;
+      const shellDigest = this._findAllDiscountSheetShells()
+        .map((el) => this._discountSheetDigest(el))
+        .filter(Boolean)
+        .slice(-2)
+        .join(' || ');
+      console.warn(
+        `[baemin] 즉시할인 시트 ${lastFailureReason} order=${orderNo} total=${T} ` +
+        `targets=${lastOpenDiag?.targetCount ?? 0} lastTarget="${lastOpenDiag?.targetDesc || '-'}" ` +
+        `mode=${lastOpenDiag?.mode || '-'} sheets=${sheetCount} shells=${shellCount} shell="${shellDigest}"`
+      );
+      this._countDiscountBlank(
+        lastFailureReason,
+        `주문 ${orderNo || '-'} 사유=${lastFailureReason} total=${T} target=${lastOpenDiag?.targetDesc || '-'}`
+      );
+      this._ordersLog(`즉시할인 재시도 실패: 주문 ${orderNo || '-'} 사유=${lastFailureReason}`, 'warn');
+      this._dumpDiscountSheet();
+      await this._dumpDiscountRow(amountEl, orderNo);
+      return result;
+    }
 
     const p = partner === null ? null : (parseInt(partner, 10) || 0);
     const s = support === null ? null : (parseInt(support, 10) || 0);
 
-    // 합이 맞지 않으면 틀린 숫자를 쓰느니 공란으로 둔다.
+    // 양쪽 부담액이 모두 읽히면 총액 정의가 달라도 공란으로 버리지 않는다.
     // 공란은 오직 '수집 실패'만 의미한다 (DB_DeliveryCommission 폴백이 이 구분에 의존).
-    if (p !== null && s !== null && p + s === T) {
+    if (p !== null && s !== null) {
+      if (p + s !== T) {
+        const diff = p + s - T;
+        const detailNo = (this._discountMismatchDetails || []).length + 1;
+        const detail = `주문 ${orderNo || '-'} total=${T} partner=${p} support=${s} diff=${diff} sheet="${this._discountSheetDigest(sheet)}"`;
+        console.warn(
+          `[baemin] 즉시할인 합계불일치 order=${orderNo} total=${T} partner=${p} support=${s} ` +
+          `diff=${diff} sheet="${this._discountSheetDigest(sheet)}"`
+        );
+        if (detailNo <= 5) {
+          this._ordersLog(`즉시할인 불일치 상세 #${detailNo}: ${detail}`, 'warn');
+        }
+        this._countDiscountMismatch(detail);
+      }
       result.파트너부담 = String(p);
       result.배민지원 = String(s);
     } else if (p === null && s !== null && s >= 0 && s <= T) {
@@ -1381,15 +1957,52 @@ Sites['baemin'] = {
       result.파트너부담 = String(p);
       result.배민지원 = String(T - p);
     } else {
-      const reason = (p === null && s === null) ? '파싱실패' : '합계불일치';
-      console.warn(`[baemin] 즉시할인 ${reason} order=${orderNo} total=${T} partner=${p} support=${s}`);
-      this._countDiscountBlank(reason);
+      const fallback = this._getUniqueInstantDiscountSplit(T);
+      if (fallback) {
+        result.파트너부담 = String(fallback.partner);
+        result.배민지원 = String(fallback.support);
+        this._discountSplitCount++;
+        this._ordersLog(
+          `즉시할인 유일값 폴백: 주문 ${orderNo || '-'} total=${T} ` +
+          `partner=${fallback.partner} support=${fallback.support}`,
+          'warn'
+        );
+        console.warn(
+          `[baemin] 즉시할인 유일값 폴백 order=${orderNo} total=${T} ` +
+          `partner=${fallback.partner} support=${fallback.support} sheet="${this._discountSheetDigest(sheet)}"`
+        );
+        return result;
+      }
+
+      const reason = '파싱실패';
+      const digest = this._discountSheetDigest(sheet);
+      console.warn(
+        `[baemin] 즉시할인 ${reason} order=${orderNo} total=${T} partner=${p} support=${s} ` +
+        `sheet="${digest}"`
+      );
+      this._countDiscountBlank(reason, `주문 ${orderNo || '-'} 사유=${reason} total=${T}`);
+      this._ordersLog(`즉시할인 재시도 실패: 주문 ${orderNo || '-'} 사유=${reason}`, 'warn');
+      this._ordersLog(`즉시할인 파싱실패 시트: 주문 ${orderNo || '-'} ${digest}`, 'warn');
       this._dumpDiscountSheet();
       return result;
     }
 
+    this._recordInstantDiscountSplit(T, result.파트너부담, result.배민지원);
     this._discountSplitCount++;
     return result;
+  },
+
+  // 배민 주문내역은 최신 → 과거 역순이다. 중간에 멈추면 빠지는 건 앞쪽(과거) 구간이므로
+  // 그 구간만 URL 날짜 파라미터로 재조회해 보충하면 된다.
+  _rowsDateSpan(rows) {
+    const dates = [];
+    for (const row of rows) {
+      const m = String(row?.주문시각 || '').match(/(\d{4})\.\s*(\d{2})\.\s*(\d{2})/);
+      if (m) dates.push(`${m[1]}-${m[2]}-${m[3]}`);
+    }
+    if (!dates.length) return null;
+    dates.sort();
+    return { oldest: dates[0], newest: dates[dates.length - 1] };
   },
 
   _findOrdersScrollElement() {
@@ -1465,7 +2078,6 @@ Sites['baemin'] = {
         const orderNo = row.querySelector('td[data-td-index="1"]')?.textContent.trim() || '';
         const key = idx !== null ? `index-${idx}` : `order-${orderNo}`;
         if (key === 'order-' || processed.has(key)) continue;
-        processed.add(key);
         if (idx !== null) {
           const idxNum = parseInt(idx, 10) || 0;
           maxIndex = maxIndex < 0 ? idxNum : Math.max(maxIndex, idxNum);
@@ -1478,7 +2090,13 @@ Sites['baemin'] = {
           ? document.querySelector(`tr.Table_b_r4ax_1dwbr4on[data-index="${idx}"]`) || row
           : row;
         if (this._findExpandAllButton()?.expanded) await this._waitRowDetail(live);
-        pageRows.push(...await this._collectRowsData([live], iso));
+        const extracted = await this._collectRowsData([live], iso);
+        if (this._stopFlag) break;
+        if (!extracted.length || extracted.some(item => !item.주문번호 || !item.주문시각)) {
+          throw new Error('주문 행 추출 실패: 상세 렌더 또는 행 참조 확인 필요');
+        }
+        pageRows.push(...extracted);
+        processed.add(key);
         if (Math.abs(scrollTopOf() - keepTop) > 2) scrollTo(keepTop);
         added++;
       }
@@ -1512,25 +2130,39 @@ Sites['baemin'] = {
 
     const leftoverSheets = await this._sweepDiscountSheets();
 
-    if (this._discountSplitCount || this._discountBlankCount || this._maxSheetCloseAttempt >= 1) {
+    if (this._discountSplitCount || this._discountBlankCount || this._discountMismatchCount || this._maxSheetCloseAttempt >= 1) {
       const bad = this._discountBlankCount > 0 || this._maxSheetCloseAttempt === 99;
       const attemptText = this._maxSheetCloseAttempt === 99
         ? '실패'
         : this._maxSheetCloseAttempt < 0 ? '해당없음' : String(this._maxSheetCloseAttempt);
       const reasons = Object.entries(this._discountBlank || {})
         .map(([key, value]) => `${key} ${value}`).join(', ');
+      const mismatchDetails = (this._discountMismatchDetails || []).length
+        ? `\n합계불일치 상세(최대 5건):\n${this._discountMismatchDetails.map((line, i) => `#${i + 1} ${line}`).join('\n')}`
+        : '';
       this._ordersLog(
         `즉시할인: 분해 ${this._discountSplitCount}건 / 공란 ${this._discountBlankCount}건(${reasons})` +
+        (this._discountMismatchCount ? ` / 합계불일치 ${this._discountMismatchCount}건(값 기록)` : '') +
         ` / 닫기 attempt ${attemptText}` +
         (this._sheetCloseHopeless ? ' / 닫기불가' : '') +
-        ` / 잔존시트 ${leftoverSheets}개`,
+        ` / 잔존시트 ${leftoverSheets}개` +
+        mismatchDetails,
         bad ? 'err' : 'ok'
       );
     }
 
     scrollTo(0);
     const indexSpan = maxIndex >= 0 ? maxIndex - minIndex + 1 : -1;
-    return { rows: pageRows, orderCount: processed.size, maxIndex, minIndex, indexSpan };
+    return {
+      rows: pageRows,
+      orderCount: processed.size,
+      maxIndex,
+      minIndex,
+      indexSpan,
+      discountBlankCount: this._discountBlankCount || 0,
+      discountBlank: { ...(this._discountBlank || {}) },
+      discountBlankDetails: [...(this._discountBlankDetails || [])]
+    };
   },
 
   async _collectRowsData(rows, iso) {
@@ -1567,6 +2199,7 @@ Sites['baemin'] = {
       let detailSection = null;
       let sibling = row.nextElementSibling;
       while (sibling?.tagName === 'TR') {
+        if (sibling.querySelector('td[data-td-index="1"]')) break;
         const section = sibling.querySelector('td[colspan="9"] .DetailInfo-module__pZYe');
         if (section) {
           detailSection = section;
@@ -1782,6 +2415,7 @@ Sites['baemin'] = {
     this._currentShopInfo = shopInfo;
     this._ordersPageCursor = 1;
     this._sheetDumped = false;
+    this._instantDiscountSplitByTotal = new Map();
 
     Utils.showProgressModal('주문 내역 수집', '첫 페이지 로딩 중...');
     this._ordersLog(`수집 범위: ${this._ordersDateRangeText()}`);
@@ -1807,6 +2441,9 @@ Sites['baemin'] = {
     let pageCount = 0;
     let hasError = false;
     let errorMessage = '';
+    let toleratedBlankCount = 0;        // 임계치 내에서 공란으로 두고 넘어간 주문 수
+    const toleratedBlankDetails = [];
+    let seenOrderCount = 0;             // 누적 주문 수 (허용치 계산 기준)
 
     while (!this._stopFlag) {
       const currentPage = this._getCurrentPage();
@@ -1818,18 +2455,111 @@ Sites['baemin'] = {
         message: `${currentPage}페이지 펼치는 중...`
       });
       
-      await this._expandAllOrders();
+      let pageResult = null;
+      let pageRetryFailed = false;
+      const maxPageAttempts = 2; // 최초 수집 + 화면 복구 1회
+      let expectedPageOrderCount = 0;
+      for (let pageAttempt = 0; pageAttempt < maxPageAttempts && !this._stopFlag; pageAttempt++) {
+        await this._expandAllOrders();
+        if (this._stopFlag) {
+          console.log('[배민] ESC로 중단됨');
+          break;
+        }
+
+        await this._randomDelay(300, 500);
+
+        Utils.updateProgressModal({ message: `${currentPage}페이지 수집 중...` });
+
+        try {
+          pageResult = await this._collectCurrentPageData(iso);
+        } catch (error) {
+          hasError = true;
+          errorMessage = error?.message || String(error);
+          break;
+        }
+        const orderCount = pageResult.orderCount || 0;
+        expectedPageOrderCount = Math.max(expectedPageOrderCount, orderCount);
+        const incompletePage = expectedPageOrderCount >= 7 && orderCount < expectedPageOrderCount;
+        if ((pageResult.discountBlankCount || 0) === 0 && !incompletePage) {
+          if (pageAttempt > 0) {
+            this._ordersLog(`${currentPage}페이지 재수집 성공 — 공란 0건`, 'ok');
+          }
+          break;
+        }
+
+        const detailText = (pageResult.discountBlankDetails || []).join(' / ');
+        const pageIssueText = incompletePage
+          ? `페이지 렌더 미완료 ${orderCount}/${expectedPageOrderCount}건`
+          : `즉시할인 공란 ${pageResult.discountBlankCount}건`;
+        if (pageAttempt >= maxPageAttempts - 1) {
+          // 렌더 미완료(행 자체 누락)는 성격이 다르므로 임계치와 무관하게 중단한다.
+          const blanks = pageResult.discountBlankCount || 0;
+          const allowance = Math.max(
+            this._DISCOUNT_BLANK_MIN_ALLOWANCE,
+            Math.ceil((seenOrderCount + orderCount) * this._DISCOUNT_BLANK_MAX_RATIO)
+          );
+          const tolerable = !incompletePage
+            && blanks > 0
+            && blanks <= this._DISCOUNT_BLANK_MAX_PER_PAGE
+            && (toleratedBlankCount + blanks) <= allowance;
+
+          if (tolerable) {
+            toleratedBlankCount += blanks;
+            if (detailText) toleratedBlankDetails.push(`${currentPage}p ${detailText}`);
+            this._ordersLog(
+              `${currentPage}페이지 ${pageIssueText} — 허용치 내(누적 ${toleratedBlankCount}/${allowance})라` +
+              ` 공란으로 두고 계속 진행` + (detailText ? ` (${detailText})` : ''),
+              'warn'
+            );
+            break;
+          }
+
+          pageRetryFailed = true;
+          this._ordersLog(
+            `${currentPage}페이지 재수집 실패 — ${pageIssueText}` +
+            ` (허용치 초과: 페이지 ${blanks}건 / 누적 ${toleratedBlankCount + blanks} > ${allowance})` +
+            (detailText ? ` (${detailText})` : ''),
+            'err'
+          );
+          break;
+        }
+
+        this._ordersLog(
+          `${currentPage}페이지 ${pageIssueText} 감지 — 페이지 재시작 ${pageAttempt + 1}/${maxPageAttempts - 1}` +
+          (detailText ? ` (${detailText})` : ''),
+          'warn'
+        );
+        await this._sweepDiscountSheets();
+        const reloaded = await this._reloadOrdersPageForRetry(currentPage, detailText || pageIssueText);
+        if (!reloaded) {
+          pageRetryFailed = true;
+          errorMessage = `${currentPage}페이지 재수집 페이지 복귀 실패`;
+          this._ordersLog(`중단: ${errorMessage}`, 'err');
+          break;
+        }
+      }
+
       if (this._stopFlag) {
         console.log('[배민] ESC로 중단됨');
         break;
       }
-      
-      await this._randomDelay(300, 500);
-      
-      Utils.updateProgressModal({ message: `${currentPage}페이지 수집 중...` });
-      
-      const pageResult = await this._collectCurrentPageData(iso);
+
+      if (hasError || !pageResult) {
+        hasError = true;
+        errorMessage = errorMessage || `${currentPage}페이지 수집 실패`;
+        this._ordersLog(`중단: ${errorMessage}`, 'err');
+        break;
+      }
+
+      if (pageRetryFailed) {
+        hasError = true;
+        if (!errorMessage) errorMessage = `${currentPage}페이지 즉시할인 공란 잔존`;
+        this._ordersLog(`정상 적재 금지: ${errorMessage}`, 'err');
+        break;
+      }
+
       allRows.push(...pageResult.rows);
+      seenOrderCount += pageResult.orderCount || 0;
 
       Utils.updateProgressModal({ rowCount: allRows.length });
 
@@ -1846,6 +2576,7 @@ Sites['baemin'] = {
       const hasNext = this._clickNextPage(currentPage);
       if (!hasNext) {
         console.log('[배민] 마지막 페이지 도달');
+        this._ordersLog('마지막 페이지 도달 — CSV 저장 준비', 'ok');
         break;
       }
       
@@ -1871,6 +2602,10 @@ Sites['baemin'] = {
       this._ordersLog(`중단: ${errorMessage}`, 'warn');
     }
 
+    if (allRows.length === 0 && (hasError || this._stopFlag)) {
+      return { success: false, partial: true, rows: 0,
+        error: errorMessage || '사용자 중단', collection_state: 'failed' };
+    }
     if (allRows.length === 0) {
       Utils.showSuccessModal('데이터 없음', '추출할 주문이 없습니다.', { status: 'error' });
       this._ordersLog('수집된 주문 없음', 'err');
@@ -1887,15 +2622,60 @@ Sites['baemin'] = {
     const csv = Utils.toCSV(headers, allRows);
     
     const dateMatch = location.href.match(/startDate=(\d{4}-\d{2}-\d{2})/);
+    const noUrlDate = !dateMatch;
     const dateStr = dateMatch ? dateMatch[1].replace(/-/g, '') : Utils.getTodayStr();
     
-    const filename = Utils.downloadCSV(csv, {
+    const partial = this._stopFlag || hasError;
+
+    if (toleratedBlankCount > 0) {
+      this._ordersLog(
+        `즉시할인 공란 ${toleratedBlankCount}건을 허용치 내로 통과시켰다 —` +
+        ` 해당 주문은 DB에서 전액 파트너부담으로 폴백된다:\n` + toleratedBlankDetails.join('\n'),
+        'warn'
+      );
+    }
+
+    const span = this._rowsDateSpan(allRows);
+    if (span) {
+      this._ordersLog(`수집 완료 범위: ${span.newest} ~ ${span.oldest}`, partial ? 'warn' : 'ok');
+      if (partial) {
+        const urlStart = location.href.match(/startDate=(\d{4}-\d{2}-\d{2})/)?.[1] || '';
+        this._ordersLog(
+          `남은 구간 보충: ?startDate=${urlStart || '조회시작일'}&endDate=${span.oldest} 로 재조회 후 재실행` +
+          ` (endDate 는 경계 주문 누락 방지를 위해 ${span.oldest} 포함)`,
+          'warn'
+        );
+      }
+    }
+
+    this._ordersLog(`CSV 저장 시작: ${allRows.length.toLocaleString()}행`, partial ? 'warn' : 'ok');
+    const filename = await Utils.downloadCSV(csv, {
       channel: 'baemin',
       purpose: 'orders',
       storeName: shopInfo.store_name,
       storeId: shopInfo.store_id,
-      dateStr: dateStr
+      dateStr: dateStr,
+      suffix: noUrlDate ? (partial ? 'nodate_partial' : 'nodate') : (partial ? 'partial' : '')
     });
+    if (filename === 'pipeline_captured') {
+      this._ordersLog(`CSV 캡처 완료: ${allRows.length.toLocaleString()}행`, partial ? 'warn' : 'ok');
+    } else {
+      // '저장 완료' 로그가 거짓말이 되지 않도록 실제 저장 여부를 확인한다.
+      const dl = Utils._lastDownloadResult;
+      if (dl && dl.verified === false) {
+        this._ordersLog(
+          `저장 미확인: ${filename} (방식=${dl.via} 사유=${dl.error || '검증 실패'})` +
+          ` — 다운로드 폴더에 파일이 없을 수 있다.`,
+          'err'
+        );
+      } else {
+        this._ordersLog(
+          (partial ? `부분 수집 저장 — 적재 금지: ` : `저장 완료: `) +
+          `${dl?.path || filename} (${allRows.length.toLocaleString()}행)`,
+          partial ? 'err' : 'ok'
+        );
+      }
+    }
     
     const uniqueOrders = new Set(allRows.map(r => r.주문번호)).size;
     
@@ -1918,7 +2698,13 @@ Sites['baemin'] = {
 ${filename}`;
     
     Utils.showSuccessModal(`주문 내역 수집 완료 ${statusMsg}`, details, { status });
-    return { success: true, filename, rows: allRows.length, partial: this._stopFlag || hasError };
+    return {
+      success: !partial,
+      filename,
+      rows: allRows.length,
+      partial,
+      error: partial ? (errorMessage || '부분 수집 파일 저장됨') : ''
+    };
   },
 
   async _collectMarketingData(shopInfo) {
@@ -3066,10 +3852,25 @@ window.BaeminPipelineSave = {
       const fallback = setTimeout(() => {
         if (!done) { done = true; resolve({ success: false, error: 'timeout' }); }
       }, 10000);
-      chrome.runtime.sendMessage({ type: 'DOWNLOAD_CSV', content: csvContent, filename }, (res) => {
+      try {
+        chrome.runtime.sendMessage({ type: 'DOWNLOAD_CSV', content: csvContent, filename }, (res) => {
+          clearTimeout(fallback);
+          if (done) return;
+          const lastError = chrome.runtime.lastError;
+          done = true;
+          if (lastError) {
+            resolve({ success: false, error: lastError.message || 'runtime.lastError' });
+            return;
+          }
+          resolve(res || { success: false, error: 'empty response' });
+        });
+      } catch (e) {
         clearTimeout(fallback);
-        if (!done) { done = true; resolve(res); }
-      });
+        if (!done) {
+          done = true;
+          resolve({ success: false, error: e?.message || String(e) });
+        }
+      }
     });
   },
 
@@ -3101,7 +3902,9 @@ window.BaeminPipelineSave = {
       : (shopInfo.store_name || '알수없는매장');
 
     const dateMatch = location.href.match(/startDate=(\d{4}-\d{2}-\d{2})/);
+    const noUrlDate = !dateMatch;
     const targetDate = dateMatch?.[1] || new Date().toISOString().slice(0, 10);
+    const targetDateCompact = targetDate.replace(/-/g, '');
 
     // Utils.downloadCSV를 임시 override → 원본 CSV 캡처 (저장은 우리가 직접 처리)
     const origDownload = Utils.downloadCSV.bind(Utils);
@@ -3115,20 +3918,52 @@ window.BaeminPipelineSave = {
       Utils.downloadCSV = origDownload;
     }
 
-    if (collectResult?.success === false) {
+    if (collectResult?.success === false && !collectResult?.partial) {
       return collectResult;
     }
 
     if (!capturedCsv) return { success: false, error: '수집 결과 없음 (0건 또는 오류)' };
 
+    const partial = !!collectResult?.partial;
+    const cleanStr = (str) => String(str || '').replace(/[\\/:*?"<>|\s]/g, '_').substring(0, 30);
+    const suffix = noUrlDate ? (partial ? 'nodate_partial' : 'nodate') : (partial ? 'partial' : '');
+    const expectedFilename = [
+      'baemin',
+      'orders',
+      cleanStr(storeName) || 'unknown',
+      shopInfo.store_id || 'unknown',
+      targetDateCompact
+    ].join('_') + (suffix ? '_' + suffix : '') + '.csv';
+
+    site._ordersLog(`실제 CSV 저장 시작: ${expectedFilename}`, partial ? 'warn' : 'ok');
     const filename = await Utils.downloadCSV(capturedCsv, {
       channel: 'baemin',
       purpose: 'orders',
       storeName: storeName,
       storeId: shopInfo.store_id || '',
-      dateStr: targetDate.replace(/-/g, '')
+      dateStr: targetDateCompact,
+      suffix
     });
-    return { success: true, filename, storeName, partial: !!collectResult?.partial };
+    if (!filename || filename === 'pipeline_captured') {
+      const error = `실제 CSV 저장 실패: filename=${filename || '없음'}`;
+      site._ordersLog(error, 'err');
+      return { success: false, filename: filename || '', storeName, partial, error };
+    }
+    // downloadCSV 는 실패해도 filename 을 돌려준다. 실제 저장 여부는 여기서 판정한다.
+    const dl = Utils._lastDownloadResult;
+    if (dl && dl.verified === false) {
+      const error = `실제 CSV 저장 미확인: ${filename} (방식=${dl.via} 사유=${dl.error || '검증 실패'})`;
+      site._ordersLog(error, 'err');
+      return { success: false, filename, storeName, partial, error };
+    }
+    site._ordersLog(`실제 CSV 저장 완료: ${dl?.path || filename}`, partial ? 'warn' : 'ok');
+    return {
+      success: !partial,
+      filename,
+      storeName,
+      partial,
+      error: partial ? (collectResult?.error || '부분 수집 파일 저장됨') : ''
+    };
   },
 
   // 광고퍼널: 특정 날짜의 배민 stat/advertisement 페이지에서 숫자 읽기

@@ -64,6 +64,17 @@ x-airflow-common:
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
     AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
     AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    # 16GB WSL 환경: 브라우저/변환 작업 16개 동시 실행 시 메모리와 스왑 고갈.
+    # 3은 전역 병목이 너무 심해 57개 DagRun이 순차 대기 → 8로 1단계 상향 (docker stats로 관찰 중, 무탈시 16으로).
+    AIRFLOW__CELERY__WORKER_CONCURRENCY: '8'
+    AIRFLOW__CORE__PARALLELISM: '8'
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: '4'
+    AIRFLOW__CELERY__WORKER_PREFETCH_MULTIPLIER: '1'
+    # 2026-09-11 장애: Docker 백엔드가 무너져 컨테이너 DNS가 깨지자 DAG 파서가
+    # 메타DB 접속 실패로 죽었고, 기본값 600초(10분)가 지나자 파일이 멀쩡한 DAG
+    # 4개를 "missing"으로 판단해 비활성화 + serialized_dag 삭제까지 했다.
+    # 일시적 백엔드 장애로 DAG가 사라지지 않도록 유예를 1시간으로 늘린다.
+    AIRFLOW__SCHEDULER__DAG_STALE_NOT_SEEN_DURATION: '3600'
     AIRFLOW__CORE__FERNET_KEY: ''
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
@@ -234,7 +245,7 @@ services:
 
   airflow-worker:
     <<: *airflow-common
-    command: celery worker
+    command: celery worker --queues default --concurrency 8
     shm_size: '2gb'
     healthcheck:
       # yamllint disable rule:line-length
@@ -250,11 +261,29 @@ services:
       # Required to handle warm shutdown of the celery workers properly
       # See https://airflow.apache.org/docs/docker-stack/entrypoint.html#signal-propagation
       DUMB_INIT_SETSID: "0"
+      AIRFLOW__CELERY__WORKER_CONCURRENCY: '8'
     restart: always
     depends_on:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
+
+  airflow-backfill-worker:
+    <<: *airflow-common
+    image: ${AIRFLOW_WORKER_IMAGE:-airflow-airflow-worker}
+    command: celery worker --queues history --concurrency 1
+    shm_size: '2gb'
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+      AIRFLOW__CELERY__WORKER_CONCURRENCY: '1'
+    healthcheck:
+      test: ["CMD-SHELL", 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
 
   airflow-triggerer:
     <<: *airflow-common

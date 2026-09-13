@@ -360,7 +360,8 @@ def backfill_easypos_stores(stores: list[str]) -> str:
         if not date_str or date_str.lower() == "nan":
             continue
         try:
-            result = run_easypos(date_str, overwrite=False, stores=sorted(store_scope))
+            from modules.transform.pipelines.db.DB_UnifiedSales_nightly import backfill_unit
+            result = backfill_unit(run_easypos, date_str, overwrite=False, stores=sorted(store_scope))
             logger.info(result)
             total_days += 1
             if "|" in result and "행" in result:

@@ -14,6 +14,7 @@ unified_sales - Posfeed 채널 전용 모듈.
 - 주문상태 '배달완료' → 정상, 그 외('취소') → 취소
 """
 
+from modules.transform.utility.process_lock import unified_writer
 import logging
 from datetime import datetime, timedelta
 
@@ -701,6 +702,7 @@ def _unified_paths_for_dates(date_strs: list[str]) -> list:
     return sorted(set(paths))
 
 
+@unified_writer
 def sync_posfeed_blacklist(target_dates: list[str] | None = None) -> str:
     """grp 블랙리스트(exclude_check=Y)를 기존 unified_sales_*.parquet에 소급 적용.
 
@@ -1313,7 +1315,8 @@ def backfill_posfeed_stores(stores: list[str]) -> str:
     total = 0
     for date_str in sorted(dates):
         try:
-            result = run_posfeed(date_str, overwrite=False, stores=sorted(store_scope))
+            from modules.transform.pipelines.db.DB_UnifiedSales_nightly import backfill_unit
+            result = backfill_unit(run_posfeed, date_str, overwrite=False, stores=sorted(store_scope))
             logger.info(result)
             try:
                 total += int(result.split(":", 1)[1].strip().split("행", 1)[0].strip())

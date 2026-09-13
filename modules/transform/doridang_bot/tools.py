@@ -6,12 +6,17 @@ import inspect
 import logging
 import re
 import time
+import threading
+from pathlib import Path
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
 import pandas as pd
 
 from modules.transform.doridang_bot import conversation
+from modules.transform.utility import flow_task_status as status_rules
 from modules.transform.utility.paths import FLOW_COMMENT_PARQUET, FLOW_POST_PARQUET, FLOW_PROJECT_PARQUET
 
 logger = logging.getLogger(__name__)
@@ -23,9 +28,72 @@ ALLOWED_PROJECTS = {
 }
 LEADER_TEAM_MEMBERS = ["조민준", "황유경", "차보령"]
 
+# 사람 기준 3종. auto = 담당자(worker) 우선, 비어 있으면 작성자(author_name)로 대체.
+# get_worker_status와 get_team_status가 같은 기준을 쓰지 않으면 같은 사람의 숫자가 어긋난다.
+BASIS_AUTO = "auto"
+BASIS_AUTHOR = "author"
+BASIS_WORKER = "worker"
+
 TOOL_FUNCTIONS: dict[str, Callable[..., Any]] = {}
 _CACHE_TTL_SEC = 60
 _PARQUET_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
+_REQUEST_TABLES = ContextVar("flow_request_tables", default=None)
+_REQUEST_TODAY = ContextVar("flow_request_today", default=None)
+_SNAPSHOT_LOCK = threading.Lock()
+_SNAPSHOT_CACHE = None
+
+
+@contextmanager
+def request_snapshot():
+    """한 요청의 재조회가 캐시 갱신으로 서로 다른 표를 읽지 않게 고정한다."""
+    global _SNAPSHOT_CACHE
+    paths = {"projects": FLOW_PROJECT_PARQUET, "posts": FLOW_POST_PARQUET, "comments": FLOW_COMMENT_PARQUET}
+
+    def signature():
+        return tuple((str(file), file.stat().st_mtime_ns, file.stat().st_size)
+                     for path in paths.values()
+                     for file in sorted(Path(path).rglob("*.parquet") if Path(path).is_dir() else [Path(path)]))
+
+    with _SNAPSHOT_LOCK:
+        before = signature()
+        if _SNAPSHOT_CACHE is not None and _SNAPSHOT_CACHE[0] == before:
+            tables = _SNAPSHOT_CACHE[1]
+        else:
+            for attempt in range(2):
+                tables = {key: pd.read_parquet(path) for key, path in paths.items()}
+                after = signature()
+                if before == after:
+                    break
+                before = after
+            else:
+                raise RuntimeError("수집 데이터가 갱신 중입니다. 다시 조회해 주세요.")
+            _SNAPSHOT_CACHE = (after, tables)
+    token = _REQUEST_TABLES.set(tables)
+    today_token = _REQUEST_TODAY.set(datetime.now().strftime("%Y%m%d"))
+    try:
+        yield
+    finally:
+        _REQUEST_TABLES.reset(token)
+        _REQUEST_TODAY.reset(today_token)
+
+
+def request_today():
+    return _REQUEST_TODAY.get() or datetime.now().strftime("%Y%m%d")
+
+
+def deadline_state(value, status, today=None):
+    raw = str(value or "").strip().replace("-", "")
+    if not raw or raw in {"nan", "None", "NaT"}:
+        return "기한 미등록"
+    try:
+        if not re.fullmatch(r"\d{8}", raw):
+            raise ValueError(raw)
+        datetime.strptime(raw, "%Y%m%d")
+    except ValueError:
+        return "기한 형식 확인 필요"
+    if not status_rules.tracks_due(str(status or "")):
+        return "현재 상태는 기한 경과 집계 대상 아님"
+    return "기한 경과" if raw < (today or request_today()) else "기한 경과 아님"
 
 
 def list_projects() -> dict[str, Any]:
@@ -55,20 +123,21 @@ def get_project_status(project_id: str) -> dict[str, Any]:
     if posts.empty:
         return _empty_project(project_id)
 
-    status_counts = _value_counts(posts.get("task_status"))
-    author_counts = _value_counts(posts.get("author_name"))
-    worker_counts = _value_counts(posts.get("worker"))
+    tasks = _task_posts(posts)
+    author_counts = _value_counts(tasks.get("author_name"))
+    worker_counts = _value_counts(tasks.get("worker"))
     overdue = _overdue_posts(posts)
     return {
         "project_id": project_id,
         "project_name": ALLOWED_PROJECTS[project_id],
         "project_url": _project_url(project_id),
-        "post_count": int(len(posts)),
-        "status_counts": status_counts,
         "author_counts": author_counts,
         "worker_counts": worker_counts,
         "overdue_count": int(len(overdue)),
         "overdue_posts": _post_records(overdue, limit=20),
+        "posts": _post_records(_sort_for_progress(_open_posts(posts)), limit=20),
+        "open_count": int(len(_open_posts(posts))),
+        **_task_summary(posts),
     }
 
 
@@ -126,6 +195,24 @@ def find_posts(keyword: str) -> dict[str, Any]:
     }
 
 
+def resolve_post_reference(question: str, worker: str | None = None, project_id: str | None = None) -> list[str]:
+    """질문에 명시된 업무 제목을 실제 자료에서 찾는다. 같은 제목은 임의 선택하지 않는다."""
+    normalized = re.sub(r"[^\w]", "", question).lower()
+    posts = _load_posts()
+    posts = posts[posts["project_id"].isin(ALLOWED_PROJECTS)]
+    if worker:
+        posts = posts[_person_mask(posts, worker, BASIS_AUTO)]
+    if project_id:
+        posts = posts[posts["project_id"].eq(project_id)]
+    matches = []
+    for row in posts[["post_id", "title"]].to_dict("records"):
+        title = re.sub(r"[^\w]", "", str(row.get("title") or "")).lower()
+        if len(title) >= 5 and title in normalized:
+            matches.append((len(title), str(row["post_id"])))
+    longest = max((length for length, _ in matches), default=0)
+    return list(dict.fromkeys(post_id for length, post_id in matches if length == longest))
+
+
 def get_post_thread(post_id: str) -> dict[str, Any]:
     post_id = str(post_id or "").strip()
     posts = _load_posts()
@@ -142,10 +229,12 @@ def get_post_thread(post_id: str) -> dict[str, Any]:
     parent = str(selected.iloc[0].get("parent_post_id") or "").strip()
     root_id = parent if parent and parent.lower() != "nan" and parent != "0" else post_id
     thread = posts[
-        _string_series(posts["post_id"]).eq(root_id)
-        | _string_series(posts["parent_post_id"]).eq(root_id)
+        _string_series(posts["project_id"]).eq(project_id)
+        & (_string_series(posts["post_id"]).eq(root_id)
+        | _string_series(posts["parent_post_id"]).eq(root_id))
     ]
-    thread_comments = comments[_string_series(comments["post_id"]).isin(_string_series(thread["post_id"]))]
+    thread_comments = comments[_string_series(comments["project_id"]).eq(project_id)
+                               & _string_series(comments["post_id"]).isin(_string_series(thread["post_id"]))]
     thread = thread.sort_values(["depth", "post_date", "post_id"], ascending=[True, True, True])
     thread_comments = thread_comments.sort_values(["written_at", "comment_id"], ascending=[True, True])
     return {
@@ -153,7 +242,7 @@ def get_post_thread(post_id: str) -> dict[str, Any]:
         "project_name": ALLOWED_PROJECTS[project_id],
         "root_post_id": root_id,
         "posts": _post_records(thread, limit=100),
-        "comments": _comment_records(thread_comments, limit=200),
+        "comments": _comment_records(thread_comments.tail(200), limit=200),
     }
 
 
@@ -195,7 +284,7 @@ def search_conversation_log(keyword: str) -> dict[str, Any]:
     return {"keyword": keyword, "matches": conversation.search_log(keyword)}
 
 
-def get_worker_status(worker: str, basis: str = "worker") -> dict[str, Any]:
+def get_worker_status(worker: str, basis: str = BASIS_AUTO) -> dict[str, Any]:
     worker = _normalize_worker_query(worker)
     if not worker:
         return {"message": "담당자 이름이 비어 있습니다", "posts": []}
@@ -203,14 +292,8 @@ def get_worker_status(worker: str, basis: str = "worker") -> dict[str, Any]:
     posts = _load_posts()
     allowed = posts[posts["project_id"].isin(ALLOWED_PROJECTS)]
     basis = _normalize_basis(basis)
-    person_column = _basis_column(basis)
-    if basis == "author":
-        matches = allowed[_team_member_mask(allowed, worker)].copy()
-        basis_label = "작성자/참여자"
-    else:
-        worker_text = _string_series(allowed[person_column])
-        matches = allowed[worker_text.str.contains(worker, case=False, na=False, regex=False)].copy()
-        basis_label = _basis_label(basis)
+    basis_label = _basis_label(basis)
+    matches = allowed[_person_mask(allowed, worker, basis)].copy()
     if matches.empty:
         return {
             "worker": worker,
@@ -228,75 +311,58 @@ def get_worker_status(worker: str, basis: str = "worker") -> dict[str, Any]:
             "project_id": str(project_id),
             "project_name": ALLOWED_PROJECTS.get(str(project_id), ""),
             "project_url": _project_url(str(project_id)),
-            "post_count": int(len(project_posts)),
-            "status_counts": _value_counts(project_posts.get("task_status")),
             "overdue_count": int(len(_overdue_posts(project_posts))),
-            "posts": _post_records(
-                project_posts.sort_values(["end_dt", "post_date", "post_id"], ascending=[True, False, False]),
-                limit=20,
-            ),
+            "posts": _post_records(_sort_for_progress(_open_posts(project_posts)), limit=20),
+            **_task_summary(project_posts),
         })
 
     return {
         "worker": worker,
         "basis": basis,
         "basis_label": basis_label,
-        "post_count": int(len(matches)),
-        "status_counts": _value_counts(matches.get("task_status")),
+        "basis_note": _basis_note(basis),
         "overdue_count": int(len(_overdue_posts(matches))),
         "projects": by_project,
-        "posts": _post_records(
-            matches.sort_values(["end_dt", "post_date", "post_id"], ascending=[True, False, False]),
-            limit=30,
-        ),
+        # 진행상황 질문이므로 지금 열려 있는 업무만 보여준다. 완료 건수는 status_counts에 남는다
+        "posts": _post_records(_sort_for_progress(_open_posts(matches)), limit=30),
+        "open_count": int(len(_open_posts(matches))),
+        "record_posts": _post_records(_record_posts(matches), limit=10),
+        **_task_summary(matches),
     }
 
 
-def get_team_status(basis: str = "author") -> dict[str, Any]:
+def get_team_status(basis: str = BASIS_AUTO) -> dict[str, Any]:
     basis = _normalize_basis(basis)
-    person_column = _basis_column(basis)
     posts = _load_posts()
     allowed = posts[posts["project_id"].isin(ALLOWED_PROJECTS)].copy()
-    empty_label = "작성자 미지정" if basis == "author" else "담당자 미지정"
-    allowed["_person_bucket"] = _string_series(allowed[person_column]).str.strip().replace("", empty_label)
 
-    if basis == "author":
-        ordered = [
-            _member_status_record(
-                name,
-                allowed[_team_member_mask(allowed, name)],
-            )
-            for name in LEADER_TEAM_MEMBERS
-        ]
-        risk_source = allowed[
-            pd.concat([_team_member_mask(allowed, name) for name in LEADER_TEAM_MEMBERS], axis=1).any(axis=1)
-        ]
+    if basis == BASIS_WORKER:
+        roster = _discover_person_names(allowed, basis)
     else:
-        members = []
-        for person, person_posts in allowed.groupby("_person_bucket", sort=False):
-            names = [name.strip() for name in person.split(",") if name.strip()] if "," in person else [person]
-            for name in names:
-                if name == empty_label:
-                    member_posts = allowed[allowed["_person_bucket"].eq(empty_label)]
-                else:
-                    member_posts = allowed[_string_series(allowed[person_column]).str.contains(name, case=False, na=False, regex=False)]
-                if member_posts.empty:
-                    continue
-                members.append(_member_status_record(name, member_posts))
-        deduped = {member["worker"]: member for member in members}
+        roster = list(LEADER_TEAM_MEMBERS)
+
+    # get_worker_status와 동일한 마스크를 써야 같은 사람의 숫자가 어긋나지 않는다.
+    masks = {name: _person_mask(allowed, name, basis) for name in roster}
+    members = [_member_status_record(name, allowed[masks[name]]) for name in roster]
+
+    if basis == BASIS_WORKER:
         ordered = sorted(
-            deduped.values(),
+            members,
             key=lambda item: (int(item.get("overdue_count", 0)), int(item.get("active_count", 0)), int(item.get("post_count", 0))),
             reverse=True,
         )
         risk_source = allowed
+    else:
+        ordered = members
+        risk_source = allowed[pd.concat(list(masks.values()), axis=1).any(axis=1)] if masks else allowed.head(0)
+
     return {
         "basis": basis,
-        "basis_label": "작성자/참여자" if basis == "author" else _basis_label(basis),
-        "post_count": int(len(allowed)),
-        "status_counts": _value_counts(allowed.get("task_status")),
+        "basis_label": _basis_label(basis),
+        "basis_note": _basis_note(basis),
         "member_count": len(ordered),
-        "team_members": LEADER_TEAM_MEMBERS if basis == "author" else [],
+        **_task_summary(allowed),
+        "team_members": [] if basis == BASIS_WORKER else list(LEADER_TEAM_MEMBERS),
         "members": ordered,
         "priority_posts": _post_records(_priority_action_posts(risk_source), limit=20),
         "risk_posts": _post_records(_risk_posts(risk_source), limit=20),
@@ -324,7 +390,13 @@ def get_risk_status(project_id: str | None = None, priority_only: bool = False) 
     }
 
 
-def filter_posts(status: str | None = None, due: str | None = None, project_id: str | None = None) -> dict[str, Any]:
+def filter_posts(
+    status: str | None = None,
+    due: str | None = None,
+    project_id: str | None = None,
+    worker: str | None = None,
+    basis: str = BASIS_AUTO,
+) -> dict[str, Any]:
     posts = _load_posts()
     allowed = posts[posts["project_id"].isin(ALLOWED_PROJECTS)].copy()
     if project_id:
@@ -335,10 +407,19 @@ def filter_posts(status: str | None = None, due: str | None = None, project_id: 
 
     status = (status or "").strip()
     due = (due or "").strip()
+    basis = _normalize_basis(basis)
     matches = allowed
-    if status:
-        status_series = _string_series(matches["task_status"]).str.strip()
-        matches = matches[status_series.eq(status)]
+    # "황유경 것 중에 기한 지난 건" 같은 후속 질문을 한 번에 답하기 위한 사람 조건
+    worker = _normalize_worker_query(worker or "")
+    if worker:
+        matches = matches[_person_mask(matches, worker, basis)]
+    if status == "미완료":
+        matches = _open_posts(matches)
+    elif status:
+        # 사용자가 "회의록 보여줘"처럼 직접 지정하면 비업무도 조회한다
+        matches = matches[_status_series(matches).eq(status)]
+    else:
+        matches = _task_posts(matches)
     if due == "none":
         due_series = _string_series(matches["end_dt"]).str.strip()
         matches = matches[due_series.eq("")]
@@ -348,16 +429,18 @@ def filter_posts(status: str | None = None, due: str | None = None, project_id: 
         due_series = _string_series(matches["end_dt"]).str.replace("-", "", regex=False).str.strip()
         matches = matches[due_series.eq(due)]
 
-    matches = matches.sort_values(["post_date", "post_id"], ascending=[False, False])
+    matches = _sort_for_progress(matches)
     return {
         "project_id": str(project_id or ""),
         "project_name": ALLOWED_PROJECTS.get(str(project_id or ""), "전체 허용 프로젝트"),
         "project_url": _project_url(str(project_id or "")),
         "status_filter": status,
         "due_filter": due,
-        "post_count": int(len(matches)),
-        "status_counts": _value_counts(matches.get("task_status")) if not matches.empty else {},
+        "worker_filter": worker,
+        "basis": basis,
+        "basis_label": _basis_label(basis),
         "posts": _post_records(matches, limit=50),
+        **_task_summary(matches),
     }
 
 
@@ -386,21 +469,16 @@ def get_topic_status(keyword: str) -> dict[str, Any]:
             "project_id": str(project_id),
             "project_name": ALLOWED_PROJECTS.get(str(project_id), ""),
             "project_url": _project_url(str(project_id)),
-            "post_count": int(len(project_posts)),
-            "status_counts": _value_counts(project_posts.get("task_status")),
-            "posts": _post_records(
-                project_posts.sort_values(["post_date", "post_id"], ascending=[False, False]),
-                limit=20,
-            ),
+            "posts": _post_records(_sort_for_progress(_task_posts(project_posts)), limit=20),
+            **_task_summary(project_posts),
         })
 
     return {
         "keyword": keyword,
         "keywords": keywords,
-        "post_count": int(len(matches)),
-        "status_counts": _value_counts(matches.get("task_status")),
         "projects": by_project,
-        "posts": _post_records(matches.sort_values(["post_date", "post_id"], ascending=[False, False]), limit=40),
+        "posts": _post_records(_sort_for_progress(_task_posts(matches)), limit=40),
+        **_task_summary(matches),
     }
 
 
@@ -467,6 +545,68 @@ def detect_risk_intent(text: str) -> bool:
     return any(keyword in text for keyword in ["위험 업무", "리스크", "기한 지난", "기한 경과", "기한 없음", "막힌 업무", "막힌", "보류", "대기", "피드백", "결제중", "결재중"])
 
 
+def basis_label(basis: str = BASIS_AUTO) -> str:
+    """사람 기준 표시 문구. 답변에 어느 기준으로 센 숫자인지 밝히기 위해 쓴다."""
+    return _basis_label(basis)
+
+
+def basis_note(basis: str = BASIS_AUTO) -> str:
+    """기준의 정의를 한 줄로 설명한다. 같은 사람의 숫자가 왜 그런지 밝히기 위해 쓴다."""
+    return _basis_note(basis)
+
+
+# Flow 수집은 하루 6회(schedule.SMP_FLOW_COLLECT_TIME)다.
+# 하루 넘게 갱신이 없으면 그 프로젝트는 수집이 멈춘 것으로 본다.
+STALE_AFTER_DAYS = 1
+
+
+def data_freshness() -> dict[str, Any]:
+    """답변 대상 3개 프로젝트의 수집 신선도.
+
+    전체 파티션(109개 프로젝트)에서 max를 뽑으면 답하지도 않는 프로젝트의
+    수집 시각으로 "오늘 데이터"라고 표시하게 된다. 반드시 허용 프로젝트만 본다.
+    """
+    empty = {"latest": "", "oldest": "", "age_days": None, "stale": False}
+    try:
+        posts = _load_posts()
+        allowed = posts[posts["project_id"].isin(ALLOWED_PROJECTS)]
+        series = _string_series(allowed.get("collected_at")).str.strip()
+        series = series[series != ""]
+    except Exception:
+        logger.warning("collected_at 조회 실패", exc_info=True)
+        return empty
+    if series.empty:
+        return empty
+
+    latest_raw, oldest_raw = series.max(), series.min()
+    age_days = None
+    try:
+        latest_ts = pd.Timestamp(latest_raw)
+        now = datetime.now(tz=latest_ts.tz) if latest_ts.tz is not None else datetime.now()
+        age_days = max(0, (now - latest_ts.to_pydatetime()).days)
+    except Exception:
+        logger.warning("collected_at 파싱 실패: %r", latest_raw)
+
+    return {
+        "latest": _safe_format_dt(latest_raw),
+        "oldest": _safe_format_dt(oldest_raw),
+        "age_days": age_days,
+        "stale": bool(age_days is not None and age_days >= STALE_AFTER_DAYS),
+    }
+
+
+def data_as_of() -> str:
+    """답변 대상 데이터의 최신 collected_at."""
+    return data_freshness()["latest"]
+
+
+def _safe_format_dt(value: Any) -> str:
+    try:
+        return _format_dt(value)
+    except Exception:
+        return str(value or "")
+
+
 def tool_schemas() -> list[dict[str, Any]]:
     return [
         _schema("list_projects", "허용된 3개 Flow 프로젝트와 게시글/댓글 수를 조회합니다.", {}),
@@ -489,19 +629,20 @@ def tool_schemas() -> list[dict[str, Any]]:
         }, ["project_id"]),
         _schema("get_worker_status", "허용된 3개 프로젝트 안에서 사람 이름으로 업무 진행상황을 조회합니다.", {
             "worker": {"type": "string", "description": "담당자 이름. 예: 황유경"},
-            "basis": {"type": "string", "description": "worker 또는 author"},
+            "basis": {"type": "string", "description": "auto(기본) | worker | author. auto는 담당자 우선, 없으면 작성자"},
         }, ["worker"]),
         _schema("get_team_status", "허용된 3개 프로젝트 전체에서 팀원별 업무 진행상황을 집계합니다.", {
-            "basis": {"type": "string", "description": "worker 또는 author. 기본 author"},
+            "basis": {"type": "string", "description": "auto(기본) | worker | author. get_worker_status와 같은 기준을 쓴다"},
         }),
-        _schema("get_risk_status", "허용된 3개 프로젝트에서 위험 업무 또는 피드백/결제중 업무를 조회합니다.", {
+        _schema("get_risk_status", "허용된 3개 프로젝트에서 위험 업무 또는 피드백/보완 업무를 조회합니다.", {
             "project_id": {"type": "string", "description": "선택 project_id"},
-            "priority_only": {"type": "boolean", "description": "true면 피드백/결제중만 조회"},
+            "priority_only": {"type": "boolean", "description": "true면 피드백/보완만 조회"},
         }),
-        _schema("filter_posts", "허용된 3개 프로젝트에서 상태와 기한 조건으로 업무를 필터링합니다.", {
-            "status": {"type": "string", "description": "예: 보류, 대기, 진행, 완료, 피드백, 결제중"},
-            "due": {"type": "string", "description": "none 또는 overdue"},
+        _schema("filter_posts", "상태/기한/담당자 조건으로 업무를 필터링합니다. 특정 사람의 지연 업무처럼 조건이 겹칠 때 씁니다.", {
+            "status": {"type": "string", "description": "진행 업무: 진행 | 대기 | 보류 | 피드백 | 보완 | 완료. 진행 업무 아님: 모니터링 | 업무단위 | 회의록 | 액션 — 사용자가 직접 물을 때만 쓴다"},
+            "due": {"type": "string", "description": "none(기한 없음) | overdue(기한 경과) | YYYYMMDD"},
             "project_id": {"type": "string", "description": "선택 project_id"},
+            "worker": {"type": "string", "description": "선택 담당자 이름. 예: 황유경"},
         }),
         _schema("get_topic_status", "허용된 3개 프로젝트 전체에서 주제/키워드 관련 게시글을 검색하고 상태를 집계합니다.", {
             "keyword": {"type": "string", "description": "검색 주제. 예: 마케팅 실적"},
@@ -524,6 +665,7 @@ def _register() -> None:
         list_projects,
         get_project_status,
         search_posts,
+        find_posts,
         get_post_thread,
         get_recent_activity,
         get_worker_status,
@@ -536,6 +678,19 @@ def _register() -> None:
         TOOL_FUNCTIONS[func.__name__] = func
 
 
+def accepted_arguments(name: str) -> set[str]:
+    """tool이 실제로 받는 인자 이름. 라우터가 조건을 잃지 않게 확인하는 데 쓴다."""
+    func = TOOL_FUNCTIONS.get(name)
+    if not func:
+        return set()
+    signature = inspect.signature(func)
+    return {
+        key
+        for key, parameter in signature.parameters.items()
+        if parameter.kind in {parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY}
+    }
+
+
 def _filter_arguments(func: Callable[..., Any], arguments: dict[str, Any]) -> dict[str, Any]:
     signature = inspect.signature(func)
     allowed = {
@@ -543,6 +698,11 @@ def _filter_arguments(func: Callable[..., Any], arguments: dict[str, Any]) -> di
         for name, parameter in signature.parameters.items()
         if parameter.kind in {parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY}
     }
+    dropped = sorted(set(arguments) - allowed)
+    if dropped:
+        # 조용히 버리면 사용자가 요청한 조건이 흔적 없이 사라진다.
+        # "진행만 정리해줘"가 status 인자를 잃고 전체를 답하던 버그가 여기서 났다.
+        logger.warning("%s가 받지 못하는 인자를 버림: %s", getattr(func, "__name__", func), dropped)
     return {key: value for key, value in arguments.items() if key in allowed}
 
 
@@ -565,12 +725,19 @@ def _load_comments() -> pd.DataFrame:
 
 
 def _cached_read_parquet(key: str, path: Any) -> pd.DataFrame:
+    tables = _REQUEST_TABLES.get()
+    if tables is not None and key in tables:
+        return tables[key].copy()
     now = time.time()
     cached = _PARQUET_CACHE.get(key)
     if cached and now - cached[0] < _CACHE_TTL_SEC:
+        if tables is not None:
+            tables[key] = cached[1].copy()
         return cached[1].copy()
     df = pd.read_parquet(path)
     _PARQUET_CACHE[key] = (now, df)
+    if tables is not None:
+        tables[key] = df.copy()
     return df.copy()
 
 
@@ -624,43 +791,132 @@ def _value_counts(series: pd.Series | None) -> dict[str, int]:
     return {str(key): int(value) for key, value in cleaned.value_counts().items()}
 
 
+def _status_series(posts: pd.DataFrame) -> pd.Series:
+    return _string_series(posts.get("task_status")).str.strip()
+
+
+def _task_mask(posts: pd.DataFrame) -> pd.Series:
+    """진행 업무만. 업무단위/회의록/액션은 업무가 아니고, 모니터링은 관찰 항목이라 뺀다."""
+    return ~_status_series(posts).isin(status_rules.EXCLUDED_FROM_TASKS)
+
+
+def _task_posts(posts: pd.DataFrame) -> pd.DataFrame:
+    return posts[_task_mask(posts)]
+
+
+def _record_posts(posts: pd.DataFrame) -> pd.DataFrame:
+    return posts[~_task_mask(posts)]
+
+
+def _open_posts(posts: pd.DataFrame) -> pd.DataFrame:
+    """진행상황 목록용. 완료와 집계 제외 상태를 뺀 '지금 열려 있는 업무'."""
+    return posts[_status_series(posts).map(status_rules.is_open)]
+
+
+def _end_sort_key(posts: pd.DataFrame) -> pd.Series:
+    """기한 없는 글이 오름차순에서 맨 앞을 차지하는 것을 막는다."""
+    end_dt = _string_series(posts.get("end_dt")).str.strip().str.replace("-", "", regex=False)
+    return end_dt.replace("", status_rules.NO_DUE_SORT_KEY)
+
+
+def _sort_for_progress(posts: pd.DataFrame) -> pd.DataFrame:
+    """진행상황 보고용 정렬: 열린 업무 먼저, 기한 임박순, 최신순."""
+    if posts.empty:
+        return posts
+    ordered = posts.copy()
+    ordered["_open_rank"] = _status_series(ordered).map(lambda value: 0 if status_rules.is_open(value) else 1)
+    ordered["_end_sort"] = _end_sort_key(ordered)
+    ordered = ordered.sort_values(
+        ["_open_rank", "_end_sort", "post_date", "post_id"],
+        ascending=[True, True, False, False],
+    )
+    return ordered.drop(columns=["_open_rank", "_end_sort"])
+
+
+def _task_summary(posts: pd.DataFrame) -> dict[str, Any]:
+    """업무와 기록을 나눠 센다. 기록은 감추지 않고 한 줄로 따로 밝힌다."""
+    tasks = _task_posts(posts)
+    records = _record_posts(posts)
+    return {
+        "overdue_task_count": int(len(_overdue_posts(tasks))),
+        "overdue_monitoring_count": int(len(_overdue_posts(records))),
+        "post_count": int(len(posts)),
+        "task_count": int(len(tasks)),
+        "record_count": int(len(records)),
+        "status_counts": _value_counts(tasks.get("task_status")),
+        "record_counts": _value_counts(records.get("task_status")),
+    }
+
+
 def _overdue_posts(posts: pd.DataFrame) -> pd.DataFrame:
-    today = datetime.now().strftime("%Y%m%d")
+    today = request_today()
     end_dt = _string_series(posts["end_dt"]).str.replace("-", "", regex=False)
     status = _string_series(posts["task_status"]).str.strip()
-    mask = end_dt.str.match(r"^\d{8}$", na=False) & (end_dt < today) & ~status.eq("완료")
-    return posts[mask].sort_values(["end_dt", "post_id"], ascending=[True, True])
+    valid = pd.to_datetime(end_dt, format="%Y%m%d", errors="coerce").notna()
+    mask = valid & end_dt.str.match(r"^\d{8}$", na=False) & (end_dt < today) & status.map(status_rules.tracks_due)
+    overdue = posts[mask].copy()
+    if overdue.empty:
+        return overdue
+    overdue["_end_sort"] = _end_sort_key(overdue)
+    return overdue.sort_values(["_end_sort", "post_id"], ascending=[True, True]).drop(columns=["_end_sort"])
 
 
 def _risk_posts(posts: pd.DataFrame) -> pd.DataFrame:
     if posts.empty:
         return posts
-    status = _string_series(posts["task_status"]).str.strip()
-    risk_status = status.isin(["결제중", "피드백", "보류", "대기"])
+    status = _status_series(posts)
+    risk_status = status.map(status_rules.is_open) & status.map(status_rules.risk_rank).lt(status_rules.UNRANKED)
     overdue_index = set(_overdue_posts(posts).index)
     overdue = posts.index.to_series().isin(overdue_index)
     risks = posts[risk_status | overdue].copy()
-    risks["_risk_rank"] = status.map({"결제중": 0, "피드백": 1, "보류": 2, "대기": 3}).fillna(4)
-    risks["_end_sort"] = _string_series(risks["end_dt"]).replace("", "99999999")
+    risks["_risk_rank"] = _status_series(risks).map(status_rules.risk_rank)
+    risks["_end_sort"] = _end_sort_key(risks)
     return risks.sort_values(["_risk_rank", "_end_sort", "post_date"], ascending=[True, True, False])
 
 
 def _priority_action_posts(posts: pd.DataFrame) -> pd.DataFrame:
     if posts.empty:
         return posts
-    status = _string_series(posts["task_status"]).str.strip()
-    priority = posts[status.isin(["결제중", "피드백"])].copy()
+    status = _status_series(posts)
+    priority = posts[status.map(status_rules.is_priority)].copy()
     if priority.empty:
         return priority
-    priority["_priority_rank"] = status.map({"결제중": 0, "피드백": 1}).fillna(2)
-    priority["_end_sort"] = _string_series(priority["end_dt"]).replace("", "99999999")
+    priority["_priority_rank"] = _status_series(priority).map(status_rules.risk_rank)
+    priority["_end_sort"] = _end_sort_key(priority)
     return priority.sort_values(["_priority_rank", "_end_sort", "post_date"], ascending=[True, True, False])
 
 
-def _team_member_mask(posts: pd.DataFrame, name: str) -> pd.Series:
-    author = _string_series(posts.get("author_name")).str.contains(name, case=False, na=False, regex=False)
-    worker = _string_series(posts.get("worker")).str.contains(name, case=False, na=False, regex=False)
-    return author | worker
+def _discover_person_names(posts: pd.DataFrame, basis: str) -> list[str]:
+    """기준 컬럼에 등장하는 사람 이름 목록. worker는 쉼표 다중값이라 펼친다."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for value in _person_series(posts, basis):
+        for name in str(value).split(","):
+            name = name.strip()
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+    return names
+
+
+def _effective_person_series(posts: pd.DataFrame) -> pd.Series:
+    """업무 담당자. worker가 비어 있으면 작성자를 담당자로 본다."""
+    worker = _string_series(posts.get("worker")).str.strip()
+    author = _string_series(posts.get("author_name")).str.strip()
+    return worker.where(worker != "", author)
+
+
+def _person_series(posts: pd.DataFrame, basis: str) -> pd.Series:
+    basis = _normalize_basis(basis)
+    if basis == BASIS_AUTHOR:
+        return _string_series(posts.get("author_name")).str.strip()
+    if basis == BASIS_WORKER:
+        return _string_series(posts.get("worker")).str.strip()
+    return _effective_person_series(posts)
+
+
+def _person_mask(posts: pd.DataFrame, name: str, basis: str) -> pd.Series:
+    return _person_series(posts, basis).str.contains(name, case=False, na=False, regex=False)
 
 
 def _member_status_record(worker: str, posts: pd.DataFrame) -> dict[str, Any]:
@@ -668,47 +924,62 @@ def _member_status_record(worker: str, posts: pd.DataFrame) -> dict[str, Any]:
         return {
             "worker": worker,
             "post_count": 0,
+            "task_count": 0,
+            "record_count": 0,
             "active_count": 0,
             "status_counts": {},
+            "record_counts": {},
             "overdue_count": 0,
             "projects": [],
             "risk_posts": [],
         }
-    active_status = _string_series(posts["task_status"]).str.strip().isin(["진행", "대기", "보류", "피드백", "결제중"])
+    tasks = _task_posts(posts)
+    active_status = _status_series(tasks).map(status_rules.is_open)
     by_project = []
     for project_id, project_posts in posts.groupby("project_id", sort=False):
+        summary = _task_summary(project_posts)
         by_project.append({
             "project_id": str(project_id),
             "project_name": ALLOWED_PROJECTS.get(str(project_id), ""),
             "project_url": _project_url(str(project_id)),
-            "post_count": int(len(project_posts)),
-            "status_counts": _value_counts(project_posts.get("task_status")),
             "overdue_count": int(len(_overdue_posts(project_posts))),
+            **summary,
         })
     return {
         "worker": worker,
-        "post_count": int(len(posts)),
         "active_count": int(active_status.sum()),
-        "status_counts": _value_counts(posts.get("task_status")),
         "overdue_count": int(len(_overdue_posts(posts))),
         "projects": by_project,
         "risk_posts": _post_records(_risk_posts(posts), limit=8),
+        **_task_summary(posts),
     }
 
 
 def _normalize_basis(basis: str) -> str:
-    basis = (basis or "author").strip().lower()
-    if basis in {"author", "author_name", "작성자"}:
-        return "author"
-    return "worker"
-
-
-def _basis_column(basis: str) -> str:
-    return "author_name" if _normalize_basis(basis) == "author" else "worker"
+    value = (basis or "").strip().lower()
+    if value in {"author", "author_name", "작성자", "작성자 기준"}:
+        return BASIS_AUTHOR
+    if value in {"worker", "담당자", "담당", "담당자 기준"}:
+        return BASIS_WORKER
+    return BASIS_AUTO
 
 
 def _basis_label(basis: str) -> str:
-    return "작성자" if _normalize_basis(basis) == "author" else "담당자"
+    basis = _normalize_basis(basis)
+    if basis == BASIS_AUTHOR:
+        return "작성자"
+    if basis == BASIS_WORKER:
+        return "담당자"
+    return "담당자"
+
+
+def _basis_note(basis: str) -> str:
+    basis = _normalize_basis(basis)
+    if basis == BASIS_AUTO:
+        return "담당자가 비어 있는 글은 작성자를 담당자로 봅니다."
+    if basis == BASIS_AUTHOR:
+        return "글을 쓴 사람 기준입니다. 담당자 지정과는 다를 수 있습니다."
+    return "Flow에 지정된 담당자만 셉니다. 담당자 미지정 글은 빠집니다."
 
 
 def _post_records(posts: pd.DataFrame, *, limit: int) -> list[dict[str, Any]]:
@@ -790,6 +1061,59 @@ def _known_worker_names() -> set[str]:
             if normalized:
                 names.add(normalized)
     return names
+
+
+def known_person_names() -> set[str]:
+    """허용 프로젝트에 실제로 등장하는 사람 이름(담당자 + 작성자 + 리더 팀)."""
+    names = _known_worker_names() | set(LEADER_TEAM_MEMBERS)
+    try:
+        posts = _load_posts()
+    except Exception:
+        return names
+    allowed = posts[posts["project_id"].isin(ALLOWED_PROJECTS)]
+    for value in _string_series(allowed.get("author_name")):
+        for name in re.findall(r"[가-힣]{2,4}", value):
+            normalized = _normalize_worker_query(name)
+            if normalized:
+                names.add(normalized)
+    return names
+
+
+def is_known_person(name: str) -> bool:
+    """LLM이 '승인검증' 같은 말을 사람 이름으로 뽑아내는 것을 걸러낸다."""
+    normalized = _normalize_worker_query(name or "")
+    return bool(normalized) and normalized in known_person_names()
+
+
+def snap_worker_name(worker: str) -> str:
+    """LLM이 '조민준'을 '조민jun'처럼 망가뜨려도 실제 이름으로 되돌린다.
+
+    한글 조각만 남긴 뒤 알려진 담당자/팀원 이름과 맞춰본다. 못 찾으면 원본을 그대로 둔다.
+    """
+    text = _normalize_worker_query(worker or "")
+    if not text:
+        return ""
+
+    known = _known_worker_names() | set(LEADER_TEAM_MEMBERS)
+    if text in known:
+        return text
+
+    hangul = "".join(re.findall(r"[가-힣]+", text))
+    if len(hangul) < 2:
+        return text
+
+    exact = [name for name in known if name == hangul]
+    if exact:
+        return exact[0]
+    prefixed = sorted((name for name in known if name.startswith(hangul)), key=len)
+    if prefixed:
+        logger.info("담당자 이름 보정: %r -> %r", worker, prefixed[0])
+        return prefixed[0]
+    contained = sorted((name for name in known if hangul in name), key=len)
+    if contained:
+        logger.info("담당자 이름 보정: %r -> %r", worker, contained[0])
+        return contained[0]
+    return text
 
 
 def _expand_topic_keywords(keyword: str) -> list[str]:

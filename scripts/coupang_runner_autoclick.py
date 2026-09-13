@@ -38,6 +38,40 @@ DEFAULT_BUTTON_ID = "topHalfBtn"
 DEBUG_ENDPOINT = "http://127.0.0.1:9222"
 TIMEOUT_SECONDS = 60
 POLL_INTERVAL_SECONDS = 0.5
+EXIT_BLOCKED_BY_CLIENT = 2
+
+
+class RunnerPageBlockedError(RuntimeError):
+    """Raised when Chrome opens a blocked error document instead of runner.html."""
+
+
+def _is_runner_tab_url(url: str, expected_runner_url: str | None = None) -> bool:
+    parsed = urllib.parse.urlparse(str(url or ""))
+    if parsed.scheme != "chrome-extension" or not parsed.netloc:
+        return False
+    if parsed.path.rstrip("/") != RUNNER_URL_SUFFIX:
+        return False
+
+    if not expected_runner_url:
+        return True
+
+    expected = urllib.parse.urlparse(expected_runner_url)
+    return (
+        parsed.scheme == expected.scheme
+        and parsed.netloc == expected.netloc
+        and parsed.path.rstrip("/") == expected.path.rstrip("/")
+    )
+
+
+def _runner_base_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(str(url or ""))
+    return f"{parsed.scheme}://{parsed.netloc}{RUNNER_URL_SUFFIX}"
+
+
+def _is_blocked_runner_page(page_state: dict[str, Any]) -> bool:
+    location_href = str(page_state.get("locationHref") or "")
+    body_text = str(page_state.get("bodyText") or "")
+    return location_href.startswith("chrome-error://") and "ERR_BLOCKED_BY_CLIENT" in body_text
 
 
 def _http_json(url: str, method: str = "GET") -> Any:
@@ -64,8 +98,8 @@ def _path_key(path: Path) -> str:
 def _runner_url_from_loaded_extensions(tabs: list[dict]) -> str | None:
     for tab in tabs:
         url = str(tab.get("url", ""))
-        if url.startswith("chrome-extension://") and url.endswith(RUNNER_URL_SUFFIX):
-            return url
+        if _is_runner_tab_url(url):
+            return _runner_base_url(url)
 
     for tab in tabs:
         url = str(tab.get("url", ""))
@@ -159,22 +193,28 @@ def _find_runner_url(tabs: list[dict] | None = None) -> str:
     raise RuntimeError(f"Unable to find Coupang runner extension ID for {BUILD_EXTENSION_DIR}.")
 
 
-def _ensure_runner_tab() -> str:
+def _existing_runner_websockets(tabs: list[dict], expected_runner_url: str | None = None) -> list[str]:
+    ws_urls: list[str] = []
+    for tab in tabs:
+        url = str(tab.get("url", ""))
+        if not _is_runner_tab_url(url, expected_runner_url):
+            continue
+        ws_url = tab.get("webSocketDebuggerUrl")
+        if ws_url:
+            logger.info("existing runner tab found: %s", url)
+            ws_urls.append(str(ws_url))
+    return ws_urls
+
+
+def _ensure_runner_tabs() -> list[str]:
     expected_runner_url = _runner_url_from_chrome_preferences() or _runner_url_from_default_extension()
     start = time.time()
+    tabs: list[dict] = []
     while time.time() - start < 10:
         tabs = _fetch_tabs()
-        for tab in tabs:
-            url = str(tab.get("url", ""))
-            if (
-                url.startswith("chrome-extension://")
-                and url.endswith(RUNNER_URL_SUFFIX)
-                and (expected_runner_url is None or url == expected_runner_url)
-            ):
-                ws_url = tab.get("webSocketDebuggerUrl")
-                if ws_url:
-                    logger.info("existing runner tab found: %s", url)
-                    return ws_url
+        ws_urls = _existing_runner_websockets(tabs, expected_runner_url)
+        if ws_urls:
+            return ws_urls
         time.sleep(POLL_INTERVAL_SECONDS)
 
     runner_url = _find_runner_url(tabs)
@@ -184,9 +224,13 @@ def _ensure_runner_tab() -> str:
     new_tab = _http_json(f"{DEBUG_ENDPOINT}/json/new?{encoded}", method="PUT")
     ws_url = new_tab.get("webSocketDebuggerUrl") if isinstance(new_tab, dict) else None
     if ws_url:
-        return ws_url
+        return [str(ws_url)]
 
     raise RuntimeError("Unable to open runner.html tab with websocket endpoint")
+
+
+def _ensure_runner_tab() -> str:
+    return _ensure_runner_tabs()[0]
 
 
 def _recv_exact(sock: socket.socket, n: int, timeout: float = 5.0) -> bytes:
@@ -354,11 +398,13 @@ class _RawWebSocket:
 def _evaluate_button_state(ws: _RawWebSocket, button_id: str) -> tuple[bool, bool, bool]:
     script = (
         "(()=>{"
+        "const bodyText=(document.body&&document.body.innerText||'').slice(0,1000);"
+        "const locationHref=location.href;"
         f"const b=document.querySelector('#{button_id}');"
         "const stop=document.querySelector('#stopBtn');"
         "const alreadyRunning=!!(stop && !stop.disabled);"
-        "if(!b){return {exists:false,enabled:false,alreadyRunning};}"
-        "return {exists:true,enabled:!b.disabled,alreadyRunning};"
+        "if(!b){return {exists:false,enabled:false,alreadyRunning,locationHref,bodyText};}"
+        "return {exists:true,enabled:!b.disabled,alreadyRunning,locationHref,bodyText};"
         "})()"
     )
     result = ws.call(
@@ -375,6 +421,10 @@ def _evaluate_button_state(ws: _RawWebSocket, button_id: str) -> tuple[bool, boo
 
     value = (result.get("result") or {}).get("result") or {}
     parsed = value.get("value") or {}
+    if _is_blocked_runner_page(parsed):
+        raise RunnerPageBlockedError(
+            "runner.html opened as Chrome blocked error page: ERR_BLOCKED_BY_CLIENT"
+        )
     return (
         bool(parsed.get("exists")),
         bool(parsed.get("enabled")),
@@ -408,31 +458,42 @@ def _parse_args() -> argparse.Namespace:
 def run_autoclick(button_id: str = DEFAULT_BUTTON_ID) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    ws_url = _ensure_runner_tab()
-    logger.info("connected runner tab: %s", ws_url)
     logger.info("target button id: %s", button_id)
 
-    ws = _RawWebSocket(ws_url)
     try:
-        ws.call("Runtime.enable")
-        start = time.time()
-        while time.time() - start < TIMEOUT_SECONDS:
-            exists, enabled, already_running = _evaluate_button_state(ws, button_id)
-            if not exists:
-                logger.info("%s not found yet, waiting", button_id)
-            elif already_running:
-                logger.info("runner batch is already running; treating autoclick as successful")
-                return 0
-            elif enabled:
-                logger.info("%s is enabled. clicking", button_id)
-                _click_button(ws, button_id)
-                logger.info("clicked %s", button_id)
-                return 0
-            else:
-                logger.info("%s exists but disabled", button_id)
-            time.sleep(POLL_INTERVAL_SECONDS)
-    finally:
-        ws.close()
+        ws_urls = _ensure_runner_tabs()
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        return 1
+    logger.info("candidate runner tabs: %s", len(ws_urls))
+
+    start = time.time()
+    while time.time() - start < TIMEOUT_SECONDS:
+        for ws_url in ws_urls:
+            logger.info("connected runner tab: %s", ws_url)
+            ws = _RawWebSocket(ws_url)
+            try:
+                ws.call("Runtime.enable")
+                try:
+                    exists, enabled, already_running = _evaluate_button_state(ws, button_id)
+                except RunnerPageBlockedError as exc:
+                    logger.error("%s", exc)
+                    return EXIT_BLOCKED_BY_CLIENT
+                if already_running:
+                    logger.info("runner batch is already running; treating autoclick as successful")
+                    return 0
+                if not exists:
+                    logger.info("%s not found yet, waiting", button_id)
+                elif enabled:
+                    logger.info("%s is enabled. clicking", button_id)
+                    _click_button(ws, button_id)
+                    logger.info("clicked %s", button_id)
+                    return 0
+                else:
+                    logger.info("%s exists but disabled", button_id)
+            finally:
+                ws.close()
+        time.sleep(POLL_INTERVAL_SECONDS)
 
     logger.error("timeout waiting %s enabled for %ss", button_id, TIMEOUT_SECONDS)
     return 1

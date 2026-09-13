@@ -10,6 +10,7 @@ import pandas as pd
 import pendulum
 
 from modules.extract.croling_beamin import (
+    STAT_LABELS,
     TIMING,
     collect_single_store_stats,
     get_store_options,
@@ -23,11 +24,59 @@ from modules.extract.croling_beamin import (
     wait_for_page,
 )
 from modules.transform.utility.paths import BAEMIN_METRICS_DB
+from modules.transform.pipelines.db.DB_BaeminManual_load import (
+    normalize_baemin_now_schema,
+)
 
 logger = logging.getLogger(__name__)
 
 KST = pendulum.timezone("Asia/Seoul")
 KNOWN_BRANDS = ["\uB098\uD640\uB85C", "\uB3C4\uB9AC\uB2F9"]
+_NOW_EMPTY_TOKENS = {"", "nan", "none", "null", "<na>"}
+_NOW_RANK_SUFFIXES = ("\uC21C\uC704\uAD6C\uBD84", "\uC21C\uC704\uBE44\uC728")
+_NOW_COLLECT_ATTEMPTS = 2
+NOW_CANONICAL_COLUMNS = [
+    "account_id",
+    "store_id",
+    "platform",
+    "collected_at",
+    "조리소요시간",
+    "조리소요시간_순위구분",
+    "조리소요시간_순위비율",
+    "주문접수시간",
+    "주문접수시간_순위구분",
+    "주문접수시간_순위비율",
+    "최근재주문율",
+    "최근재주문율_순위구분",
+    "최근재주문율_순위비율",
+    "조리시간준수율",
+    "조리시간준수율_순위구분",
+    "조리시간준수율_순위비율",
+    "주문접수율",
+    "주문접수율_순위구분",
+    "주문접수율_순위비율",
+    "최근별점",
+    "최근별점_순위구분",
+    "최근별점_순위비율",
+    "영업시간운영률",
+    "영업시간운영률_상태",
+    "주문취소율",
+    "주문취소율_상태",
+    "주문취소율_상세",
+    "준비시간정확도",
+    "준비시간정확도_상태",
+    "주문접수시간_상태",
+    "최근재주문율_상태",
+    "최근별점_상태",
+    "collection_note",
+    "date",
+    "store_name",
+    "cardIndex",
+    "url",
+    "brand",
+    "store",
+    "brand_store",
+]
 
 
 def collect_now_stats(account_list: list[dict]) -> str:
@@ -122,7 +171,6 @@ def collect_now_stats(account_list: list[dict]) -> str:
                 )
                 stats["brand"] = store_info["brand"]
                 stats["store"] = store_info["store"]
-                stats["collection_status"] = "ok"
                 stats["collection_note"] = "metric_values"
 
                 saved = _save_metrics_csv(stats, store_info["brand"], store_info["store"])
@@ -180,18 +228,76 @@ def _save_metrics_csv(stats: dict, brand: str, store: str) -> Path:
     out_path = out_dir / "baemin_now.csv"
 
     stats["date"] = today
+    _normalize_now_stats(stats, brand, store)
     new_df = pd.DataFrame([stats])
 
     if out_path.exists():
-        existing = pd.read_csv(out_path, dtype=str)
+        existing = pd.read_csv(out_path, dtype=str, keep_default_na=False)
         existing = existing[existing.get("date", pd.Series(dtype=str)) != today]
         combined = pd.concat([existing, new_df.astype(str)], ignore_index=True)
+        combined = _normalize_now_frame(combined, brand, store)
         combined.to_csv(out_path, index=False, encoding="utf-8-sig")
     else:
+        new_df = _normalize_now_frame(new_df, brand, store)
         new_df.to_csv(out_path, index=False, encoding="utf-8-sig")
 
     logger.info("\uC800\uC7A5 \uC644\uB8CC: %s", out_path)
     return out_path
+
+
+def _normalize_now_stats(stats: dict, brand: str, store: str) -> dict:
+    stats["brand"] = str(stats.get("brand") or brand or "")
+    stats["store"] = str(stats.get("store") or store or "")
+    stats["brand_store"] = f"{stats['brand']}|{stats['store']}" if stats["brand"] and stats["store"] else ""
+    stats["store_name"] = str(stats.get("store_name") or f"{stats['brand']} {stats['store']}".strip())
+    stats["platform"] = str(stats.get("platform") or "baemin")
+    stats["collection_note"] = str(stats.get("collection_note") or "")
+    return stats
+
+
+def _normalize_now_frame(df: pd.DataFrame, brand: str, store: str) -> pd.DataFrame:
+    out = df.astype(str).copy()
+    for col in NOW_CANONICAL_COLUMNS:
+        if col not in out.columns:
+            out[col] = ""
+
+    if brand:
+        out.loc[out["brand"].map(_is_now_blank), "brand"] = brand
+    if store:
+        out.loc[out["store"].map(_is_now_blank), "store"] = store
+    out.loc[out["platform"].map(_is_now_blank), "platform"] = "baemin"
+    if "collected_at" in out.columns:
+        date_mask = out["date"].map(_is_now_blank)
+        out.loc[date_mask, "date"] = out.loc[date_mask, "collected_at"].str[:10]
+
+    new_cols = {
+        "영업시간운영률",
+        "영업시간운영률_상태",
+        "주문취소율",
+        "주문취소율_상태",
+        "주문취소율_상세",
+        "준비시간정확도",
+        "준비시간정확도_상태",
+        "주문접수시간_상태",
+        "최근재주문율_상태",
+        "최근별점_상태",
+    }
+    for col in new_cols:
+        out.loc[out[col].map(_is_now_blank), col] = ""
+
+    store_name_mask = out["store_name"].map(_is_now_blank)
+    out.loc[store_name_mask, "store_name"] = (
+        out.loc[store_name_mask, "brand"].astype(str).str.strip()
+        + " "
+        + out.loc[store_name_mask, "store"].astype(str).str.strip()
+    ).str.strip()
+
+    metric_present = pd.Series(False, index=out.index)
+    for label in STAT_LABELS:
+        metric_present = metric_present | ~out[label].map(_is_now_blank)
+    out = normalize_baemin_now_schema(out)
+
+    return out[NOW_CANONICAL_COLUMNS]
 
 
 def _collect_stats_or_empty(driver, store_info: dict, account_id: str) -> dict:
@@ -205,6 +311,25 @@ def _collect_stats_or_empty(driver, store_info: dict, account_id: str) -> dict:
             "platform": "baemin",
             "collected_at": pendulum.now(KST).to_iso8601_string(),
         }
+
+
+def _is_now_blank(value: object) -> bool:
+    return str(value or "").strip().lower() in _NOW_EMPTY_TOKENS
+
+
+def _now_metric_value_count(stats: dict) -> int:
+    return sum(not _is_now_blank(stats.get(label, "")) for label in STAT_LABELS)
+
+
+def _fill_now_metric_nulls(stats: dict) -> dict:
+    for label in STAT_LABELS:
+        if _is_now_blank(stats.get(label, "")):
+            stats[label] = ""
+        for suffix in _NOW_RANK_SUFFIXES:
+            col = f"{label}_{suffix}"
+            if _is_now_blank(stats.get(col, "")):
+                stats[col] = ""
+    return stats
 
 
 def _is_recoverable_driver_error(exc: Exception) -> bool:
@@ -230,52 +355,72 @@ def collect_now_for_driver(driver, account_id: str, store_list: list[dict]) -> N
     """
     for store_info in store_list:
         try:
-            logger.info("매장 선택 시도(URL 이동): %s", store_info)
-            # URL 직접 이동(+F5)으로 매장 전환 및 NOW 지표 로드까지 한 번에 처리한다.
-            # 멀티매장 계정에서 드롭다운 전환이 되돌아가는 문제를 우회한다.
-            state = navigate_to_store_now(driver, store_info["store_id"], return_state=True)
-            if state.get("status") not in ("loaded", "no_data"):
-                logger.info("NOW 렌더/데이터 로드 실패: %s / state=%s", store_info, state)
-                raise RuntimeError(f"NOW render/metrics failed: {store_info['store_id']} / {state}")
+            last_error: Exception | None = None
+            for attempt in range(1, _NOW_COLLECT_ATTEMPTS + 1):
+                logger.info("매장 선택 시도(URL 이동) %d/%d: %s", attempt, _NOW_COLLECT_ATTEMPTS, store_info)
+                # URL 직접 이동(+F5)으로 매장 전환 및 NOW 지표 로드까지 한 번에 처리한다.
+                # 멀티매장 계정에서 드롭다운 전환이 되돌아가는 문제를 우회한다.
+                state = navigate_to_store_now(driver, store_info["store_id"], return_state=True)
+                if state.get("status") not in ("loaded", "no_data"):
+                    last_error = RuntimeError(f"NOW render/metrics failed: {store_info['store_id']} / {state}")
+                    logger.info("NOW 렌더/데이터 로드 실패: %s / state=%s", store_info, state)
+                    continue
 
-            try:
-                dom_info = driver.execute_script(r"""
-                    return {
-                        url: location.href,
-                        itemCount: document.querySelectorAll(
-                            '.WooriShopNowItem-module__TKcC'
-                        ).length,
-                        cardCount: document.querySelectorAll(
-                            '.WooriShopNowCard-module__rcFf'
-                        ).length
-                    };
-                """)
-                logger.info("수집 시점 DOM: %s", dom_info)
-            except Exception:
-                pass
+                try:
+                    dom_info = driver.execute_script(r"""
+                        return {
+                            url: location.href,
+                            itemCount: document.querySelectorAll(
+                                '.WooriShopNowItem-module__TKcC'
+                            ).length,
+                            cardCount: document.querySelectorAll(
+                                '.WooriShopNowCard-module__rcFf'
+                            ).length
+                        };
+                    """)
+                    logger.info("수집 시점 DOM: %s", dom_info)
+                except Exception:
+                    pass
 
-            stats = _collect_stats_or_empty(driver, store_info, account_id)
-            stats["brand"] = store_info["brand"]
-            stats["store"] = store_info["store"]
-            stats["collection_status"] = "no_data" if state.get("status") == "no_data" else "ok"
-            stats["collection_note"] = state.get("reason", "")
+                stats = _collect_stats_or_empty(driver, store_info, account_id)
+                stats["brand"] = store_info["brand"]
+                stats["store"] = store_info["store"]
+                stats["collection_note"] = state.get("reason", "")
 
-            saved = _save_metrics_csv(stats, store_info["brand"], store_info["store"])
-            if state.get("status") == "no_data":
-                logger.info(
-                    "NOW 데이터없음(정상): brand=%s store=%s reason=%s -> %s",
-                    store_info["brand"],
-                    store_info["store"],
-                    state.get("reason", ""),
-                    saved,
-                )
+                if state.get("status") == "loaded" and _now_metric_value_count(stats) == 0:
+                    last_error = RuntimeError(
+                        f"NOW loaded but metrics empty: {store_info['store_id']} / {store_info['store']}"
+                    )
+                    logger.warning(
+                        "NOW loaded 판정 후 지표 전부 빈값, 재시도 대상: %s / attempt=%d/%d",
+                        store_info,
+                        attempt,
+                        _NOW_COLLECT_ATTEMPTS,
+                    )
+                    continue
+
+                if state.get("status") == "no_data":
+                    _fill_now_metric_nulls(stats)
+
+                saved = _save_metrics_csv(stats, store_info["brand"], store_info["store"])
+                if state.get("status") == "no_data":
+                    logger.info(
+                        "NOW 데이터없음(정상): brand=%s store=%s reason=%s -> %s",
+                        store_info["brand"],
+                        store_info["store"],
+                        state.get("reason", ""),
+                        saved,
+                    )
+                else:
+                    logger.info(
+                        "수집 완료: brand=%s store=%s -> %s",
+                        store_info["brand"],
+                        store_info["store"],
+                        saved,
+                    )
+                break
             else:
-                logger.info(
-                    "수집 완료: brand=%s store=%s -> %s",
-                    store_info["brand"],
-                    store_info["store"],
-                    saved,
-                )
+                raise last_error or RuntimeError(f"NOW render/metrics failed: {store_info['store_id']}")
 
         except Exception as e:
             # 모든 NOW 실패를 상위에 전달해야 배치 통합 최종 retry에서 누락되지 않는다.

@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from modules.transform.utility.notifier import send_telegram
 from modules.transform.utility.paths import DOWN_DIR, TEMP_DIR
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,13 @@ PROTECTED_NAMES = {"chrome_profiles"}
 
 AIRFLOW_LOG_DIR = Path(os.getenv("AIRFLOW_HOME", "/opt/airflow")) / "logs"
 CHROME_PROFILE_DIR = DOWN_DIR / "chrome_profiles"
+
+# 이 모듈은 컨테이너 안쪽만 회수한다. docker_data.vhdx 자체가 부푸는 것은 못 막는다.
+# 2026-09-11 장애 때 그 파일이 162GB까지 자라 C: 여유가 10GB로 떨어지자
+# Docker 백엔드가 무너졌고, 컨테이너 DNS가 깨져 스케줄러가 멈췄다.
+# 그래서 정리와 별개로 "남은 공간"을 매번 보고하고, 임계치 아래면 경고한다.
+# (회수는 호스트에서 docker builder prune + wsl --manage docker-desktop --set-sparse true)
+DISK_FREE_WARN_GB = 30.0
 
 
 @dataclass
@@ -213,6 +221,43 @@ def _prune_chrome_profiles(dry_run: bool = False) -> PruneResult:
     return result
 
 
+def check_disk_headroom(path: Path | None = None, *, warn_gb: float = DISK_FREE_WARN_GB) -> dict:
+    """남은 디스크 공간을 재고, 임계치 아래면 경고한다."""
+    target = path or AIRFLOW_LOG_DIR
+    try:
+        usage = shutil.disk_usage(target)
+    except OSError as exc:
+        logger.warning("디스크 여유 확인 실패 (%s): %s", target, exc)
+        return {"path": str(target), "error": str(exc)}
+
+    free_gb = usage.free / (1024**3)
+    total_gb = usage.total / (1024**3)
+    low = free_gb < warn_gb
+    logger.info(
+        "디스크 여유: %.1f GB / %.1f GB (임계치 %.1f GB)", free_gb, total_gb, warn_gb
+    )
+    if low:
+        message = (
+            f"[Airflow 디스크 경고] 남은 공간 {free_gb:.1f} GB "
+            f"(임계치 {warn_gb:.1f} GB, 전체 {total_gb:.1f} GB)\n"
+            "호스트에서 docker builder prune -af 후 "
+            "wsl --manage docker-desktop --set-sparse true --allow-unsafe 로 회수하세요."
+        )
+        logger.warning(message)
+        try:
+            send_telegram(message)
+        except Exception as exc:  # 알림 실패가 정리 작업을 막으면 안 된다
+            logger.warning("디스크 경고 알림 실패: %s", exc)
+
+    return {
+        "path": str(target),
+        "free_gb": round(free_gb, 2),
+        "total_gb": round(total_gb, 2),
+        "warn_gb": warn_gb,
+        "low": low,
+    }
+
+
 def cleanup_storage(dry_run: bool = False, **context) -> dict:
     """Airflow 로그·임시파일·다운로드 잔여물·미사용 Chrome 프로필을 회수한다.
 
@@ -271,10 +316,13 @@ def cleanup_storage(dry_run: bool = False, **context) -> dict:
         dry_run,
     )
 
+    disk = check_disk_headroom()
+
     return {
         "dry_run": dry_run,
         "total_items": total_items,
         "total_gb": round(total_bytes / (1024**3), 3),
         "total_errors": total_errors,
         "targets": {r.target: {"items": r.items, "gb": round(r.gb_freed, 3)} for r in results},
+        "disk": disk,
     }

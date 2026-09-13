@@ -9,6 +9,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pendulum
 
 from modules.transform.utility.paths import (
     ANALYTICS_DB,
@@ -37,6 +38,7 @@ PLATFORM_TO_GROUP = {
     for platform in platforms
 }
 GAP_THRESHOLD = 2.0
+TOORDER_PATH = ANALYTICS_DB / "toorder_daily_store_platform" / "toorder_store_platform_daily.parquet"
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,41 @@ def _empty_long() -> pd.DataFrame:
     return pd.DataFrame(columns=["date", "store", "platform_group", "amt"])
 
 
+def _expected_toorder_max_date() -> str:
+    return pendulum.now("Asia/Seoul").subtract(days=1).format("YYYY-MM-DD")
+
+
+def _toorder_max_date(path: Path = TOORDER_PATH) -> str | None:
+    if not path.exists():
+        return None
+    df = pd.read_parquet(path, columns=["date"])
+    if df.empty or "date" not in df.columns:
+        return None
+    parsed = pd.to_datetime(df["date"], errors="coerce").dropna()
+    if parsed.empty:
+        return None
+    return parsed.max().strftime("%Y-%m-%d")
+
+
+def validate_toorder_freshness(
+    path: Path = TOORDER_PATH,
+    *,
+    expected_date: str | None = None,
+) -> str:
+    expected = expected_date or _expected_toorder_max_date()
+    max_date = _toorder_max_date(path)
+    if max_date is None:
+        raise RuntimeError(f"ToOrder 원천 parquet 없음 또는 날짜 없음: expected>={expected}, path={path}")
+    if max_date < expected:
+        raise RuntimeError(
+            "ToOrder 원천 최신일 지연: "
+            f"max_date={max_date}, expected>={expected}, path={path}. "
+            "DB_Toorder_store_platform_daily_Dags를 먼저 복구 실행하세요."
+        )
+    logger.info("ToOrder 원천 최신성 확인: max_date=%s expected>=%s", max_date, expected)
+    return max_date
+
+
 def _read_parquet_parts(files: list[Path], columns: list[str]) -> pd.DataFrame:
     parts = []
     for path in files:
@@ -88,7 +125,7 @@ def _read_parquet_parts(files: list[Path], columns: list[str]) -> pd.DataFrame:
 
 
 def load_toorder() -> pd.DataFrame:
-    path = ANALYTICS_DB / "toorder_daily_store_platform" / "toorder_store_platform_daily.parquet"
+    path = TOORDER_PATH
     if not path.exists():
         logger.warning("toorder parquet 없음: %s", path)
         return _empty_long()
@@ -339,6 +376,8 @@ def _empty_output() -> pd.DataFrame:
 
 
 def build_collection_compare() -> str:
+    validate_toorder_freshness()
+
     frames = []
     for spec in SOURCES:
         try:

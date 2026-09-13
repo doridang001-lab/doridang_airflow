@@ -93,6 +93,30 @@ def _write_ad_funnel_file(folder: Path, target_date: str, value: str) -> Path:
     return path
 
 
+def _write_now_file(folder: Path, date: str, rating: str, status: str | None = None) -> Path:
+    data_dir = (
+        folder
+        / "baemin_macro"
+        / "metrics_now"
+        / "brand=도리당"
+        / "store=우가클송파삼전점"
+        / "ym=2026-07"
+    )
+    data_dir.mkdir(parents=True, exist_ok=True)
+    row = {
+        "collected_at": f"{date}T08:22:34.752Z",
+        "store_id": "14356015",
+        "store_name": "[음식배달] 닭도리탕 전문 도리당 송파삼전점",
+        "date": date,
+        "최근별점": rating,
+    }
+    if status is not None:
+        row["준비시간정확도_상태"] = status
+    path = data_dir / "baemin_now.csv"
+    pd.DataFrame([row]).to_csv(path, index=False, encoding="utf-8-sig")
+    return path
+
+
 def _write_shop_change_file(folder: Path) -> Path:
     data_dir = (
         folder
@@ -547,6 +571,47 @@ def test_ad_funnel_keeps_existing_dates(monkeypatch, tmp_path):
     result = pd.read_csv(dst_stem.with_suffix(".csv"), dtype=str, encoding="utf-8-sig")
     assert set(result["target_date"]) == {"2026-07-01", "2026-07-02", "2026-07-22"}
     assert result.loc[result["target_date"].eq("2026-07-22"), "value"].tolist() == ["new"]
+
+
+def test_metrics_now_upsert_keeps_existing_dates_and_normalizes_schema(monkeypatch, tmp_path):
+    _patch_table_io(monkeypatch, tmp_path)
+    folder = tmp_path / "inbox" / "manual__bottom__run1"
+    src_file = _write_now_file(folder, "2026-07-22", "4.9", "좋아요")
+    rel = src_file.relative_to(folder)
+    dst_stem = (tmp_path / "analytics" / rel).with_suffix("")
+    dst_stem.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "date": "2026-07-01",
+                "store_id": "14356015",
+                "store_name": "[음식배달] 닭도리탕 전문 도리당 송파삼전점",
+                "최근별점": "4.1",
+            },
+            {
+                "date": "2026-07-22",
+                "store_id": "14356015",
+                "store_name": "[음식배달] 닭도리탕 전문 도리당 송파삼전점",
+                "최근별점": "3.8",
+            },
+        ]
+    ).to_csv(dst_stem.with_suffix(".csv"), index=False, encoding="utf-8-sig")
+
+    dist._distribute_one_file(folder, src_file)
+
+    result = pd.read_csv(
+        dst_stem.with_suffix(".csv"),
+        dtype=str,
+        encoding="utf-8-sig",
+        keep_default_na=False,
+    )
+    assert result["date"].tolist() == ["2026-07-01", "2026-07-22"]
+    assert result.loc[result["date"].eq("2026-07-22"), "최근별점"].tolist() == ["4.9"]
+    assert result.loc[result["date"].eq("2026-07-22"), "준비시간정확도_상태"].tolist() == ["좋아요"]
+    assert result.loc[result["date"].eq("2026-07-01"), "영업시간운영률_상태"].tolist() == [""]
+    assert result.loc[result["date"].eq("2026-07-01"), "주문취소율_상세"].tolist() == [""]
+    assert result.loc[result["date"].eq("2026-07-22"), "brand_store"].tolist() == ["도리당|송파삼전점"]
+    assert list(result.columns[-3:]) == ["brand", "store", "brand_store"]
 
 
 def test_top_pattern_does_not_match_bottom_folder(monkeypatch, tmp_path):

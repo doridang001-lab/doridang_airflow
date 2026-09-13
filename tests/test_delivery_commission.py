@@ -156,12 +156,107 @@ def _write_coupang_cmg(
 
 def _configure_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     output = tmp_path / "mart" / "delivery_commission.parquet"
+    revenue_output = tmp_path / "mart" / "delivery_revenue.parquet"
+    cost_output = tmp_path / "mart" / "store_cost_allocation.parquet"
+    unified_root = tmp_path / "mart" / "unified_sales_grp"
+    onedrive_root = tmp_path / "Repository"
+    unified_root.mkdir(parents=True, exist_ok=True)
+    onedrive_root.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(delivery, "BAEMIN_ORDERS_DB", tmp_path / "baemin_orders")
     monkeypatch.setattr(delivery, "BAEMIN_OUR_STORE_CLICKS_DB", tmp_path / "baemin_ads")
     monkeypatch.setattr(delivery, "COUPANG_ORDERS_DB", tmp_path / "coupang_orders")
     monkeypatch.setattr(delivery, "COUPANG_CMG_DB", tmp_path / "coupang_cmg")
     monkeypatch.setattr(delivery, "DELIVERY_COMMISSION_PATH", output)
+    monkeypatch.setattr(delivery, "DELIVERY_REVENUE_PATH", revenue_output)
+    monkeypatch.setattr(delivery, "STORE_COST_ALLOCATION_PATH", cost_output)
+    monkeypatch.setattr(delivery, "ONEDRIVE_DB", onedrive_root)
+    monkeypatch.setattr(
+        delivery,
+        "YOGIYO_SETTLEMENT_MONTHLY_FEE_CSV_PATH",
+        tmp_path
+        / "analytics"
+        / "Yogiyo"
+        / "Yogiyo_Settlement"
+        / "yogiyo_settlement_monthly_fee.csv",
+    )
+    monkeypatch.setattr(delivery, "UNIFIED_SALES_ROOT", unified_root)
+    monkeypatch.setattr(
+        delivery,
+        "DDANGYO_FEE_RATIO_MONTHLY_CSV",
+        tmp_path / "mart" / "ddangyo_fee_ratio_monthly.csv",
+    )
+    monkeypatch.setattr(
+        delivery,
+        "DDANGYO_FEE_RATIO_BASELINE_CSV",
+        tmp_path / "mart" / "ddangyo_fee_ratio_baseline.csv",
+    )
+    _write_yogiyo_monthly_fee(delivery.YOGIYO_SETTLEMENT_MONTHLY_FEE_CSV_PATH, [])
     return output
+
+
+def _write_sales_employee(root: Path, rows: list[dict]) -> None:
+    defaults = {
+        "오픈순서": "1",
+        "호점": "1",
+        "매장명": "도리당 부산대신점",
+        "플랫폼": "배달의 민족",
+        "임대료": "",
+        "collected_at": "2026-07-19 00:00",
+    }
+    pd.DataFrame([{**defaults, **row} for row in rows]).to_csv(
+        root / "sales_employee.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+
+def _write_unified_sales(root: Path, rows: list[dict]) -> None:
+    defaults = {
+        "sale_date": "2026-07-19",
+        "ym": "2026-07",
+        "source": "posfeed",
+        "brand": "도리당",
+        "store": "부산대신점",
+        "platform": "땡겨요",
+        "total_price": 0,
+    }
+    path = root / "unified_sales_260719.parquet"
+    pd.DataFrame([{**defaults, **row} for row in rows]).to_parquet(path, index=False)
+
+
+def _write_ddangyo_fee_ratios(monthly_path: Path, baseline_path: Path) -> None:
+    monthly_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {"ym": "2026_07", "store": "도리당 부산대신점", "fee_ratio": "0.05"},
+        ]
+    ).to_csv(monthly_path, index=False, encoding="utf-8-sig")
+    pd.DataFrame(
+        [
+            {"ym": "2026_07", "fee_ratio": "0.07"},
+        ]
+    ).to_csv(baseline_path, index=False, encoding="utf-8-sig")
+
+
+def _write_yogiyo_monthly_fee(path: Path, rows: list[dict]) -> None:
+    defaults = {
+        "ym": "2026_07",
+        "brand": "도리당",
+        "store": "부산대신점",
+        "sales_tot": 0,
+        "settlement_tot": 0,
+        "settlement_gap_rate": 0,
+        "fee_tot": 0,
+        "fee_rate": 0,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    records = [{**defaults, **row} for row in rows]
+    frame = pd.DataFrame(records) if records else pd.DataFrame(columns=defaults)
+    frame.to_csv(
+        path,
+        index=False,
+        encoding="utf-8-sig",
+    )
 
 
 def test_build_combines_both_brands_and_brand_aware_store_aliases(
@@ -207,21 +302,25 @@ def test_build_combines_both_brands_and_brand_aware_store_aliases(
     delivery.build_delivery_commission()
 
     result = pd.read_parquet(output).sort_values("platform").reset_index(drop=True)
+    assert result.attrs[delivery.BAEMIN_DISCOUNT_INCLUDED_ATTR] is True
     assert list(result.columns) == delivery.OUTPUT_COLUMNS
     assert not result.duplicated(["sale_date", "store", "platform", "brand"]).any()
     assert set(result["store"]) == {"부산대신점"}
     assert set(result["brand"]) == {"도리당", "나홀로"}
 
     keyed = result.set_index(["platform", "brand"])
-    assert keyed.loc[("배달의민족", "도리당"), "total_amt"] == 10_000
-    assert keyed.loc[("배달의민족", "도리당"), "settlement_amount"] == 6_900
+    assert keyed.loc[("배달의민족", "도리당"), "total_amt"] == 11_000
+    assert keyed.loc[("배달의민족", "도리당"), "settlement_amount"] == 7_900
     assert keyed.loc[("배달의민족", "도리당"), "diff_amt"] == 3_100
+    assert keyed.loc[("배달의민족", "도리당"), "diff_amt"] / keyed.loc[
+        ("배달의민족", "도리당"), "total_amt"
+    ] == pytest.approx(3_100 / 11_000)
     assert keyed.loc[("배달의민족", "도리당"), "배민_즉시할인"] == 1_000
     assert keyed.loc[("배달의민족", "도리당"), "우가클_평균비용"] == 2.0
     assert keyed.loc[("배달의민족", "도리당"), "우가클_주문수"] == 5
     assert keyed.loc[("배달의민족", "도리당"), "우가클_클릭율"] == 0.05
-    assert keyed.loc[("배달의민족", "나홀로"), "total_amt"] == 5_000
-    assert keyed.loc[("배달의민족", "나홀로"), "settlement_amount"] == 3_500
+    assert keyed.loc[("배달의민족", "나홀로"), "total_amt"] == 5_300
+    assert keyed.loc[("배달의민족", "나홀로"), "settlement_amount"] == 3_800
     assert keyed.loc[("배달의민족", "나홀로"), "diff_amt"] == 1_500
     assert keyed.loc[("쿠팡이츠", "도리당"), "total_amt"] == 7_000
     assert keyed.loc[("쿠팡이츠", "도리당"), "settlement_amount"] == 5_000
@@ -244,6 +343,509 @@ def test_build_combines_both_brands_and_brand_aware_store_aliases(
     assert pd.isna(keyed.loc[("배달의민족", "도리당"), "쿠팡_신규비율"])
     assert pd.isna(keyed.loc[("배달의민족", "도리당"), "쿠팡_재주문비율"])
     assert pd.isna(keyed.loc[("배달의민족", "도리당"), "쿠팡_광고비용"])
+
+
+def test_build_delivery_revenue_keeps_platform_grain(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure_paths(monkeypatch, tmp_path)
+    _write_baemin_order(
+        delivery.BAEMIN_ORDERS_DB,
+        "도리당",
+        "부산대신점",
+        10_000,
+        8_000,
+        partner_instant_discount=1_000,
+        instant_discount=4_000,
+    )
+    order_path = _partition(delivery.BAEMIN_ORDERS_DB, "도리당", "부산대신점") / "orders_2026-07.parquet"
+    order = pd.read_parquet(order_path)
+    pd.concat([order, order], ignore_index=True).to_parquet(order_path, index=False)
+    _write_baemin_order(
+        delivery.BAEMIN_ORDERS_DB, "도리당", "부산대신점", 20_000, 0,
+        order_id="할인취소주문", status="주문취소", partner_instant_discount=8_000,
+    )
+    _write_sales_employee(
+        delivery.ONEDRIVE_DB,
+        [{"매장명": "도리당 부산대신점", "플랫폼": "배달의 민족", "임대료": "3100"}],
+    )
+    _write_baemin_ad(delivery.BAEMIN_OUR_STORE_CLICKS_DB, "도리당", "도리당 부산대신점", 100)
+    _write_baemin_order(delivery.BAEMIN_ORDERS_DB, "나홀로", "대신점", 5_000, 4_000)
+    _write_baemin_ad(delivery.BAEMIN_OUR_STORE_CLICKS_DB, "나홀로", "나홀로 대신점", 200)
+    _write_coupang_order(delivery.COUPANG_ORDERS_DB, "도리당", "부산대신점", 7_000, 5_000)
+    _write_coupang_order(delivery.COUPANG_ORDERS_DB, "나홀로", "대신점", 3_000, 2_000)
+    _write_coupang_cmg(delivery.COUPANG_CMG_DB, "도리당", "부산대신점", "전체 15%")
+    _write_coupang_cmg(delivery.COUPANG_CMG_DB, "나홀로", "대신점", "전체 10%")
+
+    delivery.build_delivery_commission()
+    delivery.build_delivery_revenue()
+
+    result = pd.read_parquet(delivery.DELIVERY_REVENUE_PATH)
+    assert list(result.columns) == delivery.REVENUE_OUTPUT_COLUMNS
+    assert not result.duplicated(["sale_date", "brand", "store", "platform"]).any()
+
+    keyed = result.set_index(["platform", "brand"])
+    assert keyed.loc[("배달의민족", "도리당"), "total_price"] == 11_000
+    assert keyed.loc[("배달의민족", "도리당"), "settlement_price"] == 7_900
+    assert keyed.loc[("배달의민족", "도리당"), "revenue"] == 3_100
+    assert keyed.loc[("쿠팡이츠", "도리당"), "total_price"] == 7_000
+    assert keyed.loc[("쿠팡이츠", "도리당"), "settlement_price"] == 5_000
+    assert keyed.loc[("쿠팡이츠", "도리당"), "revenue"] == 2_000
+    assert keyed.loc[("배달의민족", "도리당"), "rent_cost"] == 59
+    assert keyed.loc[("쿠팡이츠", "도리당"), "rent_cost"] == 41
+    assert keyed.loc[("배달의민족", "도리당"), "fin_revenue"] == 3_041
+    assert keyed.loc[("쿠팡이츠", "도리당"), "fin_revenue"] == 1_959
+    assert keyed.loc[("배달의민족", "도리당"), "store_expected_month_fin_revenue"] == 155_000
+
+    commission = pd.read_parquet(delivery.DELIVERY_COMMISSION_PATH)
+    delivery.build_delivery_revenue()
+    pd.testing.assert_frame_equal(result, pd.read_parquet(delivery.DELIVERY_REVENUE_PATH))
+    delivery.build_delivery_commission()
+    delivery.build_delivery_revenue()
+    pd.testing.assert_frame_equal(commission, pd.read_parquet(delivery.DELIVERY_COMMISSION_PATH))
+    pd.testing.assert_frame_equal(result, pd.read_parquet(delivery.DELIVERY_REVENUE_PATH))
+
+
+def test_build_delivery_revenue_adds_unified_sales_delivery_platforms(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure_paths(monkeypatch, tmp_path)
+    _write_baemin_order(delivery.BAEMIN_ORDERS_DB, "도리당", "부산대신점", 10_000, 8_000)
+    _write_baemin_ad(delivery.BAEMIN_OUR_STORE_CLICKS_DB, "도리당", "도리당 부산대신점", 100)
+    _write_baemin_order(delivery.BAEMIN_ORDERS_DB, "나홀로", "대신점", 5_000, 4_000)
+    _write_baemin_ad(delivery.BAEMIN_OUR_STORE_CLICKS_DB, "나홀로", "나홀로 대신점", 200)
+    _write_coupang_order(delivery.COUPANG_ORDERS_DB, "도리당", "부산대신점", 7_000, 5_000)
+    _write_coupang_order(delivery.COUPANG_ORDERS_DB, "나홀로", "대신점", 3_000, 2_000)
+    _write_coupang_cmg(delivery.COUPANG_CMG_DB, "도리당", "부산대신점", "전체 15%")
+    _write_coupang_cmg(delivery.COUPANG_CMG_DB, "나홀로", "대신점", "전체 10%")
+    _write_ddangyo_fee_ratios(
+        delivery.DDANGYO_FEE_RATIO_MONTHLY_CSV,
+        delivery.DDANGYO_FEE_RATIO_BASELINE_CSV,
+    )
+    _write_unified_sales(
+        delivery.UNIFIED_SALES_ROOT,
+        [
+            {"platform": "땡겨요", "brand": "도리당", "store": "부산대신점", "total_price": 10_000},
+            {"platform": "땡배달", "brand": "도리당", "store": "부산대신점", "total_price": 5_000},
+            {"platform": "땡겨요", "brand": "도리당", "store": "신규점", "total_price": 20_000},
+            {"platform": "먹깨비", "brand": "도리당", "store": "부산대신점", "total_price": 10_000},
+            {"platform": "배달특급", "brand": "도리당", "store": "부산대신점", "total_price": 10_000},
+            {"platform": "인천이음", "brand": "도리당", "store": "부산대신점", "total_price": 10_000},
+        ],
+    )
+
+    delivery.build_delivery_commission()
+    delivery.build_delivery_revenue()
+
+    result = pd.read_parquet(delivery.DELIVERY_REVENUE_PATH)
+    keyed = result.set_index(["platform", "brand", "store"])
+    assert ("땡배달", "도리당", "부산대신점") not in keyed.index
+    assert keyed.loc[("땡겨요", "도리당", "부산대신점"), "total_price"] == 15_000
+    assert keyed.loc[("땡겨요", "도리당", "부산대신점"), "revenue"] == 750
+    assert keyed.loc[("땡겨요", "도리당", "부산대신점"), "settlement_price"] == 14_250
+    assert keyed.loc[("땡겨요", "도리당", "신규점"), "revenue"] == 1_400
+    assert keyed.loc[("먹깨비", "도리당", "부산대신점"), "revenue"] == 150
+    assert keyed.loc[("배달특급", "도리당", "부산대신점"), "revenue"] == 100
+    assert keyed.loc[("인천이음", "도리당", "부산대신점"), "revenue"] == 200
+
+
+def test_build_delivery_revenue_uses_yogiyo_monthly_gap_rate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure_paths(monkeypatch, tmp_path)
+    _write_baemin_order(delivery.BAEMIN_ORDERS_DB, "도리당", "부산대신점", 10_000, 8_000)
+    _write_baemin_order(delivery.BAEMIN_ORDERS_DB, "나홀로", "대신점", 5_000, 4_000)
+    _write_baemin_ad(delivery.BAEMIN_OUR_STORE_CLICKS_DB, "도리당", "도리당 부산대신점", 100)
+    _write_baemin_ad(delivery.BAEMIN_OUR_STORE_CLICKS_DB, "나홀로", "나홀로 대신점", 200)
+    _write_coupang_order(delivery.COUPANG_ORDERS_DB, "도리당", "부산대신점", 7_000, 5_000)
+    _write_coupang_order(delivery.COUPANG_ORDERS_DB, "나홀로", "대신점", 3_000, 2_000)
+    _write_coupang_cmg(delivery.COUPANG_CMG_DB, "도리당", "부산대신점", "전체 15%")
+    _write_coupang_cmg(delivery.COUPANG_CMG_DB, "나홀로", "대신점", "전체 10%")
+    _write_yogiyo_monthly_fee(
+        delivery.YOGIYO_SETTLEMENT_MONTHLY_FEE_CSV_PATH,
+        [
+            {
+                "store": "부산대신점",
+                "sales_tot": 100_000,
+                "settlement_gap_rate": 0.2,
+                "fee_rate": 0.99,
+            },
+            {
+                "store": "신규점",
+                "sales_tot": 200_000,
+                "settlement_gap_rate": 0.4,
+            },
+            {
+                "store": "보정점",
+                "sales_tot": 50_000,
+                "settlement_gap_rate": -0.1,
+            },
+        ],
+    )
+    _write_unified_sales(
+        delivery.UNIFIED_SALES_ROOT,
+        [
+            {"platform": "요기요", "brand": "도리당", "store": "부산대신점", "total_price": 10_000},
+            {"platform": "요기배달", "brand": "도리당", "store": "부산대신점", "total_price": 5_000},
+            {"platform": "요기요", "brand": "도리당", "store": "미등록점", "total_price": 30_000},
+            {"platform": "요기요", "brand": "도리당", "store": "보정점", "total_price": 10_000},
+            {"platform": "요기요", "brand": "도리당", "store": "취소점", "total_price": -10_000},
+        ],
+    )
+
+    delivery.build_delivery_commission()
+    delivery.build_delivery_revenue()
+
+    result = pd.read_parquet(delivery.DELIVERY_REVENUE_PATH)
+    yogiyo = result[result["platform"].eq("요기요")]
+    assert len(yogiyo) == 4
+    keyed = yogiyo.set_index("store")
+    row = keyed.loc["부산대신점"]
+    assert row["total_price"] == 15_000
+    assert row["revenue"] == 3_000
+    assert row["settlement_price"] == 12_000
+    fallback = keyed.loc["미등록점"]
+    assert fallback["revenue"] == 8_143
+    assert fallback["settlement_price"] == 21_857
+    negative_rate = keyed.loc["보정점"]
+    assert negative_rate["revenue"] == -1_000
+    assert negative_rate["settlement_price"] == 11_000
+    negative_sale = keyed.loc["취소점"]
+    assert negative_sale["revenue"] == -2_714
+    assert negative_sale["settlement_price"] == -7_286
+
+
+def test_build_store_cost_allocation_allocates_rent_evenly_by_day(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure_paths(monkeypatch, tmp_path)
+    _write_sales_employee(
+        delivery.ONEDRIVE_DB,
+        [
+            {"매장명": "도리당 부산대신점", "플랫폼": "배달의 민족", "임대료": "3100"},
+            {"매장명": "도리당 부산대신점", "플랫폼": "쿠팡이츠", "임대료": "3100"},
+            {"매장명": "도리당 부산대신점", "플랫폼": "토더", "임대료": "3100"},
+        ],
+    )
+    _write_unified_sales(
+        delivery.UNIFIED_SALES_ROOT,
+        [
+            {"sale_date": "2026-07-01", "platform": "홀", "total_price": 1_000},
+            {"sale_date": "2026-07-01", "platform": "배달의민족", "total_price": 500},
+            {"sale_date": "2026-07-02", "platform": "쿠팡이츠", "total_price": 500},
+        ],
+    )
+
+    delivery.build_store_cost_allocation()
+
+    result = pd.read_parquet(delivery.STORE_COST_ALLOCATION_PATH)
+    assert list(result.columns) == delivery.COST_OUTPUT_COLUMNS
+    assert not result.duplicated(["sale_date", "brand", "store", "platform"]).any()
+    assert result["monthly_rent"].max() == 3_100
+    assert result["rent_cost"].sum() == 200
+
+    keyed = result.set_index(["sale_date", "platform"])
+    assert keyed.loc[("2026-07-01", "홀"), "rent_cost"] == 67
+    assert keyed.loc[("2026-07-01", "배달의민족"), "rent_cost"] == 33
+    assert keyed.loc[("2026-07-02", "쿠팡이츠"), "rent_cost"] == 100
+
+
+@pytest.mark.parametrize("discount", [0, 500, 1_000])
+def test_build_delivery_revenue_includes_rent_cost_column(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, discount: int
+) -> None:
+    _configure_paths(monkeypatch, tmp_path)
+    _write_sales_employee(
+        delivery.ONEDRIVE_DB,
+        [
+            {"매장명": "도리당 부산대신점", "플랫폼": "배달의 민족", "임대료": "3100"},
+            {"매장명": "도리당 부산대신점", "플랫폼": "쿠팡이츠", "임대료": "3100"},
+        ],
+    )
+    _write_unified_sales(
+        delivery.UNIFIED_SALES_ROOT,
+        [
+            {"sale_date": "2026-07-19", "platform": "홀", "total_price": 1_000},
+            {"sale_date": "2026-07-19", "platform": "배달의민족", "total_price": 500},
+            {"sale_date": "2026-07-19", "platform": "쿠팡이츠", "total_price": 500},
+        ],
+    )
+    defaults = {column: pd.NA for column in delivery.OUTPUT_COLUMNS}
+    rows = [
+        {
+            **defaults,
+            "sale_date": "2026-07-19",
+            "brand": "도리당",
+            "store": "부산대신점",
+            "platform": "배달의민족",
+            "total_amt": 500 + discount,
+            "settlement_amount": 400,
+            "diff_amt": 100 + discount,
+            "배민_즉시할인": discount,
+        },
+        {
+            **defaults,
+            "sale_date": "2026-07-19",
+            "brand": "도리당",
+            "store": "부산대신점",
+            "platform": "쿠팡이츠",
+            "total_amt": 500,
+            "settlement_amount": 350,
+            "diff_amt": 150,
+        },
+    ]
+    delivery.DELIVERY_COMMISSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    commission = pd.DataFrame(rows, columns=delivery.OUTPUT_COLUMNS)
+    commission.attrs[delivery.BAEMIN_DISCOUNT_INCLUDED_ATTR] = True
+    commission.to_parquet(
+        delivery.DELIVERY_COMMISSION_PATH,
+        index=False,
+    )
+
+    delivery.build_delivery_revenue()
+
+    result = pd.read_parquet(delivery.DELIVERY_REVENUE_PATH)
+    assert list(result.columns) == delivery.REVENUE_OUTPUT_COLUMNS
+    keyed = result.set_index("platform")
+    assert keyed.loc["배달의민족", "rent_cost"] == 50
+    assert keyed.loc["배달의민족", "fin_revenue"] == 50 + discount
+    assert keyed.loc["쿠팡이츠", "rent_cost"] == 50
+    assert keyed.loc["쿠팡이츠", "fin_revenue"] == 100
+
+
+def test_delivery_revenue_keeps_legacy_commission_rent_basis(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure_paths(monkeypatch, tmp_path)
+    _write_sales_employee(
+        delivery.ONEDRIVE_DB,
+        [{"매장명": "도리당 부산대신점", "플랫폼": "배달의 민족", "임대료": "3100"}],
+    )
+    base = {column: pd.NA for column in delivery.OUTPUT_COLUMNS}
+    base.update(sale_date="2026-07-19", brand="도리당", store="부산대신점",
+                total_amt=1_000, settlement_amount=700, diff_amt=300)
+    commission = pd.DataFrame([
+        {**base, "platform": "배달의민족", "배민_즉시할인": 500},
+        {**base, "platform": "쿠팡이츠"},
+    ])
+    delivery.DELIVERY_COMMISSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    commission.to_parquet(delivery.DELIVERY_COMMISSION_PATH, index=False)
+    delivery.build_delivery_revenue()
+    result = pd.read_parquet(delivery.DELIVERY_REVENUE_PATH)
+    assert result.total_price.tolist() == [1_000, 1_000]
+    assert result.rent_cost.tolist() == [50, 50]
+    assert result.fin_revenue.tolist() == [250, 250]
+
+
+def test_delivery_revenue_allocates_full_daily_rent_to_delivery_platforms(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure_paths(monkeypatch, tmp_path)
+    _write_sales_employee(
+        delivery.ONEDRIVE_DB,
+        [
+            {"매장명": "도리당 부산대신점", "플랫폼": "배달의 민족", "임대료": "3100"},
+            {"매장명": "도리당 부산대신점", "플랫폼": "쿠팡이츠", "임대료": "3100"},
+        ],
+    )
+    _write_unified_sales(
+        delivery.UNIFIED_SALES_ROOT,
+        [
+            {"sale_date": "2026-07-19", "platform": "홀", "total_price": 9_000},
+            {"sale_date": "2026-07-19", "platform": "배달의민족", "total_price": 1_000},
+            {"sale_date": "2026-07-20", "platform": "홀", "total_price": 9_000},
+            {"sale_date": "2026-07-20", "platform": "쿠팡이츠", "total_price": 1_000},
+        ],
+    )
+    defaults = {column: pd.NA for column in delivery.OUTPUT_COLUMNS}
+    rows = [
+        {
+            **defaults,
+            "sale_date": "2026-07-19",
+            "brand": "도리당",
+            "store": "부산대신점",
+            "platform": "배달의민족",
+            "total_amt": 1_000,
+            "settlement_amount": 700,
+            "diff_amt": 300,
+        },
+        {
+            **defaults,
+            "sale_date": "2026-07-20",
+            "brand": "도리당",
+            "store": "부산대신점",
+            "platform": "쿠팡이츠",
+            "total_amt": 1_000,
+            "settlement_amount": 800,
+            "diff_amt": 200,
+        },
+    ]
+    delivery.DELIVERY_COMMISSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows, columns=delivery.OUTPUT_COLUMNS).to_parquet(
+        delivery.DELIVERY_COMMISSION_PATH,
+        index=False,
+    )
+
+    delivery.build_store_cost_allocation()
+    delivery.build_delivery_revenue()
+
+    cost = pd.read_parquet(delivery.STORE_COST_ALLOCATION_PATH)
+    revenue = pd.read_parquet(delivery.DELIVERY_REVENUE_PATH)
+    assert cost["rent_cost"].sum() == 200
+    assert revenue["rent_cost"].sum() == 200
+    assert revenue.set_index("platform").loc["배달의민족", "rent_cost"] == 100
+    assert revenue.set_index("platform").loc["쿠팡이츠", "rent_cost"] == 100
+
+
+def test_fin_revenue_subtracts_all_cost_suffix_columns() -> None:
+    revenue = pd.DataFrame(
+        [
+            {
+                "sale_date": "2026-07-19",
+                "brand": "도리당",
+                "store": "부산대신점",
+                "platform": "배달의민족",
+                "total_price": 500,
+                "settlement_price": 400,
+                "revenue": 100,
+                "rent_cost": 25,
+                "extra_cost": 7,
+            }
+        ]
+    )
+
+    result = delivery._apply_fin_revenue(revenue)
+
+    assert result.loc[0, "fin_revenue"] == 68
+
+
+def test_store_expected_month_fin_revenue_uses_model_for_remaining_days(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeModel:
+        def predict(self, features: pd.DataFrame) -> list[int]:
+            return [10] * len(features)
+
+    def fake_build_model(completed_daily: pd.DataFrame):
+        return FakeModel(), list(delivery._store_forecast_features(completed_daily).columns)
+
+    monkeypatch.setattr(delivery, "_build_store_month_forecast_model", fake_build_model)
+    revenue = pd.DataFrame(
+        [
+            {
+                "sale_date": "2026-08-01",
+                "brand": "도리당",
+                "store": "부산대신점",
+                "platform": "배달의민족",
+                "total_price": 1000,
+                "settlement_price": 800,
+                "revenue": 200,
+                "fin_revenue": 190,
+                "rent_cost": 10,
+            },
+            {
+                "sale_date": "2026-08-02",
+                "brand": "도리당",
+                "store": "부산대신점",
+                "platform": "쿠팡이츠",
+                "total_price": 1000,
+                "settlement_price": 900,
+                "revenue": 100,
+                "fin_revenue": 95,
+                "rent_cost": 5,
+            },
+            {
+                "sale_date": "2026-09-01",
+                "brand": "도리당",
+                "store": "부산대신점",
+                "platform": "배달의민족",
+                "total_price": 1000,
+                "settlement_price": 800,
+                "revenue": 200,
+                "fin_revenue": 190,
+                "rent_cost": 10,
+            },
+            {
+                "sale_date": "2026-09-02",
+                "brand": "도리당",
+                "store": "부산대신점",
+                "platform": "쿠팡이츠",
+                "total_price": 1000,
+                "settlement_price": 900,
+                "revenue": 100,
+                "fin_revenue": 95,
+                "rent_cost": 5,
+            },
+        ]
+    )
+
+    result = delivery._apply_store_expected_month_fin_revenue(revenue)
+
+    keyed = result.set_index(["sale_date", "platform"])
+    assert keyed.loc[("2026-08-01", "배달의민족"), "store_expected_month_fin_revenue"] == 285
+    assert keyed.loc[("2026-08-02", "쿠팡이츠"), "store_expected_month_fin_revenue"] == 285
+    assert keyed.loc[("2026-09-01", "배달의민족"), "store_expected_month_fin_revenue"] == 565
+    assert keyed.loc[("2026-09-02", "쿠팡이츠"), "store_expected_month_fin_revenue"] == 565
+
+
+def test_store_expected_month_fin_revenue_falls_back_when_model_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(delivery, "_build_store_month_forecast_model", lambda completed_daily: None)
+    revenue = pd.DataFrame(
+        [
+            {
+                "sale_date": "2026-09-01",
+                "brand": "도리당",
+                "store": "신규점",
+                "platform": "배달의민족",
+                "total_price": 1000,
+                "settlement_price": 800,
+                "revenue": 200,
+                "fin_revenue": 100,
+                "rent_cost": 10,
+            },
+            {
+                "sale_date": "2026-09-02",
+                "brand": "도리당",
+                "store": "신규점",
+                "platform": "쿠팡이츠",
+                "total_price": 1000,
+                "settlement_price": 900,
+                "revenue": 100,
+                "fin_revenue": 200,
+                "rent_cost": 5,
+            },
+        ]
+    )
+
+    result = delivery._apply_store_expected_month_fin_revenue(revenue)
+
+    assert result["store_expected_month_fin_revenue"].tolist() == [4500, 4500]
+
+
+def test_revenue_cost_columns_are_ordered_at_the_right_edge() -> None:
+    revenue = pd.DataFrame(
+        [
+            {
+                "sale_date": "2026-09-01",
+                "brand": "도리당",
+                "store": "부산대신점",
+                "platform": "배달의민족",
+                "total_price": 1000,
+                "settlement_price": 800,
+                "revenue": 200,
+                "rent_cost": 10,
+                "extra_cost": 5,
+            }
+        ]
+    )
+
+    result = delivery._apply_fin_revenue(revenue)
+    result = delivery._apply_store_expected_month_fin_revenue(result)
+
+    assert list(result.columns)[-2:] == ["rent_cost", "extra_cost"]
+    assert result.loc[0, "fin_revenue"] == 185
 
 
 def test_read_failure_preserves_existing_mart(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -433,7 +1035,7 @@ def test_baemin_missing_wgc_rows_keep_settlement_and_zero_metrics(
     assert baemin["우가클_클릭율"] == 0
 
 
-def test_baemin_cash_payment_is_removed_from_fee_diff(
+def test_baemin_cash_payment_uses_deposit_amount_without_extra_adjustment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     output = _configure_paths(monkeypatch, tmp_path)
@@ -460,9 +1062,8 @@ def test_baemin_cash_payment_is_removed_from_fee_diff(
     baemin = result[
         result["platform"].eq("배달의민족") & result["brand"].eq("도리당")
     ].iloc[0]
-    assert baemin["settlement_amount"] == 32_172
-    assert baemin["diff_amt"] == 2_528
-    assert baemin["diff_amt"] <= baemin["total_amt"]
+    assert baemin["settlement_amount"] == -2_528
+    assert baemin["diff_amt"] == 37_228
 
 
 def test_baemin_partner_instant_discount_is_not_double_counted_by_detail_rows(
@@ -610,6 +1211,7 @@ def test_build_writes_with_nulls_when_baemin_settlement_missing(
         10_000,
         "",
         order_id="정산미수집주문",
+        partner_instant_discount=1_000,
     )
     _write_baemin_order(delivery.BAEMIN_ORDERS_DB, "나홀로", "대신점", 5_000, 4_000)
     _write_baemin_ad(delivery.BAEMIN_OUR_STORE_CLICKS_DB, "도리당", "도리당 부산대신점", 100)
@@ -637,8 +1239,20 @@ def test_build_writes_with_nulls_when_baemin_settlement_missing(
 
     assert pd.isna(missing["settlement_amount"])
     assert pd.isna(missing["diff_amt"])
+    assert missing["total_amt"] == 11_000
     assert normal["settlement_amount"] == 3_800
     assert len(coupang) == 2
+
+    delivery.build_delivery_revenue()
+    revenue = pd.read_parquet(delivery.DELIVERY_REVENUE_PATH)
+    revenue_missing = revenue[
+        revenue["platform"].eq("배달의민족")
+        & revenue["brand"].eq("도리당")
+        & revenue["store"].eq("부산대신점")
+    ].iloc[0]
+    assert pd.isna(revenue_missing["settlement_price"])
+    assert pd.isna(revenue_missing["revenue"])
+    assert revenue_missing["total_price"] == 11_000
 
 
 def test_find_baemin_settlement_missing_targets_groups_recollect_scope(
@@ -697,7 +1311,7 @@ def test_find_baemin_settlement_missing_targets_groups_recollect_scope(
     confs = delivery.build_baemin_orders_only_recollect_confs(targets)
     assert confs == [
         {
-            "dag_id": "DB_Beamin_Macro_Dags",
+            "dag_id": "DB_Beamin_Macro_Backfill_Dags",
             "conf": {
                 "orders_only": True,
                 "target_date": "2026-07-19",
@@ -708,7 +1322,7 @@ def test_find_baemin_settlement_missing_targets_groups_recollect_scope(
             },
         },
         {
-            "dag_id": "DB_Beamin_Macro_Dags",
+            "dag_id": "DB_Beamin_Macro_Backfill_Dags",
             "conf": {
                 "orders_only": True,
                 "target_date": "2026-07-20",
@@ -832,12 +1446,20 @@ def test_delivery_commission_dag_monitors_before_build(
         "monitor_baemin_settlement_missing",
         "trigger_baemin_orders_only_recollect",
         "build_delivery_commission",
+        "build_delivery_revenue",
+        "build_store_cost_allocation",
     }
     assert dag.get_task("trigger_baemin_orders_only_recollect").upstream_task_ids == {
         "monitor_baemin_settlement_missing"
     }
     assert dag.get_task("build_delivery_commission").upstream_task_ids == {
         "trigger_baemin_orders_only_recollect"
+    }
+    assert dag.get_task("build_delivery_revenue").upstream_task_ids == {
+        "build_delivery_commission"
+    }
+    assert dag.get_task("build_store_cost_allocation").upstream_task_ids == {
+        "build_delivery_revenue"
     }
     monitor = dag.get_task("monitor_baemin_settlement_missing")
     trigger = dag.get_task("trigger_baemin_orders_only_recollect")

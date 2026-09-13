@@ -19,6 +19,7 @@ import os
 import random
 import re
 import time
+from io import StringIO
 from pathlib import Path
 
 import pandas as pd
@@ -35,7 +36,7 @@ from modules.extract.croling_beamin import (
     login_baemin,
     wait_for_page,
 )
-from modules.transform.utility.paths import BAEMIN_ORDERS_DB
+from modules.transform.utility.paths import BAEMIN_ORDERS_DB, COLLECTOR_EXT_DIR
 from modules.transform.pipelines.db.DB_UnifiedSales_common import (
     record_manual_reingest_marker,
 )
@@ -52,6 +53,25 @@ logger = logging.getLogger(__name__)
 KST = pendulum.timezone("Asia/Seoul")
 
 ORDERS_URL = "https://self.baemin.com/orders/history"
+_COLLECTOR_EXTENSION_FALLBACK = "extension_fallback"
+_COLLECTOR_EXTENSION_ONLY = "extension"
+_COLLECTOR_SELENIUM_ONLY = "selenium"
+_COLLECTOR_MODES = {
+    _COLLECTOR_EXTENSION_FALLBACK,
+    _COLLECTOR_EXTENSION_ONLY,
+    _COLLECTOR_SELENIUM_ONLY,
+}
+_EXTENSION_COLLECT_TIMEOUT_SEC = int(os.getenv("BAEMIN_EXTENSION_COLLECT_TIMEOUT_SEC", "300"))
+_EXTENSION_VALIDATION_SELENIUM_FALLBACK = (
+    os.getenv("BAEMIN_EXTENSION_VALIDATION_SELENIUM_FALLBACK", "").strip().lower()
+    in {"1", "true", "yes", "y"}
+)
+_EXTENSION_CONTENT_FILES = (
+    "content/00_config.js",
+    "content/01_utils.js",
+    "content/02_baemin.js",
+)
+_EXTENSION_SCRIPT_CACHE: str | None = None
 
 _CRASH_KEYWORDS = (
     "Remote end closed", "Connection aborted", "RemoteDisconnected",
@@ -67,6 +87,16 @@ def _is_crash(exc: Exception) -> bool:
 
 class OrdersCollectionInterrupted(RuntimeError):
     """Chrome died mid-collection; partial rows must not be saved as complete."""
+
+
+class ExtensionCollectorUnavailable(RuntimeError):
+    """Extension collector did not become ready; do not enter slow Selenium fallback."""
+
+
+class ExtensionCollectionFailed(RuntimeError):
+    """확장이 보고한 수집 실패. 빈 주문이나 다른 수집기로 숨기지 않는다."""
+
+
 _TABLE_ROW_CSS = "tr.Table_b_r4ax_1dwbr4on[data-index]"
 _MAX_PAGES = 50
 _PAGE_TRANSITION_TIMEOUT = 25
@@ -263,6 +293,22 @@ def _short_error(exc: Exception) -> str:
     return text[:240]
 
 
+def _extension_failure_disables_selenium_fallback(exc: Exception) -> bool:
+    if isinstance(exc, (ExtensionCollectorUnavailable, ExtensionCollectionFailed, TimeoutException)):
+        return True
+    message = str(exc)
+    return any(
+        text in message
+        for text in (
+            "배민 확장 orders collector 준비 실패",
+            "Sites.baemin orders collector 없음",
+            "extension collect timeout",
+            "HTTPConnectionPool",
+            "Read timed out",
+        )
+    )
+
+
 def _wait_for_orders_table(driver, timeout: int = _ORDERS_TABLE_WAIT_SEC) -> bool:
     try:
         WebDriverWait(driver, timeout).until(
@@ -329,15 +375,29 @@ def _orders_shell_debug_state(driver) -> dict:
         return {"error": _short_error(exc)}
 
 
-def _open_orders_history(driver) -> None:
+def _orders_history_url(target_date: str | None = None) -> str:
+    if not target_date:
+        return ORDERS_URL
+    return f"{ORDERS_URL}?startDate={target_date}&endDate={target_date}"
+
+
+def _open_orders_history(driver, target_date: str | None = None) -> None:
     driver.set_page_load_timeout(_ORDERS_PAGE_LOAD_TIMEOUT_SEC)
     try:
-        driver.get(ORDERS_URL)
+        driver.get(_orders_history_url(target_date))
     except TimeoutException:
         try:
             driver.execute_script("window.stop();")
         except Exception:
             pass
+
+
+def _orders_url_has_target_date(driver, target_date: str) -> bool:
+    try:
+        current_url = str(driver.current_url or "")
+    except Exception:
+        return False
+    return f"startDate={target_date}" in current_url and f"endDate={target_date}" in current_url
 
 
 # ---------------------------------------------------------------------------
@@ -461,13 +521,18 @@ def _has_low_settle_rate(vr: dict) -> bool:
 
 
 def _block_low_settle_rate(vr: dict) -> dict:
-    """정산정보 수집률이 낮으면 정상 저장하지 않고 재수집 대상으로 남긴다."""
+    """정산정보 수집률이 낮아도 합계 검증이 일치하면 저장은 진행하고 표시만 남긴다.
+
+    배민 셀러사이트는 전날 주문의 정산정보(입금예정금액)를 통상 09:00 KST 전후에 게시한다.
+    00시대 자동 수집은 구조적으로 rate=0%가 정상이므로, 여기서 matched=False로 막아
+    저장을 생략하면 정상 수집된 주문(결제금액/총결제금액은 이미 일치)까지 폐기되고
+    동기 재시도(2시간) → Retry DAG로 계속 이월되기만 한다.
+    settlement_suspect 플래그만 남겨 이후(09시 이후) 재수집이 정산 컬럼만 채우도록 한다.
+    """
     if not _has_low_settle_rate(vr):
         return vr
     vr["settlement_suspect"] = True
     vr["reason"] = "low_settle_rate"
-    vr["matched"] = False
-    vr["save_partial"] = False
     return vr
 
 
@@ -532,6 +597,305 @@ def _date_filtered_validation(
         "reason": reason,
         "save_partial": save_partial,
     }
+
+
+def _orders_collector_mode() -> str:
+    mode = os.getenv("BAEMIN_ORDERS_COLLECTOR", _COLLECTOR_EXTENSION_FALLBACK).strip().lower()
+    if mode not in _COLLECTOR_MODES:
+        logger.warning(
+            "알 수 없는 BAEMIN_ORDERS_COLLECTOR=%s, %s 사용",
+            mode,
+            _COLLECTOR_EXTENSION_FALLBACK,
+        )
+        return _COLLECTOR_EXTENSION_FALLBACK
+    return mode
+
+
+def _read_extension_script_bundle() -> str:
+    global _EXTENSION_SCRIPT_CACHE
+    if _EXTENSION_SCRIPT_CACHE is not None:
+        return _EXTENSION_SCRIPT_CACHE
+
+    snippets = [
+        """
+        window.chrome = window.chrome || {};
+        window.chrome.runtime = window.chrome.runtime || {};
+        window.chrome.storage = window.chrome.storage || {};
+        window.chrome.storage.sync = window.chrome.storage.sync || {};
+        window.chrome.storage.local = window.chrome.storage.local || {};
+        window.chrome.storage.sync.get = window.chrome.storage.sync.get || function(_keys, cb) { if (cb) cb({}); };
+        window.chrome.storage.local.get = window.chrome.storage.local.get || function(_keys, cb) { if (cb) cb({}); };
+        window.chrome.storage.local.set = window.chrome.storage.local.set || function(_values, cb) { if (cb) cb(); };
+        window.chrome.runtime.sendMessage = window.chrome.runtime.sendMessage || function(msg, cb) {
+            if (cb) cb({success: true, filename: (msg && msg.filename) || "airflow_captured"});
+            return Promise.resolve({success: true});
+        };
+        """
+    ]
+    missing: list[Path] = []
+    for rel_path in _EXTENSION_CONTENT_FILES:
+        path = COLLECTOR_EXT_DIR / rel_path
+        if not path.exists():
+            missing.append(path)
+            continue
+        snippets.append(path.read_text(encoding="utf-8"))
+
+    if missing:
+        raise FileNotFoundError(
+            "배민 확장 content 파일 없음: " + ", ".join(str(path) for path in missing)
+        )
+
+    snippets.append(
+        """
+        if (typeof Utils !== "undefined") {
+            window.Utils = Utils;
+        }
+        if (typeof Sites !== "undefined") {
+            window.Sites = Sites;
+        }
+        """
+    )
+    _EXTENSION_SCRIPT_CACHE = "\n;\n".join(snippets)
+    return _EXTENSION_SCRIPT_CACHE
+
+
+def _extension_collector_state(driver) -> dict:
+    try:
+        return driver.execute_script(
+            """
+            return {
+                hasWindowSites: !!window.Sites,
+                hasBaeminSite: !!(window.Sites && window.Sites.baemin),
+                hasCollectOrdersAllPages: !!(
+                    window.Sites &&
+                    window.Sites.baemin &&
+                    typeof window.Sites.baemin._collectOrdersAllPages === "function"
+                ),
+                hasWindowUtils: !!window.Utils,
+                hasToCSV: !!(window.Utils && typeof window.Utils.toCSV === "function"),
+                hasDownloadCSV: !!(window.Utils && typeof window.Utils.downloadCSV === "function"),
+                hasPipelineSave: !!window.BaeminPipelineSave
+            };
+            """
+        ) or {}
+    except Exception as exc:
+        if _is_crash(exc):
+            raise
+        return {"error": _short_error(exc)}
+
+
+def _baemin_extension_collector_ready(driver) -> bool:
+    try:
+        return bool(
+            driver.execute_script(
+                """
+                return !!(
+                    window.Sites &&
+                    window.Sites.baemin &&
+                    typeof window.Sites.baemin._collectOrdersAllPages === "function" &&
+                    window.Utils &&
+                    typeof window.Utils.toCSV === "function"
+                );
+                """
+            )
+        )
+    except Exception as exc:
+        if _is_crash(exc):
+            raise
+        return False
+
+
+def _inject_baemin_extension_collector(driver) -> None:
+    if _baemin_extension_collector_ready(driver):
+        return
+    driver.execute_script(_read_extension_script_bundle())
+    if not _baemin_extension_collector_ready(driver):
+        state = _extension_collector_state(driver)
+        logger.warning("배민 확장 orders collector 준비 실패: state=%s", state)
+        raise ExtensionCollectorUnavailable(f"배민 확장 orders collector 준비 실패: {state}")
+
+
+def _rows_from_extension_csv(csv_content: str) -> list[dict]:
+    text = str(csv_content or "").lstrip("\ufeff")
+    if not text.strip():
+        return []
+    df = pd.read_csv(StringIO(text), dtype=str).fillna("").astype(str)
+    return df.reindex(columns=_COLUMNS, fill_value="").to_dict("records")
+
+
+def _run_extension_collect_script(driver, store_info: dict, timeout_sec: int) -> dict:
+    """페이지에 주입된 확장 orders collector를 실행하고 결과 dict를 돌려준다."""
+    return driver.execute_async_script(
+        """
+        const done = arguments[arguments.length - 1];
+        const storeName = arguments[0] || "";
+        const storeId = arguments[1] || "";
+        const timeoutMs = Number(arguments[2] || 300000);
+
+        (async () => {
+            const site = window.Sites && window.Sites.baemin;
+            if (!site || !window.Utils || typeof site._collectOrdersAllPages !== "function") {
+                done({success: false, error: "Sites.baemin orders collector 없음"});
+                return;
+            }
+            if (site._airflowCollectorActive) {
+                done({success: false, error: "이전 확장 수집 종료 대기 중"});
+                return;
+            }
+            site._airflowCollectorActive = true;
+
+            let settled = false;
+            const finish = (payload) => {
+                if (settled) return;
+                settled = true;
+                done(payload || {});
+            };
+            const timer = setTimeout(() => {
+                site._stopFlag = true;
+                finish({success: false, timeout: true, error: "extension collect timeout"});
+            }, timeoutMs);
+
+            const originalDownload = window.Utils.downloadCSV;
+            let capturedCsv = "";
+            let capturedOptions = {};
+            window.Utils.downloadCSV = async (csv, options = {}) => {
+                capturedCsv = csv || "";
+                capturedOptions = options || {};
+                return "pipeline_captured";
+            };
+
+            try {
+                site._stopFlag = false;
+                let shopInfo = site._getShopInfo ? site._getShopInfo() : {};
+                if (typeof site.applyOrdersStoreFilter === "function" && location.href.includes("/orders/history")) {
+                    const filterResult = await site.applyOrdersStoreFilter(storeName, storeId, storeId, storeName);
+                    if (!filterResult || filterResult.success === false) {
+                        finish({
+                            success: false,
+                            error: (filterResult && filterResult.error) || "orders 가게 필터 적용 실패",
+                            debug: filterResult && filterResult.debug
+                        });
+                        return;
+                    }
+                    shopInfo = filterResult.shopInfo || (site._getShopInfo ? site._getShopInfo() : shopInfo);
+                }
+                shopInfo = Object.assign({}, shopInfo || {}, {
+                    store_name: (shopInfo && shopInfo.store_name) || storeName,
+                    store_id: (shopInfo && shopInfo.store_id) || storeId,
+                    needFilter: !!(shopInfo && shopInfo.needFilter)
+                });
+                if (shopInfo.needFilter) {
+                    finish({success: false, error: "orders 가게 필터가 전체 상태입니다"});
+                    return;
+                }
+                const collectResult = await site._collectOrdersAllPages(shopInfo);
+                clearTimeout(timer);
+                finish({
+                    success: collectResult && collectResult.success !== false,
+                    partial: !!(collectResult && collectResult.partial),
+                    error: (collectResult && collectResult.error) || "",
+                    rows: (collectResult && collectResult.rows) || 0,
+                    csv: capturedCsv,
+                    options: capturedOptions
+                });
+            } catch (err) {
+                clearTimeout(timer);
+                finish({success: false, error: err && err.message ? err.message : String(err)});
+            } finally {
+                clearTimeout(timer);
+                window.Utils.downloadCSV = originalDownload;
+                site._airflowCollectorActive = false;
+            }
+        })();
+        """,
+        f"{store_info.get('brand', '')} {store_info.get('store', '')}".strip(),
+        str(store_info.get("store_id") or ""),
+        timeout_sec * 1000,
+    ) or {}
+
+
+def _http_command_timeout(driver) -> int | None:
+    """selenium command_executor의 HTTP read timeout(초). 없으면 None."""
+    cfg = getattr(getattr(driver, "command_executor", None), "_client_config", None)
+    value = getattr(cfg, "timeout", None)
+    try:
+        return int(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _collect_all_pages_with_extension(driver, store_info: dict) -> list[dict]:
+    _inject_baemin_extension_collector(driver)
+    timeout_sec = max(30, _EXTENSION_COLLECT_TIMEOUT_SEC)
+    try:
+        driver.set_script_timeout(timeout_sec + 30)
+    except Exception:
+        pass
+
+    # failfast 클라이언트(기본 90s)는 죽은 chromedriver를 빨리 알아채기 위한 것이라
+    # 정상 동작 중인 확장 수집기(허용 300s)가 큰 매장(주문 100건 안팎)에서 90s를 넘기면
+    # "Read timed out"으로 끊기고 폴백까지 막혔다(2026-09-12 낮 재수집 실측: 미사·대화·김해구산·부산장림).
+    # 이 한 번의 execute_async_script 동안만 HTTP timeout을 스크립트 허용시간보다 길게 올리고 되돌린다.
+    from modules.transform.utility.selenium_uc import _apply_failfast_client
+
+    original_http_timeout = _http_command_timeout(driver)
+    if original_http_timeout is not None and original_http_timeout < timeout_sec + 60:
+        _apply_failfast_client(driver, timeout_sec=timeout_sec + 60, log_fn=logger.info)
+    try:
+        result = _run_extension_collect_script(driver, store_info, timeout_sec)
+    finally:
+        if original_http_timeout is not None and original_http_timeout < timeout_sec + 60:
+            _apply_failfast_client(driver, timeout_sec=original_http_timeout, log_fn=logger.info)
+
+    if result.get("timeout"):
+        raise TimeoutException(str(result.get("error") or "extension collect timeout"))
+    if result.get("partial"):
+        raise ExtensionCollectionFailed(str(result.get("error") or "배민 확장 부분 수집"))
+    if result.get("success") is False:
+        # 구버전 확장도 무매출만 별도로 확인한다. 실패 응답의 rows 기본값 0은
+        # 무매출 증거가 아니다. 매장/날짜는 호출 전에 검증된 화면을 사용한다.
+        if result.get("error") == "수집된 주문 없음":
+            summary = _read_total_summary(driver)
+            if summary is not None and summary.get("count") == 0 and summary.get("amount") == 0:
+                return []
+        raise ExtensionCollectionFailed(str(result.get("error") or "배민 확장 수집 실패"))
+    if not result.get("csv"):
+        summary = _read_total_summary(driver)
+        if result.get("success") is True and result.get("rows") == 0 and summary is not None and summary.get("count") == 0 and summary.get("amount") == 0:
+            return []
+        raise ExtensionCollectionFailed(str(result.get("error") or "배민 확장 수집 결과 CSV 없음"))
+
+    rows = _rows_from_extension_csv(str(result.get("csv") or ""))
+    logger.info(
+        "배민 확장 orders collector 수집 완료: store=%s rows=%d",
+        store_info.get("store", "?"),
+        len(rows),
+    )
+    return rows
+
+
+def _collect_all_pages_for_mode(driver, store_info: dict) -> tuple[list[dict], str]:
+    mode = _orders_collector_mode()
+    if mode == _COLLECTOR_SELENIUM_ONLY:
+        return _collect_all_pages(driver, store_info), _COLLECTOR_SELENIUM_ONLY
+    try:
+        return _collect_all_pages_with_extension(driver, store_info), _COLLECTOR_EXTENSION_ONLY
+    except Exception as exc:
+        if _is_crash(exc) or mode == _COLLECTOR_EXTENSION_ONLY:
+            raise
+        if _extension_failure_disables_selenium_fallback(exc):
+            logger.warning(
+                "배민 확장 orders collector 사용 불가, Selenium 폴백 생략: %s / %s",
+                store_info.get("store", "?"),
+                _short_error(exc),
+            )
+            raise
+        logger.warning(
+            "배민 확장 orders collector 실패, Selenium collector로 폴백: %s / %s",
+            store_info.get("store", "?"),
+            _short_error(exc),
+        )
+        return _collect_all_pages(driver, store_info), _COLLECTOR_SELENIUM_ONLY
 
 
 def _visible_order_date_state(driver, target_date: str) -> dict:
@@ -705,12 +1069,13 @@ def _collect_with_retry_on_mismatch(
                         "expected_count": expected["count"],
                         "expected_amount": expected.get("amount"),
                         "amount_source": "csv_skip", "amount_candidates": {},
+                        "collection_state": "reused_existing",
                     }
                     return [], vr
 
             if target_date:
                 _go_to_first_page(driver, store)
-            collected_rows = _collect_all_pages(driver, store_info)
+            collected_rows, collector_name = _collect_all_pages_for_mode(driver, store_info)
             rows, date_filtered = _filter_rows_to_target_date(collected_rows, target_date, store)
             if date_filtered:
                 if rows:
@@ -725,6 +1090,7 @@ def _collect_with_retry_on_mismatch(
                             "expected_amount": None,
                             "amount_source": "date_filtered_rows",
                             "reason": "date_filtered_rows",
+                            "collector": collector_name,
                         }
                     )
                     logger.warning(
@@ -747,14 +1113,14 @@ def _collect_with_retry_on_mismatch(
                 logger.warning("날짜 혼입으로 TotalSummary 검증 생략 후 필터 재적용: %s", store)
                 try:
                     try:
-                        driver.get(ORDERS_URL)
+                        _open_orders_history(driver, target_date)
                     except TimeoutException as exc:
                         logger.info("날짜 혼입 재필터 페이지 로드 지연, DOM 대기로 계속: %s / %s", store, _short_error(exc))
                         try:
                             driver.execute_script("window.stop();")
                         except Exception:
                             pass
-                    if not wait_for_page(driver, _TABLE_ROW_CSS, timeout=30):
+                    if not _wait_for_orders_page_shell(driver):
                         logger.warning("날짜 혼입 재필터 페이지 로드 실패, 중단: %s", store)
                         break
                     if not filter_fn(driver):
@@ -772,9 +1138,11 @@ def _collect_with_retry_on_mismatch(
                 raise
             raise
         vr = _validate_collected(rows, expected)
+        vr["collection_state"] = "collected" if rows else "no_data"
         vr["status"] = status_label
         vr["store"] = store
         vr["retried"] = attempt
+        vr["collector"] = locals().get("collector_name", _COLLECTOR_SELENIUM_ONLY)
         settle_rate = vr.get("settle_rate")
         low_settle_rate = _has_low_settle_rate(vr)
         if low_settle_rate:
@@ -830,19 +1198,73 @@ def _collect_with_retry_on_mismatch(
             )
             break
 
+        if (
+            vr["matched"] is False
+            and locals().get("collector_name") == _COLLECTOR_EXTENSION_ONLY
+            and _orders_collector_mode() == _COLLECTOR_EXTENSION_FALLBACK
+            and _EXTENSION_VALIDATION_SELENIUM_FALLBACK
+        ):
+            logger.warning(
+                "배민 확장 collector 검증 실패, Selenium collector로 즉시 재시도: %s / %s",
+                store,
+                vr.get("reason") or "validation_mismatch",
+            )
+            try:
+                try:
+                    _open_orders_history(driver, target_date)
+                except TimeoutException as exc:
+                    logger.info("Selenium 폴백 페이지 로드 지연, DOM 대기로 계속: %s / %s", store, _short_error(exc))
+                    try:
+                        driver.execute_script("window.stop();")
+                    except Exception:
+                        pass
+                if not _wait_for_orders_page_shell(driver):
+                    logger.warning("Selenium 폴백 페이지 shell 로드 실패, 중단: %s", store)
+                    break
+                if not filter_fn(driver):
+                    logger.warning("Selenium 폴백 필터 적용 실패, 중단: %s", store)
+                    break
+                collected_rows = _collect_all_pages(driver, store_info)
+                collector_name = _COLLECTOR_SELENIUM_ONLY
+                rows, _date_filtered = _filter_rows_to_target_date(collected_rows, target_date, store)
+                vr = _validate_collected(rows, expected)
+                vr["status"] = status_label
+                vr["store"] = store
+                vr["retried"] = attempt
+                vr["collector"] = _COLLECTOR_SELENIUM_ONLY
+                if _has_low_settle_rate(vr):
+                    vr["settlement_suspect"] = True
+                    vr["reason"] = "low_settle_rate"
+                if vr["matched"] is not False and not _has_low_settle_rate(vr):
+                    break
+            except Exception as e:
+                if _is_crash(e):
+                    raise
+                logger.warning("Selenium 폴백 collector 실패, 기존 재시도 루프 계속: %s / %s", store, e)
+        elif (
+            vr["matched"] is False
+            and locals().get("collector_name") == _COLLECTOR_EXTENSION_ONLY
+            and _orders_collector_mode() == _COLLECTOR_EXTENSION_FALLBACK
+        ):
+            logger.warning(
+                "배민 확장 collector 검증 실패, Selenium 폴백 비활성화로 잔여 실패 보존: %s / %s",
+                store,
+                vr.get("reason") or "validation_mismatch",
+            )
+
         if attempt >= max_retry:
             break
 
         try:
             try:
-                driver.get(ORDERS_URL)
+                _open_orders_history(driver, target_date)
             except TimeoutException as exc:
                 logger.info("재수집 페이지 로드 지연, DOM 대기로 계속: %s / %s", store, _short_error(exc))
                 try:
                     driver.execute_script("window.stop();")
                 except Exception:
                     pass
-            if not wait_for_page(driver, _TABLE_ROW_CSS, timeout=30):
+            if not _wait_for_orders_page_shell(driver):
                 logger.warning("재수집 페이지 로드 실패, 중단: %s", store)
                 break
             if not filter_fn(driver):
@@ -856,6 +1278,8 @@ def _collect_with_retry_on_mismatch(
         time.sleep(2.0)
 
     _block_low_settle_rate(vr)
+    if vr.get("matched") is False:
+        vr["collection_state"] = "failed"
     return rows, vr
 
 
@@ -893,7 +1317,7 @@ def collect_orders_for_driver(
         page_ready = False
         for page_attempt in range(2):
             try:
-                _open_orders_history(driver)
+                _open_orders_history(driver, target_date)
             except Exception as exc:
                 raise OrdersCollectionInterrupted(
                     f"orders navigation failed before table wait: {store} / {_short_error(exc)}"
@@ -914,23 +1338,13 @@ def collect_orders_for_driver(
             logger.warning("가게 필터 선택 실패, 건너뜀: %s", store)
             return {"ok": False, "reason": "store_filter", "validation": validation}
 
-        prev_sig = _page_signature(driver)
-        prev_summary = _read_total_summary(driver)
         date_filter_uncertain = False
-        if not _set_date(driver, target_date):
-            logger.warning("날짜 설정 실패, 수집 중단: %s / %s", store, target_date)
+        if not _ensure_orders_target_date(driver, target_date, store):
             return {"ok": False, "reason": "date_filter", "validation": validation}
-
-        if not _wait_for_filter_settle(driver, prev_sig, prev_summary):
-            if not _confirm_visible_order_date(driver, target_date, "적용후", timeout=4.5):
-                logger.warning("날짜 필터 적용 후 테이블 정착 실패, 수집 중단: %s / %s", store, target_date)
-                return {"ok": False, "reason": "date_filter", "validation": validation}
-            else:
-                logger.info("날짜 필터 signature 변화 없음, 주문시각 실측으로 계속 진행: %s", store)
 
         # 배달완료 수집 + TotalSummary 검증
         def _filter_normal(d):
-            return _select_order_store(d, store_id, store) and _set_date(d, target_date)
+            return _select_order_store(d, store_id, store) and _ensure_orders_target_date(d, target_date, store)
 
         rows, vr_normal = _collect_with_retry_on_mismatch(
             driver, store_info, "배달완료", _filter_normal,
@@ -956,6 +1370,8 @@ def collect_orders_for_driver(
         elif rows:
             saved = _save_orders_csv(rows, brand, store, target_date)
             logger.info("저장 완료(정상): brand=%s store=%s → %s (%d행)", brand, store, saved, len(rows))
+        elif vr_normal.get("amount_source") == "csv_skip" and vr_normal.get("matched") is True:
+            logger.info("검증된 기존 주문 파일 재사용: %s / %s", store, target_date)
         elif not _handle_zero_orders(brand, store, store_id, target_date):
             ok = False
             failure_reason = SUSPECT_ZERO_REASON
@@ -969,6 +1385,11 @@ def collect_orders_for_driver(
         if _is_crash(e):
             raise
         logger.warning("주문내역 수집 실패 (%s): %s", store, e)
+        if isinstance(e, ExtensionCollectionFailed):
+            validation.append({"matched": False, "store": store,
+                               "reason": "extension_collection_failed",
+                               "collection_state": "failed", "error": _short_error(e)})
+            return {"ok": False, "reason": "extension_collection_failed", "validation": validation}
         return {"ok": False, "reason": "exception", "validation": validation}
 
 
@@ -1016,7 +1437,7 @@ def collect_orders_for_account(
                     break
 
                 try:
-                    _open_orders_history(driver)
+                    _open_orders_history(driver, target_date)
                 except Exception as exc:
                     logger.warning("주문내역 페이지 이동 실패, 건너뜀: %s / %s", store, _short_error(exc))
                     failure_reason = "navigation"
@@ -1042,36 +1463,17 @@ def collect_orders_for_account(
                         continue
                     break
 
-                prev_sig = _page_signature(driver)
-                prev_summary = _read_total_summary(driver)
                 date_filter_uncertain = False
-                if not _set_date(driver, target_date):
-                    logger.warning(
-                        "날짜 설정 실패, 수집 중단: %s / %s",
-                        store,
-                        target_date,
-                    )
+                if not _ensure_orders_target_date(driver, target_date, store):
                     failure_reason = "date_filter"
                     break
-
-                if not _wait_for_filter_settle(driver, prev_sig, prev_summary):
-                    if not _confirm_visible_order_date(driver, target_date, "적용후", timeout=4.5):
-                        logger.warning(
-                            "날짜 필터 적용 후 테이블 정착 실패, 수집 중단: %s / %s",
-                            store,
-                            target_date,
-                        )
-                        failure_reason = "date_filter"
-                        break
-                    else:
-                        logger.info("날짜 필터 signature 변화 없음, 주문시각 실측으로 계속 진행: %s", store)
 
                 # 배달완료 수집 + TotalSummary 검증
                 _sid, _sn = store_id, store  # closure 캡처용
                 _td = target_date  # closure 캡처용
 
                 def _filter_normal(d):
-                    return _select_order_store(d, _sid, _sn) and _set_date(d, _td)
+                    return _select_order_store(d, _sid, _sn) and _ensure_orders_target_date(d, _td, _sn)
 
                 rows, vr_normal = _collect_with_retry_on_mismatch(
                     driver, store_info, "배달완료", _filter_normal, target_date=target_date,
@@ -1103,6 +1505,8 @@ def collect_orders_for_account(
                     logger.info(
                         "저장 완료(정상): brand=%s store=%s → %s (%d행)", brand, store, saved, len(rows)
                     )
+                elif vr_normal.get("amount_source") == "csv_skip" and vr_normal.get("matched") is True:
+                    logger.info("검증된 기존 주문 파일 재사용: %s / %s", store, target_date)
                 elif not _handle_zero_orders(brand, store, store_id, target_date):
                     failure_reason = SUSPECT_ZERO_REASON
                     if attempt < _ORDER_COLLECTION_ATTEMPTS - 1:
@@ -1117,6 +1521,12 @@ def collect_orders_for_account(
                     "매장 수집 실패 (%s) attempt=%d/%d: %s",
                     store, attempt + 1, _ORDER_COLLECTION_ATTEMPTS, e,
                 )
+                if isinstance(e, ExtensionCollectionFailed):
+                    failure_reason = "extension_collection_failed"
+                    validation.append({"matched": False, "store": store,
+                                       "reason": failure_reason,
+                                       "collection_state": "failed", "error": _short_error(e)})
+                    break
                 if _is_crash(e) and attempt < _ORDER_COLLECTION_ATTEMPTS - 1:
                     try:
                         clean_chrome_profile(account_id)
@@ -1675,6 +2085,21 @@ def _apply_specific_date_selection(driver, target_date: str) -> bool:
     return applied_any
 
 
+def _calendar_yms_from_texts(texts: list[object]) -> list[tuple[int, int]]:
+    yms: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for text in texts or []:
+        cleaned = str(text or "").replace("\xa0", " ")
+        if "~" in cleaned:
+            continue
+        for match in re.finditer(r"(\d{4})\s*[.년]\s*(\d{1,2})\s*[.월]?", cleaned):
+            ym = (int(match.group(1)), int(match.group(2)))
+            if 1 <= ym[1] <= 12 and ym not in seen:
+                seen.add(ym)
+                yms.append(ym)
+    return yms
+
+
 def _set_date_specific(driver, target_date: str) -> bool:
     """DefaultDateFilter 달력에서 target_date 하루를 선택하고 적용한다.
 
@@ -1685,8 +2110,6 @@ def _set_date_specific(driver, target_date: str) -> bool:
         4. target_date를 시작일/종료일로 클릭
         5. 적용 버튼 클릭
     """
-    import re as _re
-
     try:
         dt = pendulum.parse(target_date, tz=KST)
         target_year = dt.year
@@ -1716,24 +2139,27 @@ def _set_date_specific(driver, target_date: str) -> bool:
         time.sleep(0.2)
 
         # 2. 달력 헤더 확인 후 목표 월로 이동
-        def _get_calendar_ym(d):
-            """달력에서 (year, month) 반환. 실패 시 None."""
-            text = d.execute_script(
+        def _get_calendar_yms(d):
+            """달력에서 보이는 (year, month) 목록 반환."""
+            texts = d.execute_script(
                 """
+                function cleanText(el) {
+                    return (el?.textContent || '').replace(/\\s+/g, ' ').trim();
+                }
                 function hasCalendarMonth(text) {
                     return /(\\d{4})\\s*[.년]\\s*(\\d{1,2})\\s*[.월]?/.test(text || '');
                 }
-                function cleanText(el) {
-                    return (el?.textContent || '').replace(/\\s+/g, ' ').trim();
+                const texts = [];
+                function addText(el) {
+                    const t = cleanText(el);
+                    if (t && !t.includes('~') && hasCalendarMonth(t)) texts.push(t);
                 }
                 const prev = [...document.querySelectorAll('button')]
                     .find(b => /이전\\s*달/.test(b.getAttribute('aria-label') || ''));
                 if (prev) {
                     let node = prev.parentElement;
                     for (let i = 0; i < 5 && node; i++, node = node.parentElement) {
-                        const t = cleanText(node);
-                        if (t.includes('~')) continue;
-                        if (hasCalendarMonth(t)) return t;
+                        addText(node);
                     }
                 }
                 const anchors = [
@@ -1744,18 +2170,13 @@ def _set_date_specific(driver, target_date: str) -> bool:
                 ];
                 for (const sel of anchors) {
                     for (const el of document.querySelectorAll(sel)) {
-                        const t = cleanText(el);
-                        if (t.includes('~')) continue;
-                        if (hasCalendarMonth(t)) return t;
+                        addText(el);
                     }
                 }
-                return null;
+                return [...new Set(texts)].slice(0, 20);
                 """
-            )
-            if not text:
-                return None
-            m = _re.search(r"(\d{4})\s*[.년]\s*(\d{1,2})", text)
-            return (int(m.group(1)), int(m.group(2))) if m else None
+            ) or []
+            return _calendar_yms_from_texts(texts)
 
         # 달력이 열릴 때까지 대기
         WebDriverWait(driver, 10).until(
@@ -1768,10 +2189,10 @@ def _set_date_specific(driver, target_date: str) -> bool:
         # 최대 24번(2년치) 월 이동. 목표 월 확인 없이 같은 일자만 누르면 현재 월 데이터가 섞인다.
         ym_unreadable = 0
         for _ in range(24):
-            ym = _get_calendar_ym(driver)
-            if ym and (ym[0], ym[1]) == (target_year, target_month):
+            yms = _get_calendar_yms(driver)
+            if (target_year, target_month) in yms:
                 break
-            if not ym:
+            if not yms:
                 ym_unreadable += 1
                 if ym_unreadable >= 2:
                     logger.warning(
@@ -1782,7 +2203,8 @@ def _set_date_specific(driver, target_date: str) -> bool:
                     break
                 time.sleep(0.4)
                 continue
-            direction = "prev" if (ym[0] * 12 + ym[1]) > target_month_index else "next"
+            visible_indexes = [year * 12 + month for year, month in yms]
+            direction = "prev" if min(visible_indexes) > target_month_index else "next"
             moved = driver.execute_script(
                 """
                 const direction = arguments[0];
@@ -1813,12 +2235,12 @@ def _set_date_specific(driver, target_date: str) -> bool:
                 break
             time.sleep(0.3)
 
-        final_ym = _get_calendar_ym(driver)
-        if final_ym != (target_year, target_month):
+        final_yms = _get_calendar_yms(driver)
+        if (target_year, target_month) not in final_yms:
             logger.warning(
-                "달력 목표 월 이동 실패: target=%s final_ym=%s popup=%s",
+                "달력 목표 월 이동 실패: target=%s final_yms=%s popup=%s",
                 target_date,
-                final_ym,
+                final_yms,
                 _date_popup_debug_state(driver),
             )
             return False
@@ -1828,6 +2250,31 @@ def _set_date_specific(driver, target_date: str) -> bool:
             """
             const targetDay = String(arguments[0]);
             const dayLabel = arguments[1];
+            const targetYear = String(arguments[2]);
+            const targetMonth = String(arguments[3]);
+            const paddedMonth = targetMonth.padStart(2, '0');
+            function cleanText(el) {
+                return (el?.textContent || '').replace(/\\s+/g, ' ').trim();
+            }
+            function monthScoped(button) {
+                const monthPatterns = [
+                    `${targetYear}. ${targetMonth}`,
+                    `${targetYear}. ${paddedMonth}`,
+                    `${targetYear}.${targetMonth}`,
+                    `${targetYear}.${paddedMonth}`,
+                    `${targetYear}년 ${targetMonth}`,
+                    `${targetYear}년 ${paddedMonth}`,
+                    `${targetYear}년${targetMonth}`,
+                    `${targetYear}년${paddedMonth}`,
+                ];
+                let node = button;
+                for (let i = 0; i < 7 && node; i++, node = node.parentElement) {
+                    const text = cleanText(node);
+                    if (text.includes('~')) continue;
+                    if (monthPatterns.some(pattern => text.includes(pattern))) return true;
+                }
+                return false;
+            }
             const btns = [...document.querySelectorAll('button')].filter(b => {
                 const rect = b.getBoundingClientRect();
                 const aria = b.getAttribute('aria-label') || '';
@@ -1837,11 +2284,15 @@ def _set_date_specific(driver, target_date: str) -> bool:
                     && rect.height > 0
                     && (aria === dayLabel || aria.includes(dayLabel) || text === targetDay || text === dayLabel);
             });
-            if (btns.length > 0) { btns[0].click(); return true; }
+            const scoped = btns.find(monthScoped);
+            const target = scoped || (btns.length === 1 ? btns[0] : null);
+            if (target) { target.click(); return true; }
             return false;
             """,
             str(target_day),
             day_label,
+            target_year,
+            target_month,
         )
         if not clicked_start:
             logger.warning("달력 시작일 버튼 미발견: %s / popup=%s", day_label, _date_popup_debug_state(driver))
@@ -1854,6 +2305,31 @@ def _set_date_specific(driver, target_date: str) -> bool:
             """
             const targetDay = String(arguments[0]);
             const dayLabel = arguments[1];
+            const targetYear = String(arguments[2]);
+            const targetMonth = String(arguments[3]);
+            const paddedMonth = targetMonth.padStart(2, '0');
+            function cleanText(el) {
+                return (el?.textContent || '').replace(/\\s+/g, ' ').trim();
+            }
+            function monthScoped(button) {
+                const monthPatterns = [
+                    `${targetYear}. ${targetMonth}`,
+                    `${targetYear}. ${paddedMonth}`,
+                    `${targetYear}.${targetMonth}`,
+                    `${targetYear}.${paddedMonth}`,
+                    `${targetYear}년 ${targetMonth}`,
+                    `${targetYear}년 ${paddedMonth}`,
+                    `${targetYear}년${targetMonth}`,
+                    `${targetYear}년${paddedMonth}`,
+                ];
+                let node = button;
+                for (let i = 0; i < 7 && node; i++, node = node.parentElement) {
+                    const text = cleanText(node);
+                    if (text.includes('~')) continue;
+                    if (monthPatterns.some(pattern => text.includes(pattern))) return true;
+                }
+                return false;
+            }
             const btns = [...document.querySelectorAll('button')].filter(b => {
                 const rect = b.getBoundingClientRect();
                 const aria = b.getAttribute('aria-label') || '';
@@ -1863,10 +2339,14 @@ def _set_date_specific(driver, target_date: str) -> bool:
                     && rect.height > 0
                     && (aria === dayLabel || aria.includes(dayLabel) || text === targetDay || text === dayLabel);
             });
-            if (btns.length > 0) btns[0].click();
+            const scoped = btns.find(monthScoped);
+            const target = scoped || (btns.length === 1 ? btns[0] : null);
+            if (target) target.click();
             """,
             str(target_day),
             day_label,
+            target_year,
+            target_month,
         )
         time.sleep(0.2)
 
@@ -1912,6 +2392,28 @@ def _set_date(driver, target_date: str) -> bool:
     if target_date == yesterday:
         return _set_date_relative_for_target(driver, target_date, "어제") or _set_date_specific(driver, target_date)
     return _set_date_specific(driver, target_date)
+
+
+def _ensure_orders_target_date(driver, target_date: str, store: str) -> bool:
+    """URL 날짜 파라미터를 우선 신뢰하고, 화면 검증 실패 시 기존 날짜 UI로 보정한다."""
+    if _orders_url_has_target_date(driver, target_date):
+        if _confirm_visible_order_date(driver, target_date, "URL", timeout=4.5):
+            logger.info("orders URL 날짜 파라미터 확인: %s / %s", store, target_date)
+            return True
+        logger.warning("orders URL 날짜 파라미터 화면 미확인, 날짜 UI 보정 시도: %s / %s", store, target_date)
+
+    prev_sig = _page_signature(driver)
+    prev_summary = _read_total_summary(driver)
+    if not _set_date(driver, target_date):
+        logger.warning("날짜 설정 실패, 수집 중단: %s / %s", store, target_date)
+        return False
+
+    if not _wait_for_filter_settle(driver, prev_sig, prev_summary):
+        if not _confirm_visible_order_date(driver, target_date, "적용후", timeout=4.5):
+            logger.warning("날짜 필터 적용 후 테이블 정착 실패, 수집 중단: %s / %s", store, target_date)
+            return False
+        logger.info("날짜 필터 signature 변화 없음, 주문시각 실측으로 계속 진행: %s", store)
+    return True
 
 
 def _set_date_today(driver, confirm_retry: bool = True) -> bool:
@@ -2434,18 +2936,54 @@ return false;
 """
 
 # 반환: {partner, support} (미검출 항목은 null) 또는 null(시트 없음)
+# 확장 content/02_baemin.js `_parseDiscountSheet` 와 동일 규격:
+# 시트 하단 요약(총 할인금액 + 그 아래 부담 내역)만이 신뢰할 수 있는 합계다.
+# 항목별 '파트너 부담' 과 요약의 '파트너 부담' 을 함께 더하면 총액을 넘고,
+# 배민 지원이 0원이면 '배민 지원' 줄 자체가 렌더되지 않는다.
+# (첫 항목만 채택하던 옛 로직은 할인 2건 이상인 주문에서 조용히 틀린 값을 냈다)
 _PARSE_DISCOUNT_SHEET_JS = _DISCOUNT_SHEET_HELPERS_JS + r"""
 const sheet = __dsFindSheet();
 if (!sheet) return null;
 
-let partner = null, support = null;
-for (const item of sheet.querySelectorAll('[data-atelier-component="TextListItem"], li')) {
+const partnerLabelRe = /(?:파트너|가게|점주|업주|사장님)\s*부담/;
+const supportLabelRe = /(?:배민|배달의민족)\s*(?:100%)?\s*(?:지원|부담)/;
+const sheetText = (sheet.textContent || '').replace(/\s+/g, '');
+const partnerFlatRe = /(?:파트너|가게|점주|업주|사장님)부담/;
+const supportFlatRe = /(?:배민|배달의민족)(?:100%)?(?:지원|부담)/;
+
+let summaryTotal = NaN;
+const summaryIdx = sheetText.search(/총할인금액[\d,]+원/);
+if (summaryIdx >= 0) {
+    const tail = sheetText.slice(summaryIdx);
+    const totalMatch = tail.match(/총할인금액([\d,]+)원/);
+    summaryTotal = parseInt(__dsClean(totalMatch ? totalMatch[1] : ''), 10);
+    if (Number.isFinite(summaryTotal)) {
+        const pick = (re) => {
+            const m = tail.match(new RegExp(re.source + '[^\\d]{0,30}([\\d,]+)원'));
+            const v = m ? parseInt(__dsClean(m[1]), 10) : NaN;
+            return Number.isFinite(v) ? v : null;
+        };
+        const p = pick(partnerFlatRe);
+        const s = pick(supportFlatRe);
+        if (p !== null && s !== null) return {partner: String(p), support: String(s)};
+        if (p !== null && p <= summaryTotal) {
+            return {partner: String(p), support: String(summaryTotal - p)};
+        }
+        if (s !== null && s <= summaryTotal) {
+            return {partner: String(summaryTotal - s), support: String(s)};
+        }
+    }
+}
+
+// 요약이 없거나 요약 값이 총액을 넘으면 항목 합산으로 폴백한다.
+const candidates = [...sheet.querySelectorAll('[data-atelier-component="TextListItem"], li')];
+const items = candidates.filter((el) => !candidates.some((o) => o !== el && el.contains(o)));
+let partnerTotal = 0, supportTotal = 0, partnerCount = 0, supportCount = 0;
+for (const item of items) {
     const label = item.textContent || '';
-    const isPartner = /(\ud30c\ud2b8\ub108|\uac00\uac8c|\uc810\uc8fc)\s*\ubd80\ub2f4/.test(label);
-    const isSupport = /\ubc30\ubbfc\s*\uc9c0\uc6d0/.test(label);
+    const isPartner = partnerLabelRe.test(label);
+    const isSupport = supportLabelRe.test(label);
     if (!isPartner && !isSupport) continue;
-    if (isPartner && partner !== null) continue;
-    if (isSupport && support !== null) continue;
 
     const valueBox = item.querySelector('.TextListItem_b_r4ax_n197m77') || item.lastElementChild;
     if (!valueBox) continue;
@@ -2455,10 +2993,21 @@ for (const item of sheet.querySelectorAll('[data-atelier-component="TextListItem
     const value = __dsClean(raw);
     if (value === '') continue;
 
-    if (isPartner) partner = value;
-    else support = value;
+    const amount = parseInt(value, 10) || 0;
+    if (isPartner) { partnerTotal += amount; partnerCount++; }
+    else { supportTotal += amount; supportCount++; }
 }
-return {partner, support};
+
+// 합이 총액을 넘으면 요약 행까지 함께 더한 것이다.
+// 틀린 값을 적재하느니 공란(=수집 실패)으로 남긴다.
+if (Number.isFinite(summaryTotal)) {
+    if (partnerTotal > summaryTotal) partnerCount = 0;
+    if (supportTotal > summaryTotal) supportCount = 0;
+}
+return {
+    partner: partnerCount ? String(partnerTotal) : null,
+    support: supportCount ? String(supportTotal) : null
+};
 """
 
 # arguments[0]: 주문번호. 해당 행의 즉시할인 금액 엘리먼트를 클릭한다.

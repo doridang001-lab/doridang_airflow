@@ -19,6 +19,18 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
+def _subprocess_window_kwargs() -> dict:
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+        "startupinfo": startupinfo,
+    }
+
+
 def _load_dotenv(path: Path) -> None:
     if not path.exists():
         return
@@ -117,6 +129,8 @@ def _airflow_variable_get(key: str) -> str:
             text=True,
             check=False,
             timeout=20,
+            stdin=subprocess.DEVNULL,
+            **_subprocess_window_kwargs(),
         )
         if result.returncode == 0:
             return result.stdout.strip()
@@ -197,6 +211,10 @@ def get_task_instance(dag_id, run_id, task_id) -> dict | None:
 
 def clear_task_instance(dag_id, run_id, task_id) -> bool:
     """미실행 태스크를 clear 해서 재실행시킨다. upstream_failed 하위까지 같이 되살린다."""
+    from modules.transform.utility.history_admission import backfill_dags
+    if dag_id in backfill_dags():
+        logger.info("배민 백필 자동 복구는 전체 1건 제한을 사용하는 자원 제어기에 위임: %s", dag_id)
+        return False
     url = f"{AIRFLOW_API_URL}/dags/{_quote(dag_id)}/clearTaskInstances"
     payload = {
         "dry_run": False,
@@ -207,6 +225,15 @@ def clear_task_instance(dag_id, run_id, task_id) -> bool:
         "reset_dag_runs": True,
     }
     try:
+        from modules.transform.utility.safe_recovery import claim_key, ALLOW
+        if task_id in ALLOW.get(dag_id, set()):
+            # Variable key의 DB unique 제약으로 메모리 복구기와 중복 claim을 막는다.
+            instances = json.loads(_request(f"{AIRFLOW_API_URL}/dags/{_quote(dag_id)}/dagRuns/{_quote(run_id)}/taskInstances").decode("utf-8"))
+            indices = [row.get("map_index", -1) for row in (instances or {}).get("task_instances", [])
+                       if row.get("task_id") == task_id and row.get("state") in ("failed", "upstream_failed")]
+            for map_index in indices or [-1]:
+                _request(f"{AIRFLOW_API_URL}/variables", method="POST", data={
+                    "key": claim_key(dag_id, run_id, task_id, map_index), "value": "legacy_autoheal"})
         _request(url, method="POST", data=payload)
         logger.info("미실행 태스크 재실행 요청: dag_id=%s task_id=%s run_id=%s", dag_id, task_id, run_id)
         return True
@@ -247,6 +274,8 @@ def get_task_log(dag_id, run_id, task_id, try_number) -> str:
             text=True,
             check=False,
             timeout=30,
+            stdin=subprocess.DEVNULL,
+            **_subprocess_window_kwargs(),
         )
         if result.returncode == 0:
             return result.stdout
@@ -515,6 +544,8 @@ def _git_output(workdir: str, *args: str) -> str:
         errors="replace",
         check=False,
         timeout=30,
+        stdin=subprocess.DEVNULL,
+        **_subprocess_window_kwargs(),
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"git {' '.join(args)} 실패")
@@ -549,9 +580,9 @@ def _run_codex(prompt: str) -> subprocess.CompletedProcess:
     logger.info("Codex 격리 워크트리 준비 완료: runtime_head=%s", runtime_head)
     env = os.environ.copy()
     env["CODEX_WORKDIR"] = CODEX_WORKDIR
-    kwargs = {}
+    kwargs = _subprocess_window_kwargs()
     if os.name == "nt":
-        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        kwargs["creationflags"] |= subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
 
@@ -1072,6 +1103,13 @@ def process_once() -> bool:
     log_text = get_task_log(dag_id, run_id, task_id, try_number)
     if not log_text:
         logger.warning("task log lookup returned empty: dag_id=%s task_id=%s run_id=%s", dag_id, task_id, run_id)
+    from modules.transform.utility.safe_recovery import memory_failure, ALLOW
+    if task_id in ALLOW.get(dag_id, set()) and memory_failure(log_text):
+        if claim_heal_task(dag_id, run_id, task_id, "resource-controller", try_number=try_number,
+                           updates={"failure_class": "memory_pressure", "skip_reason": "resource_controller_owned"}):
+            _record_suppressed_terminal(entry, "skipped", reason="resource_controller_owned")
+            return True
+        return False
     failure_class = _classify_task_entry(entry, log_text)
     entry["failure_class"] = failure_class
     signature = _task_signature(entry, log_text)

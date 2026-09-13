@@ -140,11 +140,29 @@ if ($endFreeGb -lt $MinFreeGbWarning) {
     if (-not $DryRun -and -not $SkipNotify) {
         $notifyLog = Join-Path $RunLogDir "space-warning-notify.log"
         $env:PYTHONIOENCODING = "utf-8"
-        & python -X utf8 "$ProjectRoot\scripts\notify_airflow_space_warning.py" `
-            --free-gb $endFreeGb `
-            --threshold-gb $MinFreeGbWarning `
-            --log-path $RunLog *> $notifyLog
-        Write-RunLog "space warning notify exit_code=$LASTEXITCODE"
+        # $ErrorActionPreference="Stop"(전역)이면 python이 stderr에 아무 경고 한 줄만
+        # 찍어도(Airflow의 흔한 RuntimeWarning 등) NativeCommandError로 격상되어
+        # 스크립트 전체가 여기서 죽는다. 그래서 -SkipNotify가 상시로 붙어 있었고,
+        # 알림이 한 번도 발송되지 않은 채(2026-08-31~09-11) 디스크 경고만 로그에 쌓였다.
+        # try/catch로 흡수하고 실제 종료 코드는 $LASTEXITCODE로 따로 확인한다.
+        $notifyExitCode = 1
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            # stderr 한 줄만 나와도 Stop 때문에 명령 도중에 죽는 걸 막으려면
+            # 이 호출 동안만 Continue로 낮춰야 한다 - try/catch만으로는
+            # 프로세스가 출력 중간에 끊긴다.
+            $ErrorActionPreference = "Continue"
+            & python -X utf8 "$ProjectRoot\scripts\notify_airflow_space_warning.py" `
+                --free-gb $endFreeGb `
+                --threshold-gb $MinFreeGbWarning `
+                --log-path $RunLog *> $notifyLog
+            $notifyExitCode = $LASTEXITCODE
+        } catch {
+            Write-RunLog "space warning notify exception (see $notifyLog): $($_.Exception.Message)"
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        Write-RunLog "space warning notify exit_code=$notifyExitCode"
     }
 }
 

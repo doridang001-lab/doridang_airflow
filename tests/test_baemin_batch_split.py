@@ -108,6 +108,7 @@ def test_main_dag_uses_two_parallel_batch_lanes_and_one_final_retry():
     assert set(macro._BATCH_TASK_IDS).issubset(macro.dag.task_ids)
     assert "init_staging" in macro.dag.task_ids
     assert macro.dag.max_active_tasks == 2
+    assert macro.dag.params["orders_only"] is True
 
     init = macro.dag.get_task("init_staging")
     batch_1 = macro.dag.get_task("collect_batch_1")
@@ -163,7 +164,7 @@ def test_collect_timeout_pushes_only_unfinished_accounts(tmp_path):
     accounts = _accounts()[:3]
     ti = FakeTaskInstance(account_list=accounts)
     context = {
-        "dag_run": FakeDagRun(conf={"target_date": "2026-07-23"}),
+        "dag_run": FakeDagRun(conf={"target_date": "2026-07-23", "orders_only": False}),
         "ti": ti,
     }
     local_analytics = tmp_path / "run"
@@ -205,7 +206,7 @@ def test_second_batch_preserves_first_batch_staging(tmp_path):
     accounts = _accounts()[:33]
     ti = FakeTaskInstance(account_list=accounts, task_id="collect_batch_2")
     context = {
-        "dag_run": FakeDagRun(conf={"target_date": "2026-07-23"}),
+        "dag_run": FakeDagRun(conf={"target_date": "2026-07-23", "orders_only": False}),
         "ti": ti,
     }
     local_analytics = tmp_path / "run"
@@ -243,6 +244,81 @@ def test_second_batch_preserves_first_batch_staging(tmp_path):
     assert len(collect.call_args.args[0]) == 8
     assert marker.read_bytes() == b"batch1"
     reset.assert_not_called()
+
+
+def test_collect_batch_defaults_to_orders_only(tmp_path):
+    accounts = _accounts()[:2]
+    ti = FakeTaskInstance(account_list=accounts, task_id="collect_batch_1")
+    context = {
+        "dag_run": FakeDagRun(conf={"target_date": "2026-07-23"}),
+        "params": {},
+        "ti": ti,
+    }
+    local_analytics = tmp_path / "run"
+    local_baemin = local_analytics / "baemin_macro"
+    pipeline_result = {
+        "summary": "orders-only ok",
+        "failed": {"accounts": [], "stores": [], "orders": [], "ads": [], "stages": []},
+        "validation": [],
+        "store_info_per_account": [],
+    }
+
+    with patch.object(macro, "_main_stage_paths", return_value=(local_analytics, local_baemin)), \
+         patch.object(macro, "resolve_stability_profile", return_value={
+             "name": "test",
+             "initial_stagger_range": (0, 0),
+             "driver_restart_every_stores": 999,
+             "max_session_recovery_per_account": 2,
+         }), \
+         patch.object(macro, "patch_baemin_staging_paths", return_value=(None, [])), \
+         patch.object(macro, "restore_baemin_staging_paths"), \
+         patch.object(macro, "pipeline_collect_orders_only", return_value=pipeline_result) as collect_orders, \
+         patch.object(macro, "pipeline_collect_all") as collect_all, \
+         patch.object(macro.random, "uniform", return_value=0), \
+         patch.object(macro.time, "sleep"):
+        result = macro.collect_batch(**context)
+
+    assert result == "orders-only ok"
+    collect_orders.assert_called_once()
+    collect_all.assert_not_called()
+
+
+def test_collect_batch_allows_manual_full_collect_override(tmp_path):
+    accounts = _accounts()[:2]
+    ti = FakeTaskInstance(account_list=accounts, task_id="collect_batch_1")
+    context = {
+        "dag_run": FakeDagRun(conf={"target_date": "2026-07-23", "orders_only": False}),
+        "params": {},
+        "ti": ti,
+    }
+    local_analytics = tmp_path / "run"
+    local_baemin = local_analytics / "baemin_macro"
+    pipeline_result = {
+        "summary": "full ok",
+        "failed": {"accounts": [], "stores": [], "orders": [], "ads": [], "stages": []},
+        "validation": [],
+        "ad_stores": [],
+        "store_info_per_account": [],
+    }
+
+    with patch.object(macro, "_main_stage_paths", return_value=(local_analytics, local_baemin)), \
+         patch.object(macro, "resolve_stability_profile", return_value={
+             "name": "test",
+             "initial_stagger_range": (0, 0),
+             "driver_restart_every_stores": 999,
+             "max_session_recovery_per_account": 2,
+         }), \
+         patch.object(macro, "patch_baemin_staging_paths", return_value=(None, [])), \
+         patch.object(macro, "restore_baemin_staging_paths"), \
+         patch.object(macro, "pipeline_collect_orders_only") as collect_orders, \
+         patch.object(macro, "pipeline_collect_all", return_value=pipeline_result) as collect_all, \
+         patch.object(macro.random, "uniform", return_value=0), \
+         patch.object(macro.time, "sleep"):
+        result = macro.collect_batch(**context)
+
+    assert result == "full ok"
+    collect_all.assert_called_once()
+    collect_orders.assert_not_called()
 
 
 def test_final_retry_merges_all_batch_failure_types():
@@ -306,6 +382,48 @@ def test_final_retry_merges_all_batch_failure_types():
     assert merged["orders"] == []
     assert len(merged["stores"]) == 1
     assert len(merged["ads"]) == 1
+
+
+def test_retry_failed_defers_date_filter_failures_without_sync_retry():
+    account = _accounts()[0]
+    store = {"store_id": "s1", "store": "매장 1", "reason": "date_filter"}
+
+    class BatchTI(FakeTaskInstance):
+        def __init__(self):
+            super().__init__(account_list=[account])
+            self.batch_values = {
+                ("collect_batch_1", "failed"): {
+                    "accounts": [],
+                    "stores": [],
+                    "orders": [{"account": account, "stores": [store], "reason": "date_filter"}],
+                    "ads": [],
+                    "stages": [],
+                },
+            }
+
+        def xcom_pull(self, *, task_ids, key):
+            if task_ids == "load_accounts" and key == "account_list":
+                return self.account_list
+            return self.batch_values.get((task_ids, key))
+
+    ti = BatchTI()
+    context = {
+        "dag_run": FakeDagRun(conf={"target_date": "2026-07-23"}),
+        "ti": ti,
+    }
+
+    with patch.object(macro, "resolve_stability_profile", return_value={"name": "test"}), \
+         patch.object(macro, "pipeline_retry_failed") as retry:
+        result = macro.retry_failed(
+            collect_task_ids=["collect_batch_1"],
+            **context,
+        )
+
+    assert result.startswith("동기 retry 생략")
+    retry.assert_not_called()
+    assert ti.values["residual_failed"]["orders"] == [
+        {"account": account, "stores": [store]}
+    ]
 
 
 def test_export_meta_uses_retry_residual_failed(tmp_path):
@@ -394,6 +512,7 @@ def test_trigger_retry_filters_failed_payload_to_loaded_accounts(monkeypatch):
     assert result.startswith("Retry DAG 트리거 완료:")
     retry_conf = trigger.call_args.kwargs["conf"]
     assert retry_conf["collect_range"] == "상위"
+    assert retry_conf["orders_only"] is True
     assert retry_conf["allowed_account_ids"] == ["acct-upper"]
     assert retry_conf["failed_account_ids"] == ["acct-upper"]
     assert retry_conf["failed_accounts_ids_only"] == ["acct-upper"]

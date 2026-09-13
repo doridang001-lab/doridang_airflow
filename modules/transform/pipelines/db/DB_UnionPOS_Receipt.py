@@ -19,7 +19,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeout, Error as PlaywrightError
 
 from modules.transform.utility.paths import RAW_UNIONPOS_SALES
 from modules.transform.utility.playwright_launcher import launch_chromium
@@ -71,15 +71,29 @@ def _login(page: Page) -> None:
 
 def _set_date_input(page: Page, start: str, end: str) -> None:
     """#startDate / #endDate 입력 필드를 직접 조작 (fn_SetDate 미사용)"""
-    page.evaluate(
-        """([s, e]) => {
+    for attempt in range(3):
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+            page.wait_for_selector("#startDate", state="visible", timeout=15000)
+            page.wait_for_selector("#endDate", state="visible", timeout=15000)
+            applied = page.evaluate(
+                """([s, e]) => {
             var si = document.getElementById('startDate');
             var ei = document.getElementById('endDate');
+            if (!si || !ei) return false;
             if (si) { si.removeAttribute('readonly'); si.value = s; si.setAttribute('readonly', 'readonly'); }
             if (ei) { ei.removeAttribute('readonly'); ei.value = e; ei.setAttribute('readonly', 'readonly'); }
+            return si.value === s && ei.value === e;
         }""",
-        [start, end],
-    )
+                [start, end],
+            )
+            if not applied:
+                raise PlaywrightTimeout("UnionPOS date inputs were replaced during navigation")
+            return
+        except PlaywrightError as exc:
+            if "Execution context was destroyed" not in str(exc) or attempt == 2:
+                raise
+            logger.warning("UnionPOS navigation interrupted date entry; waiting for new document")
 
 
 def _set_date_and_search(page: Page, sale_date: str) -> None:

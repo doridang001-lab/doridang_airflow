@@ -46,7 +46,11 @@ class TestValidateCollected:
         assert result["settle_denominator"] == 2
         assert result["settle_rate"] == 0.5
 
-    def test_low_settle_rate_marks_suspect_and_blocks_save(self):
+    def test_low_settle_rate_marks_suspect_but_keeps_save(self):
+        # 배민 정산정보(입금예정금액)는 09:00 KST 전후에 게시되므로, 그 전 수집은
+        # 합계가 맞아도 정산 수집률이 낮은 게 정상이다. settlement_suspect로
+        # 표시만 하고 matched=True를 유지해 주문 저장을 막지 않는다
+        # (정산 컬럼은 이후 DB_DeliveryCommission 정산 미게시 감지 재수집이 채운다).
         rows = [
             {"주문번호": "A001", "결제금액": "10,000", "입금예정금액": "8,000"},
             {"주문번호": "A002", "결제금액": "5,000", "입금예정금액": ""},
@@ -55,10 +59,9 @@ class TestValidateCollected:
 
         blocked = _block_low_settle_rate(result)
 
-        assert blocked["matched"] is False
+        assert blocked["matched"] is True
         assert blocked["settlement_suspect"] is True
         assert blocked["reason"] == "low_settle_rate"
-        assert blocked["save_partial"] is False
 
     def test_match_fail_count_mismatch(self):
         rows = [{"주문번호": "A001", "결제금액": "10,000"}]

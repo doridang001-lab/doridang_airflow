@@ -28,7 +28,7 @@ function Get-FreshHeartbeat {
         if ($age -lt $heartbeatMaxAgeSeconds) {
             if ($payload.backend -eq "windows") {
                 $watcherProcess = Get-Process -Id ([int]$payload.pid) -ErrorAction SilentlyContinue
-                if (-not $watcherProcess -or $watcherProcess.ProcessName -ne "python") {
+                if (-not $watcherProcess -or $watcherProcess.ProcessName -notin @("python", "pythonw")) {
                     Write-AutohealLog "heartbeat references dead Windows watcher pid=$($payload.pid)"
                     return $null
                 }
@@ -87,6 +87,7 @@ try {
         -ArgumentList @("-d", "Ubuntu", "-u", "myuser", "bash", "-lc", $wslScript) `
         -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    $null = $wsl.Handle
     $wslCompleted = $wsl.WaitForExit($launchTimeoutSeconds * 1000)
     if (-not $wslCompleted) {
         Stop-Process -Id $wsl.Id -Force -ErrorAction SilentlyContinue
@@ -112,7 +113,10 @@ try {
     $env:AUTOHEAL_HEARTBEAT_PATH = $heartbeatPath
     $env:AIRFLOW_RUNTIME_WORKDIR = $root
     $env:CODEX_WORKDIR = "C:\tmp\airflow-autoheal"
-    $pythonPath = "$root\.venv\Scripts\python.exe"
+    $pythonPath = "$root\.venv\Scripts\pythonw.exe"
+    if (-not (Test-Path -LiteralPath $pythonPath)) {
+        $pythonPath = "$root\.venv\Scripts\python.exe"
+    }
     Write-AutohealLog "Windows fallback running in foreground python=$pythonPath"
     $watcherStdout = Join-Path $tmpDir "windows_stdout_$PID.log"
     $watcherStderr = Join-Path $tmpDir "windows_stderr_$PID.log"
@@ -121,6 +125,8 @@ try {
         -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput $watcherStdout -RedirectStandardError $watcherStderr
     Write-AutohealLog "Windows fallback watcher pid=$($windowsWatcher.Id)"
+    # Retain the handle so ExitCode remains available after a long-running child exits.
+    $null = $windowsWatcher.Handle
     $windowsWatcher.WaitForExit()
     Append-ProcessOutput $watcherStdout "Windows stdout:"
     Append-ProcessOutput $watcherStderr "Windows stderr:"

@@ -1,2 +1,2 @@
 Set shell = CreateObject("WScript.Shell")
-shell.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""C:\airflow\scripts\start_airflow_on_login.ps1""", 0, False
+WScript.Quit shell.Run("""C:\airflow\.venv\Scripts\pythonw.exe"" -X utf8 ""C:\airflow\scripts\docker_airflow_watchdog.py""", 0, True)

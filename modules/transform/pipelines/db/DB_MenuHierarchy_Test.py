@@ -3256,6 +3256,19 @@ def _normalize_material_name(value: object) -> str:
     return re.sub(r"[\s\-_+]+", "", text).strip()
 
 
+def _manual_profit_material_name(row: pd.Series) -> str:
+    text = str(row.get("item_name", "") or "").strip()
+    compact = _normalize_item_key(text)
+    if "한우대창" in compact:
+        grams = _extract_chicken_addon_grams(text)
+        if grams in {75.0, 150.0}:
+            return f"한우대창{_format_number(grams)}g"
+    material = str(row.get("재료명", "") or "").strip()
+    if material:
+        return material
+    return _normalize_material_name(text)
+
+
 def _looks_like_chicken_addon_option(value: object) -> bool:
     text = str(value or "").strip()
     if not text:
@@ -6412,6 +6425,10 @@ def _manual_profit_item_name(row: pd.Series) -> str:
         item_drink_signals = _infer_drink_profit_name(text)
         if item_drink_signals:
             return item_drink_signals
+    if kind == OPTION_KIND_MATERIAL:
+        normalized_material = _manual_profit_material_name(row)
+        if normalized_material:
+            return normalized_material
     material = str(row.get("재료명", "") or "").strip()
     if material:
         return material

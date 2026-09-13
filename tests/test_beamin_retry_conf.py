@@ -76,6 +76,58 @@ def test_build_retry_conf_initializes_store_retry_history_once_per_store():
     assert conf["retry_history"] == {"acct-1::store-1": 1}
 
 
+def test_retry_conf_clamps_legacy_max_attempts_above_internal_cap():
+    store = _store()
+    conf = retry.build_retry_conf(
+        failed={"orders": [{"account": {"account_id": "acct-1"}, "stores": [store]}]},
+        target_date="2026-07-01",
+        max_attempts=10,
+    )
+
+    assert retry.clamp_retry_attempts(10) == 3
+    assert conf["max_attempts"] == 3
+
+    next_conf = retry.build_next_retry_conf(
+        previous_conf=conf,
+        retry_payload=_retry_payload(store),
+        toorder_result=_toorder_result(),
+        ad_funnel_result={},
+        attempt=2,
+        max_attempts=10,
+    )
+
+    assert next_conf["max_attempts"] == 3
+
+
+def test_build_retry_conf_preserves_orders_only_to_next_conf():
+    store = _store()
+    conf = retry.build_retry_conf(
+        failed={
+            "orders": [{"account": {"account_id": "acct-1"}, "stores": [store]}],
+        },
+        target_date="2026-07-01",
+        orders_only=True,
+    )
+
+    assert conf["orders_only"] is True
+
+    next_conf = retry.build_next_retry_conf(
+        previous_conf=conf,
+        retry_payload={
+            "target_date": "2026-07-01",
+            "orders_only": True,
+            "store_info_per_account": [{"account_id": "acct-1", "stores": [store]}],
+            "ad_store_infos": [{"account_id": "acct-1", **store}],
+        },
+        toorder_result=_toorder_result(),
+        ad_funnel_result=_ad_result(store),
+        attempt=2,
+        max_attempts=3,
+    )
+
+    assert next_conf["orders_only"] is True
+
+
 def test_restore_failed_from_conf_filters_to_allowed_account_ids(monkeypatch):
     accounts = {
         "acct-1": {"account_id": "acct-1", "password": "pw", "store_name": "상위 매장"},
@@ -142,7 +194,9 @@ def test_build_next_retry_conf_exhausts_store_after_per_store_limit():
     assert second["failed_account_ids"] == ["acct-1"]
     assert second["failed_orders"] == [{"account_id": "acct-1", "stores": [store]}]
     assert second["failed_ads"] == [{"account_id": "acct-1", "stores": [store]}]
-    assert second["notification_context"] == conf["notification_context"]
+    assert second["notification_context"]["target_date"] == conf["notification_context"]["target_date"]
+    assert second["notification_context"]["toorder"]["mismatched_stores"] == ["store-a"]
+    assert second["notification_context"]["toorder"]["store_results"]["store-a"]["matched"] is False
 
     third = retry.build_next_retry_conf(
         previous_conf=second,
@@ -228,6 +282,54 @@ def test_build_next_retry_conf_seeds_legacy_conf_without_retry_history():
     assert fourth["toorder_possible_mismatch_stores"] == ["store-a"]
 
 
+def test_build_next_retry_conf_carries_latest_toorder_snapshot():
+    store = _store()
+    conf = retry.build_retry_conf(
+        failed={"orders": [{"account": {"account_id": "acct-1"}, "stores": [store]}]},
+        target_date="2026-07-01",
+        source_run_id="scheduled__2026-06-30T18:10:00+00:00",
+    )
+    conf["notification_context"] = {
+        "target_date": "2026-07-01",
+        "toorder": {
+            "compared": 2,
+            "store_results": {
+                "store-a": {
+                    "baemin": 0,
+                    "toorder": 1000,
+                    "matched": False,
+                    "brand_issue": "missing_partition",
+                },
+                "store-b": {"baemin": 0, "toorder": 2000, "matched": False},
+            },
+            "mismatched_stores": ["store-a", "store-b"],
+            "gap_stores": [],
+            "missing_brand_stores": ["store-a"],
+        },
+    }
+
+    next_conf = retry.build_next_retry_conf(
+        previous_conf=conf,
+        retry_payload=_retry_payload(store),
+        toorder_result={
+            "compared_count": 1,
+            "store_results": {"store-a": {"baemin": 1000, "toorder": 1000, "matched": True}},
+            "mismatched_stores": [],
+            "missing_brand_stores": [],
+            "toorder_gap_stores": [],
+        },
+        ad_funnel_result={},
+        attempt=2,
+        max_attempts=3,
+    )
+
+    carried = next_conf["notification_context"]["toorder"]
+    assert carried["store_results"]["store-a"]["matched"] is True
+    assert carried["store_results"]["store-b"]["matched"] is False
+    assert carried["mismatched_stores"] == ["store-b"]
+    assert carried["missing_brand_stores"] == []
+
+
 def test_build_next_retry_conf_excludes_source_mismatch_stores():
     store = _store()
     conf = retry.build_retry_conf(
@@ -310,6 +412,7 @@ def test_split_retry_conf_by_lane_keeps_accounts_disjoint_and_allows_empty_lane(
 def test_merge_retry_payloads_dedupes_stores_and_joins_result():
     payload_1 = {
         "target_date": "2026-07-01",
+        "orders_only": True,
         "retry_result": "lane 1",
         "store_info_per_account": [{"account_id": "acct-1", "stores": [_store("s1")]}],
         "ad_store_infos": [{"account_id": "acct-1", **_store("s1")}],
@@ -336,6 +439,7 @@ def test_merge_retry_payloads_dedupes_stores_and_joins_result():
     merged = retry.merge_retry_payloads(payload_1, payload_2)
 
     assert merged["target_date"] == "2026-07-01"
+    assert merged["orders_only"] is True
     assert merged["retry_result"] == "lane 1\nlane 2"
     assert merged["store_info_per_account"] == [
         {"account_id": "acct-1", "stores": [_store("s1"), _store("s2")]}
@@ -394,6 +498,38 @@ def test_retry_collect_from_conf_preserves_account_failures_when_collection_rais
 
     assert result["residual_failed"]["accounts"] == failed["accounts"]
     assert "계정 재수집 실패" in result["account_result"]["summary"]
+
+
+def test_retry_collect_from_conf_orders_only_uses_orders_collector(monkeypatch):
+    failed = {
+        "accounts": [{"account_id": "acct-1", "password": "pw", "store_name": "store-a"}],
+        "stores": [],
+        "orders": [],
+        "ads": [],
+        "stages": [],
+    }
+
+    monkeypatch.setattr(retry, "restore_failed_from_conf", lambda conf: (failed, failed["accounts"]))
+    monkeypatch.setattr(
+        retry,
+        "collect_now_and_woori",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("full collect should not run")),
+    )
+
+    def fake_orders(accounts, target_date=None, stability_profile=None):
+        return {
+            "summary": f"orders {len(accounts)}",
+            "failed": {"accounts": [], "stores": [], "orders": [], "ads": [], "stages": []},
+            "store_info_per_account": [{"account_id": accounts[0]["account_id"], "stores": [_store()]}],
+            "ad_stores": [],
+        }
+
+    monkeypatch.setattr(retry, "collect_orders_only", fake_orders)
+    result = retry.retry_collect_from_conf({"target_date": "2026-07-09", "orders_only": True})
+
+    assert result["orders_only"] is True
+    assert result["residual_failed"] == {"accounts": [], "stores": [], "orders": [], "ads": [], "stages": []}
+    assert result["store_info_per_account"] == [{"account_id": "acct-1", "stores": [_store()]}]
 
 
 def test_retry_needed_requires_ad_funnel_still_empty():

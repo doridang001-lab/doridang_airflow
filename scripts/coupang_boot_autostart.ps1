@@ -5,7 +5,8 @@
     [string]$RunnerUrl = "chrome-extension://ocpdgnoaajajnlehamcalfcpholjhfbe/runner.html?auto=1&mode=top50&date=yesterday",
     [string]$ChromeProfileDirectory = "Default",
     [string]$AirflowDag = "DB_CoupangMacro_Load_Dags",
-    [string]$AirflowSchedulerContainer = "airflow-airflow-scheduler-1"
+    [string]$AirflowSchedulerContainer = "airflow-airflow-scheduler-1",
+    [switch]$CheckOnly
 )
 
 Set-StrictMode -Version Latest
@@ -23,6 +24,34 @@ $hostScript = Join-Path $repoRoot "scripts\coupang_host_chrome.ps1"
 $autoClickScript = Join-Path $repoRoot "scripts\coupang_runner_autoclick.py"
 $logRoot = Join-Path $repoRoot ".tmp\coupang_boot_autostart"
 $logPath = $null
+$doridangCompanyName = [string]::Concat([char[]]@(0xC8FC, 0xC2DD, 0xD68C, 0xC0AC, 0x20, 0xB3C4, 0xB9AC, 0xB2F9))
+$doridangName = [string]::Concat([char[]]@(0xB3C4, 0xB9AC, 0xB2F9))
+$collectFolderName = [string]::Concat([char[]]@(0xC601, 0xC5C5, 0xAD00, 0xB9AC, 0xBD80, 0x5F, 0xC218, 0xC9D1))
+
+function Join-ChildPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Base,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$Children
+    )
+
+    $parts = @($Base) + $Children
+    return [System.IO.Path]::Combine([string[]]$parts)
+}
+
+function ConvertTo-NativeArgumentList {
+    param([string[]]$Arguments)
+
+    return (($Arguments | ForEach-Object {
+        $arg = [string]$_
+        if ($arg -match '[\s"]') {
+            '"' + ($arg -replace '"', '\"') + '"'
+        } else {
+            $arg
+        }
+    }) -join ' ')
+}
 
 function Initialize-RunLog {
     if (-not (Test-Path $logRoot)) {
@@ -57,21 +86,27 @@ function Open-RunnerUrl {
         [string]$ProfileDirectory
     )
 
+    $existingRunner = Get-ExistingRunnerTab -RunnerUrl $Url
+    if ($existingRunner) {
+        Write-Step ("기존 runner 탭 재사용: {0}" -f $existingRunner)
+        return $false
+    }
+
     $chrome = Resolve-ChromePath
     $separator = if ($Url.Contains("?")) { "&" } else { "?" }
     $openUrl = "{0}{1}runTs={2}" -f $Url, $separator, (Get-Date -Format "yyyyMMddHHmmss")
     $args = @(
-        "--profile-directory=`"$ProfileDirectory`"",
-        "--new-window",
+        "--profile-directory=$ProfileDirectory",
         $openUrl
     )
-    Write-Step ("runner URL 직접 실행: {0}" -f $openUrl)
-    Start-Process -FilePath $chrome -ArgumentList $args -WindowStyle Normal
+    Write-Step ("runner URL 단일 탭 실행: {0}" -f $openUrl)
+    Start-Process -FilePath $chrome -ArgumentList (ConvertTo-NativeArgumentList $args) -WindowStyle Normal
+    return $true
 }
 
 function Resolve-ExpectedCollectDir {
     if ($env:COLLECT_DB -and (Test-Path $env:COLLECT_DB)) {
-        $candidate = Join-Path -Path $env:COLLECT_DB -ChildPath "영업관리부_수집"
+        $candidate = Join-ChildPath $env:COLLECT_DB $collectFolderName
         if (Test-Path $candidate) {
             return $candidate
         }
@@ -79,12 +114,12 @@ function Resolve-ExpectedCollectDir {
 
     $userProfile = [Environment]::GetFolderPath("UserProfile")
     $onedriveCandidates = @(
-        (Join-Path -Path $userProfile -ChildPath "OneDrive - 주식회사 도리당"),
-        (Join-Path -Path $userProfile -ChildPath "OneDrive - 도리당")
+        (Join-ChildPath $userProfile ("OneDrive - " + $doridangCompanyName)),
+        (Join-ChildPath $userProfile ("OneDrive - " + $doridangName))
     )
     foreach ($base in $onedriveCandidates) {
         if (Test-Path $base) {
-            $candidate = Join-Path -Path $base -ChildPath "Collect_Data\영업관리부_수집"
+            $candidate = Join-ChildPath $base "Collect_Data" $collectFolderName
             if (Test-Path $candidate) {
                 return $candidate
             }
@@ -142,21 +177,70 @@ function Wait-DevToolsEndpoint {
     throw "Chrome DevTools endpoint not ready within ${TimeoutSeconds}s: $Endpoint"
 }
 
+function Test-RunnerTabUrl {
+    param(
+        [string]$CandidateUrl,
+        [string]$RunnerUrl
+    )
+
+    try {
+        $candidate = [System.Uri]$CandidateUrl
+        $expected = [System.Uri]$RunnerUrl
+    } catch {
+        return $false
+    }
+
+    return (
+        $candidate.Scheme -eq "chrome-extension" -and
+        $candidate.Host -eq $expected.Host -and
+        $candidate.AbsolutePath.TrimEnd([char[]]@("/")) -eq "/runner.html" -and
+        $expected.AbsolutePath.TrimEnd([char[]]@("/")) -eq "/runner.html"
+    )
+}
+
+function Get-DevToolsTabs {
+    param([string]$Endpoint = "http://127.0.0.1:9222/json")
+
+    try {
+        $response = Invoke-WebRequest -Uri $Endpoint -TimeoutSec 3 -UseBasicParsing
+        return ($response.Content | ConvertFrom-Json)
+    } catch {
+        return @()
+    }
+}
+
+function Get-ExistingRunnerTab {
+    param([string]$RunnerUrl)
+
+    $tabs = @(Get-DevToolsTabs)
+    foreach ($tab in $tabs) {
+        $tabUrl = [string]$tab.url
+        if (Test-RunnerTabUrl -CandidateUrl $tabUrl -RunnerUrl $RunnerUrl) {
+            $tabTitle = [string]$tab.title
+            if ($tabTitle -eq $tabUrl) {
+                throw "기존 runner.html 탭이 차단 페이지로 보입니다: $tabUrl"
+            }
+            return $tabUrl
+        }
+    }
+    return $null
+}
+
 function Get-CollectDirs {
     $dirs = @()
 
     if ($env:COLLECT_DB -and (Test-Path $env:COLLECT_DB)) {
-        $dirs += Join-Path -Path $env:COLLECT_DB -ChildPath "영업관리부_수집"
+        $dirs += Join-ChildPath $env:COLLECT_DB $collectFolderName
     }
     else {
         $userProfile = [Environment]::GetFolderPath("UserProfile")
         $onedriveCandidates = @(
-            (Join-Path -Path $userProfile -ChildPath "OneDrive - 주식회사 도리당"),
-            (Join-Path -Path $userProfile -ChildPath "OneDrive - 도리당")
+            (Join-ChildPath $userProfile ("OneDrive - " + $doridangCompanyName)),
+            (Join-ChildPath $userProfile ("OneDrive - " + $doridangName))
         )
         foreach ($base in $onedriveCandidates) {
             if (Test-Path $base) {
-                $collect = Join-Path -Path $base -ChildPath "Collect_Data\영업관리부_수집"
+                $collect = Join-ChildPath $base "Collect_Data" $collectFolderName
                 if (Test-Path $collect) {
                     $dirs += $collect
                 }
@@ -231,6 +315,16 @@ try {
     $collectDirs = Get-CollectDirs
     $collectDirText = ($collectDirs | ForEach-Object { $_ }) -join ', '
     Write-Step ('수집 디렉터리: {0}' -f $collectDirText)
+    $expectedCollectDir = Resolve-ExpectedCollectDir
+    if (-not $expectedCollectDir) {
+        Write-Error 'Collect_Data\영업관리부_수집 경로를 찾지 못해 쿠팡 runner 실행을 중단합니다.'
+        exit 1
+    }
+    Write-Step ('기대 다운로드 디렉터리: {0}' -f $expectedCollectDir)
+    if ($CheckOnly) {
+        Write-Step 'CheckOnly: Chrome 실행 없이 경로 판정 완료'
+        exit 0
+    }
     $before = Get-RawCounts -Paths $collectDirs
     Write-Step ('시작 시 수집 파일 수: {0}개' -f $before)
 
@@ -238,14 +332,12 @@ try {
     Write-Step ('host chrome 실행: {0}' -f $hostScript)
     & powershell -NoProfile -ExecutionPolicy Bypass -File $hostScript
     if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne $null) {
-        $expectedCollectDir = Resolve-ExpectedCollectDir
         if (-not (Test-ChromeDownloadPref -ExpectedDir $expectedCollectDir)) {
             Write-Error ('coupang_host_chrome.ps1 실행 실패: {0}; 다운로드 경로가 영업관리부_수집으로 보장되지 않아 runner 직접 실행을 중단합니다. Chrome을 완전히 종료한 뒤 다시 실행하세요.' -f $LASTEXITCODE)
             exit $LASTEXITCODE
         }
         Write-Warning ('coupang_host_chrome.ps1 실행 실패: {0}; 다운로드 경로 확인 후 runner URL 직접 실행으로 전환합니다.' -f $LASTEXITCODE)
-        Open-RunnerUrl -Url $RunnerUrl -ProfileDirectory $ChromeProfileDirectory
-        $usedDirectRunner = $true
+        $usedDirectRunner = Open-RunnerUrl -Url $RunnerUrl -ProfileDirectory $ChromeProfileDirectory
     }
 
     if (-not $usedDirectRunner) {
@@ -253,8 +345,7 @@ try {
             Wait-DevToolsEndpoint
         } catch {
             Write-Warning ('Chrome DevTools endpoint 확인 실패: {0}; runner URL 직접 실행으로 전환합니다.' -f $_.Exception.Message)
-            Open-RunnerUrl -Url $RunnerUrl -ProfileDirectory $ChromeProfileDirectory
-            $usedDirectRunner = $true
+            $usedDirectRunner = Open-RunnerUrl -Url $RunnerUrl -ProfileDirectory $ChromeProfileDirectory
         }
     }
 
@@ -263,9 +354,12 @@ try {
         & $venvPython $autoClickScript
         $clickExit = $LASTEXITCODE
         if ($clickExit -ne 0) {
-            Write-Warning ('coupang_runner_autoclick.py 실행 실패: {0}; runner URL 직접 실행으로 전환합니다.' -f $clickExit)
-            Open-RunnerUrl -Url $RunnerUrl -ProfileDirectory $ChromeProfileDirectory
-            $usedDirectRunner = $true
+            if ($clickExit -eq 2) {
+                Write-Error 'runner.html이 Chrome 차단 페이지(ERR_BLOCKED_BY_CLIENT)로 열려 자동수집을 중단합니다. Chrome을 완전히 종료한 뒤 다시 실행하세요.'
+                exit $clickExit
+            }
+            Write-Warning ('coupang_runner_autoclick.py 실행 실패: {0}; 기존 runner 확인 후 직접 실행으로 전환합니다.' -f $clickExit)
+            $usedDirectRunner = Open-RunnerUrl -Url $RunnerUrl -ProfileDirectory $ChromeProfileDirectory
         } else {
             Write-Step 'runner 자동 클릭 완료'
         }

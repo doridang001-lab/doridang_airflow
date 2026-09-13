@@ -9,6 +9,8 @@ from airflow.operators.python import PythonOperator
 
 from modules.transform.pipelines.db.DB_DeliveryCommission import (
     build_delivery_commission,
+    build_delivery_revenue,
+    build_store_cost_allocation,
     monitor_baemin_settlement_missing,
     trigger_baemin_orders_only_recollect,
 )
@@ -54,4 +56,14 @@ with DAG(
         python_callable=build_delivery_commission,
     )
 
-    monitor_settlement >> trigger_recollect >> build_commission
+    build_revenue = PythonOperator(
+        task_id="build_delivery_revenue",
+        python_callable=build_delivery_revenue,
+    )
+
+    build_cost = PythonOperator(
+        task_id="build_store_cost_allocation",
+        python_callable=build_store_cost_allocation,
+    )
+
+    monitor_settlement >> trigger_recollect >> build_commission >> build_revenue >> build_cost

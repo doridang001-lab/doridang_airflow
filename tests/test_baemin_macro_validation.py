@@ -1,6 +1,8 @@
 import ast
 from pathlib import Path
 
+import pandas as pd
+
 from modules.transform.pipelines.db import DB_Beamin_Macro_validate as macro_validate
 from modules.transform.pipelines.db import DB_Beamin_04_orders as orders
 from modules.transform.pipelines.db import DB_Beamin_combined as combined
@@ -76,6 +78,30 @@ def test_lookup_store_key_uses_store_name_map_when_available():
     assert lookup_store_key(NAHOLLO, "간석중앙점") == "인천간석중앙점"
     assert lookup_store_key("도리당", "부산대신점") == "부산대신점"
     assert lookup_store_key("도리당", "역삼점") == "역삼점"
+
+
+def test_brand_coverage_ignores_suspect_no_data_marker_when_target_rows_exist(monkeypatch, tmp_path):
+    table_path = tmp_path / f"brand={DORIDANG}" / f"store={SAMSUNG}" / "ym=2026-09" / "orders_2026-09.parquet"
+    df = pd.DataFrame({"주문시각": ["2026. 09. 01. 11:20"]})
+
+    monkeypatch.setattr(macro_validate, "find_tables", lambda *_args, **_kwargs: [table_path])
+    monkeypatch.setattr(macro_validate, "read_file", lambda *_args, **_kwargs: df)
+    monkeypatch.setattr(macro_validate, "has_orders_no_data_marker", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        macro_validate,
+        "orders_no_data_marker_reason",
+        lambda *_args, **_kwargs: macro_validate.SUSPECT_ZERO_REASON,
+    )
+
+    coverage = macro_validate._inspect_brand_coverage(
+        "2026-09-01",
+        {SAMSUNG},
+        {SAMSUNG: {DORIDANG}},
+    )[SAMSUNG]
+
+    assert coverage["issue_type"] is None
+    assert coverage["active_brands"] == [DORIDANG]
+    assert coverage["suspect_zero_brands"] == []
 
 
 def test_store_option_dedup_keeps_same_store_id_with_different_text(monkeypatch):
@@ -476,6 +502,6 @@ def test_retry_and_lookback_ingest_manual_before_validation_or_gap_checks():
     lookback_source = LOOKBACK_DAG_SOURCE.read_text(encoding="utf-8")
 
     assert "task_id=\"ingest_manual_baemin_orders\"" in retry_source
-    assert "t_ingest_manual >> t1 >> retry_tasks >> t_merge >> t3 >> t4 >> t5 >> t_cleanup_manual" in retry_source
+    assert "t_ingest_manual >> t1 >> retry_tasks >> t_merge >> t3 >> t4 >> t_cleanup_manual >> t5" in retry_source
     assert "task_id=\"ingest_manual_baemin_orders\"" in lookback_source
     assert "t_ingest_manual >> t_trigger_missing >> t_cleanup_manual" in lookback_source

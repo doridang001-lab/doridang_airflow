@@ -12,6 +12,8 @@
 - 상품 마스터나 `fin_product_grp.csv`에 영향을 주는 변경은 `fin_product.md`도 함께 참조한다.
 
 ## 검증
+- 아침 정규 실행의 전체기간 추가 계산은 기본 비활성이다. `DB_UnifiedSales_Nightly_Dags`가 22시에 별도 실행하며 날짜별 완료 기록은 `LOCAL_DB/airflow_ops/nightly_unified.json`에 남긴다.
+- 야간 작업은 07시 이후 새 날짜를 시작하지 않고 다음 밤에 이어간다. 공유 통합매출 파일의 읽기·수정·쓰기는 `unified_writer` 잠금을 사용한다.
 - 최소 검증:
   ```powershell
   python -c "import importlib; importlib.import_module('dags.db.DB_UnifiedSales_Dags'); print('import ok')"

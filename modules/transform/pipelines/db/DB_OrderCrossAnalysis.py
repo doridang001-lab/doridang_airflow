@@ -1,612 +1,333 @@
+"""검증된 주문 교차 결과와 같은 세대의 보조 자료를 원자적으로 반영한다."""
 from __future__ import annotations
 
 import hashlib
+import io
+import json
 import logging
+import os
+import re
+import shutil
+import stat
+import uuid
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
+from modules.transform.pipelines.db.DB_OrderCrossAnalysis_core import (
+    VERSION, CROSS_COLUMNS, REQUIRED_SALES_COLUMNS, ALLOWED_CATEGORIES, UNIQUE_KEY,
+    Catalog, build_day, make_catalog, validate_frames,
+)
 from modules.transform.pipelines.db.DB_UnifiedSales_common import (
-    UNIFIED_ROOT,
-    _unified_daily_path,
-    iter_unified_sales_files,
+    UNIFIED_ROOT, _unified_daily_path, iter_unified_sales_files,
 )
 from modules.transform.utility.paths import (
-    FIN_PRODUCT_MAP_JOIN_CSV_PATH,
-    ORDER_CROSS_DIR,
-    existing_fin_product_csv_path,
+    FIN_PRODUCT_MAP_JOIN_CSV_PATH, ORDER_CROSS_DIR, LOCAL_DB, existing_fin_product_csv_path,
 )
+from modules.transform.utility.process_lock import named_lock
 
 logger = logging.getLogger(__name__)
-
 CROSS_ROOT = ORDER_CROSS_DIR
-
-CROSS_COLUMNS = [
-    "sale_date",
-    "ym",
-    "brand",
-    "store",
-    "order_type",
-    "main_item_id",
-    "main_name",
-    "main_standard_menu_name",
-    "main_source",
-    "pair_type",
-    "pair_item_id",
-    "pair_name",
-    "pair_standard_menu_name",
-    "co_order_cnt",
-    "co_qty",
-    "co_amount",
-    "is_multi_main",
-    "updated_at",
-]
-
-PAIR_WORK_COLUMNS = [
-    "sale_date",
-    "ym",
-    "brand",
-    "store",
-    "order_type",
-    "main_item_id",
-    "main_name",
-    "main_standard_menu_name",
-    "main_source",
-    "pair_type",
-    "pair_item_id",
-    "pair_name",
-    "pair_standard_menu_name",
-    "order_id",
-    "pair_qty",
-    "pair_amount",
-    "is_multi_main",
-]
-
-REQUIRED_SALES_COLUMNS = [
-    "sale_date",
-    "ym",
-    "source",
-    "brand",
-    "store",
-    "order_type",
-    "order_id",
-    "menu_name",
-    "item_seq",
-    "item_id",
-    "item_name",
-    "qty",
-    "total_price",
-    "sale_type",
-]
-
-FEE_KEYWORDS = ("배달비", "할인", "수수료", "배달팁", "포장비")
-SYNTHETIC_MAIN_SOURCES = {"posfeed", "배민수동", "쿠팡수동"}
-ALLOWED_CATEGORIES = {"메인", "사이드", "옵션", "토핑", "음료", "주류", "세트", "기타"}
-
-_CATEGORY_MAP_CACHE: dict[str, dict] | None = None
-_CATEGORY_MAP_CACHE_MTIME: float | None = None
-_OVERLAY_CACHE: dict[str, dict] | None = None
-_OVERLAY_CACHE_MTIME: float | None = None
+METADATA_KEY = b"order_cross_generation"
+SUPPORT_FILES = ("main_orders", "standard_pairs", "item_mapping")
 
 
-def _read_csv_utf8(path) -> pd.DataFrame:
+class StaleCrossInputError(ValueError):
+    """발행 시점 이후 입력 매출 파일 또는 상품 매핑이 변경되어 재검증이 필요함을 나타낸다."""
+
+
+def _now():
+    return datetime.now(ZoneInfo("Asia/Seoul"))
+
+
+def _hash_bytes(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def _remove_under(path, root):
+    path, root = Path(path).resolve(), Path(root).resolve()
+    if path == root or not path.is_relative_to(root):
+        raise ValueError(f"정리 대상이 전용 폴더 밖입니다: {path}")
+    def retry_readonly(function, failed_path, exc_info):
+        target = Path(failed_path).resolve()
+        if target == root or not target.is_relative_to(root):
+            raise ValueError(f"정리 대상이 전용 폴더 밖입니다: {target}")
+        # OneDrive가 동기화한 디렉터리도 Windows 읽기 전용 속성을 가질 수 있다.
+        attributes = getattr(target.stat(), "st_file_attributes", 0)
+        if os.name != "nt" or not attributes & stat.FILE_ATTRIBUTE_READONLY:
+            raise exc_info[1]
+        target.chmod(stat.S_IWRITE | stat.S_IREAD)
+        function(failed_path)
+
+    shutil.rmtree(path, onerror=retry_readonly)
+
+
+def _fingerprint(path):
+    return _hash_bytes(Path(path).read_bytes())
+
+
+def _frame_hash(frame):
+    return _hash_bytes(pd.util.hash_pandas_object(frame, index=False).values.tobytes())
+
+
+def _read_csv_bytes(value):
     for encoding in ("utf-8-sig", "utf-8", "cp949"):
         try:
-            return pd.read_csv(path, dtype=str, encoding=encoding).fillna("")
+            return pd.read_csv(io.BytesIO(value), dtype=str, encoding=encoding).fillna("")
         except UnicodeDecodeError:
             continue
-    return pd.read_csv(path, dtype=str).fillna("")
+    raise ValueError("상품 매핑 CSV 인코딩 오류")
 
 
-def _normalize_text(value) -> str:
-    return str(value or "").strip()
+def load_catalog() -> Catalog:
+    paths = [existing_fin_product_csv_path(), FIN_PRODUCT_MAP_JOIN_CSV_PATH]
+    content = [p.read_bytes() for p in paths]
+    files = {str(p): _hash_bytes(data) for p, data in zip(paths, content)}
+    catalog = make_catalog(*[_read_csv_bytes(data) for data in content])
+    catalog.files = files
+    catalog.fingerprint = _hash_bytes(json.dumps(list(files.values())).encode())
+    _check_catalog(catalog)
+    return catalog
 
 
-def _compact_text(value) -> str:
-    return _normalize_text(value).replace("[홀]", "").replace(" ", "")
+def _check_catalog(catalog):
+    if any(_fingerprint(path) != value for path, value in (catalog.files or {}).items()):
+        raise RuntimeError("계산 중 상품 매핑 변경: 동일 매핑으로 재시도 필요")
 
 
-def _normalize_category(value) -> str:
-    text = _compact_text(value)
-    if not text:
-        return "기타"
-    if "토핑" in text:
-        return "토핑"
-    if "사이드" in text or "곁들임" in text:
-        return "사이드"
-    if "옵션" in text or "반반" in text:
-        return "옵션"
-    if "주류" in text:
-        return "주류"
-    if "음료" in text:
-        return "음료"
-    if "세트" in text:
-        return "세트"
-    if any(token in text for token in ("메인", "점심", "저녁", "단품")):
-        return "메인"
-    return "기타"
-
-
-def _coerce_category(value) -> str:
-    category = _normalize_text(value)
-    if category == "1인":
-        return "메인"
-    if category in ALLOWED_CATEGORIES:
-        return category
-    return _normalize_category(category)
-
-
-def _infer_category_from_name(name: str) -> str:
-    text = _compact_text(name)
-    if not text:
-        return "기타"
-    if any(token in text for token in FEE_KEYWORDS):
-        return "기타"
-    if any(token in text for token in ("소주", "맥주", "막걸리", "청하", "하이볼", "참이슬", "처음처럼", "새로", "카스", "테라")):
-        return "주류"
-    if any(token in text for token in ("콜라", "사이다", "스프라이트", "환타", "제로", "음료", "탄산", "생수")):
-        return "음료"
-    if any(token in text for token in ("공기밥", "주먹밥", "계란찜", "치킨무", "파김치")):
-        return "사이드"
-    if any(token in text for token in ("추가", "토핑", "사리", "당면", "분모자", "떡", "오뎅", "대파", "감자", "버섯", "메추리알", "계란", "순살", "대창")):
-        return "토핑"
-    if any(token in text for token in ("기본맛", "매운맛", "순한맛", "맛", "뼈", "괜찮습니다", "없음", "빼주세요", "많이", "적게", "중간")):
-        return "옵션"
-    if "세트" in text:
-        return "세트"
-    return "기타"
-
-
-def _is_fee_like(name: str) -> bool:
-    text = _compact_text(name)
-    return any(token in text for token in FEE_KEYWORDS)
-
-
-def _load_fin_product_category_map() -> dict[str, dict]:
-    global _CATEGORY_MAP_CACHE, _CATEGORY_MAP_CACHE_MTIME
-    try:
-        source_path = existing_fin_product_csv_path()
-        mtime = source_path.stat().st_mtime
-    except FileNotFoundError:
-        _CATEGORY_MAP_CACHE = {}
-        _CATEGORY_MAP_CACHE_MTIME = None
-        return _CATEGORY_MAP_CACHE
-
-    if _CATEGORY_MAP_CACHE is not None and _CATEGORY_MAP_CACHE_MTIME == mtime:
-        return _CATEGORY_MAP_CACHE
-
-    try:
-        df = _read_csv_utf8(source_path)
-    except Exception as exc:
-        logger.warning("fin_product 로드 실패: %s | %s", source_path, exc)
-        _CATEGORY_MAP_CACHE = {}
-        _CATEGORY_MAP_CACHE_MTIME = mtime
-        return _CATEGORY_MAP_CACHE
-
-    for col in ("source", "brand", "store", "상품코드", "상품명", "중메뉴", "is_main_candidate", "is_latest", "updated_at"):
-        if col not in df.columns:
-            df[col] = ""
-        df[col] = df[col].fillna("").astype(str).str.strip()
-
-    df = df[df["상품코드"].ne("")].copy()
-    if df.empty:
-        _CATEGORY_MAP_CACHE = {}
-        _CATEGORY_MAP_CACHE_MTIME = mtime
-        return _CATEGORY_MAP_CACHE
-
-    df["_is_latest_rank"] = df["is_latest"].eq("Y").astype(int)
-    if df["updated_at"].ne("").any():
-        df["_updated_at_ts"] = pd.to_datetime(df["updated_at"], errors="coerce").fillna(pd.Timestamp.min)
-        df = (
-            df.sort_values(["source", "brand", "store", "상품코드", "_is_latest_rank", "_updated_at_ts"])
-            .groupby(["source", "brand", "store", "상품코드"], as_index=False)
-            .last()
-        )
-    else:
-        df = (
-            df.sort_values(["source", "brand", "store", "상품코드", "_is_latest_rank"])
-            .groupby(["source", "brand", "store", "상품코드"], as_index=False)
-            .last()
-        )
-
-    result: dict[str, dict] = {}
-    for row in df.to_dict("records"):
-        item_id = _normalize_text(row.get("상품코드"))
-        key = (
-            _normalize_text(row.get("source")),
-            _normalize_text(row.get("brand")),
-            _normalize_text(row.get("store")),
-            item_id,
-        )
-        is_main = _normalize_text(row.get("is_main_candidate")) == "Y"
-        category = "메인" if is_main else _normalize_category(row.get("중메뉴"))
-        result[key] = {
-            "category": category,
-            "is_main": is_main or category == "메인",
-            "name": _normalize_text(row.get("상품명")),
-        }
-
-    _CATEGORY_MAP_CACHE = result
-    _CATEGORY_MAP_CACHE_MTIME = mtime
-    return _CATEGORY_MAP_CACHE
-
-
-def _load_map_join_overlay() -> dict[str, dict]:
-    global _OVERLAY_CACHE, _OVERLAY_CACHE_MTIME
-    try:
-        mtime = FIN_PRODUCT_MAP_JOIN_CSV_PATH.stat().st_mtime
-    except FileNotFoundError:
-        _OVERLAY_CACHE = {}
-        _OVERLAY_CACHE_MTIME = None
-        return _OVERLAY_CACHE
-
-    if _OVERLAY_CACHE is not None and _OVERLAY_CACHE_MTIME == mtime:
-        return _OVERLAY_CACHE
-
-    try:
-        df = _read_csv_utf8(FIN_PRODUCT_MAP_JOIN_CSV_PATH)
-    except Exception as exc:
-        logger.warning("fin_product_map_join 로드 실패: %s | %s", FIN_PRODUCT_MAP_JOIN_CSV_PATH, exc)
-        _OVERLAY_CACHE = {}
-        _OVERLAY_CACHE_MTIME = mtime
-        return _OVERLAY_CACHE
-
-    for col in ("item_id", "store", "source", "brand", "category", "standard_menu_name"):
-        if col not in df.columns:
-            df[col] = ""
-        df[col] = df[col].fillna("").astype(str).str.strip()
-
-    result: dict[str, dict] = {}
-    for row in df[df["item_id"].ne("")].to_dict("records"):
-        item_id = _normalize_text(row.get("item_id"))
-        key = (
-            _normalize_text(row.get("source")),
-            _normalize_text(row.get("brand")),
-            _normalize_text(row.get("store")),
-            item_id,
-        )
-        category = _normalize_text(row.get("category"))
-        name = _normalize_text(row.get("standard_menu_name"))
-        result[key] = {"category": category, "name": name}
-
-    _OVERLAY_CACHE = result
-    _OVERLAY_CACHE_MTIME = mtime
-    return _OVERLAY_CACHE
-
-
-def _load_map_join_scopes() -> set[tuple[str, str, str]]:
-    overlay = _load_map_join_overlay()
-    return {(source, brand, store) for source, brand, store, _ in overlay.keys()}
-
-
-def _classify_categories(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    category_map = _load_fin_product_category_map()
-    overlay = _load_map_join_overlay()
-    out = df.copy()
-    out["item_id"] = out["item_id"].fillna("").astype(str).str.strip()
-    out["item_name"] = out["item_name"].fillna("").astype(str).str.strip()
-    for col in ("source", "brand", "store"):
-        if col not in out.columns:
-            out[col] = ""
-        out[col] = out[col].fillna("").astype(str).str.strip()
-
-    def classify(source: str, brand: str, store: str, item_id: str, item_name: str) -> dict:
-        key = (source, brand, store, item_id)
-        base = dict(category_map.get(key, {}))
-        over = overlay.get(key, {})
-        category = _coerce_category(over.get("category") or base.get("category") or "기타")
-        standard_name = _normalize_text(over.get("name")) or _normalize_text(base.get("name"))
-        name = standard_name or item_name
-        if category == "기타":
-            category = _infer_category_from_name(name)
-        is_main = bool(base.get("is_main")) or category == "메인"
-        return {
-            "category": category,
-            "is_main": is_main,
-            "disp_name": name,
-            "standard_menu_name": standard_name,
-        }
-
-    classified = [
-        classify(source, brand, store, item_id, item_name)
-        for source, brand, store, item_id, item_name in zip(
-            out["source"],
-            out["brand"],
-            out["store"],
-            out["item_id"],
-            out["item_name"],
-        )
-    ]
-    out["category"] = [row["category"] for row in classified]
-    out["is_main"] = [row["is_main"] for row in classified]
-    out["disp_name"] = [row["disp_name"] for row in classified]
-    out["standard_menu_name"] = [row["standard_menu_name"] for row in classified]
-    return out
-
-
-def _synthetic_main_id(source: str, store: str, menu_name: str) -> str:
-    key = f"{source}|{store}|{menu_name}"
-    digest = hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
-    return f"MENU::{digest}"
-
-
-def _empty_pairs() -> pd.DataFrame:
-    return pd.DataFrame(columns=PAIR_WORK_COLUMNS)
-
-
-def _order_pairs(group: pd.DataFrame) -> list[pd.DataFrame]:
-    mains = group[group["is_main"]].copy()
-    synthetic = False
-
-    if mains.empty:
-        menu_names = group["menu_name"].fillna("").astype(str).str.strip()
-        menu_names = menu_names[menu_names.ne("")]
-        if menu_names.empty:
-            return []
-        first = group.iloc[0]
-        main_name = menu_names.iloc[0]
-        mains = pd.DataFrame(
-            [
-                {
-                    "_row_id": "__synthetic_main__",
-                    "item_id": _synthetic_main_id(first["source"], first["store"], main_name),
-                    "disp_name": main_name,
-                    "standard_menu_name": "",
-                    "main_source": "menu_name",
-                }
-            ]
-        )
-        synthetic = True
-    else:
-        mains["main_source"] = "item_id"
-
-    multi_main = mains["item_id"].nunique() >= 2
-    parts: list[pd.DataFrame] = []
-    min_seq = group["item_seq_num"].min()
-
-    for _, main in mains.iterrows():
-        pairs = group.copy()
-        if synthetic:
-            pairs = pairs[pairs["item_seq_num"].ne(min_seq)]
-            pairs = pairs[pairs["disp_name"].map(_compact_text).ne(_compact_text(main["disp_name"]))]
-        else:
-            pairs = pairs[pairs["_row_id"].ne(main["_row_id"])]
-            pairs = pairs[pairs["item_id"].ne(main["item_id"])]
-
-        pairs = pairs[pairs["category"].ne("기타")]
-        pairs = pairs[~pairs["disp_name"].map(_is_fee_like)]
-        if pairs.empty:
-            continue
-
-        part = pd.DataFrame(
-            {
-                "sale_date": pairs["sale_date"].values,
-                "ym": pairs["ym"].values,
-                "brand": pairs["brand"].values,
-                "store": pairs["store"].values,
-                "order_type": pairs["order_type"].values,
-                "main_item_id": main["item_id"],
-                "main_name": main["disp_name"],
-                "main_standard_menu_name": main["standard_menu_name"],
-                "main_source": main["main_source"],
-                "pair_type": pairs["category"].values,
-                "pair_item_id": pairs["item_id"].values,
-                "pair_name": pairs["disp_name"].values,
-                "pair_standard_menu_name": pairs["standard_menu_name"].values,
-                "order_id": pairs["order_id"].values,
-                "pair_qty": pairs["qty_num"].values,
-                "pair_amount": pairs["total_price_num"].values,
-                "is_multi_main": multi_main,
-            }
-        )
-        parts.append(part)
-    return parts
-
-
-def _build_pairs_one_day(date_str: str) -> pd.DataFrame:
-    path = _unified_daily_path(date_str)
-    if not path.exists():
-        logger.warning("unified_sales parquet 없음: %s", path)
-        return _empty_pairs()
-
-    try:
-        df = pd.read_parquet(path)
-    except Exception as exc:
-        logger.warning("unified_sales parquet 로드 실패, 스킵: %s | %s", path, exc)
-        return _empty_pairs()
-
-    if df.empty:
-        return _empty_pairs()
-
-    for col in REQUIRED_SALES_COLUMNS:
-        if col not in df.columns:
-            logger.warning("필수 컬럼 누락(%s), 스킵: %s", col, path)
-            return _empty_pairs()
-
-    out = df.copy()
-    for col in (
-        "sale_date",
-        "ym",
-        "source",
-        "brand",
-        "store",
-        "order_type",
-        "order_id",
-        "menu_name",
-        "item_seq",
-        "item_id",
-        "item_name",
-        "sale_type",
-    ):
-        out[col] = out[col].fillna("").astype(str).str.strip()
-
-    out = out[out["sale_type"].ne("취소")].copy()
-    out = out[out["order_id"].ne("") & out["item_id"].ne("")].copy()
-    if out.empty:
-        return _empty_pairs()
-
-    out["qty_num"] = pd.to_numeric(out["qty"], errors="coerce").fillna(0)
-    out["total_price_num"] = pd.to_numeric(out["total_price"], errors="coerce").fillna(0)
-    out = out[out["total_price_num"].ge(0)].copy()
-    if out.empty:
-        return _empty_pairs()
-
-    scopes = _load_map_join_scopes()
-    if scopes:
-        scope_key = list(zip(out["source"], out["brand"], out["store"]))
-        out = out[[key in scopes for key in scope_key]].copy()
-        if out.empty:
-            return _empty_pairs()
-
-    out = _classify_categories(out)
-    out = out[~out["disp_name"].map(_is_fee_like)].copy()
-    out["_row_id"] = out.index.astype(str)
-    out["item_seq_num"] = pd.to_numeric(out["item_seq"], errors="coerce")
-    out["item_seq_num"] = out["item_seq_num"].fillna(out.groupby(["source", "brand", "store", "order_id"]).cumcount() + 1)
-
-    parts: list[pd.DataFrame] = []
-    group_cols = ["source", "brand", "store", "order_id"]
-    for _, group in out.groupby(group_cols, dropna=False):
-        parts.extend(_order_pairs(group))
-
-    if not parts:
-        return _empty_pairs()
-    return pd.concat(parts, ignore_index=True).reindex(columns=PAIR_WORK_COLUMNS)
-
-
-def _aggregate_pairs(pairs: pd.DataFrame) -> pd.DataFrame:
-    if pairs is None or pairs.empty:
-        return pd.DataFrame(columns=CROSS_COLUMNS)
-
-    key_cols = [
-        "sale_date",
-        "ym",
-        "brand",
-        "store",
-        "order_type",
-        "main_item_id",
-        "main_name",
-        "main_standard_menu_name",
-        "main_source",
-        "pair_type",
-        "pair_item_id",
-        "pair_name",
-        "pair_standard_menu_name",
-    ]
-    agg = (
-        pairs.groupby(key_cols, dropna=False)
-        .agg(
-            co_order_cnt=("order_id", "nunique"),
-            co_qty=("pair_qty", "sum"),
-            co_amount=("pair_amount", "sum"),
-            is_multi_main=("is_multi_main", "any"),
-        )
-        .reset_index()
-    )
-    agg["co_order_cnt"] = pd.to_numeric(agg["co_order_cnt"], errors="coerce").fillna(0).astype(int)
-    agg["co_qty"] = pd.to_numeric(agg["co_qty"], errors="coerce").fillna(0).round().astype(int)
-    agg["co_amount"] = pd.to_numeric(agg["co_amount"], errors="coerce").fillna(0).round().astype(int)
-    agg["is_multi_main"] = agg["is_multi_main"].astype(bool)
-    agg["updated_at"] = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
-    return agg.reindex(columns=CROSS_COLUMNS).sort_values(
-        ["sale_date", "brand", "store", "order_type", "main_name", "co_order_cnt", "pair_type", "pair_name"],
-        ascending=[True, True, True, True, True, False, True, True],
-    ).reset_index(drop=True)
-
-
-def _cross_daily_path(date_str: str):
+def _cross_daily_path(date_str, output_root=None):
     ymd = datetime.strptime(date_str, "%Y-%m-%d").strftime("%y%m%d")
-    return CROSS_ROOT / f"order_cross_{ymd}.parquet"
+    return Path(output_root or CROSS_ROOT) / f"order_cross_{ymd}.parquet"
 
 
-def _save_cross_daily(df: pd.DataFrame, date_str: str) -> int:
-    CROSS_ROOT.mkdir(parents=True, exist_ok=True)
-    daily_path = _cross_daily_path(date_str)
-    out = (df if df is not None else pd.DataFrame()).reindex(columns=CROSS_COLUMNS)
-    out.to_parquet(daily_path, index=False, engine="pyarrow")
-    logger.info("order_cross 저장 완료: %s | rows=%d", daily_path, len(out))
-    return len(out)
+def _input_path(date_str, input_root=None):
+    if input_root is None:
+        return _unified_daily_path(date_str)
+    return Path(input_root) / ("unified_sales_" + datetime.strptime(date_str, "%Y-%m-%d").strftime("%y%m%d") + ".parquet")
 
 
-def _process_order_cross(date_str: str, overwrite: bool = True) -> dict:
-    pairs = _build_pairs_one_day(date_str)
-    agg = _aggregate_pairs(pairs)
-    rows = _save_cross_daily(agg, date_str)
-    return {
-        "date": date_str,
-        "rows": rows,
-        "pair_rows": len(pairs),
-        "path": str(_cross_daily_path(date_str)),
-        "overwrite": overwrite,
-    }
+def _assert_output_allowed(root, allow_publish):
+    resolved = Path(root).resolve()
+    is_onedrive = resolved == Path(ORDER_CROSS_DIR).resolve() or any("onedrive" in part.lower() for part in resolved.parts)
+    if is_onedrive and not allow_publish:
+        raise PermissionError("OneDrive 반영 승인이 필요합니다. 로컬 output_root로 검증하세요.")
 
 
-def run_order_cross_analysis(date_str: str, overwrite: bool = True) -> str:
-    result = _process_order_cross(date_str, overwrite=overwrite)
-    msg = f"order_cross overwrite | {date_str} | rows={result['rows']} pair_rows={result['pair_rows']}"
-    logger.info(msg)
-    return msg
+def _generation(path):
+    metadata = pq.read_metadata(path).metadata or {}
+    raw = metadata.get(METADATA_KEY)
+    if raw is None:
+        raise ValueError("기존 결과에 검증된 교차분석 생성번호가 없습니다")
+    result = json.loads(raw)
+    if not isinstance(result, dict) or not isinstance(result.get("id"), str) or not re.fullmatch(r"[0-9a-f]{32}", result["id"]):
+        raise ValueError("교차분석 생성번호 오류")
+    return result
 
 
-def run_lookback_order_cross_analysis(days: int = 3) -> str:
-    now = datetime.now(ZoneInfo("Asia/Seoul"))
-    total = 0
-    for i in range(1, days + 1):
-        date_str = (now - timedelta(days=i)).strftime("%Y-%m-%d")
-        total += _process_order_cross(date_str, overwrite=True)["rows"]
-    msg = f"order_cross lookback({days}d) | overwrite rows={total}"
-    logger.info(msg)
-    return msg
+def _support_dir(path, generation):
+    return path.parent / "_support" / path.stem.removeprefix("order_cross_") / generation["id"]
 
 
-def backfill_order_cross_analysis() -> str:
-    files = iter_unified_sales_files()
-    if not files:
-        msg = f"order_cross backfill 스킵 (unified_sales parquet 없음) | {UNIFIED_ROOT}"
-        logger.warning(msg)
-        return msg
+def load_validated_support(date_str, output_root=None, *, require_fresh=True, catalog=None, input_root=None):
+    path = _cross_daily_path(date_str, output_root)
+    meta = _generation(path)
+    if meta.get("version") != VERSION or meta.get("date") != date_str:
+        raise ValueError("교차분석 처리 버전/날짜 불일치")
+    support = _support_dir(path, meta)
+    quality_bytes = (support / "quality.json").read_bytes()
+    if _hash_bytes(quality_bytes) != meta["quality_hash"]:
+        raise ValueError("교차분석 품질 기록 변경")
+    quality = json.loads(quality_bytes)
+    if not isinstance(quality, dict) or quality.get("generation") != meta["id"] or not quality.get("validated"):
+        raise ValueError("교차분석 보조 자료 세대/검증 상태 불일치")
+    frames = {}
+    for name in SUPPORT_FILES:
+        data = (support / f"{name}.parquet").read_bytes()
+        if _hash_bytes(data) != quality["support_hashes"][name]:
+            raise ValueError(f"교차분석 보조 자료 변경: {name}")
+        frames[name] = pd.read_parquet(io.BytesIO(data))
+    frames["cross"] = pd.read_parquet(path)
+    frames["quality"] = quality
+    if _frame_hash(frames["cross"]) != quality.get("cross_content_hash"):
+        raise ValueError("교차 결과 내용 변경")
+    validate_frames(frames["cross"], frames["main_orders"], frames["standard_pairs"])
+    if require_fresh:
+        catalog = catalog or load_catalog()
+        _check_catalog(catalog)
+        if meta["catalog_hash"] != catalog.fingerprint or meta["input_hash"] != _fingerprint(_input_path(date_str, input_root)):
+            raise StaleCrossInputError("교차분석 갱신 대기: 입력 또는 매핑 변경")
+    return frames
 
-    total = 0
-    dates = 0
+
+def _schema():
+    return pa.schema([(c, pa.int64() if c in {"co_order_cnt", "co_qty", "co_amount"} else pa.bool_() if c == "is_multi_main" else pa.string()) for c in CROSS_COLUMNS])
+
+
+def _publish(bundle, date_str, root, input_hash, catalog, input_path, *, allow_publish=False):
+    _assert_output_allowed(root, allow_publish)
+    path = _cross_daily_path(date_str, root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    generation = uuid.uuid4().hex
+    meta = {"id": generation, "date": date_str, "version": VERSION, "input_hash": input_hash, "catalog_hash": catalog.fingerprint}
+    support = _support_dir(path, meta)
+    support.mkdir(parents=True)
+    temporary = path.with_name(path.name + "." + generation + ".tmp")
+    backup_dir = Path(LOCAL_DB) / "temp" / "backups" / "order_cross" / generation
+    backup = backup_dir / path.name
+    previous = None
+    committed = False
+    rollback_failed = False
+    try:
+        if path.exists():
+            try:
+                previous = _support_dir(path, _generation(path))
+            except (ValueError, KeyError):
+                previous = None
+            backup_dir.mkdir(parents=True)
+            shutil.copy2(path, backup)
+        hashes = {}
+        for name in SUPPORT_FILES:
+            target = support / f"{name}.parquet"
+            bundle[name].to_parquet(target, index=False, engine="pyarrow")
+            hashes[name] = _fingerprint(target)
+        quality = {**bundle["quality"], "generation": generation, "input_hash": input_hash,
+                   "catalog_hash": catalog.fingerprint, "support_hashes": hashes,
+                   "cross_content_hash": _frame_hash(bundle["cross"])}
+        qbytes = json.dumps(quality, ensure_ascii=False, indent=2).encode("utf-8")
+        (support / "quality.json").write_bytes(qbytes)
+        meta["quality_hash"] = _hash_bytes(qbytes)
+        table = pa.Table.from_pandas(bundle["cross"], schema=_schema(), preserve_index=False)
+        table = table.replace_schema_metadata({**(table.schema.metadata or {}), METADATA_KEY: json.dumps(meta).encode()})
+        pq.write_table(table, temporary)
+        reread = pd.read_parquet(temporary)
+        validate_frames(reread, pd.read_parquet(support / "main_orders.parquet"), pd.read_parquet(support / "standard_pairs.parquet"))
+        pd.testing.assert_frame_equal(reread, bundle["cross"])
+        _check_catalog(catalog)
+        if _fingerprint(input_path) != input_hash:
+            raise RuntimeError("계산 중 매출 입력 변경: 반영 중단")
+        os.replace(temporary, path)
+        committed = True
+        load_validated_support(date_str, root, catalog=catalog, input_root=input_path.parent)
+    except Exception:
+        if committed:
+            try:
+                if backup.exists():
+                    restore = path.with_name(path.name + ".restore.tmp")
+                    shutil.copy2(backup, restore)
+                    os.replace(restore, path)
+                else:
+                    path.unlink(missing_ok=True)
+            except Exception:
+                rollback_failed = True
+                logger.exception("롤백 실패, 복구본 보존: %s", backup_dir)
+        if not rollback_failed:
+            _remove_under(support, path.parent / "_support")
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
+        if backup_dir.exists() and not rollback_failed:
+            _remove_under(backup_dir, Path(LOCAL_DB) / "temp" / "backups" / "order_cross")
+    # 이전 세대는 새 세대의 재읽기 검증이 끝난 뒤 정리한다.
+    if previous and previous != support and previous.exists():
+        _remove_under(previous, path.parent / "_support")
+    return quality
+
+
+def _process_order_cross(date_str, overwrite=True, *, output_root=None, input_root=None, catalog=None, allow_publish=False):
+    root = Path(output_root or CROSS_ROOT)
+    _assert_output_allowed(root, allow_publish)
+    path = _cross_daily_path(date_str, root)
+    input_path = _input_path(date_str, input_root)
+    catalog = catalog or load_catalog()
+    with named_lock("order_cross:" + str(path.resolve()), timeout=120):
+        if not overwrite and path.exists():
+            loaded = load_validated_support(date_str, root, catalog=catalog, input_root=input_root)
+            return {"date": date_str, "rows": len(loaded["cross"]), "path": str(path), "skipped": True}
+        _check_catalog(catalog)
+        content = input_path.read_bytes()
+        bundle = build_day(pd.read_parquet(io.BytesIO(content)), date_str, catalog, _now().strftime("%Y-%m-%d %H:%M:%S"))
+        quality = _publish(bundle, date_str, root, _hash_bytes(content), catalog, input_path, allow_publish=allow_publish)
+    result = {"date": date_str, "rows": len(bundle["cross"]), "standard_rows": len(bundle["standard_pairs"]), "path": str(path), "quality": quality}
+    logger.info("교차분석 검증·저장 완료: %s | rows=%d", date_str, result["rows"])
+    return result
+
+
+def run_order_cross_analysis(date_str, overwrite=True, **kwargs):
+    r = _process_order_cross(date_str, overwrite, **kwargs)
+    return f"order_cross 검증 완료 | {date_str} | rows={r['rows']}"
+
+
+def validate_order_cross(date_str, *, output_root=None, input_root=None, catalog=None):
+    frames = load_validated_support(date_str, output_root, catalog=catalog, input_root=input_root)
+    return f"order_cross validate | {date_str} | rows={len(frames['cross'])}"
+
+
+def _dates(input_root=None):
+    files = iter_unified_sales_files() if input_root is None else sorted(Path(input_root).glob("unified_sales_*.parquet"))
+    dates = []
     for path in files:
         try:
-            ymd = path.name.split("unified_sales_", 1)[1].split(".", 1)[0]
-            date_str = f"{2000 + int(ymd[:2])}-{ymd[2:4]}-{ymd[4:6]}"
-        except Exception:
-            logger.warning("unified_sales 파일명 파싱 실패, 스킵: %s", path)
+            date = datetime.strptime(path.stem, "unified_sales_%y%m%d").strftime("%Y-%m-%d")
+            if path.name != "unified_sales_" + datetime.strptime(date, "%Y-%m-%d").strftime("%y%m%d") + ".parquet":
+                continue
+        except ValueError:
             continue
-        total += _process_order_cross(date_str, overwrite=True)["rows"]
-        dates += 1
-
-    msg = f"order_cross backfill 완료 | dates={dates} rows={total}"
-    logger.info(msg)
-    return msg
+        if date < _now().strftime("%Y-%m-%d"):
+            dates.append(date)
+    return sorted(set(dates))
 
 
-def validate_order_cross(date_str: str) -> str:
-    path = _cross_daily_path(date_str)
-    if not path.exists():
-        raise FileNotFoundError(f"order_cross 결과 없음: {path}")
-    df = pd.read_parquet(path)
-    missing = [col for col in CROSS_COLUMNS if col not in df.columns]
-    if missing:
-        raise ValueError(f"order_cross 컬럼 누락: {missing}")
-    key_cols = ["sale_date", "brand", "store", "order_type", "main_item_id", "pair_type", "pair_item_id"]
-    dup_cnt = int(df.duplicated(key_cols, keep=False).sum()) if not df.empty else 0
-    if dup_cnt:
-        raise ValueError(f"order_cross unique key 중복: {dup_cnt} rows")
-    msg = f"order_cross validate | {date_str} | rows={len(df)}"
-    logger.info(msg)
-    return msg
+def _is_current(date_str, root, catalog, input_root=None):
+    try:
+        metadata = _generation(_cross_daily_path(date_str, root))
+        if metadata.get("version") != VERSION or metadata.get("catalog_hash") != catalog.fingerprint:
+            return False
+        if metadata.get("input_hash") != _fingerprint(_input_path(date_str, input_root)):
+            return False
+        # 보조 자료까지 검사하므로 중간 저장/손상 파일은 완료 체크포인트가 아니다.
+        load_validated_support(date_str, root, require_fresh=False)
+        return True
+    except (OSError, ValueError, KeyError, pa.ArrowException):
+        return False
 
 
-def backup_order_cross_to_onedrive(date_str: str | None = None) -> str:
-    # 산출 루트가 이미 MART_DB(OneDrive)라 별도 백업은 DAG 승인 게이트의 명시 로그만 남긴다.
-    if date_str:
-        path = _cross_daily_path(date_str)
-        return f"order_cross onedrive backup 스킵(이미 MART_DB 저장): {path}"
-    return f"order_cross onedrive backup 스킵(이미 MART_DB 저장): {CROSS_ROOT}"
+def process_pending(*, output_root=None, input_root=None, days=3, max_history_dates=10, allow_publish=False, all_dates=False):
+    if days < 1 or max_history_dates < 0:
+        raise ValueError("최근 일수는 양수, 과거 처리 한도는 0 이상이어야 합니다")
+    root = Path(output_root or CROSS_ROOT)
+    _assert_output_allowed(root, allow_publish)
+    catalog = load_catalog()
+    dates = _dates(input_root)
+    cutoff = (_now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    pending = [d for d in dates if not _is_current(d, root, catalog, input_root)]
+    recent = sorted([d for d in pending if d >= cutoff], reverse=True)
+    history = [d for d in pending if d < cutoff]
+    selected = pending if all_dates else recent + history[:max_history_dates]
+    results, failed = [], []
+    for date in selected:
+        try:
+            results.append(_process_order_cross(date, output_root=root, input_root=input_root, catalog=catalog, allow_publish=allow_publish))
+        except Exception as exc:
+            logger.exception("교차분석 날짜 처리 실패: %s", date)
+            failed.append({"date": date, "error": str(exc)})
+    result = {"dates": [r["date"] for r in results], "rows": sum(r["rows"] for r in results),
+              "remaining": len(pending) - len(results), "failed": failed}
+    if failed:
+        raise RuntimeError("교차분석 미완료: " + json.dumps(result, ensure_ascii=False))
+    return result
+
+
+def run_lookback_order_cross_analysis(days=3, **kwargs):
+    return json.dumps(process_pending(days=days, **kwargs), ensure_ascii=False)
+
+
+def backfill_order_cross_analysis(**kwargs):
+    return json.dumps(process_pending(all_dates=True, **kwargs), ensure_ascii=False)
+
+
+def backup_order_cross_to_onedrive(date_str=None):
+    return "별도 OneDrive 백업 없음: 검증 후 원자 교체 및 로컬 임시 복구본 사용"

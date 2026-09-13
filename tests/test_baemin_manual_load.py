@@ -720,6 +720,8 @@ def test_load_manual_baemin_metrics_replaces_same_date(tmp_path, monkeypatch):
     assert len(out) == 1
     assert out["date"].iloc[0] == "2026-07-10"
     assert out["최근별점"].iloc[0] == "4.8"
+    assert out["brand_store"].iloc[0] == "도리당|경북상주점"
+    assert list(out.columns[-3:]) == ["brand", "store", "brand_store"]
 
 
 def test_cleanup_manual_baemin_files_moves_unified_payload(tmp_path, monkeypatch):

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import logging
+import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.exceptions import AirflowSkipException
+from airflow.models import Variable
 
 from modules.transform.pipelines.db.DB_OrderCrossAnalysis import (
     backup_order_cross_to_onedrive,
@@ -13,6 +16,7 @@ from modules.transform.pipelines.db.DB_OrderCrossAnalysis import (
     run_lookback_order_cross_analysis,
     run_order_cross_analysis,
     validate_order_cross,
+    StaleCrossInputError,
 )
 from modules.transform.utility.notifier import enqueue_heal_task, send_telegram
 from modules.transform.utility.schedule import DB_ORDER_CROSS_ANALYSIS_TIME
@@ -20,7 +24,7 @@ from modules.transform.utility.schedule import DB_ORDER_CROSS_ANALYSIS_TIME
 logger = logging.getLogger(__name__)
 
 dag_id = "DB_OrderCrossAnalysis_Dags"
-LOOKBACK_DAYS = None
+LOOKBACK_DAYS = 3
 
 
 def _on_failure_callback(context):
@@ -79,15 +83,25 @@ def resolve_date(**context) -> str:
 
 def build_cross(**context) -> str:
     conf = _conf(context)
+    # 운영 승인은 변수로 지속하고, 단일 승인 실행은 conf로 지정한다.
+    enabled = _truthy(conf.get("publish")) or _truthy(
+        Variable.get("order_cross_publish_enabled", default_var="false")
+    )
+    if not enabled:
+        raise AirflowSkipException("교차분석 운영 반영 승인 대기: 로컬 검증 결과 확인 필요")
     if _truthy(conf.get("backfill")):
-        return backfill_order_cross_analysis()
+        result = backfill_order_cross_analysis(allow_publish=True)
+        context["ti"].xcom_push(key="processed_dates", value=json.loads(result)["dates"])
+        return result
 
     sale_date = context["ti"].xcom_pull(task_ids="resolve_date", key="sale_date")
     if sale_date:
-        return run_order_cross_analysis(sale_date, overwrite=True)
-    if LOOKBACK_DAYS is None:
-        return backfill_order_cross_analysis()
-    return run_lookback_order_cross_analysis(days=LOOKBACK_DAYS)
+        result = run_order_cross_analysis(sale_date, overwrite=True, allow_publish=True)
+        context["ti"].xcom_push(key="processed_dates", value=[sale_date])
+        return result
+    result = run_lookback_order_cross_analysis(days=LOOKBACK_DAYS, allow_publish=True)
+    context["ti"].xcom_push(key="processed_dates", value=json.loads(result)["dates"])
+    return result
 
 
 def backup_onedrive(**context) -> str:
@@ -99,22 +113,18 @@ def backup_onedrive(**context) -> str:
 
 
 def validate_cross(**context) -> str:
-    conf = _conf(context)
-    if _truthy(conf.get("backfill")):
-        return "backfill=true - 일별 validate 스킵"
-
-    sale_date = context["ti"].xcom_pull(task_ids="resolve_date", key="sale_date")
-    if sale_date:
-        return validate_order_cross(sale_date)
-    if LOOKBACK_DAYS is None:
-        return "LOOKBACK_DAYS=None - 전체 재생성 validate 스킵"
-
-    kst_now = datetime.now(ZoneInfo("Asia/Seoul"))
+    dates = context["ti"].xcom_pull(task_ids="build_cross", key="processed_dates")
+    if dates is None:
+        raise ValueError("검증 대상 날짜 기록 누락")
     results = []
-    for i in range(1, LOOKBACK_DAYS + 1):
-        date_str = (kst_now - timedelta(days=i)).strftime("%Y-%m-%d")
-        results.append(validate_order_cross(date_str))
-    return " | ".join(results)
+    for date in dates:
+        try:
+            results.append(validate_order_cross(date))
+        except StaleCrossInputError as exc:
+            raise AirflowSkipException(
+                f"{date}: {exc} - 동시 갱신으로 인한 대기, 다음 실행에서 재검증"
+            ) from exc
+    return " | ".join(results) or "입력 변경 없음: 재계산 대상 0일"
 
 
 with DAG(

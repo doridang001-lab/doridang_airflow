@@ -73,6 +73,98 @@ def test_retry_result_overlays_root_mismatch_and_sends_terminal_counts():
     assert "매장B:" in message
 
 
+def test_retry_result_removes_stale_missing_partitions_from_final_message():
+    context = _notification_context()
+    context["orders"] = {"total": 44, "matched": 15, "mismatched": 29, "unknown": 0}
+    context["toorder"] = {
+        "compared": 24,
+        "store_results": {
+            "강동점": {
+                "baemin": 0,
+                "toorder": 488200,
+                "matched": False,
+                "brand_issue": "missing_partition",
+            },
+            "김해구산점": {
+                "baemin": 150000,
+                "toorder": 145500,
+                "matched": False,
+                "brand_issue": "suspect_no_data",
+            },
+        },
+        "mismatched_stores": ["강동점", "김해구산점"],
+        "gap_stores": [],
+        "missing_brand_stores": ["강동점"],
+    }
+    final_toorder = {
+        "compared_count": 2,
+        "store_results": {
+            "강동점": {"baemin": 488200, "toorder": 488200, "matched": True},
+            "김해구산점": {
+                "baemin": 150000,
+                "toorder": 145500,
+                "matched": False,
+                "brand_issue": "suspect_no_data",
+            },
+        },
+        "mismatched_stores": ["김해구산점"],
+        "toorder_gap_stores": [],
+        "missing_brand_stores": [],
+    }
+
+    message = upload.build_final_notification_message(
+        context,
+        final_toorder_result=final_toorder,
+        final_ad_funnel_result={"still_empty": []},
+        residual_failed={"accounts": [], "stores": [], "orders": [], "ads": [], "stages": []},
+        attempt=3,
+        max_attempts=3,
+    )
+
+    assert message.startswith("[배민 최종 결과] 부분완료")
+    assert "ToOrder 비교 24 / 일치 23 / 불일치 1" in message
+    assert "강동점:" not in message
+    assert "김해구산점: 배민=150,000 / ToOrder=145,500 / diff=-4,500 / suspect_no_data" in message
+
+
+def test_clean_retry_result_can_complete_despite_initial_orders_mismatch():
+    context = _notification_context()
+    context["ingest_stats"] = {"folders": 2, "cleaned": 2, "skipped": 0, "failed": 0}
+    context["orders"] = {"total": 44, "matched": 15, "mismatched": 29, "unknown": 0}
+    context["toorder"] = {
+        "compared": 1,
+        "store_results": {
+            "강동점": {
+                "baemin": 0,
+                "toorder": 488200,
+                "matched": False,
+                "brand_issue": "missing_partition",
+            }
+        },
+        "mismatched_stores": ["강동점"],
+        "gap_stores": [],
+        "missing_brand_stores": ["강동점"],
+    }
+
+    message = upload.build_final_notification_message(
+        context,
+        final_toorder_result={
+            "compared_count": 1,
+            "store_results": {"강동점": {"baemin": 488200, "toorder": 488200, "matched": True}},
+            "mismatched_stores": [],
+            "toorder_gap_stores": [],
+            "missing_brand_stores": [],
+        },
+        final_ad_funnel_result={"still_empty": []},
+        residual_failed={"accounts": [], "stores": [], "orders": [], "ads": [], "stages": []},
+        attempt=1,
+        max_attempts=3,
+    )
+
+    assert message.startswith("[배민 최종 결과] 완료")
+    assert "[재수집 필요]" not in message
+
+
 class _FakeTelegramResponse:
     def __enter__(self):
         return self
@@ -262,6 +354,7 @@ def test_no_telegram_failure_callback_keeps_email_and_heal_queue(monkeypatch):
 
 
 class _RetryTI:
+    dag_id = "DB_Beamin_Macro_Dags_Retry"
     def __init__(self, values):
         self.values = values
 
@@ -451,6 +544,57 @@ def test_intermediate_retry_carries_residual_stages_to_next_conf(monkeypatch):
     assert triggered[0]["conf"]["failed_stages"] == [
         {"account_id": "acct-1", "store": {"store_id": "s1"}, "stage": "운영시간 수집"}
     ]
+
+
+def test_retry_notify_task_is_final_leaf_after_cleanup():
+    cleanup = retry_dag.dag.get_task("cleanup_manual_baemin_orders")
+    notify = retry_dag.dag.get_task("notify_and_trigger_next")
+
+    assert cleanup.downstream_task_ids == {"notify_and_trigger_next"}
+    assert notify.downstream_task_ids == set()
+
+
+def test_append_residual_skips_exhausted_store_history():
+    next_conf = {
+        "failed_account_ids": [],
+        "failed_accounts_ids_only": [],
+        "failed_stores": [],
+        "failed_orders": [],
+        "failed_ads": [],
+        "failed_stages": [],
+        "retry_history": {"acct-1::s1": 3},
+    }
+    residual = {
+        "accounts": [],
+        "stores": [
+            {"account": {"account_id": "acct-1"}, "store": {"store_id": "s1", "store": "매장A"}}
+        ],
+        "orders": [
+            {"account": {"account_id": "acct-1"}, "stores": [{"store_id": "s1", "store": "매장A"}]}
+        ],
+        "ads": [
+            {"account": {"account_id": "acct-1"}, "stores": [{"store_id": "s1", "store": "매장A"}]}
+        ],
+        "stages": [
+            {
+                "account": {"account_id": "acct-1"},
+                "store": {"store_id": "s1", "store": "매장A"},
+                "stage": "orders",
+            }
+        ],
+    }
+
+    retry_dag._append_residual_to_next_conf(
+        next_conf,
+        residual,
+        retry_history=next_conf["retry_history"],
+    )
+
+    assert next_conf["failed_account_ids"] == []
+    assert next_conf["failed_stores"] == []
+    assert next_conf["failed_orders"] == []
+    assert next_conf["failed_ads"] == []
+    assert next_conf["failed_stages"] == []
 
 
 def test_terminal_retry_sends_exactly_one_final_telegram(monkeypatch):

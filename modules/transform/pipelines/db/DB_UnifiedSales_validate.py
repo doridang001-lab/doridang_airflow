@@ -11,6 +11,7 @@ unified_sales 일별/월별 검증 파이프라인.
    (올해 데이터가 있는 모든 ym에 대해 생성, 알림은 어제 기준 달만)
 """
 
+from modules.transform.utility.process_lock import unified_writer
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1157,6 +1158,7 @@ def _status(v: int) -> str:
     return "5천 초과"
 
 
+@unified_writer
 def build_daily_summary() -> str:
     """unified_sales parquet → 일별×store×brand×order_type×platform 집계 parquet.
 

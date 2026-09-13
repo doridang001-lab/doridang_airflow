@@ -38,7 +38,8 @@
 | author_name, author_id | 작성자 |
 | content_text, content_hash | `outContent` 원문과 해시 |
 | post_type | `방문일지`, `매장정보`, `업무`, `기타` |
-| task_nm, task_status, progress, worker, start_dt, end_dt | 업무형 게시글 정보 |
+| task_nm, task_status, progress, worker, start_dt, end_dt | 업무형 게시글 정보. `worker`는 쉼표 구분 다중값 |
+| task_status | Flow 사용자가 프로젝트마다 직접 만드는 자유 라벨이라 고정 열거가 아니다. 분류는 `modules/transform/utility/flow_task_status.py` 참조 — 진행 업무: `진행`,`대기`,`보류`,`피드백`,`보완` / 종료: `완료` / **관찰만**(집계 제외, 기한은 감시): `모니터링` / **묶음·기록**(집계·기한 모두 제외): `업무단위`,`회의록`,`액션`. 모르는 값은 열린 업무로 본다 |
 | remark_cnt, child_cnt, image_cnt, attach_cnt | 댓글/자식/첨부 개수 |
 | post_url, collected_at | Flow 링크와 수집 시각 |
 

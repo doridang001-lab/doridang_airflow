@@ -558,6 +558,19 @@ def _iter_child_tasks(data: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
                 yield task
 
 
+_TRAILING_PAREN_RE = re.compile(r"\s*\([^()]*\)\s*$")
+
+
+def _strip_trailing_parens(value: str) -> str:
+    """끝에 연속으로 붙은 괄호 접미사(예: "평택비전점(양수)", "시흥장현점(양수)(68호점)")를 전부 제거한다."""
+    text = value or ""
+    while True:
+        stripped = _TRAILING_PAREN_RE.sub("", text)
+        if stripped == text:
+            return text.strip()
+        text = stripped
+
+
 def _infer_project_parts(project_name: str) -> Tuple[bool, str, str, str]:
     name = _clean_nbsp(project_name)
     status_tag = ""
@@ -583,7 +596,7 @@ def _infer_project_parts(project_name: str) -> Tuple[bool, str, str, str]:
     )
     store_like = bool(store_name) and (store_name.endswith("점") or bool(region))
     is_store = bool(store_like and not is_non_store)
-    return is_store, region.strip(), store_name.strip(), status_tag
+    return is_store, region.strip(), _strip_trailing_parens(store_name.strip()), status_tag
 
 
 def _normalize_project(project: Dict[str, Any], collected_at: str) -> Dict[str, Any]:

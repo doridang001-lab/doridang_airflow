@@ -14,6 +14,7 @@ unified_sales - 홀용 시각화 전용 누적 테이블 생성/갱신.
 
 from __future__ import annotations
 
+from modules.transform.utility.process_lock import unified_writer
 import logging
 from datetime import datetime
 
@@ -84,6 +85,7 @@ def _aggregate_one_day(date_str: str) -> pd.DataFrame:
     return agg.reindex(columns=HALL_VIZ_COLUMNS, fill_value=0)
 
 
+@unified_writer
 def _upsert_rows(new_rows: pd.DataFrame) -> int:
     if new_rows is None or new_rows.empty:
         return 0

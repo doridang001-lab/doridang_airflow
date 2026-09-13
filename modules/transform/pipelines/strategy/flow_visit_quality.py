@@ -9,7 +9,7 @@ from typing import Any
 
 import pandas as pd
 
-from modules.transform.utility.paths import FLOW_VISIT_ISSUE_PARQUET, FLOW_VISIT_VIZ_PARQUET
+from modules.transform.utility.paths import FLOW_VISIT_ISSUE_PARQUET, FLOW_VISIT_VIZ_PARQUET, FLOW_VISIT_LOG_PARQUET
 
 QUALITY_CASES_PATH = Path(__file__).with_name("flow_visit_quality_cases.jsonl")
 DISPLAY_REQUIRED_COLS = ("owner_voice", "sv_action")
@@ -40,6 +40,7 @@ def _read_outputs(issue_path: Path = FLOW_VISIT_ISSUE_PARQUET) -> pd.DataFrame:
 def evaluate_visit_quality(
     issue_df: pd.DataFrame | None = None,
     cases: list[dict[str, Any]] | None = None,
+    visit_df: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     df = issue_df.copy() if issue_df is not None else _read_outputs()
     case_rows = cases or load_quality_cases()
@@ -49,6 +50,14 @@ def evaluate_visit_quality(
         raise RuntimeError("품질 평가에는 post_id, issue_key 컬럼이 필요합니다.")
 
     df["post_id"] = df["post_id"].astype(str)
+    if visit_df is None and issue_df is None and FLOW_VISIT_LOG_PARQUET.exists():
+        visit_df = pd.read_parquet(FLOW_VISIT_LOG_PARQUET)
+    empty_post_ids = []
+    if visit_df is not None and {"post_id", "content_clean"}.issubset(visit_df.columns):
+        empty = visit_df["content_clean"].fillna("").astype(str).str.strip().eq("")
+        empty_post_ids = sorted(set(visit_df.loc[empty, "post_id"].astype(str)))
+    categories = {"매출/광고/수익", "물류/사입", "정책", "기타"}
+    invalid_category_count = int((~df["category"].isin(categories)).sum()) if "category" in df else len(df)
     rows = []
     for case in case_rows:
         post_id = _as_text(case.get("post_id"))
@@ -109,6 +118,9 @@ def evaluate_visit_quality(
         "weak_evidence_count": weak_evidence_count,
         "weak_evidence_rows": weak_evidence_rows,
         "display_blank_counts": display_blank_counts,
+        "empty_post_ids": empty_post_ids,
+        "empty_post_count": len(empty_post_ids),
+        "invalid_category_count": invalid_category_count,
     }
     return result, summary
 
@@ -123,6 +135,8 @@ def quality_report_markdown(
         "",
         f"- 기준 글 수: {summary['case_cnt']}",
         f"- 추출 이슈 수: {summary['issue_cnt']}",
+        f"- 본문 누락(상세 재수집 필요): {', '.join(summary['empty_post_ids']) or '없음'}",
+        f"- 분류 공백/허용값 오류: {summary['invalid_category_count']}",
         f"- 기대 이슈 평균 회수율: {summary['avg_recall']:.1%}",
         f"- 완전 회수 글 수: {summary['perfect_case_cnt']}/{summary['case_cnt']}",
         f"- 누락 이슈 수: {summary['missing_total']}",

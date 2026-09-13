@@ -7,12 +7,12 @@ import re
 from typing import Any
 
 GPT_OSS_MODELS = ["gpt-oss:20b", "gpt-oss:latest", "gpt-oss"]
-PROMPT_VERSION = "flow_visit_v16_profile_brief_copy"
+PROMPT_VERSION = "flow_visit_v17_category_boundary"
 # 이슈 분류/요약 프롬프트 전용 버전. 이슈 단위 LLM 캐시 키에 들어가므로
 # build_issue_prompt / build_summary_prompt를 실제로 바꿀 때만 올린다.
 # PROMPT_VERSION과 같이 올리면 전체 이슈 분류 캐시가 날아가 재분류가 강제되고,
 # LLM_MAX_SEGMENTS 상한에 걸려 fallback 비율 가드가 터진다.
-ISSUE_PROMPT_VERSION = "flow_visit_v17_topic_anchored"
+ISSUE_PROMPT_VERSION = "flow_visit_v19_owner_evidence"
 # 요약 결과 최대 길이. 표의 "핵심 요약" 칸에 그대로 들어간다.
 SUMMARY_MAX_CHARS = 60
 # 다음 확인 사항 최대 길이. 표의 "남은 확인" 칸에 들어간다.
@@ -206,9 +206,9 @@ def build_issue_prompt(
     negatives = "\n".join(f"- {line}" for line in NEGATIVE_GUIDES.get(store_name, [])) or "- 없음"
     evidence = _short(
         " ".join([
-            _as_text(segment.get("topic")),
-            _as_text(segment.get("sv_action_raw")),
-            _as_text(segment.get("owner_voice_raw") or segment.get("raw_text")),
+            "주제: " + _as_text(segment.get("topic")),
+            "점주 의견: " + _as_text(segment.get("owner_voice_raw") or segment.get("raw_text")),
+            "본사 안내: " + _as_text(segment.get("sv_action_raw")),
         ]),
         1200,
     )
@@ -222,7 +222,22 @@ Do not explain. Do not reason. Start with {{ and end with }}.
 {negatives}
 - 발췌가 제목/목차 수준(예: "홀관련", "매장현황", "계육")이고 구체 불만/요청/조치/수치가 없으면 issue_key는 반드시 "기타"다.
 - issue_key는 아래 후보 중 원문 발췌에 직접 근거가 있는 값만 고른다. 매장 힌트만으로 고르지 않는다.
+- 점주가 구체적인 의견을 냈다면 그 의견과 주제에 맞는 issue_key를 고른다. 공통 안내의 예시·질문에만 나온 단어로 점주에게 없는 불만을 만들지 않는다. 맞는 후보가 없으면 기타로 둔다.
 - 본사 댓글은 같은 글의 보조 근거일 뿐이며, 발췌와 연결되는 표현이 없으면 분류 근거로 쓰지 않는다.
+- 방문일지 구조를 헷갈리지 마라.
+  전달내용은 본사 전달·공지·요청, 가맹점의견은 점주 의견·반응, 답변사항은 본사 후속 회신이다.
+  이 셋을 한 칸에 섞지 말고, 각 문구의 주어와 역할을 먼저 구분한다.
+- category는 반드시 "정책", "매출/광고/수익", "물류/사입", "기타" 중 하나다.
+- 제목 키워드가 아니라 발췌의 최종 목적과 행동으로 category를 판단한다.
+- 첫째, 가맹점에 반복 적용할 수 있는 기준, 조건, 예외, 권한, 책임, 비용, 보상, 지원, 의무, 승인 절차, 공지 기준, 적용 기간 또는 종료 조건을 새로 정하거나 바꾸면 category="정책"이다.
+- 특정 가맹점 한 곳의 요청이라도 기존에 없는 예외 승인, 비용/지원금 결정, 계약/의무/책임 판단, 점주 동의/약정서 필요, 다른 매장 선례가 있으면 category="정책"이다.
+- 예: "동탄영천점에서 홀 메뉴 판매를 허용할까?"는 특정 매장명이 있어도 홀 판매 허용 기준/예외를 정하는 일이므로 category="정책"이다.
+- 둘째, 상품/식자재/원부자재/포장재의 구매, 발주, 입고, 배송, 재고, 품절, 불량, 오배송, 반품, 교환, 회수, 공급업체 확인을 실제 처리하면 category="물류/사입"이다.
+- 단, 지정 품목, 외부 사입 허용 조건, 반품/보상 기준, 물류 지원 대상/금액/조건을 새로 정하면 category="정책"이다.
+- 셋째, 매출, 주문, 판매량, 고객 유입, 광고, 배달 플랫폼, 쿠폰, 프로모션, 노출, 클릭, 전환율, 원가율, 마진, 수익률, 손익을 분석하거나 개선하면 category="매출/광고/수익"이다.
+- 단, 광고비 분담, 할인 비용 분담, 지원 대상, 참여 조건, 적용 기간, 중단 기준을 새로 정하면 category="정책"이다.
+- 그 외 단순 전달, 기록, 정보 수집, 일정 조율, 일반 상담, 교육, 시스템 입력, 기존 기준에 따른 등록/설정/확인/회신은 category="기타"다.
+- 문서에 "정책", "광고", "물류", "가맹점"이라는 단어가 있다는 이유만으로 category를 고르지 않는다.
 
 [발췌]
 매장: {store_name}
@@ -238,7 +253,7 @@ Do not explain. Do not reason. Start with {{ and end with }}.
 [severity] 높음=안전/법적/매출 직접 타격, 보통=운영/품질/광고 개선, 낮음=단순 문의
 
 [출력 JSON 스키마]
-{{"issue_key":"", "severity":"보통", "status":"미해결", "is_request":false}}
+{{"issue_key":"", "category":"기타", "severity":"보통", "status":"미해결", "is_request":false}}
 """
 
 
@@ -268,6 +283,8 @@ rules:
 - 모든 값은 한국어다.
 - **모든 값은 위 topic에 대한 것이어야 한다.** 원문 한 문단에 다른 주제가 섞여 있어도
   topic과 무관한 내용은 쓰지 않는다. topic이 "토더 공지"인데 순이익 이야기를 쓰면 안 된다.
+- 방문일지 구조를 헷갈리지 마라. 전달내용은 본사 전달·공지·요청, 가맹점의견은 점주 의견·반응,
+  답변사항은 본사 후속 회신이다. owner_summary에는 점주 의견만, sv_summary에는 담당자 조치만 쓴다.
 - owner_summary: 점주 발언의 요지를 {SUMMARY_MAX_CHARS}자 이내 한 문장으로 쓴다. 원문이 "없음"이면 "".
 - sv_summary: 담당자가 실제로 한 조치를 {SUMMARY_MAX_CHARS}자 이내 한 문장으로 쓴다. 원문이 "없음"이면 "".
 - issue_label: 12자 이내 한국어 명사구. 문장 종결어미를 쓰지 않는다.
@@ -303,7 +320,9 @@ def build_profile_prompt(history_digest: dict[str, Any]) -> tuple[str, str]:
         prompt = (
             "JSON만 출력. 설명 금지.\n"
             "의도: 담당자가 인수인계 없이도 현재 점주 상태, 최근 화두, 현재 고민, 다음 대응을 바로 이해하게 만든다. "
-            "사람이 별도 작성한 평가가 아니라 방문 히스토리에서 자동으로 뽑는다.\n"
+            "사람이 별도 작성한 평가가 아니라 방문 히스토리에서 자동으로 뽑는다. "
+            "방문일지 구조에서 전달내용은 본사 전달·공지·요청, 가맹점의견은 점주 의견·반응, 답변사항은 본사 후속 회신이다. "
+            "세 역할을 섞지 말고 각 칸의 의미를 그대로 유지한다.\n"
             "스키마={"
             "\"owner_status\":\"현재 점주 상태 문장\","
             "\"store_status_summary\":[\"전기간 누적 특징·성향 최대3\"],"
@@ -331,7 +350,7 @@ def build_profile_prompt(history_digest: dict[str, Any]) -> tuple[str, str]:
             "점수·등급·N/10 표현은 쓰지 말고, 근거가 약하면 단정하지 않는다. "
             "후보는 참고 자료이며 같은 근거 안에서 업무적으로 읽히는 표현으로 다듬어도 된다.\n"
             "데이터="
-            + json.dumps(history_digest, ensure_ascii=False)
+            + json.dumps(history_digest, ensure_ascii=False, separators=(",", ":"))
         )
         return prompt, system_prompt
 

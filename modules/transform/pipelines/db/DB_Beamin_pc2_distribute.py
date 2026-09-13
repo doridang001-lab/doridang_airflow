@@ -380,6 +380,8 @@ def _distribute_one_file(folder: Path, src_file: Path) -> tuple[str, int, Path]:
             combined = _upsert_orders(dst_stem, new_df)
         else:
             combined = new_df
+    elif subtype == "metrics_now":
+        combined = _upsert_metrics_now(dst_stem, new_df)
     elif subtype in CSV_UPSERT_KEYS:
         combined = _upsert_by_key(dst_stem, new_df, CSV_UPSERT_KEYS[subtype])
     else:
@@ -409,6 +411,33 @@ def _write_csv_table(df: pd.DataFrame, stem_path: Path) -> Path:
 
 def _upsert_orders(dst_stem: Path, new_df: pd.DataFrame) -> pd.DataFrame:
     return _upsert_by_key(dst_stem, new_df, ORDER_KEY)
+
+
+def _upsert_metrics_now(dst_stem: Path, new_df: pd.DataFrame) -> pd.DataFrame:
+    from modules.transform.pipelines.db.DB_BaeminManual_load import (
+        normalize_baemin_now_schema,
+    )
+
+    normalized_new = normalize_baemin_now_schema(new_df)
+    existing = read_table(dst_stem)
+    if existing is None or existing.empty:
+        return normalized_new
+
+    normalized_existing = normalize_baemin_now_schema(existing)
+    if "date" not in normalized_new.columns or "date" not in normalized_existing.columns:
+        return normalize_baemin_now_schema(
+            pd.concat([normalized_existing, normalized_new], ignore_index=True)
+        )
+
+    new_dates = set(normalized_new["date"].fillna("").astype(str).str.strip())
+    new_dates.discard("")
+    if new_dates:
+        normalized_existing = normalized_existing[
+            ~normalized_existing["date"].fillna("").astype(str).str.strip().isin(new_dates)
+        ]
+    return normalize_baemin_now_schema(
+        pd.concat([normalized_existing, normalized_new], ignore_index=True)
+    )
 
 
 def _upsert_by_key(dst_stem: Path, new_df: pd.DataFrame, key: str) -> pd.DataFrame:

@@ -7,6 +7,7 @@ unified_sales 채널별 파이프라인 공통 모듈.
 - 기존 parquet 재저장/재분류 유틸
 """
 
+from modules.transform.utility.process_lock import unified_writer
 import logging
 import hashlib
 import json
@@ -708,13 +709,12 @@ ADD_TEST_STORES = [ "삼송점", # 쿠팡거절
                    "대전장대점", # 08-13
                    "대전둔산점", 
                    "기흥테라타워점", "천안성정점" , "교대점", "서울대입구역점", "광명철산점", "부산서면점", # 참여매장
-                   "미사점", "양주옥정점", "수유점"
-
+                   "미사점", "양주옥정점", "수유점", "송파점","익산영등점", "화성봉담점",
 ]
 
 # 기본 실행 범위는 유지하고, 지정 매장만 전체기간 추가 재계산하는 임시 운영 목록.
 # 복구 완료 후 비운다.
-FULL_RECALC_STORES = [
+FULL_RECALC_STORES = [ "익산영등점","화성봉담점",
 ]
 
 # 제외시 사용
@@ -1133,7 +1133,14 @@ def _make_unified_pk(df: pd.DataFrame) -> pd.Series:
     return key.map(lambda s: hashlib.md5(s.encode()).hexdigest())
 
 
-def _save_unified_daily(
+@unified_writer
+def _save_unified_daily(df, date_str, overwrite=False, replace_stores=None):
+    from modules.transform.utility.process_lock import locked_partition
+    with locked_partition("unified_daily:" + str(date_str)):
+        return _save_unified_daily_unlocked(df, date_str, overwrite, replace_stores)
+
+
+def _save_unified_daily_unlocked(
     df: pd.DataFrame,
     date_str: str,
     overwrite: bool = False,
@@ -1378,6 +1385,7 @@ def resave_existing_unified_sales() -> str:
     return result
 
 
+@unified_writer
 def normalize_existing_unified_platforms(
     *,
     apply: bool = False,
@@ -1590,6 +1598,7 @@ def filter_manual_delivery_sources_for_non_test_stores(
     return out[~remove_mask].reset_index(drop=True)
 
 
+@unified_writer
 def enforce_manual_delivery_sources_for_test_stores(
     stores: list[str] | None = None,
 ) -> str:
@@ -1635,6 +1644,7 @@ def enforce_manual_delivery_sources_for_test_stores(
     return result
 
 
+@unified_writer
 def purge_manual_delivery_sources_for_non_test_stores(
     stores: list[str] | None = None,
 ) -> str:
@@ -1680,6 +1690,7 @@ def purge_manual_delivery_sources_for_non_test_stores(
     return result
 
 
+@unified_writer
 def refresh_store_meta_in_unified_sales() -> str:
     """현재 sales_employee.csv 기준으로 unified_sales 매장 메타를 일괄 갱신."""
     files = iter_unified_sales_files()
@@ -1732,6 +1743,7 @@ def refresh_store_meta_in_unified_sales() -> str:
     return result
 
 
+@unified_writer
 def purge_source_from_unified_sales(source: str = "toorder") -> str:
     """Remove all rows of target source from all unified_sales parquet files."""
     src = str(source).strip().lower()

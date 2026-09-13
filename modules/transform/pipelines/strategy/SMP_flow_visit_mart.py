@@ -14,6 +14,7 @@ from typing import Any
 import pandas as pd
 
 from modules.transform.pipelines.strategy.SMP_flow_store_collect import (
+    _strip_trailing_parens,
     _write_parquet_atomic,
     _write_project_partitions,
 )
@@ -68,7 +69,7 @@ PROFILE_LLM_PROVIDER = (os.getenv("FLOW_VISIT_PROFILE_PROVIDER", "off") or "off"
 PROFILE_OPENAI_MODEL = os.getenv("FLOW_VISIT_PROFILE_OPENAI_MODEL", "gpt-5-mini")
 PROFILE_LOCAL_MAX_PROMPT_CHARS = _env_int("FLOW_VISIT_PROFILE_LOCAL_MAX_PROMPT_CHARS", 6000)
 
-CATEGORY_ORDER = ["매출", "광고", "사입", "가맹점의견", "미분류"]
+CATEGORY_ORDER = ["정책", "매출/광고/수익", "물류/사입", "기타"]
 VALID_CATEGORIES = set(CATEGORY_ORDER)
 VALID_SENTIMENT = {"긍정", "중립", "부정", "불만"}
 VALID_SEVERITY = {"높음", "보통", "낮음"}
@@ -223,8 +224,7 @@ def _as_text(value: Any) -> str:
 
 def _store_key(store_name: Any) -> str:
     value = re.sub(r"\s+", "", _as_text(store_name))
-    value = re.sub(r"\([^)]*\)$", "", value)
-    return value
+    return _strip_trailing_parens(value)
 
 
 def _rel_key(*parts: Any) -> str | None:
@@ -1716,7 +1716,7 @@ def _profile_stats(posts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], d
     counts = {category: 0 for category in CATEGORY_ORDER}
     recurring: dict[str, dict[str, Any]] = {}
     for issue in issues:
-        category = issue.get("category") if issue.get("category") in VALID_CATEGORIES else "미분류"
+        category = issue.get("category") if issue.get("category") in VALID_CATEGORIES else "기타"
         counts[category] = counts.get(category, 0) + 1
         key = issue.get("issue_key") or "기타"
         item = recurring.setdefault(key, {
@@ -1857,7 +1857,7 @@ def _iter_flow_visit_target_rows(value: Any) -> list[dict[str, Any]]:
 
 def _normalize_target_store_name(value: Any) -> str:
     text = re.sub(r"\s+", "", _as_text(value))
-    text = re.sub(r"\([^)]*\)$", "", text)
+    text = _strip_trailing_parens(text)
     if text.startswith("도리당"):
         text = text[len("도리당"):]
     return text
@@ -1871,6 +1871,11 @@ def _flow_visit_target_request(context: dict[str, Any] | None) -> dict[str, Any]
     source_targets = context.get("flow_visit_targets") if context else None
     source_project_ids = context.get("flow_visit_project_ids") if context else None
     source_store_names = context.get("flow_visit_store_names") if context else None
+    # 명시적인 실행 대상은 DAG의 기본 목록을 대체한다.
+    if any(conf.get(key) for key in ("flow_visit_targets", "flow_visit_project_ids", "flow_visit_store_names")):
+        source_targets = conf.get("flow_visit_targets")
+        source_project_ids = conf.get("flow_visit_project_ids")
+        source_store_names = conf.get("flow_visit_store_names")
     if not source_targets:
         source_targets = conf.get("flow_visit_targets")
     if not source_project_ids:
@@ -1878,9 +1883,14 @@ def _flow_visit_target_request(context: dict[str, Any] | None) -> dict[str, Any]
     if not source_store_names:
         source_store_names = conf.get("flow_visit_store_names")
 
+    store_name_by_id: dict[str, str] = {}
     for row in _iter_flow_visit_target_rows(source_targets):
-        project_ids.update(_split_conf_values(row.get("project_id") or row.get("projectId")))
-        store_names.update(_split_conf_values(row.get("store_name") or row.get("storeName") or row.get("name")))
+        row_project_ids = _split_conf_values(row.get("project_id") or row.get("projectId"))
+        row_store_names = _split_conf_values(row.get("store_name") or row.get("storeName") or row.get("name"))
+        project_ids.update(row_project_ids)
+        store_names.update(row_store_names)
+        if len(row_project_ids) == 1 and len(row_store_names) == 1:
+            store_name_by_id[next(iter(row_project_ids))] = next(iter(row_store_names))
 
     project_ids.update(_split_conf_values(source_project_ids))
     store_names.update(_split_conf_values(source_store_names))
@@ -1891,6 +1901,7 @@ def _flow_visit_target_request(context: dict[str, Any] | None) -> dict[str, Any]
         "store_names": store_names,
         "explicit": bool(project_ids or store_names),
         "labels": labels,
+        "store_name_by_id": store_name_by_id,
     }
 
 
@@ -2040,11 +2051,19 @@ def extract_visit_logs(**context) -> dict[str, Any]:
     visit_mask = title_norm.str.contains("방문일지", regex=False, na=False) | body.str.contains(r"방문\s*일자", regex=True, na=False)
     visit_posts = post[visit_mask].copy()
     missing_visit_project_ids = target_ids - set(visit_posts["project_id"].dropna().astype(str))
-    if missing_visit_project_ids and target_request["explicit"]:
-        raise RuntimeError(
-            "Flow 방문일지 대상 프로젝트 방문일지 누락: "
-            f"{', '.join(sorted(missing_visit_project_ids))}. "
-            f"요청 대상={target_labels or sorted(target_ids)}."
+    if missing_visit_project_ids:
+        # 오픈 준비 중인 신규 매장은 raw 게시글은 있어도 방문일지가 아직 0건일 수 있다.
+        # 대상 목록에 이런 매장이 섞이는 건 정상 운영이므로 실패가 아니라 경고로 남기고 진행한다.
+        store_name_by_id = target_request.get("store_name_by_id") or {}
+        missing_labels = [
+            f"{store_name_by_id.get(project_id) or '?'}({project_id})"
+            for project_id in sorted(missing_visit_project_ids)
+        ]
+        logger.warning(
+            "Flow 방문일지 0건 매장 제외하고 진행: %s / 방문일지 있는 매장=%s/%s",
+            ", ".join(missing_labels),
+            len(target_ids) - len(missing_visit_project_ids),
+            len(target_ids),
         )
     if visit_posts.empty:
         fallback = _fallback_visit_payload_from_existing_mart(target_ids)
@@ -2125,7 +2144,11 @@ def _clean_content(text: Any) -> str:
     cleaned = cleaned.replace("\xa0", " ").replace("\u200b", " ")
     cleaned = re.sub(r"https://docs\.google\.com/\S+", "", cleaned)
     cleaned = re.sub(r"[=~_\-]{4,}", "\n", cleaned)
-    cleaned = re.sub(r"주제\s*[1-9]\s*(전달내용|내용)\s*(가맹점의견)?\s*(?=주제|\Z)", "", cleaned)
+    cleaned = re.sub(
+        r"주제\s*[1-9]\s*(전달내용|내용)\s*(가맹점의견|점주의견)?\s*(답변사항|담당자\s*최종\s*의견|담당자\s*의견)?\s*(?=주제|\Z)",
+        "",
+        cleaned,
+    )
     cleaned = re.sub(r"[ \t]{3,}", " ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
@@ -2243,18 +2266,28 @@ def _parse_topic_table(content: str) -> tuple[str | None, list[dict[str, str]] |
     rows: list[dict[str, str]] = []
     for match in re.finditer(r"주제\s*([1-8])(.*?)(?=주제\s*[1-8]|\Z)", content, re.S):
         block = match.group(2).strip()
-        split = re.match(r"^(.*?)(?:전달\s*내용|내용)(.*?)(?:가맹점\s*의견|점주\s*의견)(.*)$", block, re.S)
+        split = re.match(
+            r"^(.*?)(?:전달\s*내용|내용)(.*?)(?:가맹점\s*의견|점주\s*의견)(.*?)(?:답변\s*사항|담당자\s*최종\s*의견|담당자\s*의견)(.*)$",
+            block,
+            re.S,
+        )
         if split:
-            topic, message, owner = split.group(1), split.group(2), split.group(3)
+            topic, message, owner, answer = split.group(1), split.group(2), split.group(3), split.group(4)
         else:
-            topic, message, owner = block, "", ""
+            split = re.match(r"^(.*?)(?:전달\s*내용|내용)(.*?)(?:가맹점\s*의견|점주\s*의견)(.*)$", block, re.S)
+            if split:
+                topic, message, owner = split.group(1), split.group(2), split.group(3)
+                answer = ""
+            else:
+                topic, message, owner, answer = block, "", "", ""
         row = {
             "topic_no": match.group(1),
             "topic": re.sub(r"\s+", " ", topic).strip(),
             "message": re.sub(r"\s+", " ", message).strip(),
             "owner_opinion": re.sub(r"\s+", " ", owner).strip(),
+            "answer_note": re.sub(r"\s+", " ", answer).strip(),
         }
-        if row["message"] or row["owner_opinion"]:
+        if row["message"] or row["owner_opinion"] or row["answer_note"]:
             rows.append(row)
     return purpose, rows or None
 
@@ -2497,6 +2530,8 @@ def _segment_has_issue_signal(segment: dict[str, Any], issue_candidates: list[di
     raw_stripped = re.sub(r"^\d+[.)]?", "", raw_compact)
     if raw_stripped in generic_headings or topic_compact in generic_headings:
         return False
+    if _has_policy_boundary(text):
+        return True
     for issue in issue_candidates:
         if issue.get("key") == "기타":
             continue
@@ -2515,6 +2550,109 @@ def _evidence_ok(evidence: str, content: str) -> bool:
     return bool(normalized_evidence and normalized_evidence in normalized_content)
 
 
+_SALES_AD_PROFIT_KEYS = {
+    "매출_홀부진",
+    "매출_배달정체",
+    "수익_감소체감",
+    "고정비_부담",
+    "상권_악화",
+    "매장이전_양도양수",
+    "운영_홀배달동시한계",
+    "광고_우가클단가",
+    "광고_즉시할인",
+    "광고_쿠팡노출률",
+    "광고_한그릇하나만",
+    "배달대행_배정지연",
+    "플랫폼_배달팁설정",
+}
+_LOGISTICS_PURCHASE_PREFIXES = (
+    "계육_",
+    "김치_",
+    "묵은지_",
+    "우거지_",
+    "소스_",
+    "대창_",
+    "파김치_",
+    "용기_",
+    "발주_",
+    "사입_",
+    "부자재_",
+    "유니폼_",
+    "리뷰이벤트_",
+)
+_POLICY_SUBJECT_RE = re.compile(
+    r"(기준|조건|예외|권한|책임|비용|보상|지원|지원금|의무|절차|승인|허용|가능\s*여부|"
+    r"적용|기간|종료|중단|약정서|동의|서명|계약|위반|사입\s*의심|지정\s*상품|대체품|"
+    r"가격\s*인상|가격\s*변경|판매\s*채널|판매\s*가능|홀\s*판매|참여\s*조건|대상\s*선정)"
+)
+_POLICY_SUPPORT_RE = re.compile(
+    r"(지원\s*(대상|가맹점|금액|조건|비율|범위|리스트)|"
+    r"(물류|사입|광고|할인)\s*지원|"
+    r"(보상|반품|교환|회수|패널티)\s*(기준|조건)|"
+    r"(계약|약정서|동의|서명|승인)\s*(필요|여부|절차)|"
+    r"(양도양수|사입\s*의심|계약\s*위반|예외\s*승인))"
+)
+_POLICY_DECISION_RE = re.compile(
+    r"(정하|정하겠|정하였|정했|변경|바꾸|개정|수립|결정|검토|판단|승인|허용|불가|가능한지|"
+    r"필요|요구|확대|적용|산출|선정|공지|설문|약정|동의|서명|분담|부담)"
+)
+_EXECUTION_ONLY_RE = re.compile(
+    r"(등록\s*처리|설정\s*처리|확인\s*완료|안내\s*완료|전달\s*완료|업로드|입력|일정\s*조율|"
+    r"자료\s*요청|정보\s*요청|담당자\s*연결|기존\s*기준|기준에\s*따라)"
+)
+_LOGISTICS_EXECUTION_RE = re.compile(
+    r"(발주|입고|배송|재고|품절|불량|오배송|반품|교환|공급업체|물량|식자재|원부자재|포장재|계육|소스|용기|"
+    r"(?:상품|제품|물품)\s*(?:을|를)?\s*회수)"
+)
+_SALES_AD_PROFIT_RE = re.compile(
+    r"(매출|매출현황|판매현황|판매\s*현황|주문현황|주문\s*현황|주문량|판매량|고객\s*유입|광고|배달\s*플랫폼|"
+    r"쿠폰|프로모션|노출|클릭|전환율|원가율|마진|수익률|손익|순이익|순수익)"
+)
+
+
+def _normalize_category(value: Any) -> str:
+    category = _as_text(value).strip()
+    return category if category in VALID_CATEGORIES else ""
+
+
+def _has_policy_boundary(text: str) -> bool:
+    value = re.sub(r"\s+", " ", _as_text(text)).strip()
+    if not value:
+        return False
+    if _EXECUTION_ONLY_RE.search(value) and not re.search(r"(예외|선례|새로|변경|확대|약정|동의|서명|전체|모든)", value):
+        return False
+    support = bool(_POLICY_SUPPORT_RE.search(value))
+    if support:
+        return True
+    # 다른 문장의 계약 현황과 육아 부담 등을 묶어 정책 결정으로 오인하지 않는다.
+    clauses = re.split(r"\n+|(?<=[.!?])\s+|\*\s*|ㄴ\s*", _as_text(text))
+    if any(_POLICY_SUBJECT_RE.search(clause) and _POLICY_DECISION_RE.search(clause)
+           for clause in clauses):
+        return True
+    return any(
+        re.search(r"(모든|전체|전\s*가맹점|타\s*가맹점|다른\s*가맹점|선례|공통)", clause)
+        and _POLICY_SUBJECT_RE.search(clause)
+        for clause in clauses
+    )
+
+
+def _infer_category(issue_key: Any, text: Any, proposed: Any = None) -> str:
+    evidence = _as_text(text)
+    proposed_category = _normalize_category(proposed)
+    if _has_policy_boundary(evidence):
+        return "정책"
+    if proposed_category == "정책":
+        return "정책"
+    if proposed_category in {"매출/광고/수익", "물류/사입"}:
+        return proposed_category
+    key = _as_text(issue_key)
+    if key in _SALES_AD_PROFIT_KEYS or _SALES_AD_PROFIT_RE.search(evidence):
+        return "매출/광고/수익"
+    if key.startswith(_LOGISTICS_PURCHASE_PREFIXES) or _LOGISTICS_EXECUTION_RE.search(evidence):
+        return "물류/사입"
+    return "기타"
+
+
 def _heuristic_extract(post: dict[str, Any], comments: list[dict[str, Any]]) -> dict[str, Any]:
     issue_by_key, issues = _issue_maps()
     text = f"{post.get('title') or ''}\n{post.get('content_clean') or ''}"
@@ -2527,8 +2665,9 @@ def _heuristic_extract(post: dict[str, Any], comments: list[dict[str, Any]]) -> 
         matched = next((alias for alias in aliases if alias and alias in text), None)
         if not matched:
             continue
+        evidence_text = _snippet_around(text, matched)
         found.append({
-            "category": issue["category"],
+            "category": _infer_category(key, evidence_text, issue.get("category")),
             "issue_key": key,
             "issue_label": key.replace("_", " "),
             "owner_voice": matched,
@@ -2537,12 +2676,12 @@ def _heuristic_extract(post: dict[str, Any], comments: list[dict[str, Any]]) -> 
             "is_request": any(token in text for token in ["요청", "문의", "건의", "필요"]),
             "severity": "보통",
             "status": "미해결",
-            "evidence": matched[:40],
+            "evidence": evidence_text[:40],
         })
     if not found and len(_as_text(post.get("content_clean"))) >= 80:
         snippet = re.sub(r"\s+", " ", _as_text(post.get("content_clean"))).strip()[:40]
         found.append({
-            "category": issue_by_key["기타"]["category"],
+            "category": _infer_category("기타", snippet, issue_by_key["기타"].get("category")),
             "issue_key": "기타",
             "issue_label": "방문일지 주요 내용",
             "owner_voice": snippet,
@@ -2577,9 +2716,22 @@ def _build_prompt(post: dict[str, Any], comments: list[dict[str, Any]]) -> str:
     topic_table = post.get("topic_table") or []
     hint = ""
     if topic_table:
-        hint = "\n[구조화 힌트]\n" + "\n".join(
-            f"{row.get('topic_no')}. {row.get('topic')} / 전달내용: {row.get('message')} / 가맹점의견: {row.get('owner_opinion')}"
-            for row in topic_table
+        hint_lines = []
+        for row in topic_table:
+            parts = [
+                f"{row.get('topic_no')}. {row.get('topic')}",
+                f"전달내용: {row.get('message')}",
+                f"가맹점의견: {row.get('owner_opinion')}",
+            ]
+            answer_note = _as_text(row.get("answer_note")).strip()
+            if answer_note:
+                parts.append(f"답변사항: {answer_note}")
+            hint_lines.append(" / ".join(parts))
+        hint = (
+            "\n[구조화 힌트]\n"
+            "전달내용은 본사 전달·공지·요청이고, 가맹점의견은 점주 의견·반응이며, 답변사항은 본사 후속 회신이다.\n"
+            "세 역할을 섞지 말고 항목별로 분리해서 읽는다.\n"
+            + "\n".join(hint_lines)
         )
     comment_text = "\n".join(f"{c.get('author_name')}: {c.get('content_text')}" for c in comments)
     return (
@@ -2609,8 +2761,16 @@ def _normalize_llm_result(result: dict[str, Any], post: dict[str, Any]) -> dict[
         if key not in issue_by_key:
             key = "기타"
         issue_meta = issue_by_key[key]
+        evidence_text = "\n".join([
+            _as_text(raw.get("issue_label")),
+            _as_text(raw.get("owner_voice")),
+            _as_text(raw.get("sv_action")),
+            _as_text(raw.get("evidence")),
+            _as_text(post.get("title")),
+            _as_text(post.get("content_clean")),
+        ])
         row = {
-            "category": issue_meta["category"],
+            "category": _infer_category(key, evidence_text, raw.get("category") or issue_meta.get("category")),
             "issue_key": key,
             "issue_label": _as_text(raw.get("issue_label")) or key.replace("_", " "),
             "owner_voice": _as_text(raw.get("owner_voice")),
@@ -2645,10 +2805,16 @@ def _fallback_segment_issue(post: dict[str, Any], segment: dict[str, Any], comme
     issue_by_key, _ = _issue_maps()
     meta = issue_by_key.get(key) or issue_by_key["기타"]
     owner_voice = _first_clause(segment.get("owner_voice_raw") or segment.get("raw_text"), 80)
+    evidence_text = "\n".join([
+        _as_text(segment.get("topic")),
+        _as_text(segment.get("raw_text")),
+        _as_text(segment.get("owner_voice_raw")),
+        _as_text(segment.get("sv_action_raw")),
+    ])
     return {
         "seg_id": segment.get("seg_id"),
         "source_kind": segment.get("source_kind"),
-        "category": meta.get("category", "미분류"),
+        "category": _infer_category(key, evidence_text, (rule_result or {}).get("category") or meta.get("category")),
         "issue_key": key,
         "issue_label": _issue_display_label(key, segment.get("topic")),
         "owner_voice": owner_voice,
@@ -2681,6 +2847,7 @@ def _normalize_segment_issue(
     ])
     key = _resolve_issue_key(class_result.get("issue_key"), evidence_text)
     meta = issue_by_key.get(key) or issue_by_key["기타"]
+    category = _infer_category(key, evidence_text, class_result.get("category") or meta.get("category"))
     # 3단 폴백: LLM이 쓴 요약 -> (구 캐시의) 문장 번호 선택 -> 원문 첫 절.
     # 구 pick 형식 캐시 엔트리와 호환을 유지한다.
     owner_summary = prompts.normalize_summary(summary_result.get("owner_summary"))
@@ -2711,7 +2878,7 @@ def _normalize_segment_issue(
     return {
         "seg_id": segment.get("seg_id"),
         "source_kind": segment.get("source_kind"),
-        "category": meta.get("category", "미분류"),
+        "category": category,
         "issue_key": key,
         "issue_label": label,
         "owner_voice": owner_summary,
@@ -2749,8 +2916,10 @@ def _recover_class_result(
         return None
     severity = next((value for value in VALID_SEVERITY if value in raw), "보통")
     status = next((value for value in VALID_STATUS if value in raw), _status_from_text(evidence))
+    category = next((value for value in CATEGORY_ORDER if value in raw), None)
     return {
         "issue_key": picked,
+        "category": _infer_category(picked, evidence, category),
         "severity": severity,
         "status": status if status in VALID_STATUS else "미해결",
         "is_request": any(token in evidence for token in ["요청", "문의", "건의", "희망", "필요", "개선"]),
@@ -2775,6 +2944,10 @@ def _rule_class_result(
         if key == "기타":
             continue
         aliases = [alias for alias in issue.get("aliases") or [] if alias]
+        # 표의 공통 안내문만으로 점주의 다른 의견을 덮지 않는다.
+        if owner_text and not prompts.is_empty_content(owner_text):
+            if not any(alias in topic_text or alias in owner_text for alias in aliases):
+                continue
         score = 0
         for alias in aliases:
             if alias in topic_text:
@@ -2792,6 +2965,7 @@ def _rule_class_result(
     if best:
         return {
             "issue_key": best[1],
+            "category": _infer_category(best[1], text),
             "severity": "높음" if any(token in text for token in ["부상", "보험", "이취", "법", "위반"]) else "보통",
             "status": _status_from_text(text),
             "is_request": any(token in text for token in ["요청", "문의", "건의", "희망", "필요", "개선"]),
@@ -2827,6 +3001,7 @@ def _supplement_post_issue_coverage(post: dict[str, Any], issues: list[dict[str,
     issue_by_key, taxonomy_issues = _issue_maps()
     content = _as_text(post.get("content_clean") or post.get("content_text"))
     supplemental: list[dict[str, Any]] = []
+    segments = flow_visit_segmenter.segment_post(post)
     for meta in taxonomy_issues:
         key = _as_text(meta.get("key"))
         if not key or key == "기타" or key in existing:
@@ -2841,17 +3016,22 @@ def _supplement_post_issue_coverage(post: dict[str, Any], issues: list[dict[str,
         if not usable_aliases:
             continue
         alias = sorted(usable_aliases, key=len, reverse=True)[0]
-        evidence = _snippet_around(content, alias)
+        matched_segment = next((segment for segment in segments
+                                if alias in _as_text(segment.get("raw_text"))
+                                and _rule_class_result(segment, [meta], [])), None)
+        if matched_segment is None:
+            continue
+        evidence = _snippet_around(_as_text(matched_segment.get("raw_text")), alias)
         supplemental.append({
             "seg_id": f"{post.get('post_id')}#coverage-{key}",
             "source_kind": "post_coverage",
-            "category": meta.get("category", "미분류"),
+            "category": _infer_category(key, evidence, meta.get("category")),
             "issue_key": key,
             "issue_label": _issue_display_label(key),
-            "owner_voice": _first_clause(evidence, 80),
-            "sv_action": "",
-            "owner_voice_raw": evidence,
-            "sv_action_raw": "",
+            "owner_voice": _first_clause(matched_segment.get("owner_voice_raw") or evidence, 80),
+            "sv_action": _first_clause(matched_segment.get("sv_action_raw"), 80),
+            "owner_voice_raw": _as_text(matched_segment.get("owner_voice_raw")) or evidence,
+            "sv_action_raw": _as_text(matched_segment.get("sv_action_raw")),
             "raw_text": evidence,
             "opinion_source": "점주직접" if re.search(r"(점주|가맹점|요청|문의|희망|답답|부담)", evidence) else "담당자판단",
             "is_request": any(token in evidence for token in ["요청", "문의", "건의", "희망", "필요", "개선"]),
@@ -3042,6 +3222,10 @@ def _build_store_status_summary(post: dict[str, Any], issues: list[dict[str, Any
 def llm_extract_issues(payload: dict[str, Any], **context) -> dict[str, Any]:
     comments = payload.get("comments") or []
     posts = payload.get("posts") or []
+    empty_posts = [_as_text(post.get("post_id")) for post in posts
+                   if not _as_text(post.get("content_clean") or post.get("content_text")).strip()]
+    if empty_posts:
+        raise RuntimeError("Flow 방문일지 본문 누락, 상세 재수집 필요: " + ", ".join(empty_posts))
     cache = _load_cache()
     cache_dirty = False
     client = None
@@ -3061,6 +3245,7 @@ def llm_extract_issues(payload: dict[str, Any], **context) -> dict[str, Any]:
     enriched_posts = []
     fallback_count = 0
     total_count = 0
+    classification_calls = 0
     summary_state = {"count": 0, "dirty": False}
     for post in posts:
         post_comments_all = _comments_for_post(comments, post.get("post_id"))
@@ -3082,8 +3267,9 @@ def llm_extract_issues(payload: dict[str, Any], **context) -> dict[str, Any]:
                 class_result = _rule_class_result(segment, candidates, [])
                 if class_result is not None:
                     model_name = "rule_storefit"
-            if class_result is None and client is not None and model_candidates and total_count <= LLM_MAX_SEGMENTS:
+            if class_result is None and client is not None and model_candidates and classification_calls < LLM_MAX_SEGMENTS:
                 if class_result is None:
+                    classification_calls += 1
                     class_result = _query_flow_json(
                         prompts.build_issue_prompt(_as_text(post.get("store_name")), segment, candidates, []),
                         system_prompt,
@@ -3722,6 +3908,17 @@ def export_llm_corpus(payload: dict[str, Any], **context) -> str:
                     "prompt_version": PROMPT_VERSION,
                 },
             })
+    target_ids = {_as_text(row.get("project_id"))
+                  for row in (payload.get("posts") or []) + (payload.get("profiles") or [])}
+    if FLOW_VISIT_CORPUS_JSONL.exists():
+        kept = []
+        with FLOW_VISIT_CORPUS_JSONL.open(encoding="utf-8") as existing:
+            for line in existing:
+                if line.strip():
+                    row = json.loads(line)
+                    if _as_text(row.get("project_id")) not in target_ids:
+                        kept.append(row)
+        rows = kept + rows
     with tmp.open("w", encoding="utf-8", newline="\n") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -3735,6 +3932,11 @@ def eval_quality(**context) -> str:
     from modules.transform.pipelines.strategy.flow_visit_quality import evaluate_visit_quality
 
     _, summary = evaluate_visit_quality()
+    if summary["empty_post_count"] or summary["invalid_category_count"]:
+        raise RuntimeError(
+            f"Flow 방문일지 품질 오류: 상세 재수집 필요={summary['empty_post_ids']} "
+            f"분류 공백/허용값 오류={summary['invalid_category_count']}"
+        )
     message = (
         "Flow 방문일지 품질검사 완료: "
         f"cases={summary['case_cnt']} issue={summary['issue_cnt']} "

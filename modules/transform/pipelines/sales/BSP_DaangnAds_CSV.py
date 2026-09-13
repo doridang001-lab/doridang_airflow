@@ -28,7 +28,9 @@ MAIL_DAANGN_ADS_CHA = "melanie0204@kakao.com"
 
 COLLECTED_AT_COL = "collected_at"
 GROUP_COL = "광고그룹명"
+AD_NAME_COL = "광고명"
 URL_COL = "url"
+IMAGE_URL_COL = "image_url"
 DEDUP_COLS = ["시작일", "종료일", "campaign_id"]
 KNOWN_AD_GROUP_URLS = {
     "도리당 송파삼전점 #3": "https://ads-lite.business.daangn.com/ad-groups/QWRHcm91cDoxNzgxMTM1NDQ3OTQxODUxMDAx/?filterType=ALL&startAt=2025-07-30T15%3A00%3A00.000Z&endAt=2026-08-31T14%3A59%3A59.999Z&groupConnectionId=client%3AQWR2ZXJ0aXNlcjozMDA0Mzc3%3A__adGroupList_adGroups_connection%28filter%3A%7B%22placementFilter%22%3A%5B%22ALL%22%5D%2C%22statusFilter%22%3A%5B%22ALL%22%5D%7D%29",
@@ -74,6 +76,7 @@ def _process_daangn_ads(
     if not files:
         if output_path.exists():
             existing = _read_csv_with_fallback(output_path)
+            duplicate_diagnostics = _duplicate_diagnostics(existing)
             logger.info("당근 광고 신규 CSV 없음. 기존 통합 파일 유지: %s", output_path)
             return {
                 "dataset_name": "Daangn_ads",
@@ -88,6 +91,7 @@ def _process_daangn_ads(
                 "output_rows": len(existing),
                 "deduplicated_rows": 0,
                 "dedup_cols": DEDUP_COLS,
+                **duplicate_diagnostics,
                 "missing_dates": [],
                 "missing_by_group": [],
                 "telegram_sent": None,
@@ -109,6 +113,9 @@ def _process_daangn_ads(
             "output_rows": 0,
             "deduplicated_rows": 0,
             "dedup_cols": DEDUP_COLS,
+            "duplicate_key_rows": 0,
+            "same_name_cross_group_rows": 0,
+            "same_name_cross_group_groups": 0,
             "missing_dates": [],
             "missing_by_group": [],
             "telegram_sent": None,
@@ -147,6 +154,7 @@ def _process_daangn_ads(
     before_rows = len(combined)
     normalized = _normalize_and_deduplicate(combined)
     duplicate_rows = before_rows - len(normalized)
+    duplicate_diagnostics = _duplicate_diagnostics(normalized)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     normalized.to_csv(output_path, index=False, encoding="utf-8-sig")
@@ -166,6 +174,7 @@ def _process_daangn_ads(
         "output_rows": len(normalized),
         "deduplicated_rows": duplicate_rows,
         "dedup_cols": DEDUP_COLS,
+        **duplicate_diagnostics,
         "missing_dates": alert_result["missing_dates"],
         "missing_by_group": alert_result["missing_by_group"],
         "telegram_sent": alert_result["telegram_sent"],
@@ -328,6 +337,33 @@ def _validate_required_columns(df: pd.DataFrame) -> None:
         raise ValueError(f"당근 광고 CSV 필수 컬럼 누락: {missing}")
 
 
+def _duplicate_diagnostics(df: pd.DataFrame) -> dict[str, int]:
+    duplicate_key_rows = 0
+    if all(col in df.columns for col in DEDUP_COLS):
+        duplicate_key_rows = int(df.duplicated(subset=DEDUP_COLS, keep=False).sum())
+
+    same_name_cross_group_rows = 0
+    same_name_cross_group_groups = 0
+    same_name_cols = ["시작일", AD_NAME_COL]
+    if all(col in df.columns for col in [*same_name_cols, GROUP_COL]):
+        name_group_counts = (
+            df.groupby(same_name_cols, dropna=False)[GROUP_COL]
+            .nunique()
+            .reset_index(name="_ad_group_count")
+        )
+        cross_group_keys = name_group_counts[name_group_counts["_ad_group_count"] > 1][same_name_cols]
+        if not cross_group_keys.empty:
+            cross_group_rows = df.merge(cross_group_keys, on=same_name_cols, how="inner")
+            same_name_cross_group_rows = len(cross_group_rows)
+            same_name_cross_group_groups = len(cross_group_keys)
+
+    return {
+        "duplicate_key_rows": duplicate_key_rows,
+        "same_name_cross_group_rows": same_name_cross_group_rows,
+        "same_name_cross_group_groups": same_name_cross_group_groups,
+    }
+
+
 def _normalize_and_deduplicate(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
     if URL_COL not in work.columns:
@@ -339,6 +375,7 @@ def _normalize_and_deduplicate(df: pd.DataFrame) -> pd.DataFrame:
 
     work = work.sort_values("_collected_at_sort", ascending=False)
     work = _fill_missing_urls(work)
+    work = _fill_missing_image_url(work)
     work = work.drop_duplicates(subset=DEDUP_COLS, keep="first")
     work = work.sort_values(DEDUP_COLS).reset_index(drop=True)
     work = work.drop(columns=[col for col in ("_source_file", "_collected_at_sort") if col in work.columns])
@@ -374,6 +411,41 @@ def _fill_missing_urls(df: pd.DataFrame) -> pd.DataFrame:
     fill_mask = group_values.ne("") & url_values.eq("") & group_values.isin(url_by_group.index)
     if fill_mask.any():
         work.loc[fill_mask, URL_COL] = group_values[fill_mask].map(url_by_group)
+
+    return work
+
+
+def _fill_missing_image_url(df: pd.DataFrame) -> pd.DataFrame:
+    """같은 campaign_id(광고 단위 결정론적 ID)에 image_url이 있는 행이 하나라도 있으면
+    같은 campaign_id의 빈 image_url 행을 채운다. 확장이 image_url을 수집하기 전에 쌓인
+    과거 행도, 이후 같은 광고가 한 번이라도 수집되면 채워진다.
+
+    url과 달리 그룹(광고그룹명)이 아니라 campaign_id로 채운다 - 한 광고그룹 안에도 소재별로
+    이미지가 다르기 때문에 그룹 단위로 채우면 서로 다른 광고의 썸네일이 뒤섞인다.
+    """
+    work = df.copy()
+    if IMAGE_URL_COL not in work.columns:
+        work[IMAGE_URL_COL] = ""
+    work[IMAGE_URL_COL] = work[IMAGE_URL_COL].fillna("").astype(str)
+
+    campaign_values = work["campaign_id"].fillna("").astype(str).str.strip()
+    image_values = work[IMAGE_URL_COL].str.strip()
+
+    reference_mask = campaign_values.ne("") & image_values.ne("")
+    if not reference_mask.any():
+        return work
+
+    refs = pd.DataFrame(
+        {
+            "campaign_id": campaign_values[reference_mask],
+            IMAGE_URL_COL: work.loc[reference_mask, IMAGE_URL_COL],
+        }
+    )
+    image_by_campaign = refs.drop_duplicates("campaign_id", keep="first").set_index("campaign_id")[IMAGE_URL_COL]
+
+    fill_mask = campaign_values.ne("") & image_values.eq("") & campaign_values.isin(image_by_campaign.index)
+    if fill_mask.any():
+        work.loc[fill_mask, IMAGE_URL_COL] = campaign_values[fill_mask].map(image_by_campaign)
 
     return work
 

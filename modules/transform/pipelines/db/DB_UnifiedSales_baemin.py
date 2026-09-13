@@ -4,6 +4,7 @@
 TEST_STORES에 한해 posfeed 배달의민족 행을 제거하고 직수집 데이터로 대체한다.
 """
 
+from modules.transform.utility.process_lock import unified_writer
 import logging
 import re
 from datetime import timedelta
@@ -281,6 +282,7 @@ def _record_baemin_fallback_event(
         events.append(event)
 
 
+@unified_writer
 def enforce_baemin_manual_only_for_test_stores(
     stores: list[str],
     sale_date: str | None = None,
@@ -728,6 +730,7 @@ def _recalculate_order_fields(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+@unified_writer
 def _upsert_daily(
     df_new: pd.DataFrame, date: str, store: str, *, verified_zero: bool = False
 ) -> tuple[int, int]:

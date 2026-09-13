@@ -64,7 +64,8 @@ def test_collect_shop_change_retries_dead_store_and_continues():
 
 def test_collect_now_and_woori_bootstrap_recovery_failure_marks_account_failed():
     account = {"account_id": "acct1", "password": "pw"}
-    with patch.object(combined, "_build_account_session", return_value=None):
+    with patch.object(combined, "_build_account_session", return_value=None), \
+         patch.object(combined.time, "sleep"):
         with pytest.raises(RuntimeError):
             combined.collect_now_and_woori([account])
 

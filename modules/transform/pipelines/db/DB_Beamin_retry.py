@@ -9,6 +9,7 @@ from modules.transform.pipelines.db.DB_Beamin_05_ad_funnel import _validate_and_
 from modules.transform.pipelines.db.DB_Beamin_collect import load_accounts as pipeline_load_accounts
 from modules.transform.pipelines.db.DB_Beamin_combined import (
     collect_now_and_woori,
+    collect_orders_only,
     retry_once_failed,
 )
 from modules.transform.pipelines.db.DB_Beamin_Macro_validate import validate_toorder_orders
@@ -17,6 +18,7 @@ from modules.transform.utility.account import _read_sales_employee_csv
 logger = logging.getLogger(__name__)
 KST = pendulum.timezone("Asia/Seoul")
 PER_STORE_MAX_RETRY = 3
+MAX_RETRY_ATTEMPTS = 3
 MIN_ACCOUNT_RETRY_SEC = 20 * 60
 MIN_ITEM_RETRY_SEC = 10 * 60
 
@@ -64,6 +66,19 @@ def _strip_account(items: list[dict], payload_key: str) -> list[dict]:
 def count_failed_items(failed: dict | None) -> int:
     data = failed or {}
     return sum(len(data.get(key) or []) for key in ("accounts", "stores", "orders", "ads", "stages"))
+
+
+def clamp_retry_attempts(value, *, default: int = MAX_RETRY_ATTEMPTS) -> int:
+    try:
+        requested = int(value)
+    except (TypeError, ValueError):
+        requested = int(default)
+    if requested < 1:
+        return 1
+    if requested > MAX_RETRY_ATTEMPTS:
+        logger.warning("Retry max_attempts 상한 적용: requested=%s capped=%s", requested, MAX_RETRY_ATTEMPTS)
+        return MAX_RETRY_ATTEMPTS
+    return requested
 
 
 def merge_failed_payloads(*payloads: dict | None) -> dict:
@@ -197,6 +212,7 @@ def build_retry_conf(
     stability_profile: str | None = None,
     allowed_account_ids: list[str] | None = None,
     collect_range: str | None = None,
+    orders_only: bool = False,
 ) -> dict:
     failed_accounts = failed.get("accounts") or []
     failed_stores = _strip_account(failed.get("stores") or [], "store")
@@ -222,11 +238,12 @@ def build_retry_conf(
 
     conf = {
         "attempt": int(attempt),
-        "max_attempts": int(max_attempts),
+        "max_attempts": clamp_retry_attempts(max_attempts),
         "target_date": target_date,
         "source_dag_id": source_dag_id,
         "source_run_id": source_run_id,
         "stability_profile": stability_profile,
+        "orders_only": bool(orders_only),
         "failed_account_ids": failed_account_ids,
         "failed_accounts_ids_only": _unique(_account_id(account) for account in failed_accounts),
         "failed_stores": failed_stores,
@@ -339,6 +356,81 @@ def _store_lookup_from_retry_payload(retry_payload: dict) -> dict[str, dict]:
     return lookup
 
 
+def _toorder_notification_snapshot(result: dict | None) -> dict:
+    result = result or {}
+    store_results: dict[str, dict] = {}
+    for store, item in (result.get("store_results") or {}).items():
+        item = item or {}
+        store_results[str(store)] = {
+            "baemin": int(item.get("baemin") or 0),
+            "toorder": int(item.get("toorder") or 0),
+            "matched": bool(item.get("matched")),
+            "toorder_gap": bool(item.get("toorder_gap")),
+            "brand_issue": item.get("brand_issue"),
+            "source_mismatch": bool(item.get("source_mismatch")),
+            "source_mismatch_reason": item.get("source_mismatch_reason"),
+            "amount_only": bool(item.get("amount_only")),
+        }
+    return {
+        "compared": int(result.get("compared_count") or result.get("compared") or 0),
+        "store_results": store_results,
+        "mismatched_stores": sorted(set(result.get("mismatched_stores") or [])),
+        "gap_stores": sorted(set(result.get("toorder_gap_stores") or result.get("gap_stores") or [])),
+        "missing_brand_stores": sorted(set(result.get("missing_brand_stores") or [])),
+        "source_mismatch_stores": sorted(set(result.get("source_mismatch_stores") or [])),
+        "amount_only_mismatch_stores": sorted(set(result.get("amount_only_mismatch_stores") or [])),
+        "restored_stores": sorted(set(result.get("restored_stores") or [])),
+    }
+
+
+def merge_toorder_notification_snapshot(root_toorder: dict | None, latest_result: dict | None) -> dict:
+    root = deepcopy(root_toorder or {})
+    if latest_result is None:
+        return root
+
+    latest = _toorder_notification_snapshot(latest_result)
+    latest_stores = set(latest.get("store_results") or {})
+    for key in (
+        "mismatched_stores",
+        "gap_stores",
+        "missing_brand_stores",
+        "source_mismatch_stores",
+        "amount_only_mismatch_stores",
+        "restored_stores",
+    ):
+        latest_stores.update(latest.get(key) or [])
+
+    merged_store_results = dict(root.get("store_results") or {})
+    merged_store_results.update(latest.get("store_results") or {})
+    root["store_results"] = merged_store_results
+    root["compared"] = max(int(root.get("compared") or 0), int(latest.get("compared") or 0))
+
+    for key in (
+        "mismatched_stores",
+        "gap_stores",
+        "missing_brand_stores",
+        "source_mismatch_stores",
+        "amount_only_mismatch_stores",
+        "restored_stores",
+    ):
+        previous = set(root.get(key) or [])
+        previous -= latest_stores
+        previous.update(latest.get(key) or [])
+        root[key] = sorted(previous)
+
+    for key in ("blind", "expected_accounts", "observed_accounts", "store_info_fallback_accounts"):
+        if key in latest_result:
+            root[key] = latest_result.get(key)
+
+    return root
+
+
+def merge_toorder_notification_context(notification_context: dict | None, latest_result: dict | None) -> dict:
+    context = deepcopy(notification_context or {})
+    context["toorder"] = merge_toorder_notification_snapshot(context.get("toorder") or {}, latest_result)
+    return context
+
+
 def build_next_retry_conf(
     *,
     previous_conf: dict,
@@ -400,13 +492,19 @@ def build_next_retry_conf(
         ]
     )
 
+    next_notification_context = merge_toorder_notification_context(
+        previous_conf.get("notification_context") or {},
+        toorder_result,
+    )
+
     return {
         "attempt": int(attempt),
-        "max_attempts": int(max_attempts),
+        "max_attempts": clamp_retry_attempts(max_attempts),
         "target_date": target_date,
         "source_dag_id": source_dag_id,
         "source_run_id": source_run_id,
         "stability_profile": previous_conf.get("stability_profile"),
+        "orders_only": bool(previous_conf.get("orders_only")),
         "retry_wait_sec": previous_conf.get("retry_wait_sec"),
         "allowed_account_ids": _unique(previous_conf.get("allowed_account_ids") or []),
         "collect_range": previous_conf.get("collect_range"),
@@ -425,7 +523,7 @@ def build_next_retry_conf(
                 if item.get("store")
             }
         ),
-        "notification_context": previous_conf.get("notification_context") or {},
+        "notification_context": next_notification_context,
     }
 
 
@@ -743,6 +841,7 @@ def sanitize_retry_payload(payload: dict) -> dict:
 
     return {
         "target_date": payload.get("target_date"),
+        "orders_only": bool(payload.get("orders_only")),
         "retry_result": payload.get("retry_result"),
         "store_info_per_account": payload.get("store_info_per_account") or [],
         "ad_store_infos": strip_password(payload.get("ad_store_infos") or []),
@@ -752,6 +851,7 @@ def sanitize_retry_payload(payload: dict) -> dict:
 
 def merge_retry_payloads(*payloads: dict | None) -> dict:
     target_date = None
+    orders_only = False
     retry_results: list[str] = []
     store_info_by_account: dict[str, dict] = {}
     ad_infos: dict[tuple[str, str], dict] = {}
@@ -761,6 +861,7 @@ def merge_retry_payloads(*payloads: dict | None) -> dict:
             continue
         if target_date is None and payload.get("target_date"):
             target_date = payload.get("target_date")
+        orders_only = orders_only or bool(payload.get("orders_only"))
         retry_result = str(payload.get("retry_result") or "").strip()
         if retry_result:
             retry_results.append(retry_result)
@@ -788,6 +889,7 @@ def merge_retry_payloads(*payloads: dict | None) -> dict:
 
     return {
         "target_date": target_date,
+        "orders_only": orders_only,
         "retry_result": "\n".join(retry_results),
         "store_info_per_account": list(store_info_by_account.values()),
         "ad_store_infos": list(ad_infos.values()),
@@ -804,6 +906,7 @@ def retry_collect_from_conf(
     partial_result_callback=None,
 ) -> dict:
     target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
+    orders_only = bool(conf.get("orders_only"))
     failed, retry_accounts = restore_failed_from_conf(conf)
 
     account_failed = {"accounts": failed.get("accounts") or [], "stores": [], "orders": [], "ads": [], "stages": []}
@@ -833,6 +936,7 @@ def retry_collect_from_conf(
             retry_result = "재시도 대상 없음"
         return {
             "target_date": target_date,
+            "orders_only": orders_only,
             "failed": failed,
             "retry_accounts": retry_accounts,
             "retry_result": retry_result,
@@ -859,12 +963,19 @@ def retry_collect_from_conf(
             emit_partial()
             break
         try:
-            result = collect_now_and_woori(
-                [account],
-                target_date=target_date,
-                stability_profile=conf.get("stability_profile"),
-                _raise_on_total_failure=False,
-            )
+            if orders_only:
+                result = collect_orders_only(
+                    [account],
+                    target_date=target_date,
+                    stability_profile=conf.get("stability_profile"),
+                )
+            else:
+                result = collect_now_and_woori(
+                    [account],
+                    target_date=target_date,
+                    stability_profile=conf.get("stability_profile"),
+                    _raise_on_total_failure=False,
+                )
         except Exception as exc:
             logger.exception("Retry 계정 재수집 실패 - 잔여 실패로 전파: %s", exc)
             result = {
@@ -910,6 +1021,7 @@ def retry_collect_from_conf(
             unit_failed,
             target_date=target_date,
             stability_profile=conf.get("stability_profile"),
+            orders_only=orders_only,
         )
         if isinstance(item_result, dict):
             summary = str(item_result.get("summary") or "")
@@ -957,6 +1069,8 @@ def validate_retry_ad_funnel(
     *,
     deadline_at: float | None = None,
 ) -> dict:
+    if retry_payload.get("orders_only"):
+        return {"empty_stores": [], "retried": [], "still_empty": []}
     target_date = retry_payload["target_date"]
     ad_store_infos = _restore_ad_passwords(retry_payload.get("ad_store_infos") or [])
     if not ad_store_infos:

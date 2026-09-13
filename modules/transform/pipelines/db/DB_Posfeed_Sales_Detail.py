@@ -927,7 +927,11 @@ def extract_order_codes(collect_mode: str = "yesterday", force_rescrape: bool = 
     logger.info("수집 대상: %d개 매장 / %d건 | 모드: %s", len(stores), total_new, collect_mode)
 
     if not stores:
-        raise AirflowSkipException("수집할 신규 주문 코드 없음")
+        context["ti"].xcom_push(
+            key="order_codes",
+            value={"stores": []},
+        )
+        return f"[{collect_mode}] 신규 주문 코드 없음 | 전체 탐색 완료"
 
     context["ti"].xcom_push(
         key="order_codes",
@@ -995,7 +999,8 @@ def check_undetailed_orders(**context) -> str:
 
     total_new = sum(len(s["codes"]) for s in stores)
     if not stores:
-        raise AirflowSkipException("수집할 신규 주문 코드 없음 (extract + cross-check 통합)")
+        ti.xcom_push(key="order_codes", value={"stores": []})
+        return "cross-check 완료 | detail 미보유 주문 코드 없음 | 전체 탐색 완료"
 
     ti.xcom_push(key="order_codes", value={"stores": stores})
     return f"cross-check 완료 | detail 미보유 추가 {added_codes}건 | 총 {total_new}건 / {len(stores)}개 매장"
@@ -1010,6 +1015,11 @@ def scrape_order_details(**context) -> str:
     stores: list = payload["stores"]
     total_stores = len(stores)
     total_codes = sum(len(s["codes"]) for s in stores)
+    if not stores:
+        result = "상세 누락 주문 없음 | 전체 탐색 완료 | 0건"
+        logger.info(result)
+        return result
+
     logger.info("크롤링 시작 | %d개 매장 | 총 %d건", total_stores, total_codes)
 
     driver = _launch_browser()
@@ -1255,7 +1265,9 @@ def scrape_missing_order_details(collect_mode: str = "yesterday", **context) -> 
 
     extracted_stores: list = payload["stores"]
     if not extracted_stores:
-        raise AirflowSkipException("No missing codes (extract_order_codes stores is empty)")
+        result = "미수집 재수집 대상 없음 | 전체 탐색 완료 | 0건"
+        logger.info(result)
+        return result
     extracted_total = sum(len(s["codes"]) for s in extracted_stores)
     logger.info("미수집 재수집 체크 시작 | 추출 코드: %d건", extracted_total)
 

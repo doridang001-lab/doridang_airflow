@@ -57,6 +57,7 @@ REVIEW_STATUS_DISPLAY_COLUMN = "검수유무"
 REVIEW_APPROVED = "1"
 REVIEW_PENDING = "0"
 DUP_LABEL_COLUMN = "중복_수동분류"
+SIBLING_CONFLICT_COLUMN = "형제분류_불일치"
 MANUAL_CHICKEN_COLUMNS = ["닭유형_manual", "사이즈_manual", "닭사용량_manual"]
 VALID_CHICKEN_TYPES = ("뼈닭", "순살")
 VALID_CHICKEN_SIZES = ("소", "중", "대", "1인", "2인")
@@ -110,6 +111,7 @@ REVIEW_COLUMNS = [
     "표준_메뉴명_edit",
     "수동분류_edit",
     DUP_LABEL_COLUMN,
+    SIBLING_CONFLICT_COLUMN,
     REVIEW_STATUS_DISPLAY_COLUMN,
     "검수사유",
     *MANUAL_CHICKEN_COLUMNS,
@@ -238,10 +240,10 @@ def _fill_item_identity_columns(df: pd.DataFrame, *, persist: bool = True) -> pd
     legacy_okpos_adj = result["source"].eq("okpos") & result["item_id"].eq("__OKPOS_ADJ__")
     if legacy_okpos_adj.any():
         result.loc[legacy_okpos_adj, "item_id"] = OKPOS_ADJUSTMENT_ITEM_ID
-    result["item_key"] = result["item_key"].where(
-        result["item_key"] != "",
-        result["item_name"].map(normalize_item_key),
-    )
+    # item_key는 item_name에서 결정적으로 파생되는 값이므로 항상 재계산한다.
+    # (과거에는 빈 값일 때만 채웠는데, scan_target_items()에서 item_key/item_name을
+    #  서로 독립적으로 최빈값 집계하면서 둘이 어긋나는 행이 생겼다 - 2026-09-11)
+    result["item_key"] = result["item_name"].map(normalize_item_key)
 
     allocated_mask = result["source"].map(is_manual_allocated_source)
     if allocated_mask.any():
@@ -302,14 +304,15 @@ def _apply_classification_overrides(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "item_name" not in df.columns:
         return df
     result = df.copy()
+    has_classified_by = "classified_by" in result.columns
     for idx, item_name in result["item_name"].fillna("").astype(str).str.strip().items():
         override = _classification_override(item_name)
         if not override:
             continue
+        if has_classified_by and _strip_text(result.at[idx, "classified_by"]) == "human":
+            continue
         for col, value in override.items():
             if col in result.columns:
-                if col == "classified_by" and _strip_text(result.at[idx, col]) not in {"", "rule"}:
-                    continue
                 result.at[idx, col] = value
     return result
 
@@ -368,7 +371,9 @@ def scan_target_items(*, persist_identity: bool = True) -> pd.DataFrame:
         pd.concat(frames, ignore_index=True)
         .groupby(KEY_COLUMNS)
         .agg(
-            item_key=("item_key", _pick_common_value),
+            # item_key는 별도로 집계하지 않는다: item_name과 독립적으로 최빈값을 뽑으면
+            # 서로 다른 레코드에서 값이 선택되어 item_key가 item_name과 어긋날 수 있다.
+            # _fill_item_identity_columns()가 선택된 item_name으로부터 다시 계산한다.
             item_name=("item_name", _pick_common_value),
             unitprice=("unit_price", _pick_common_value),
             대표메뉴=("menu_name", _representative_menu_name),
@@ -608,11 +613,9 @@ def write_review_map(review_df: pd.DataFrame) -> int:
         output_df = review_df.reindex(columns=REVIEW_INTERNAL_COLUMNS, fill_value="").copy()
         output_df = _restore_manual_chicken_columns(output_df)
         if "item_key" in output_df.columns and "item_name" in output_df.columns:
-            output_df["item_key"] = output_df["item_key"].fillna("").astype(str).str.strip().where(
-                output_df["item_key"].fillna("").astype(str).str.strip() != "",
-                output_df["item_name"].fillna("").astype(str).map(normalize_item_key),
-            )
+            output_df["item_key"] = output_df["item_name"].fillna("").astype(str).map(normalize_item_key)
         output_df = _mark_duplicate_labels(output_df)
+        output_df = _mark_sibling_conflicts(output_df)
         output_df[REVIEW_STATUS_DISPLAY_COLUMN] = output_df[REVIEW_STATUS_COLUMN].apply(_normalize_review_status)
         warning_count = _validate_chicken_usage(output_df)
         output_df.reindex(columns=REVIEW_COLUMNS, fill_value="").to_csv(tmp, index=False, encoding="utf-8-sig")
@@ -1061,6 +1064,84 @@ def _mark_duplicate_labels(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def _mark_sibling_conflicts(df: pd.DataFrame) -> pd.DataFrame:
+    """같은 item_key(=상품명 정규화값)를 공유하는 서로 다른 item_id들("형제" 행)이
+    표준_메뉴명_edit 또는 수동분류_edit가 서로 다르면 표시한다.
+
+    item_id가 여러 개로 쪼개진 동일 상품(POS 코드 재등록 등)인데 사람이 한쪽만
+    재분류하면 나머지가 예전 값 그대로 남는 문제의 안전망이다. 값을 자동으로
+    맞추지 않고 표시만 한다 - 어느 쪽이 맞는지는 데이터만으로 판단할 수 없다
+    (2026-09-11, 참이슬후레쉬355ml 사례).
+    """
+    result = df.copy()
+    for col in ["store", "source", "brand", "item_key", "표준_메뉴명_edit", "수동분류_edit"]:
+        if col not in result.columns:
+            result[col] = ""
+        result[col] = result[col].fillna("").astype(str).str.strip()
+
+    if result.empty:
+        result[SIBLING_CONFLICT_COLUMN] = "N"
+        return result
+
+    group_cols = ["store", "source", "brand", "item_key"]
+    work = result[(result["item_key"] != "") & (result["표준_메뉴명_edit"] != "") & (result["수동분류_edit"] != "")]
+    conflict_keys = set()
+    if not work.empty:
+        conflict_df = (
+            work.groupby(group_cols)
+            .agg(
+                표준명_종류수=("표준_메뉴명_edit", "nunique"),
+                분류_종류수=("수동분류_edit", "nunique"),
+            )
+            .reset_index()
+        )
+        conflicts = conflict_df[(conflict_df["표준명_종류수"] > 1) | (conflict_df["분류_종류수"] > 1)]
+        conflict_keys = set(conflicts[group_cols].itertuples(index=False, name=None))
+
+    keys = list(result[group_cols].itertuples(index=False, name=None))
+    result[SIBLING_CONFLICT_COLUMN] = ["Y" if key in conflict_keys else "N" for key in keys]
+    return result
+
+
+def _format_sibling_conflicts(review_rows: pd.DataFrame, limit: int = 10) -> str:
+    if review_rows.empty or SIBLING_CONFLICT_COLUMN not in review_rows.columns:
+        return ""
+    conflict = review_rows[review_rows[SIBLING_CONFLICT_COLUMN].fillna("").astype(str).str.strip() == "Y"]
+    if conflict.empty:
+        return ""
+    lines = []
+    grouped = conflict.groupby(["store", "source", "brand", "item_key"], dropna=False)
+    for key, rows in list(grouped)[:limit]:
+        store, source, brand, item_key = key
+        detail = "; ".join(
+            f"{r['item_id']}:{r['item_name']}→{r['표준_메뉴명_edit']}/{r['수동분류_edit']}"
+            for _, r in rows.iterrows()
+        )
+        lines.append(f"- {store}/{source}/{brand} item_key={item_key} | {detail}")
+    remaining = len(grouped) - len(lines)
+    if remaining > 0:
+        lines.append(f"- 외 {remaining}개 key")
+    return "\n".join(lines)
+
+
+def _notify_sibling_conflicts(review_rows: pd.DataFrame) -> int:
+    if review_rows.empty or SIBLING_CONFLICT_COLUMN not in review_rows.columns:
+        return 0
+    conflict = review_rows[review_rows[SIBLING_CONFLICT_COLUMN].fillna("").astype(str).str.strip() == "Y"]
+    conflict_key_count = int(
+        conflict.drop_duplicates(subset=["store", "source", "brand", "item_key"]).shape[0]
+    )
+    if conflict_key_count:
+        detail = _format_sibling_conflicts(review_rows)
+        send_telegram(
+            "[상품 매핑] 형제 상품(item_key 동일) 분류 불일치 감지\n"
+            f"불일치 상품군: {conflict_key_count}개 (같은 상품이 item_id만 다른데 분류가 다름)\n"
+            "fin_product_map_review_input.csv의 형제분류_불일치=Y 행을 확인해주세요.\n"
+            f"{detail}"
+        )
+    return conflict_key_count
+
+
 def build_review_rows(map_df: pd.DataFrame) -> pd.DataFrame:
     if map_df.empty:
         return _empty_review_map()
@@ -1074,7 +1155,7 @@ def build_review_rows(map_df: pd.DataFrame) -> pd.DataFrame:
         .sort_values(["store", "source", "검수사유", "item_name"])
         .reset_index(drop=True)
     )
-    return _mark_duplicate_labels(result)
+    return _mark_sibling_conflicts(_mark_duplicate_labels(result))
 
 
 def apply_review_edits(map_df: pd.DataFrame, review_df: pd.DataFrame) -> pd.DataFrame:
@@ -1118,6 +1199,31 @@ def apply_review_edits(map_df: pd.DataFrame, review_df: pd.DataFrame) -> pd.Data
             result.loc[idx, "classified_by"] = "human"
         result.loc[idx, "updated_at"] = TODAY
     return result
+
+
+def _reset_reused_item_classifications(existing: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """item_id 재사용으로 실제 상품(item_name)이 바뀐 행은 예전 수동분류를 신뢰할 수 없다.
+
+    쿠팡/배민 등에서 상품코드가 재사용되면 item_name만 새 상품으로 갱신되고
+    표준_메뉴명_edit/수동분류_edit/classified_by는 예전 값이 그대로 남아, 전혀 무관한
+    상품(예: 소주)의 분류가 새 상품(예: 닭도리탕)에 계속 붙어있는 문제가 있었다
+    (참이슬후레쉬355ml → [1인] 순살 닭도리탕, 2026-09-11). item_name의 정규화 키가
+    바뀐 행은 재분류 대상으로 초기화한다. `existing`은 migrate_product_map()에서
+    구 map.csv에 새 스캔 결과를 merge(suffixes=("", "_current"))한 직후의 df여야 한다.
+    """
+    if "item_name_current" not in existing.columns:
+        return existing, 0
+    old_key = existing["item_name"].fillna("").astype(str).map(normalize_item_key)
+    new_name = existing["item_name_current"].fillna("").astype(str).str.strip()
+    new_key = new_name.map(normalize_item_key)
+    reused_mask = (new_name != "") & (old_key != "") & (new_key != "") & (old_key != new_key)
+    reused_count = int(reused_mask.sum())
+    if reused_count:
+        logger.warning("item_id 재사용(실제 상품 변경) 감지 → 기존 수동분류 초기화: %d행", reused_count)
+        existing.loc[reused_mask, ["표준_메뉴명_edit", "수동분류_edit", "classified_by"]] = ""
+        existing.loc[reused_mask, REVIEW_STATUS_COLUMN] = REVIEW_PENDING
+        existing.loc[reused_mask, "updated_at"] = TODAY
+    return existing, reused_count
 
 
 def _reset_automatic_approvals(
@@ -1955,12 +2061,14 @@ def migrate_product_map(dry_run: bool = False, **context) -> dict:
     result = build_initial_map(persist_identity=not dry_run)
     existing = load_map()
     review_edits = load_review_map()
+    item_reused_reset = 0
     if not result.empty and not existing.empty:
         current_value_cols = [col for col in [
             "item_id", "store_seq", "item_seq", "item_name", "unitprice", "대표메뉴",
         ] if col not in KEY_COLUMNS]
         current_values = result[KEY_COLUMNS + current_value_cols].drop_duplicates(subset=KEY_COLUMNS, keep="last")
         existing = existing.merge(current_values, on=KEY_COLUMNS, how="left", suffixes=("", "_current"))
+        existing, item_reused_reset = _reset_reused_item_classifications(existing)
         for col in current_value_cols:
             current_col = f"{col}_current"
             if current_col in existing.columns:
@@ -2010,6 +2118,11 @@ def migrate_product_map(dry_run: bool = False, **context) -> dict:
         .drop_duplicates(subset=["source", "item_id"])
         .shape[0]
     )
+    sibling_conflict_count = int(
+        review_rows[review_rows[SIBLING_CONFLICT_COLUMN].fillna("").astype(str).str.strip() == "Y"]
+        .drop_duplicates(subset=["store", "source", "brand", "item_key"])
+        .shape[0]
+    )
     summary = {
         "target_stores": TARGET_STORES,
         "target_rows": int(len(result)),
@@ -2021,7 +2134,9 @@ def migrate_product_map(dry_run: bool = False, **context) -> dict:
         "join_conflict_keys": join_conflict_count,
         "duplicate_keys": duplicate_count,
         "duplicate_label_keys": duplicate_label_count,
+        "sibling_conflict_keys": sibling_conflict_count,
         "auto_approval_reset": auto_approval_reset,
+        "item_reused_reset": item_reused_reset,
         "main_set_corrected": main_set_corrected,
         "main_set_unresolved": main_set_unresolved,
         "chicken_usage_warnings": 0,
@@ -2042,6 +2157,14 @@ def migrate_product_map(dry_run: bool = False, **context) -> dict:
         write_recently_map(result)
         summary.update(write_join_map(result))
         _notify_duplicate_labels(review_rows)
+        _notify_sibling_conflicts(review_rows)
+        if item_reused_reset:
+            send_telegram(
+                "[상품 매핑] item_id 재사용 감지\n"
+                f"실제 상품이 바뀐 것으로 보이는 상품코드: {item_reused_reset}건\n"
+                "기존 수동분류를 초기화하고 1차 검수 대기로 되돌렸습니다.\n"
+                "fin_product_map_review_input.csv에서 새 상품명 기준으로 재분류해주세요."
+            )
         logger.info("fin_product_map.csv 저장: %s (%d행)", FIN_PRODUCT_MAP_CSV_PATH, len(result))
         logger.info("fin_product_map_review_input.csv 저장: %s (%d행)", FIN_PRODUCT_MAP_REVIEW_CSV_PATH, len(review_rows))
         logger.info("fin_product_map_recently.csv 저장: %s", FIN_PRODUCT_MAP_RECENTLY_CSV_PATH)
@@ -2147,6 +2270,11 @@ def llm_product_map(dry_run: bool = False, limit: int | None = None, **context) 
         .drop_duplicates(subset=["source", "item_id"])
         .shape[0]
     )
+    summary["sibling_conflict_keys"] = int(
+        review_rows[review_rows[SIBLING_CONFLICT_COLUMN].fillna("").astype(str).str.strip() == "Y"]
+        .drop_duplicates(subset=["store", "source", "brand", "item_key"])
+        .shape[0]
+    )
     summary["join_output_path"] = str(FIN_PRODUCT_MAP_JOIN_CSV_PATH)
     summary["approved"] = int((map_df[REVIEW_STATUS_COLUMN] == REVIEW_APPROVED).sum()) if not map_df.empty else 0
     summary["pending"] = int((map_df[REVIEW_STATUS_COLUMN] == REVIEW_PENDING).sum()) if not map_df.empty else 0
@@ -2160,6 +2288,7 @@ def llm_product_map(dry_run: bool = False, limit: int | None = None, **context) 
         write_recently_map(map_df)
         summary.update(write_join_map(map_df))
         _notify_duplicate_labels(review_rows)
+        _notify_sibling_conflicts(review_rows)
         logger.info("fin_product_map.csv 업데이트: %s (%d행)", FIN_PRODUCT_MAP_CSV_PATH, len(map_df))
         logger.info("fin_product_map_review_input.csv 저장: %s (%d행)", FIN_PRODUCT_MAP_REVIEW_CSV_PATH, len(review_rows))
         logger.info("fin_product_map_recently.csv 저장: %s", FIN_PRODUCT_MAP_RECENTLY_CSV_PATH)

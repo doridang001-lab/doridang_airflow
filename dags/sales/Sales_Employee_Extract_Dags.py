@@ -33,6 +33,8 @@ from modules.transform.pipelines.sales.employee_accounts_export import (
     export_accounts_js,
 )
 
+from modules.transform.utility.dag_defaults import COLLECT_DAGRUN_TIMEOUT
+
 logger = logging.getLogger(__name__)
 
 # 설정
@@ -44,9 +46,12 @@ AUTOMATION_NOTE_COL = '비고'
 AUTOMATION_NOTE_VALUE = '자동화 연결'
 
 # 저장 컬럼 정의 — 새 컬럼 추가 시 이 리스트만 수정
-BASE_FIELDS = ['오픈순서', '호점', '매장명', '사업자번호', '점주명', '담당자',
+BASE_FIELDS = ['오픈순서', '호점', '매장명', '사업자번호', '점주명', '전화번호', '담당자',
                '실오픈일', '상세주소', '광역', '시군구', '읍면동', 'email', AUTOMATION_NOTE_COL]
-PLATFORM_FIELDS = ['플랫폼', '계정ID', '계정PW', 'collected_at']
+PHONE_FIELD = '전화번호'
+PHONE_FIELD_ALIASES = {'전화번호', '전화번호(mobile)', '핸드폰번호', '휴대폰번호', '연락처'}
+RENT_FIELD = '임대료'
+PLATFORM_FIELDS = ['플랫폼', '계정ID', '계정PW', RENT_FIELD, 'collected_at']
 
 
 def parse_address(address_str):
@@ -62,6 +67,39 @@ def parse_address(address_str):
     dong = parts[2] if len(parts) > 2 else ''
     
     return sido, sigungu, dong
+
+
+def coalesce_duplicate_columns(df, column_name):
+    """중복 표준화된 컬럼은 행별 첫 유효값으로 합친다."""
+    matching_positions = [idx for idx, column in enumerate(df.columns) if column == column_name]
+    if len(matching_positions) <= 1:
+        return df
+
+    coalesced = df.iloc[:, matching_positions].replace(
+        to_replace=r'^\s*(?:nan|None)?\s*$',
+        value=pd.NA,
+        regex=True,
+    ).bfill(axis=1).iloc[:, 0]
+
+    result = df.iloc[:, [idx for idx, column in enumerate(df.columns) if column != column_name]].copy()
+    insert_at = min(matching_positions)
+    result.insert(insert_at, column_name, coalesced)
+    return result
+
+
+def normalize_phone_columns(df):
+    """시트 설명이 붙은 전화번호 헤더를 저장 표준명으로 맞춘다."""
+    renamed_columns = []
+    for column in df.columns:
+        normalized = re.sub(r'\s+', '', str(column))
+        if normalized in PHONE_FIELD_ALIASES or normalized.lower().startswith('전화번호('):
+            renamed_columns.append(PHONE_FIELD)
+        else:
+            renamed_columns.append(column)
+
+    df = df.copy()
+    df.columns = renamed_columns
+    return coalesce_duplicate_columns(df, PHONE_FIELD)
 
 
 def check_toder_null_values(df_original):
@@ -136,8 +174,11 @@ def load_employee_from_gsheet(**context):
         '오픈순서': '오픈순서', '호점': '호점', '매장명': '매장명',
         '사업자 번호': '사업자번호', '사업자번호': '사업자번호',
         '점주명': '점주명',
+        '전화번호': '전화번호', '핸드폰번호': '전화번호',
+        '전화번호(mobile)': '전화번호', '휴대폰번호': '전화번호', '연락처': '전화번호',
         '담당 S.V': '담당자', '담당 SV': '담당자', '담당SV': '담당자',
         '주소': '상세주소',
+        '임대료': RENT_FIELD,
         '배달의민족ID': '배민ID', '배달의민족PW': '배민PW',
         '배달의 민족ID': '배민ID', '배달의 민족PW': '배민PW',
         '요기요ID': '요기요ID', '요기요PW': '요기요PW',
@@ -151,6 +192,7 @@ def load_employee_from_gsheet(**context):
     # 존재하는 컬럼만 변경
     rename_dict = {old: new for old, new in column_mapping.items() if old in df.columns}
     df = df.rename(columns=rename_dict)
+    df = normalize_phone_columns(df)
     
     # 4️⃣ 호점 기준 유효 데이터 필터링
     if '호점' not in df.columns:
@@ -229,6 +271,11 @@ def load_employee_from_gsheet(**context):
                     new_row['플랫폼'] = platform
                     new_row['계정ID'] = account_id
                     new_row['계정PW'] = str(row[pw_col]).strip() if pw_col in df.columns else ''
+                    rent_value = row.get(RENT_FIELD, '')
+                    if pd.isna(rent_value) or str(rent_value).strip() in ['', 'nan', 'None']:
+                        new_row[RENT_FIELD] = ''
+                    else:
+                        new_row[RENT_FIELD] = str(rent_value).strip()
                     rows.append(new_row)
     
     df_final = pd.DataFrame(rows)
@@ -240,7 +287,8 @@ def load_employee_from_gsheet(**context):
     
     
     
-    final_columns = [col for col in BASE_FIELDS + PLATFORM_FIELDS if col in df_final.columns]
+    final_column_order = BASE_FIELDS + PLATFORM_FIELDS
+    final_columns = [col for col in final_column_order if col in df_final.columns]
 
     df_final = df_final[final_columns]
     
@@ -291,6 +339,7 @@ with DAG(
     schedule="30 2 * * *", # 매일 새벽 2시 30분 실행
     start_date=pendulum.datetime(2023, 1, 1, tz="Asia/Seoul"),
     catchup=False,
+    dagrun_timeout=COLLECT_DAGRUN_TIMEOUT,
     tags=['01_employee', 'gsheet', 'load'],
     default_args={
         "retries": 1,

@@ -17,7 +17,8 @@ function Write-Log {
 function Test-AirflowHealth {
     try {
         $response = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/health" -TimeoutSec 5
-        return $response.StatusCode -eq 200
+        $health = $response.Content | ConvertFrom-Json
+        return ($health.metadatabase.status -eq "healthy" -and $health.scheduler.status -eq "healthy")
     } catch {
         return $false
     }
@@ -68,16 +69,15 @@ try {
 
     $deadline = (Get-Date).AddMinutes(8)
     do {
-        docker info *> $null
-        if ($LASTEXITCODE -eq 0) {
+        $engineExit = Invoke-RepoProcess -FilePath "docker" -Arguments "info" -TimeoutSeconds 15
+        if ($engineExit -eq 0) {
             Write-Log "Docker engine ready"
             break
         }
         Start-Sleep -Seconds 10
     } while ((Get-Date) -lt $deadline)
 
-    docker info *> $null
-    if ($LASTEXITCODE -ne 0) {
+    if ($engineExit -ne 0) {
         Write-Log "Docker engine did not become ready"
         exit 2
     }

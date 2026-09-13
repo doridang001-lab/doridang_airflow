@@ -30,7 +30,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from modules.transform.utility.paths import MANUAL_DOWN_DIR, MART_DB, TEMP_DIR
+from modules.transform.utility.paths import FOOD_GUIDE_RAW_DIR, MANUAL_DOWN_DIR, TEMP_DIR
 from modules.transform.utility.selenium_uc import configure_chrome_temp_root, launch_uc_chrome
 
 logger = logging.getLogger(__name__)
@@ -43,7 +43,7 @@ VAR_ID_KEYS = ENV_ID_KEYS
 VAR_PW_KEYS = ENV_PW_KEYS
 
 DEFAULT_DOWNLOAD_DIR = TEMP_DIR / "food_guide_orders_download"
-DEFAULT_DEST_DIR = MART_DB / "Food_Guide"
+DEFAULT_DEST_DIR = FOOD_GUIDE_RAW_DIR
 DEBUG_DIR = TEMP_DIR / "food_guide_debug"
 DEFAULT_ORDER_XLSX_GLOB = str(MANUAL_DOWN_DIR / "주문 예정 목*")
 FOOD_GUIDE_ORDER_COLUMNS = [

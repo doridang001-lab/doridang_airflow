@@ -297,6 +297,9 @@ BAEMIN_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "baemin_policy_raw.csv"
 CHICKEN_PRICE_CSV_PATH = ANALYTICS_DB / "chicken_price" / "chicken_price.csv"
 COUPANG_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "coupang_policy_raw.csv"
 YOGIYO_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "yogiyo_policy_raw.csv"
+YOGIYO_SETTLEMENT_MONTHLY_FEE_CSV_PATH = (
+    ANALYTICS_DB / "Yogiyo" / "Yogiyo_Settlement" / "yogiyo_settlement_monthly_fee.csv"
+)
 DDANGYO_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "ddangyo_policy_raw.csv"
 BAEDALTTEUK_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "baedaltteuk_policy_raw.csv"
 MUKKEBI_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "mukkebi_policy_raw.csv"
@@ -308,11 +311,15 @@ INSTAGRAM_SNAPSHOT_DIR = ANALYTICS_DB / "Instagram"
 INSTAGRAM_SNAPSHOT_CSV_PATH = INSTAGRAM_SNAPSHOT_DIR / "instagram_snapshot.csv"
 KAKAO_FRIENDS_DIR = ANALYTICS_DB / "Kakao" / "Friends"
 KAKAO_FRIENDS_CSV_PATH = KAKAO_FRIENDS_DIR / "kakao_friends.csv"
+KAKAO_STORE_RAW_DIR = ANALYTICS_DB / "Kakao" / "raw"
+KAKAO_STORE_RAW_STATE_JSON = LOCAL_DB / "kakao_store_raw_processed_files.json"
 NAVER_ADS_DIR = ANALYTICS_DB / "naver" / "naver_ad"
 NAVER_ADS_FILE_PATTERN = "naverads_adgroups_*.csv"
 DAANGN_ADS_CSV_PATH = ANALYTICS_DB / "Daangn_ads" / "daangn_ads.csv"
 REPORT_SALES_DB = resolve_report_sales_db()
 MART_DB = resolve_mart_db()
+KAKAO_STORE_RAW_PARQUET_DIR = MART_DB / "Kakao_Store_Raw"
+KAKAO_STORE_RAW_PARQUET = KAKAO_STORE_RAW_PARQUET_DIR / "kakao_store_raw.parquet"
 LLM_OUTPUT_DIR = resolve_llm_output_dir()
 DASHBOARD_DB = resolve_dashboard_db()
 FLOW_BASE_DIR = ANALYTICS_DB / "flow"
@@ -343,6 +350,8 @@ FLOW_VISIT_VIZ_PARQUET = FLOW_VISIT_BASE_DIR / "flow_visit_viz.parquet"
 FLOW_VISIT_LLM_CACHE = LOCAL_DB / "flow_visit_llm_cache.json"
 FLOW_VISIT_PROFILE_CACHE = LOCAL_DB / "flow_visit_profile_cache.json"
 COLLECTION_COMPARE_PATH = MART_DB / "collection_compare" / "collection_compare.parquet"
+BAEMIN_NOW_GRP_DIR = MART_DB / "Baemin_now_grp"
+BAEMIN_NOW_GRP_PARQUET = BAEMIN_NOW_GRP_DIR / "baemin_now_grp.parquet"
 NAVER_CORP_STORE_MKT_CSV_PATH = (
     MART_DB / "naver_corporate_store_marketing" / "naver_corporate_store_marketing.csv"
 )
@@ -354,9 +363,17 @@ MARKETING_ADS_DAILY_FLOW_TASKS_CSV = MARKETING_ADS_TRACKING_DIR / "marketing_ads
 MARKETING_ADS_LINK_MANUAL_CSV = MARKETING_ADS_TRACKING_DIR / "campaign_link_manual.csv"
 DELIVERY_COMMISSION_DIR = MART_DB / "delivery_commission"
 DELIVERY_COMMISSION_PATH = DELIVERY_COMMISSION_DIR / "delivery_commission.parquet"
+DELIVERY_REVENUE_DIR = MART_DB / "delivery_revenue"
+DELIVERY_REVENUE_PATH = DELIVERY_REVENUE_DIR / "delivery_revenue.parquet"
+STORE_COST_ALLOCATION_DIR = MART_DB / "store_cost_allocation"
+STORE_COST_ALLOCATION_PATH = STORE_COST_ALLOCATION_DIR / "store_cost_allocation.parquet"
+DDANGYO_FEE_DIR = MART_DB / "Ddangyo" / "Ddangyo_fee"
+DDANGYO_FEE_RATIO_MONTHLY_CSV = DDANGYO_FEE_DIR / "ddangyo_fee_ratio_monthly.csv"
+DDANGYO_FEE_RATIO_BASELINE_CSV = DDANGYO_FEE_DIR / "ddangyo_fee_ratio_baseline.csv"
 ITEM_MASTER_CHECKPOINT_DIR = ANALYTICS_DB / "item_master_checkpoints"
 RAW_OKPOS_SALES = resolve_raw_okpos_sales()
 RAW_UNIONPOS_SALES = resolve_raw_unionpos_sales()
+FOOD_GUIDE_RAW_DIR = ANALYTICS_DB / "Food_Guide_Raw"
 FIN_PRODUCT_LEGACY_CSV_PATH = MART_DB / "fin_product" / "fin_product_grp.csv"
 FIN_PRODUCT_CSV_PATH = MART_DB / "fin_product" / "fin_product_grp_input.csv"
 FIN_PRODUCT_REVIEW_CSV_PATH = MART_DB / "fin_product" / "fin_product_review.csv"
@@ -374,6 +391,8 @@ FIN_PRODUCT_RULES_JSON_PATH = MART_DB / "fin_product" / "fin_product_rules.json"
 FIN_PRODUCT_RULES_MANUAL_JSON_PATH = MART_DB / "fin_product" / "fin_product_rules_manual.json"
 FIN_PRODUCT_RULE_PROPOSAL_DIR = TEMP_DIR / "fin_product_rule_proposals"
 ORDER_CROSS_DIR = MART_DB / "order_cross_analysis"
+STORE_MANAGER_MART_DIR = MART_DB / "Store_Manager"
+STORE_MANAGER_MART_CSV = STORE_MANAGER_MART_DIR / "store_manager.csv"
 
 # 입력 엑셀과 통합 산출물을 같은 폴더에 둔다. 입력 파일은 파일명으로 직접 지정하므로
 # 산출물이 섞여도 수집 대상에 잡히지 않는다. 별도 마트 폴더를 만들지 않는다.

@@ -2184,8 +2184,10 @@ def collect_receipts(**context) -> str:
                         logger.info("영수증 수집 실패 후 재오픈 성공: %s", sale_date)
                         continue
 
-                    all_rows.extend(rows)
-                    logger.info("수집 완료: %s → %d건", sale_date, len(rows))
+                # break(기준 없음/합계 일치)로 루프를 빠져나온 뒤에 누적해야 한다.
+                # 루프 안에 두면 정상 경로(break)가 extend를 건너뛰어 항상 0건이 된다(2026-08-30~09-11 실제 발생).
+                all_rows.extend(rows)
+                logger.info("수집 완료: %s → %d건", sale_date, len(rows))
 
         finally:
             try:

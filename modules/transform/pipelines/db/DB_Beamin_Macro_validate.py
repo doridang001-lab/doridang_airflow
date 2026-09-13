@@ -492,6 +492,8 @@ def _inspect_brand_coverage(
             if not has_orders_no_data_marker(brand, store_name, target_date):
                 continue
             existing.add(brand)
+            if brand in active:
+                continue
             if orders_no_data_marker_reason(brand, store_name, target_date) == SUSPECT_ZERO_REASON:
                 # 직전 영업일 데이터가 있는데 0건으로 읽힌 케이스 → 빈값으로 신뢰하지 않는다.
                 suspect_zero.add(brand)

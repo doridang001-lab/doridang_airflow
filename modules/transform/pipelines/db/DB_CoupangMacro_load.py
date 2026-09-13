@@ -35,7 +35,9 @@ KNOWN_BRANDS = ["도리당", "나홀로"]
 CMG_DIR = COUPANG_ORDERS_DETAIL_DB / "cmg"
 OPTIONS_DIR = COUPANG_ORDERS_DETAIL_DB / "options"
 COLLECT_SRC = COLLECT_DB / "영업관리부_수집"
+MISPLACED_MARKETING_SRC = COLLECT_DB / "마케팅_수집"
 ARCHIVE_DIR = COLLECT_SRC / "_archived"
+COUPANG_RAW_PREFIXES = ("orders", "cmg", "options")
 ORDER_DEDUP_COLUMNS = [
     "order_date",
     "order_id",
@@ -193,6 +195,49 @@ def _iter_source_files(prefix: str) -> list[dict[str, Path]]:
             items.append({"path": path, "source": source})
 
     return items
+
+
+def _collect_dest_path(src: Path) -> Path:
+    dest = COLLECT_SRC / src.name
+    if not dest.exists():
+        return dest
+
+    stem = src.stem
+    suffix = src.suffix
+    idx = 1
+    while True:
+        candidate = COLLECT_SRC / f"{stem}.{idx}{suffix}"
+        if not candidate.exists():
+            return candidate
+        idx += 1
+
+
+def move_misplaced_coupang_marketing_to_collect() -> list[dict[str, str]]:
+    """Move Coupang raw CSVs accidentally saved in marketing collection dir."""
+    try:
+        if _path_key(MISPLACED_MARKETING_SRC) == _path_key(COLLECT_SRC):
+            return []
+    except OSError:
+        return []
+
+    if not MISPLACED_MARKETING_SRC.exists():
+        return []
+
+    COLLECT_SRC.mkdir(parents=True, exist_ok=True)
+    moved: list[dict[str, str]] = []
+    for prefix in COUPANG_RAW_PREFIXES:
+        pattern = f"coupangeats_{prefix}_*.csv"
+        for src in sorted(MISPLACED_MARKETING_SRC.glob(pattern)):
+            if not src.is_file():
+                continue
+            dest = _collect_dest_path(src)
+            try:
+                shutil.move(str(src), str(dest))
+                moved.append({"source": str(src), "dest": str(dest)})
+                logger.warning("misplaced coupang csv moved to collect: %s -> %s", src, dest)
+            except Exception as exc:
+                logger.warning("failed to move misplaced coupang csv %s: %s", src, exc)
+    return moved
 
 
 def _resolve_brand_store(display_name: str) -> tuple[str, str]:
@@ -711,20 +756,12 @@ def move_coupang_down_to_collect() -> str:
     """
     COLLECT_SRC.mkdir(parents=True, exist_ok=True)
     moved = 0
-    for prefix in ("orders", "cmg", "options"):
+    for prefix in COUPANG_RAW_PREFIXES:
         pattern = f"coupangeats_{prefix}_*.csv"
         for _, source_dir in _raw_source_dirs(include_collect=False):
             for item in sorted(glob(str(source_dir / pattern))):
                 src = Path(item)
-                dest = COLLECT_SRC / src.name
-                if dest.exists():
-                    stem, suffix, idx = src.stem, src.suffix, 1
-                    while True:
-                        candidate = COLLECT_SRC / f"{stem}.{idx}{suffix}"
-                        if not candidate.exists():
-                            dest = candidate
-                            break
-                        idx += 1
+                dest = _collect_dest_path(src)
                 try:
                     shutil.move(str(src), str(dest))
                     logger.info("moved to collect: %s -> %s", src.name, dest)
@@ -741,6 +778,7 @@ def load_coupang_macro_partition() -> str:
 
 
 def _load_coupang_macro_partition_unlocked() -> str:
+    misplaced_moved = move_misplaced_coupang_marketing_to_collect()
     order_files = _iter_source_files("orders")
     cmg_files = _iter_source_files("cmg")
     options_files = _iter_source_files("options")
@@ -755,6 +793,8 @@ def _load_coupang_macro_partition_unlocked() -> str:
                 "orders": {"files_found": 0, "files_loaded": 0, "rows_loaded": 0, "outputs": []},
                 "cmg": {"files_found": 0, "files_loaded": 0, "rows_loaded": 0, "outputs": []},
                 "options": {"files_found": 0, "files_loaded": 0, "rows_loaded": 0, "outputs": []},
+                "misplaced_moved_count": len(misplaced_moved),
+                "misplaced_moved_files": misplaced_moved,
             },
             ensure_ascii=False,
         )
@@ -821,6 +861,8 @@ def _load_coupang_macro_partition_unlocked() -> str:
             },
             "cleaned_count": len(loaded_files),
             "cleaned_files": [str(item["path"]) for item in loaded_files],
+            "misplaced_moved_count": len(misplaced_moved),
+            "misplaced_moved_files": misplaced_moved,
         },
         ensure_ascii=False,
     )

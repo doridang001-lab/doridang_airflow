@@ -48,3 +48,14 @@ def test_content_stop_contract_blocks_collect_and_reload_resume():
     assert "if (await isRunnerStopRequested()) return;" in source
     assert "if (!naverAdsCollect && source === 'batch' && targetStores && targetStores.length > 0)" in source
     assert "} else if (!naverAdsCollect) {" in source
+
+
+def test_runner_reclicks_same_login_page_for_permission_error_text():
+    source = _read(RUNNER)
+
+    assert "const permissionErr = isLoginPermissionError(lastLoginErrText);" in source
+    assert "permissionErr || (!isLoginCredError(lastLoginErrText) && !throttleErr)" in source
+    assert "retryLoginWithoutReload = true;" in source
+    assert "권한 오류 문구' : '로그인 에러 문구'" in source
+    assert "같은 페이지 마우스형 재클릭으로 확인" in source
+    assert "로그인 권한 거절 — 재클릭 후에도 동일 문구, 다음 계정 진행" in source

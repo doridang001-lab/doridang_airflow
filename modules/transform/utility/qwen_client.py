@@ -3,6 +3,7 @@
 """
 import json
 import logging
+import os
 import re
 import tempfile
 import time
@@ -15,11 +16,31 @@ UNHEALTHY_MODEL_CACHE = Path(tempfile.gettempdir()) / "codex_qwen_unhealthy_mode
 UNHEALTHY_MODEL_TTL_SEC = 24 * 60 * 60
 GPT_OSS_UNHEALTHY_TTL_SEC = 30 * 60
 
-OLLAMA_HOST_CANDIDATES = [
-    "http://host.docker.internal:11434",  # Docker 컨테이너 내부 → 호스트
-    "http://localhost:11434",             # Windows/WSL 직접 실행
-    "http://127.0.0.1:11434",            # localhost 대체
+OLLAMA_HOST_DOCKER = "http://host.docker.internal:11434"   # 컨테이너 내부 → 호스트
+OLLAMA_HOSTS_LOCAL = [
+    "http://127.0.0.1:11434",   # 가장 빠름 (DNS 없음)
+    "http://localhost:11434",   # IPv6 우선 해석으로 느릴 수 있어 뒤에 둔다
 ]
+
+
+def _in_docker() -> bool:
+    env = os.getenv("IS_DOCKER")
+    if env is not None:
+        return env.lower() == "true"
+    return Path("/.dockerenv").exists()
+
+
+def _host_candidates() -> list:
+    """컨테이너 밖에서 host.docker.internal을 먼저 때리면 호출마다 20초 넘게 버려진다."""
+    override = os.getenv("OLLAMA_HOST")
+    if override:
+        return [override]
+    if _in_docker():
+        return [OLLAMA_HOST_DOCKER] + OLLAMA_HOSTS_LOCAL
+    return OLLAMA_HOSTS_LOCAL + [OLLAMA_HOST_DOCKER]
+
+
+OLLAMA_HOST_CANDIDATES = _host_candidates()
 LLM_MODEL_CANDIDATES = [
     "gpt-oss:20b",
     "gpt-oss:latest",

@@ -14,6 +14,10 @@ Docker Airflow에서는 Chrome DevTools Host 헤더 제한 때문에 Docker Desk
 doridang 계정(doridang001@gmail.com)이 로그인된 기본 Chrome 프로필(Default)만 사용합니다.
 #>
 
+param(
+    [switch]$CheckOnly
+)
+
 try {
     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
     $OutputEncoding = [System.Text.Encoding]::UTF8
@@ -36,6 +40,34 @@ $port = 9222
 $defaultExtensionId = "ocpdgnoaajajnlehamcalfcpholjhfbe"
 $fallbackExtDir = "C:\airflow\coupang_extension_build"
 $requiredExtFiles = @("manifest.json", "runner.html", "runner.js")
+$doridangCompanyName = [string]::Concat([char[]]@(0xC8FC, 0xC2DD, 0xD68C, 0xC0AC, 0x20, 0xB3C4, 0xB9AC, 0xB2F9))
+$doridangName = [string]::Concat([char[]]@(0xB3C4, 0xB9AC, 0xB2F9))
+$collectFolderName = [string]::Concat([char[]]@(0xC601, 0xC5C5, 0xAD00, 0xB9AC, 0xBD80, 0x5F, 0xC218, 0xC9D1))
+
+function Join-ChildPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Base,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$Children
+    )
+
+    $parts = @($Base) + $Children
+    return [System.IO.Path]::Combine([string[]]$parts)
+}
+
+function ConvertTo-NativeArgumentList {
+    param([string[]]$Arguments)
+
+    return (($Arguments | ForEach-Object {
+        $arg = [string]$_
+        if ($arg -match '[\s"]') {
+            '"' + ($arg -replace '"', '\"') + '"'
+        } else {
+            $arg
+        }
+    }) -join ' ')
+}
 
 function Test-CoupangExtensionDir {
     param([string]$Path)
@@ -132,6 +164,26 @@ function Wait-DevToolsEndpoint {
     exit 1
 }
 
+function Test-DevToolsHasBlockedRunnerTab {
+    param([int]$Port)
+
+    try {
+        $response = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/json" -TimeoutSec 3 -UseBasicParsing
+        $tabs = @($response.Content | ConvertFrom-Json)
+    } catch {
+        return $false
+    }
+
+    foreach ($tab in $tabs) {
+        $url = [string]$tab.url
+        $title = [string]$tab.title
+        if ($url -like "chrome-extension://*/runner.html*" -and $title -eq $url) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Ensure-ChromeDownloadPref {
     param(
         [string]$UserDataDir,
@@ -181,7 +233,7 @@ function Ensure-ChromeDownloadPref {
 
 function Resolve-CoupangCollectDownloadDir {
     if ($env:COLLECT_DB) {
-        $candidate = Join-Path -Path $env:COLLECT_DB -ChildPath "영업관리부_수집"
+        $candidate = Join-ChildPath $env:COLLECT_DB $collectFolderName
         if (Test-Path -Path $candidate) {
             return $candidate
         }
@@ -189,30 +241,29 @@ function Resolve-CoupangCollectDownloadDir {
 
     $userProfile = [Environment]::GetFolderPath("UserProfile")
     $onedriveCandidates = @(
-        (Join-Path -Path $userProfile -ChildPath "OneDrive - 주식회사 도리당"),
-        (Join-Path -Path $userProfile -ChildPath "OneDrive - 도리당")
+        (Join-ChildPath $userProfile ("OneDrive - " + $doridangCompanyName)),
+        (Join-ChildPath $userProfile ("OneDrive - " + $doridangName))
     )
     foreach ($base in $onedriveCandidates) {
-        $candidate = Join-Path -Path $base -ChildPath "Collect_Data\영업관리부_수집"
+        $candidate = Join-ChildPath $base "Collect_Data" $collectFolderName
         if (Test-Path -Path $candidate) {
             return $candidate
         }
     }
 
-    $localDownloadDir = "E:\down"
-    if (Test-Path -Path $localDownloadDir) {
-        Write-Warning "영업관리부_수집 폴더를 찾지 못해 임시 다운로드 폴더를 사용합니다: $localDownloadDir"
-        return $localDownloadDir
-    }
-
-    throw "쿠팡 다운로드 대상 폴더를 찾을 수 없습니다: Collect_Data\영업관리부_수집 또는 E:\down"
+    throw "쿠팡 다운로드 대상 폴더를 찾을 수 없습니다: Collect_Data\영업관리부_수집"
 }
 
 # 다운로드 경로: 쿠팡 원본 CSV의 정식 수집 폴더와 일치시킨다.
 $collectDownloadDir = Resolve-CoupangCollectDownloadDir
-New-Item -ItemType Directory -Path $collectDownloadDir -Force | Out-Null
 Write-Host "다운로드 경로: $collectDownloadDir" -ForegroundColor Cyan
 
+if ($CheckOnly) {
+    Write-Host "CheckOnly: Chrome 실행 없이 다운로드 대상 폴더 확인 완료" -ForegroundColor Green
+    exit 0
+}
+
+New-Item -ItemType Directory -Path $collectDownloadDir -Force | Out-Null
 Ensure-ChromeDownloadPref -UserDataDir $userDataDir -ProfileDirectory $profileDirectory -TargetDir $collectDownloadDir
 
 # 이미 같은 포트로 떠 있으면 중복 실행 방지
@@ -221,6 +272,10 @@ if ($inUse) {
     Write-Host "이미 디버그 포트 $port 로 크롬이 떠 있습니다. 새로 띄우지 않습니다." -ForegroundColor Yellow
     Write-Warning "이미 떠 있는 Chrome에는 실행 플래그(--download-default-directory 포함)가 적용되지 않습니다."
     Wait-DevToolsEndpoint -Port $port -TimeoutSeconds 10
+    if (Test-DevToolsHasBlockedRunnerTab -Port $port) {
+        Write-Error "기존 Chrome의 runner.html 탭이 차단 페이지로 보입니다. Chrome을 완전히 종료한 뒤 다시 실행하세요."
+        exit 1
+    }
     exit 0
 }
 
@@ -245,6 +300,6 @@ Write-Host "확장 로드: $extDir" -ForegroundColor Cyan
 $chromeArgs += "about:blank"
 
 Write-Host "doridang Chrome 실행 (debug port $port, profile $profileDirectory, user-data-dir $userDataDir)" -ForegroundColor Green
-Start-Process -FilePath $chrome -WindowStyle Normal -ArgumentList $chromeArgs
+Start-Process -FilePath $chrome -WindowStyle Normal -ArgumentList (ConvertTo-NativeArgumentList $chromeArgs)
 Wait-DevToolsEndpoint -Port $port -TimeoutSeconds 30
 Write-Host "완료. 확장이 실제 ID의 runner.html을 열고 topHalfBtn 자동 클릭 후 수집이 시작됩니다." -ForegroundColor Green

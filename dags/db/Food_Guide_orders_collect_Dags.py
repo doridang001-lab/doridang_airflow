@@ -1,9 +1,10 @@
 """
 Food Guide order history collection DAG.
 
-Default run collects yesterday in KST and archives the downloaded source file
-under LOCAL_DB/temp/food_guide_orders. OneDrive-backed analytics storage should
-be enabled only after an explicit approval and sample schema confirmation.
+Default run collects yesterday in KST. The downloaded source Excel is staged
+under TEMP_DIR/food_guide_orders_download and deleted once the monthly parquet
+conversion succeeds. Converted parquet output is saved under OneDrive analytics
+storage (ANALYTICS_DB/Food_Guide_Raw, i.e. FOOD_GUIDE_RAW_DIR in paths.py).
 """
 
 from __future__ import annotations

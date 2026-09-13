@@ -333,6 +333,9 @@ def test_not_run_task_is_cleared_instead_of_codex(tmp_path, monkeypatch):
     assert watcher.process_once() is True
 
     posts = [call for call in calls if call[0] == "POST"]
+    claims = [call for call in posts if call[1].endswith("/variables")]
+    assert len(claims) == 1
+    posts = [call for call in posts if call[1].endswith("/clearTaskInstances")]
     assert len(posts) == 1
     assert posts[0][1].endswith("/clearTaskInstances")
     assert posts[0][2]["dag_run_id"] == "manual__2026-08-24T04:03:55.448896+00:00"
