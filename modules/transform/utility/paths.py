@@ -86,6 +86,24 @@ def resolve_collect_db() -> Path:
     return Path.home() / WINDOWS_ONEDRIVE_FALLBACK / "Collect_Data"
 
 
+def resolve_extension_dir() -> Path:
+    env_path = os.getenv("EXTENSION_DIR")
+    if env_path:
+        return Path(env_path)
+
+    container_mount = _container_mount("/opt/airflow/Extention")
+    if container_mount.exists():
+        return container_mount
+
+    if _is_windows():
+        existing = _resolve_existing_windows_onedrive_path("Extention")
+        if existing is not None:
+            return existing
+        return _windows_onedrive_path("Extention")
+
+    return Path.home() / WINDOWS_ONEDRIVE_FALLBACK / "Extention"
+
+
 def resolve_local_db() -> Path:
     env_path = os.getenv("LOCAL_DB")
     if env_path:
@@ -152,18 +170,33 @@ def resolve_down_dir() -> Path:
     return fallback
 
 
+def resolve_manual_down_dir() -> Path:
+    env_path = os.getenv("D_DOWN_DIR")
+    if env_path:
+        return Path(env_path)
+
+    if _is_windows():
+        return Path("E:/d_down")
+
+    container_down = _container_mount("/opt/airflow/manual_download")
+    if container_down.parent.exists():
+        return container_down
+
+    return Path.cwd() / "manual_download"
+
+
 def resolve_analytics_db() -> Path:
     env_path = os.getenv("ANALYTICS_DB")
     if env_path:
         return Path(env_path)
 
+    if _is_windows():
+        return _windows_onedrive_path("data", "analytics")
+
     container_mount = _container_mount("/opt/airflow/analytics")
     if container_mount.parent.exists():
         container_mount.mkdir(parents=True, exist_ok=True)
         return container_mount
-
-    if _is_windows():
-        return _windows_onedrive_path("data", "analytics")
 
     return Path.home() / WINDOWS_ONEDRIVE_FALLBACK / "data" / "analytics"
 
@@ -197,6 +230,13 @@ def resolve_mart_db() -> Path:
         return container_mount
 
     return Path.home() / WINDOWS_ONEDRIVE_FALLBACK / "data" / "mart"
+
+
+def resolve_flow_visit_base_dir() -> Path:
+    env_path = os.getenv("FLOW_VISIT_BASE_DIR")
+    if env_path:
+        return Path(env_path)
+    return MART_DB / "Flow_mart" / "Flow_visit"
 
 
 def resolve_llm_output_dir() -> Path:
@@ -243,73 +283,160 @@ def resolve_raw_unionpos_sales() -> Path:
     return resolve_analytics_db() / "unionpos_sales_raw"
 
 
-_cache: dict = {}
+ONEDRIVE_DB = resolve_onedrive_db()
+COLLECT_DB = resolve_collect_db()
+EXTENSION_DIR = resolve_extension_dir()
+COLLECTOR_EXT_DIR = EXTENSION_DIR / "doridang_collector_개발용"
+LOCAL_DB = resolve_local_db()
+TEMP_DIR = resolve_temp_dir()
+DOWN_DIR = resolve_down_dir()
+MANUAL_DOWN_DIR = resolve_manual_down_dir()
+ANALYTICS_DB = resolve_analytics_db()
+BAEMIN_MARKETING_DB = ANALYTICS_DB / "baemin_marketing"
+BAEMIN_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "baemin_policy_raw.csv"
+CHICKEN_PRICE_CSV_PATH = ANALYTICS_DB / "chicken_price" / "chicken_price.csv"
+COUPANG_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "coupang_policy_raw.csv"
+YOGIYO_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "yogiyo_policy_raw.csv"
+YOGIYO_SETTLEMENT_MONTHLY_FEE_CSV_PATH = (
+    ANALYTICS_DB / "Yogiyo" / "Yogiyo_Settlement" / "yogiyo_settlement_monthly_fee.csv"
+)
+DDANGYO_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "ddangyo_policy_raw.csv"
+BAEDALTTEUK_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "baedaltteuk_policy_raw.csv"
+MUKKEBI_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "mukkebi_policy_raw.csv"
+BAEDALEUM_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "baedaleum_policy_raw.csv"
+NAVER_PLACE_POLICY_CSV_PATH = ANALYTICS_DB / "policy" / "naver_place_policy_raw.csv"
+POLICY_LOG_PATH = ANALYTICS_DB / "policy" / "log.parquet"
+POLICY_CONSOLIDATED_CSV = ANALYTICS_DB / "policy" / "policy_consolidated_latest.csv"
+INSTAGRAM_SNAPSHOT_DIR = ANALYTICS_DB / "Instagram"
+INSTAGRAM_SNAPSHOT_CSV_PATH = INSTAGRAM_SNAPSHOT_DIR / "instagram_snapshot.csv"
+KAKAO_FRIENDS_DIR = ANALYTICS_DB / "Kakao" / "Friends"
+KAKAO_FRIENDS_CSV_PATH = KAKAO_FRIENDS_DIR / "kakao_friends.csv"
+KAKAO_STORE_RAW_DIR = ANALYTICS_DB / "Kakao" / "raw"
+KAKAO_STORE_RAW_STATE_JSON = LOCAL_DB / "kakao_store_raw_processed_files.json"
+NAVER_ADS_DIR = ANALYTICS_DB / "naver" / "naver_ad"
+NAVER_ADS_FILE_PATTERN = "naverads_adgroups_*.csv"
+DAANGN_ADS_CSV_PATH = ANALYTICS_DB / "Daangn_ads" / "daangn_ads.csv"
+REPORT_SALES_DB = resolve_report_sales_db()
+MART_DB = resolve_mart_db()
+KAKAO_STORE_RAW_PARQUET_DIR = MART_DB / "Kakao_Store_Raw"
+KAKAO_STORE_RAW_PARQUET = KAKAO_STORE_RAW_PARQUET_DIR / "kakao_store_raw.parquet"
+LLM_OUTPUT_DIR = resolve_llm_output_dir()
+DASHBOARD_DB = resolve_dashboard_db()
+FLOW_BASE_DIR = ANALYTICS_DB / "flow"
+FLOW_PROJECT_PARQUET = FLOW_BASE_DIR / "flow_project" / "flow_project.parquet"
+FLOW_POST_PARQUET = FLOW_BASE_DIR / "flow_post"
+FLOW_COMMENT_PARQUET = FLOW_BASE_DIR / "flow_comment"
+FLOW_ATTACHMENT_PARQUET = FLOW_BASE_DIR / "flow_attachment"
+FLOW_ATTACHMENT_FILES_DIR = FLOW_BASE_DIR / "flow_attachment_files"
+DORIDANG_BOT_LOG_MD = FLOW_BASE_DIR / "log.md"
+DORIDANG_BOT_KNOWLEDGE_MD = FLOW_BASE_DIR / "bot_knowledge.md"
+FLOW_LEGACY_PROJECT_PARQUET = ANALYTICS_DB / "flow" / "flow_project.parquet"
+FLOW_LEGACY_POST_PARQUET = ANALYTICS_DB / "flow" / "flow_post.parquet"
+FLOW_LEGACY_COMMENT_PARQUET = ANALYTICS_DB / "flow" / "flow_comment.parquet"
+FLOW_STATE_JSON = LOCAL_DB / "flow_posts_index.json"
+MARKETING_ADS_ALERT_STATE_JSON = LOCAL_DB / "marketing_ads_missing_alert.json"
+FLOW_VISIT_BASE_DIR = resolve_flow_visit_base_dir()
+FLOW_VISIT_LOG_PARQUET = FLOW_VISIT_BASE_DIR / "flow_visit_log"
+FLOW_VISIT_ISSUE_PARQUET = FLOW_VISIT_BASE_DIR / "flow_visit_issue"
+FLOW_VISIT_FOLLOWUP_PARQUET = FLOW_VISIT_BASE_DIR / "flow_visit_followup"
+FLOW_VISIT_TODO_PARQUET = FLOW_VISIT_BASE_DIR / "flow_visit_todo"
+FLOW_VISIT_SUBTASK_PARQUET = FLOW_VISIT_BASE_DIR / "flow_visit_subtask"
+FLOW_VISIT_PROFILE_SNAPSHOT_PARQUET = FLOW_VISIT_BASE_DIR / "flow_visit_profile_snapshot"
+FLOW_STORE_PROFILE_PARQUET = (
+    FLOW_VISIT_BASE_DIR / "flow_store_profile" / "flow_store_profile.parquet"
+)
+FLOW_VISIT_CORPUS_JSONL = FLOW_VISIT_BASE_DIR / "flow_visit_corpus.jsonl"
+FLOW_VISIT_VIZ_PARQUET = FLOW_VISIT_BASE_DIR / "flow_visit_viz.parquet"
+FLOW_VISIT_LLM_CACHE = LOCAL_DB / "flow_visit_llm_cache.json"
+FLOW_VISIT_PROFILE_CACHE = LOCAL_DB / "flow_visit_profile_cache.json"
+COLLECTION_COMPARE_PATH = MART_DB / "collection_compare" / "collection_compare.parquet"
+BAEMIN_NOW_GRP_DIR = MART_DB / "Baemin_now_grp"
+BAEMIN_NOW_GRP_PARQUET = BAEMIN_NOW_GRP_DIR / "baemin_now_grp.parquet"
+NAVER_CORP_STORE_MKT_CSV_PATH = (
+    MART_DB / "naver_corporate_store_marketing" / "naver_corporate_store_marketing.csv"
+)
+MARKETING_ADS_TRACKING_DIR = MART_DB / "Marketing_Ads_Tracking"
+MARKETING_ADS_CAMPAIGN_CSV = MARKETING_ADS_TRACKING_DIR / "marketing_ads_campaign.csv"
+MARKETING_ADS_DAILY_CSV = MARKETING_ADS_TRACKING_DIR / "marketing_ads_daily.csv"
+MARKETING_ADS_FLOW_COMPARE_CSV = MARKETING_ADS_TRACKING_DIR / "marketing_ads_flow_compare.csv"
+MARKETING_ADS_DAILY_FLOW_TASKS_CSV = MARKETING_ADS_TRACKING_DIR / "marketing_ads_daily_flow_tasks.csv"
+MARKETING_ADS_LINK_MANUAL_CSV = MARKETING_ADS_TRACKING_DIR / "campaign_link_manual.csv"
+DELIVERY_COMMISSION_DIR = MART_DB / "delivery_commission"
+DELIVERY_COMMISSION_PATH = DELIVERY_COMMISSION_DIR / "delivery_commission.parquet"
+DELIVERY_REVENUE_DIR = MART_DB / "delivery_revenue"
+DELIVERY_REVENUE_PATH = DELIVERY_REVENUE_DIR / "delivery_revenue.parquet"
+STORE_COST_ALLOCATION_DIR = MART_DB / "store_cost_allocation"
+STORE_COST_ALLOCATION_PATH = STORE_COST_ALLOCATION_DIR / "store_cost_allocation.parquet"
+DDANGYO_FEE_DIR = MART_DB / "Ddangyo" / "Ddangyo_fee"
+DDANGYO_FEE_RATIO_MONTHLY_CSV = DDANGYO_FEE_DIR / "ddangyo_fee_ratio_monthly.csv"
+DDANGYO_FEE_RATIO_BASELINE_CSV = DDANGYO_FEE_DIR / "ddangyo_fee_ratio_baseline.csv"
+ITEM_MASTER_CHECKPOINT_DIR = ANALYTICS_DB / "item_master_checkpoints"
+RAW_OKPOS_SALES = resolve_raw_okpos_sales()
+RAW_UNIONPOS_SALES = resolve_raw_unionpos_sales()
+FOOD_GUIDE_RAW_DIR = ANALYTICS_DB / "Food_Guide_Raw"
+FIN_PRODUCT_LEGACY_CSV_PATH = MART_DB / "fin_product" / "fin_product_grp.csv"
+FIN_PRODUCT_CSV_PATH = MART_DB / "fin_product" / "fin_product_grp_input.csv"
+FIN_PRODUCT_REVIEW_CSV_PATH = MART_DB / "fin_product" / "fin_product_review.csv"
+FIN_PRODUCT_ALIAS_CSV_PATH = MART_DB / "fin_product" / "fin_product_alias.csv"
+FIN_PRODUCT_MART_CSV_PATH = MART_DB / "fin_product" / "fin_product_mart.csv"
+POSFEED_WHITELIST_CSV_PATH = MART_DB / "fin_product" / "fin_product_posfeed_whitelist.csv"
+FIN_PRODUCT_MAP_CSV_PATH = MART_DB / "fin_product" / "fin_product_map.csv"
+FIN_PRODUCT_MAP_REVIEW_LEGACY_CSV_PATH = MART_DB / "fin_product" / "fin_product_map_review.csv"
+FIN_PRODUCT_MAP_REVIEW_CSV_PATH = MART_DB / "fin_product" / "fin_product_map_review_input.csv"
+NEW_FIN_PRODUCT_MAP_REVIEW_CSV_PATH = MART_DB / "fin_product" / "new_fin_product_map_review_input.csv"
+FIN_PRODUCT_MAP_RECENTLY_CSV_PATH = MART_DB / "fin_product" / "fin_product_map_recently.csv"
+FIN_PRODUCT_MAP_JOIN_CSV_PATH = MART_DB / "fin_product" / "fin_product_map_join.csv"
+FIN_PRODUCT_MAP_TRAIN_JSON_PATH = MART_DB / "fin_product" / "fin_product_map_train.json"
+FIN_PRODUCT_RULES_JSON_PATH = MART_DB / "fin_product" / "fin_product_rules.json"
+FIN_PRODUCT_RULES_MANUAL_JSON_PATH = MART_DB / "fin_product" / "fin_product_rules_manual.json"
+FIN_PRODUCT_RULE_PROPOSAL_DIR = TEMP_DIR / "fin_product_rule_proposals"
+ORDER_CROSS_DIR = MART_DB / "order_cross_analysis"
+STORE_MANAGER_MART_DIR = MART_DB / "Store_Manager"
+STORE_MANAGER_MART_CSV = STORE_MANAGER_MART_DIR / "store_manager.csv"
+
+# 입력 엑셀과 통합 산출물을 같은 폴더에 둔다. 입력 파일은 파일명으로 직접 지정하므로
+# 산출물이 섞여도 수집 대상에 잡히지 않는다. 별도 마트 폴더를 만들지 않는다.
+BSP_KPI_DIR = MART_DB / "brand_strategy_planning_team" / "bsp_kpi"
+BSP_KPI_WEEKLY_PARQUET = BSP_KPI_DIR / "bsp_kpi_weekly.parquet"
+BSP_KPI_WEEKLY_CSV = BSP_KPI_DIR / "bsp_kpi_weekly.csv"
+BSP_MONTHLY_KPI_XLSX = BSP_KPI_DIR / "monthly_kpi.xlsx"
 
 
-def _get(name: str):
-    if name not in _cache:
-        _cache[name] = _RESOLVERS[name]()
-    return _cache[name]
+def existing_fin_product_csv_path() -> Path:
+    return FIN_PRODUCT_CSV_PATH if FIN_PRODUCT_CSV_PATH.exists() else FIN_PRODUCT_LEGACY_CSV_PATH
 
 
-_RESOLVERS = {
-    # Primary resolvers
-    "ONEDRIVE_DB":    resolve_onedrive_db,
-    "COLLECT_DB":     resolve_collect_db,
-    "LOCAL_DB":       resolve_local_db,
-    "TEMP_DIR":       resolve_temp_dir,
-    "DOWN_DIR":       resolve_down_dir,
-    "ANALYTICS_DB":   resolve_analytics_db,
-    "REPORT_SALES_DB": resolve_report_sales_db,
-    "MART_DB":        resolve_mart_db,
-    "LLM_OUTPUT_DIR": resolve_llm_output_dir,
-    "DASHBOARD_DB":   resolve_dashboard_db,
-    "RAW_OKPOS_SALES":    resolve_raw_okpos_sales,
-    "RAW_UNIONPOS_SALES": resolve_raw_unionpos_sales,
-    # Derived — ANALYTICS_DB 계열
-    "BAEMIN_MARKETING_DB":          lambda: _get("ANALYTICS_DB") / "baemin_marketing",
-    "BAEMIN_POLICY_CSV_PATH":       lambda: _get("ANALYTICS_DB") / "policy" / "baemin_policy_raw.csv",
-    "CHICKEN_PRICE_CSV_PATH":       lambda: _get("ANALYTICS_DB") / "chicken_price" / "chicken_price.csv",
-    "COUPANG_POLICY_CSV_PATH":      lambda: _get("ANALYTICS_DB") / "policy" / "coupang_policy_raw.csv",
-    "YOGIYO_POLICY_CSV_PATH":       lambda: _get("ANALYTICS_DB") / "policy" / "yogiyo_policy_raw.csv",
-    "DDANGYO_POLICY_CSV_PATH":      lambda: _get("ANALYTICS_DB") / "policy" / "ddangyo_policy_raw.csv",
-    "BAEDALTTEUK_POLICY_CSV_PATH":  lambda: _get("ANALYTICS_DB") / "policy" / "baedaltteuk_policy_raw.csv",
-    "MUKKEBI_POLICY_CSV_PATH":      lambda: _get("ANALYTICS_DB") / "policy" / "mukkebi_policy_raw.csv",
-    "BAEDALEUM_POLICY_CSV_PATH":    lambda: _get("ANALYTICS_DB") / "policy" / "baedaleum_policy_raw.csv",
-    "NAVER_PLACE_POLICY_CSV_PATH":  lambda: _get("ANALYTICS_DB") / "policy" / "naver_place_policy_raw.csv",
-    "POLICY_LOG_PATH":              lambda: _get("ANALYTICS_DB") / "policy" / "log.parquet",
-    "POLICY_CONSOLIDATED_CSV":      lambda: _get("ANALYTICS_DB") / "policy" / "policy_consolidated_latest.csv",
-    "ITEM_MASTER_CHECKPOINT_DIR":   lambda: _get("ANALYTICS_DB") / "item_master_checkpoints",
-    "BAEMIN_ORDERS_DETAIL_DB":      lambda: _get("ANALYTICS_DB") / "baemin_macro",
-    "BAEMIN_METRICS_DB":            lambda: _get("BAEMIN_ORDERS_DETAIL_DB") / "metrics_now",
-    "BAEMIN_OUR_STORE_CLICKS_DB":   lambda: _get("BAEMIN_ORDERS_DETAIL_DB") / "metrics_our_store_clicks",
-    "BAEMIN_SHOP_CHANGE_DB":        lambda: _get("BAEMIN_ORDERS_DETAIL_DB") / "shop_change",
-    "BAEMIN_SHOP_OPERATION_DB":     lambda: _get("BAEMIN_ORDERS_DETAIL_DB") / "shop_operation",
-    "BAEMIN_MONTHLY_OPERATION_DB":  lambda: _get("BAEMIN_ORDERS_DETAIL_DB") / "monthly_operation",
-    "BAEMIN_ORDERS_DB":             lambda: _get("BAEMIN_ORDERS_DETAIL_DB") / "orders",
-    "BAEMIN_AD_FUNNEL_DB":          lambda: _get("BAEMIN_ORDERS_DETAIL_DB") / "ad_funnel",
-    "COUPANG_ORDERS_DETAIL_DB":     lambda: _get("ANALYTICS_DB") / "coupang_macro",
-    "COUPANG_ORDERS_DB":            lambda: _get("COUPANG_ORDERS_DETAIL_DB") / "orders",
-    "TOORDER_REVIEW_ANALYTICS_DIR": lambda: _get("ANALYTICS_DB") / "toorder_review",
-    # Derived — MART_DB 계열
-    "COLLECTION_COMPARE_PATH":      lambda: _get("MART_DB") / "collection_compare" / "collection_compare.parquet",
-    "FIN_PRODUCT_CSV_PATH":         lambda: _get("MART_DB") / "fin_product" / "fin_product_grp.csv",
-    "FIN_PRODUCT_GRP_TRAIN_JSON_PATH": lambda: _get("MART_DB") / "fin_product" / "fin_product_grp_train.json",
-    "FIN_PRODUCT_REVIEW_CSV_PATH":  lambda: _get("MART_DB") / "fin_product" / "fin_product_review.csv",
-    "FIN_PRODUCT_ALIAS_CSV_PATH":   lambda: _get("MART_DB") / "fin_product" / "fin_product_alias.csv",
-    "FIN_PRODUCT_MAP_CSV_PATH":         lambda: _get("MART_DB") / "fin_product" / "fin_product_map.csv",
-    "FIN_PRODUCT_MAP_REVIEW_CSV_PATH":  lambda: _get("MART_DB") / "fin_product" / "fin_product_map_review.csv",
-    "FIN_PRODUCT_MAP_TRAIN_JSON_PATH": lambda: _get("MART_DB") / "fin_product" / "fin_product_map_train.json",
-    "UNIFIED_REVIEW_MART_DIR":      lambda: _get("MART_DB") / "unified_review",
-    # Derived — STORE_SALES 계열
-    "STORE_SALES_TARGET_DIR":        lambda: _get("ANALYTICS_DB") / "store_sales_target",
-    "STORE_SALES_TARGET_CSV":        lambda: _get("STORE_SALES_TARGET_DIR") / "target.csv",
-    "STORE_SALES_DAILY_ACTUALS_CSV": lambda: _get("STORE_SALES_TARGET_DIR") / "daily_actuals.csv",
-    "STORE_SALES_ANALYSIS_CSV":      lambda: _get("STORE_SALES_TARGET_DIR") / "sales_analysis.csv",
-}
+def existing_fin_product_map_review_csv_path() -> Path:
+    return (
+        FIN_PRODUCT_MAP_REVIEW_CSV_PATH
+        if FIN_PRODUCT_MAP_REVIEW_CSV_PATH.exists()
+        else FIN_PRODUCT_MAP_REVIEW_LEGACY_CSV_PATH
+    )
 
 
-def __getattr__(name: str):
-    if name in _RESOLVERS:
-        return _get(name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+def existing_new_fin_product_map_review_csv_path() -> Path:
+    return (
+        NEW_FIN_PRODUCT_MAP_REVIEW_CSV_PATH
+        if NEW_FIN_PRODUCT_MAP_REVIEW_CSV_PATH.exists()
+        else existing_fin_product_map_review_csv_path()
+    )
+
+STORE_SALES_TARGET_DIR = ANALYTICS_DB / "store_sales_target"
+STORE_SALES_TARGET_CSV = STORE_SALES_TARGET_DIR / "target.csv"
+STORE_SALES_DAILY_ACTUALS_CSV = STORE_SALES_TARGET_DIR / "daily_actuals.csv"
+STORE_SALES_ANALYSIS_CSV = STORE_SALES_TARGET_DIR / "sales_analysis.csv"
+
+BAEMIN_ORDERS_DETAIL_DB = ANALYTICS_DB / "baemin_macro"
+BAEMIN_METRICS_DB = BAEMIN_ORDERS_DETAIL_DB / "metrics_now"
+BAEMIN_OUR_STORE_CLICKS_DB = BAEMIN_ORDERS_DETAIL_DB / "metrics_our_store_clicks"
+BAEMIN_SHOP_CHANGE_DB = BAEMIN_ORDERS_DETAIL_DB / "shop_change"
+BAEMIN_SHOP_OPERATION_DB = BAEMIN_ORDERS_DETAIL_DB / "shop_operation"
+BAEMIN_MONTHLY_OPERATION_DB = BAEMIN_ORDERS_DETAIL_DB / "monthly_operation"
+BAEMIN_ORDERS_DB = BAEMIN_ORDERS_DETAIL_DB / "orders"
+BAEMIN_AD_FUNNEL_DB = BAEMIN_ORDERS_DETAIL_DB / "ad_funnel"
+
+COUPANG_ORDERS_DETAIL_DB = ANALYTICS_DB / "coupang_macro"
+COUPANG_ORDERS_DB = COUPANG_ORDERS_DETAIL_DB / "orders"
+
+UNIFIED_REVIEW_MART_DIR = MART_DB / "unified_review"
+TOORDER_REVIEW_ANALYTICS_DIR = ANALYTICS_DB / "toorder_review"

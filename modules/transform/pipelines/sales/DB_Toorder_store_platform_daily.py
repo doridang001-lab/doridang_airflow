@@ -14,12 +14,12 @@ import pandas as pd
 import pendulum
 
 from modules.extract.crawling_toorder_sales_report import run_crawling_datedetail_months
+from modules.transform.utility.account import get_default_account, get_pw
 from modules.transform.utility.paths import ANALYTICS_DB, DOWN_DIR
 
 logger = logging.getLogger(__name__)
 
-_TOORDER_ID = os.getenv("TOORDER_ID", "doridang15")
-_TOORDER_PW = os.getenv("TOORDER_PW", "ehfl5233!")
+_DEFAULT_TOORDER_ID, _ = get_default_account("toorder")
 _DEFAULT_DEST = ANALYTICS_DB / "toorder_daily_store_platform"
 _PARQUET_NAME = "toorder_store_platform_daily.parquet"
 _DATEDETAIL_PREFIX = "\uc885\ud569\ubcf4\uace0\uc11c_\uc77c\ubcc4\uc0c1\uc138_\ub9e4\ucd9c\ubcf4\uace0\uc11c"
@@ -30,6 +30,43 @@ _STORE_COL_START = 5
 _STORE_COL_STRIDE = 4
 _DATA_ROW_START = 6
 _OUTPUT_COLUMNS = ["date", "store", "platform", "price", "receipts_num"]
+QUALITY_REF_DAYS = 7
+QUALITY_MIN_REF_DAYS = 3
+QUALITY_MIN_STORE_RATIO = 0.70
+QUALITY_MIN_ROW_RATIO = 0.70
+QUALITY_MIN_TOTAL_RATIO = 0.50
+
+
+def _get_airflow_variable(key: str) -> str:
+    try:
+        from airflow.models import Variable
+        value = Variable.get(key, default_var=None)
+        return (value or "").strip()
+    except Exception:
+        return ""
+
+
+def _resolve_toorder_id(explicit: str | None = None) -> str:
+    if explicit and get_pw("toorder", explicit):
+        return explicit
+    if explicit:
+        logger.warning("자동화 연결 대상이 아닌 ToOrder 계정 무시: account_id=%s", explicit)
+    for key in ("TOORDER_ID", "TOORDER_VOC_ACCOUNT_ID", "TOORDER_DELIVERY_ACCOUNT_ID"):
+        value = (os.getenv(key) or _get_airflow_variable(key)).strip()
+        if value and get_pw("toorder", value):
+            return value
+        if value:
+            logger.warning("자동화 연결 대상이 아닌 ToOrder 계정 무시: key=%s account_id=%s", key, value)
+    return _DEFAULT_TOORDER_ID
+
+
+def _resolve_toorder_password(account_id: str, explicit: str | None = None) -> str:
+    if explicit:
+        logger.warning("명시적 ToOrder 비밀번호는 자동화 연결 필터 우회를 막기 위해 무시합니다.")
+    account_pw = get_pw("toorder", account_id)
+    if account_pw:
+        return account_pw
+    return ""
 
 
 def run_toorder_store_platform_daily(
@@ -43,6 +80,7 @@ def run_toorder_store_platform_daily(
     toorder_pw: str | None = None,
     manual_dir: str | Path | None = None,
     log_prefix: str = "",
+    force_download: bool = False,
     **_: object,
 ) -> str:
     """Collect datedetail data and upsert it into Parquet.
@@ -58,6 +96,13 @@ def run_toorder_store_platform_daily(
     )
     resolved_dest = Path(dest_dir) if dest_dir else _DEFAULT_DEST
     resolved_manual = Path(manual_dir) if manual_dir else DOWN_DIR
+    resolved_toorder_id = _resolve_toorder_id(toorder_id)
+    resolved_toorder_pw = _resolve_toorder_password(resolved_toorder_id, toorder_pw)
+    if not resolved_toorder_id or not resolved_toorder_pw:
+        raise RuntimeError(
+            "ToOrder datedetail 계정 해석 실패: "
+            "sales_employee.csv 자동화 계정 또는 내장 fallback 계정을 확인하세요."
+        )
     parquet_path = resolved_dest / _PARQUET_NAME
     resolved_dest.mkdir(parents=True, exist_ok=True)
     resolved_manual.mkdir(parents=True, exist_ok=True)
@@ -67,7 +112,7 @@ def run_toorder_store_platform_daily(
     missing_spans: list[tuple[str, str]] = []
     for month_start, month_end in month_spans:
         month_token = month_start[:7]
-        xlsx_path = _find_pending_datedetail_file(resolved_manual, month_token)
+        xlsx_path = None if force_download else _find_pending_datedetail_file(resolved_manual, month_token)
         if xlsx_path is None:
             missing_spans.append((month_start, month_end))
         else:
@@ -75,23 +120,28 @@ def run_toorder_store_platform_daily(
             logger.info("%sUsing pending datedetail workbook: %s", log_prefix, xlsx_path.name)
 
     downloaded_by_month: dict[str, Path] = {}
+    failed_download_months: list[str] = []
+    empty_months: list[str] = []
+    download_results: list[dict] = []
     if missing_spans:
         logger.info(
             "%sDownloading ToOrder datedetail months: %s",
             log_prefix,
             ", ".join(month_start[:7] for month_start, _month_end in missing_spans),
         )
-        results = run_crawling_datedetail_months(
-            toorder_id=toorder_id or _TOORDER_ID,
-            toorder_pw=toorder_pw or _TOORDER_PW,
+        download_results = run_crawling_datedetail_months(
+            toorder_id=resolved_toorder_id,
+            toorder_pw=resolved_toorder_pw,
             month_spans=missing_spans,
             download_dir=resolved_manual,
         )
-        for result in results:
+        for result in download_results:
             month_token = str(result.get("month") or "")
             if result.get("success") and result.get("file"):
                 downloaded_by_month[month_token] = Path(str(result["file"]))
             else:
+                if month_token and month_token not in failed_download_months:
+                    failed_download_months.append(month_token)
                 logger.warning(
                     "%sDatedetail download failed: %s (%s)",
                     log_prefix,
@@ -104,11 +154,15 @@ def run_toorder_store_platform_daily(
         month_token = month_start[:7]
         xlsx_path = pending_by_month.get(month_token) or downloaded_by_month.get(month_token)
         if xlsx_path is None:
+            if month_token not in failed_download_months:
+                failed_download_months.append(month_token)
             logger.warning("%sSkipping ToOrder datedetail month without workbook: %s", log_prefix, month_token)
             continue
 
         month_df = _parse_datedetail_xlsx(xlsx_path)
         if month_df.empty:
+            if month_token not in empty_months:
+                empty_months.append(month_token)
             logger.warning("%sDatedetail workbook parsed empty: %s", log_prefix, xlsx_path.name)
         else:
             month_df = month_df[
@@ -118,13 +172,44 @@ def run_toorder_store_platform_daily(
             if not month_df.empty:
                 all_dfs.append(month_df)
                 logger.info("%sParsed datedetail %s: %d rows", log_prefix, month_token, len(month_df))
+            else:
+                if month_token not in empty_months:
+                    empty_months.append(month_token)
+                logger.warning("%sDatedetail workbook has no in-range rows: %s", log_prefix, month_token)
         _rename_to_raw(xlsx_path)
 
     if all_dfs:
         new_df = pd.concat(all_dfs, ignore_index=True)
+        quality_reason = _new_rows_quality_reason(new_df, parquet_path)
+        if quality_reason:
+            raise RuntimeError(
+                "ToOrder datedetail 부분수집 의심: "
+                f"{quality_reason}, range={resolved_from}~{resolved_to}, parquet={parquet_path}"
+            )
         _upsert_parquet(new_df, parquet_path)
     else:
         logger.warning("%sNo ToOrder datedetail rows collected: %s~%s", log_prefix, resolved_from, resolved_to)
+
+    login_failures = [
+        str(result.get("error") or "")
+        for result in download_results
+        if "login failed" in str(result.get("error") or "").lower()
+    ]
+    if login_failures:
+        raise RuntimeError(
+            "ToOrder datedetail 인증 실패: "
+            f"account_id={resolved_toorder_id}, "
+            f"download_failed={failed_download_months}, "
+            f"range={resolved_from}~{resolved_to}, "
+            f"error={login_failures[0]}"
+        )
+
+    if failed_download_months or empty_months or not all_dfs:
+        raise RuntimeError(
+            f"ToOrder datedetail 수집 실패(데이터 없음): "
+            f"download_failed={failed_download_months}, empty={empty_months}, "
+            f"range={resolved_from}~{resolved_to}, parquet={parquet_path}"
+        )
 
     return str(parquet_path)
 
@@ -272,6 +357,99 @@ def _coerce_int(value: object) -> int:
         return int(float(str(value).replace(",", "")))
     except (TypeError, ValueError):
         return 0
+
+
+def _daily_quality(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["date", "rows", "stores", "total"])
+    out = df.copy()
+    out["date"] = out["date"].astype(str).str[:10]
+    out = out[out["date"].str.match(r"\d{4}-\d{2}-\d{2}", na=False)]
+    if out.empty:
+        return pd.DataFrame(columns=["date", "rows", "stores", "total"])
+    out["store"] = out["store"].fillna("").astype(str).str.strip()
+    out["price"] = pd.to_numeric(out["price"], errors="coerce").fillna(0)
+    quality = (
+        out.groupby("date", as_index=False)
+        .agg(rows=("date", "size"), stores=("store", "nunique"), total=("price", "sum"))
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+    quality["total"] = quality["total"].round().astype(int)
+    return quality
+
+
+def _quality_reason_from_frame(quality: pd.DataFrame, target_date: str) -> str:
+    if quality.empty:
+        return ""
+    current_rows = quality[quality["date"].eq(target_date)]
+    if current_rows.empty:
+        return "missing_date"
+    refs = quality[quality["date"].lt(target_date)].tail(QUALITY_REF_DAYS)
+    if len(refs) < QUALITY_MIN_REF_DAYS:
+        return ""
+    current = current_rows.iloc[-1]
+    failed = []
+    for col, min_ratio in (
+        ("stores", QUALITY_MIN_STORE_RATIO),
+        ("rows", QUALITY_MIN_ROW_RATIO),
+        ("total", QUALITY_MIN_TOTAL_RATIO),
+    ):
+        ref_value = float(refs[col].median())
+        if ref_value <= 0:
+            continue
+        value = float(current[col])
+        ratio = value / ref_value
+        if ratio < min_ratio:
+            failed.append(f"{target_date} {col} {value:.0f}/{ref_value:.0f} ({ratio:.0%})")
+    return ", ".join(failed)
+
+
+def _new_rows_quality_reason(new_df: pd.DataFrame, parquet_path: Path) -> str:
+    if new_df.empty or not parquet_path.exists():
+        return ""
+    try:
+        existing = pd.read_parquet(parquet_path, columns=_OUTPUT_COLUMNS)
+    except Exception as exc:
+        logger.warning("기존 ToOrder parquet 품질 기준 로드 실패: %s | %s", parquet_path, exc)
+        return ""
+    if existing.empty:
+        return ""
+
+    new_dates = sorted(new_df["date"].astype(str).str[:10].dropna().unique())
+    existing = existing[~existing["date"].astype(str).str[:10].isin(new_dates)].copy()
+    combined = pd.concat([existing, new_df], ignore_index=True)
+    quality = _daily_quality(combined)
+    reasons = [_quality_reason_from_frame(quality, date_str) for date_str in new_dates]
+    return "; ".join(reason for reason in reasons if reason)
+
+
+def toorder_partial_dates(
+    parquet_path: str | Path,
+    *,
+    date_from: str,
+    date_to: str,
+) -> dict[str, str]:
+    path = Path(parquet_path)
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_parquet(path, columns=_OUTPUT_COLUMNS)
+    except Exception as exc:
+        logger.warning("ToOrder parquet 품질 조회 실패: %s | %s", path, exc)
+        return {}
+    quality = _daily_quality(df)
+    if quality.empty:
+        return {}
+    dates = quality[
+        (quality["date"].astype(str) >= date_from)
+        & (quality["date"].astype(str) <= date_to)
+    ]["date"].astype(str)
+    return {
+        date_str: reason
+        for date_str in dates
+        if (reason := _quality_reason_from_frame(quality, date_str))
+    }
 
 
 def _rename_to_raw(xlsx_path: Path) -> None:

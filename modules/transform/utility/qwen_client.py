@@ -3,6 +3,7 @@
 """
 import json
 import logging
+import os
 import re
 import tempfile
 import time
@@ -13,21 +14,42 @@ logger = logging.getLogger(__name__)
 
 UNHEALTHY_MODEL_CACHE = Path(tempfile.gettempdir()) / "codex_qwen_unhealthy_models.json"
 UNHEALTHY_MODEL_TTL_SEC = 24 * 60 * 60
+GPT_OSS_UNHEALTHY_TTL_SEC = 30 * 60
 
-OLLAMA_HOST_CANDIDATES = [
-    "http://host.docker.internal:11434",  # Docker 컨테이너 내부 → 호스트
-    "http://localhost:11434",             # Windows/WSL 직접 실행
-    "http://127.0.0.1:11434",            # localhost 대체
+OLLAMA_HOST_DOCKER = "http://host.docker.internal:11434"   # 컨테이너 내부 → 호스트
+OLLAMA_HOSTS_LOCAL = [
+    "http://127.0.0.1:11434",   # 가장 빠름 (DNS 없음)
+    "http://localhost:11434",   # IPv6 우선 해석으로 느릴 수 있어 뒤에 둔다
 ]
+
+
+def _in_docker() -> bool:
+    env = os.getenv("IS_DOCKER")
+    if env is not None:
+        return env.lower() == "true"
+    return Path("/.dockerenv").exists()
+
+
+def _host_candidates() -> list:
+    """컨테이너 밖에서 host.docker.internal을 먼저 때리면 호출마다 20초 넘게 버려진다."""
+    override = os.getenv("OLLAMA_HOST")
+    if override:
+        return [override]
+    if _in_docker():
+        return [OLLAMA_HOST_DOCKER] + OLLAMA_HOSTS_LOCAL
+    return OLLAMA_HOSTS_LOCAL + [OLLAMA_HOST_DOCKER]
+
+
+OLLAMA_HOST_CANDIDATES = _host_candidates()
 LLM_MODEL_CANDIDATES = [
+    "gpt-oss:20b",
+    "gpt-oss:latest",
+    "gpt-oss",
     "qwen2.5:7b",
     "qwen2.5:latest",
     "qwen2.5",
     "qwen:latest",
     "qwen",
-    "gpt-oss:20b",
-    "gpt-oss:latest",
-    "gpt-oss",
     "gemma2:2b",
 ]
 LLM_CHAT_OPTIONS = {
@@ -82,7 +104,7 @@ def _load_unhealthy_models() -> dict[str, float]:
         return {
             str(model): float(ts)
             for model, ts in payload.items()
-            if now - float(ts) < UNHEALTHY_MODEL_TTL_SEC
+            if now - float(ts) < _unhealthy_ttl_for_model(str(model))
         }
     except Exception:
         return {}
@@ -98,7 +120,13 @@ def _save_unhealthy_models(models: dict[str, float]) -> None:
 def _is_model_unhealthy(model_name: str, unhealthy: dict[str, float] | None = None) -> bool:
     unhealthy = unhealthy or _load_unhealthy_models()
     ts = unhealthy.get(model_name)
-    return bool(ts and (time.time() - ts) < UNHEALTHY_MODEL_TTL_SEC)
+    return bool(ts and (time.time() - ts) < _unhealthy_ttl_for_model(model_name))
+
+
+def _unhealthy_ttl_for_model(model_name: str) -> int:
+    if "gpt-oss" in model_name:
+        return GPT_OSS_UNHEALTHY_TTL_SEC
+    return UNHEALTHY_MODEL_TTL_SEC
 
 
 def _mark_model_unhealthy(model_name: str) -> None:
@@ -112,7 +140,7 @@ def _should_mark_model_unhealthy(exc: Exception) -> bool:
     return any(hint in message for hint in MODEL_UNHEALTHY_HINTS)
 
 
-def _prioritize_primary_models(model_candidates: list[str], prefer_stable: bool = True) -> list[str]:
+def _prioritize_primary_models(model_candidates: list[str], prefer_stable: bool = False) -> list[str]:
     gpt_oss = [m for m in model_candidates if "gpt-oss" in m]
     stable = [m for m in model_candidates if "gpt-oss" not in m]
     if prefer_stable:
@@ -124,8 +152,9 @@ def _chat_options_for_model(model_name: str, is_json: bool = False) -> dict:
     if "gpt-oss" in model_name:
         options = dict(GPT_OSS_OPTIONS)
         if is_json:
-            options["num_predict"] = 256
-            options["top_p"] = 0.5
+            options["num_predict"] = 1024
+            options["num_ctx"] = 8192
+            options["top_p"] = 0.2
         return options
     options = dict(LLM_CHAT_OPTIONS)
     if is_json:
@@ -317,6 +346,7 @@ def query_qwen_json(
     preferred_models: Optional[list] = None,
     client=None,
     model_candidates: Optional[list] = None,
+    options_override: Optional[dict] = None,
 ) -> dict:
     """
     qwen에 JSON 응답 요청
@@ -348,7 +378,7 @@ def query_qwen_json(
     last_error = None
     last_response_text = ""
 
-    for model_name in _prioritize_primary_models(model_candidates):
+    for model_name in _prioritize_primary_models(model_candidates, prefer_stable=True):
         try:
             attempts = 2 if "gpt-oss" in model_name else 1
             for attempt in range(1, attempts + 1):
@@ -369,12 +399,15 @@ def query_qwen_json(
                         request_messages.append({"role": "system", "content": strict_system})
                     request_messages.append({"role": "user", "content": prompt})
 
+                options = _chat_options_for_model(model_name, is_json=True)
+                if options_override:
+                    options.update(options_override)
                 chat_kwargs = {
                     "model": model_name,
                     "messages": request_messages,
                     "stream": False,
-                    "think": "gpt-oss" in model_name,
-                    "options": _chat_options_for_model(model_name, is_json=True),
+                    "think": "low" if "gpt-oss" in model_name else False,
+                    "options": options,
                 }
                 # gpt-oss는 Ollama format=json에서 CUDA/stack buffer 오류가 나는 경우가 있어
                 # 일반 chat + 엄격 JSON 프롬프트로 JSON 텍스트를 받는다.

@@ -17,8 +17,6 @@ filename = os.path.basename(__file__)
 
 from modules.transform.utility.paths import LOCAL_DB
 
-# 크롤링 모듈 import
-from modules.transform.pipelines.sales.SMD_sales_visit_log_01_crawling import run_flow_visit_crawling
 from modules.transform.utility.io import SMD_VISIT_LOG
 from modules.transform.utility.notifier import on_failure_callback
 
@@ -42,6 +40,8 @@ OUTPUT_DIR = Path('/opt/airflow/download/업로드_temp')  # ✅ 절대 경로
 
 def crawl_flow_visit(**context):
     """플로우 방문일지 크롤링"""
+    from modules.transform.pipelines.sales.SMD_sales_visit_log_01_crawling import run_flow_visit_crawling
+
     print(f"\n{'='*60}")
     print(f"[플로우 방문일지] 크롤링 시작")
     print(f"{'='*60}")

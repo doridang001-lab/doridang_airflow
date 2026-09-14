@@ -19,7 +19,7 @@
   const LOGIN_URL  = 'https://store.coupangeats.com/merchant/login';
   // CMG는 store 도메인 안의 /cmg 경로가 기본 (이미 로그인된 세션 재사용, 빠름)
   // advertising.coupangeats.com 은 여기서 iframe으로 임베딩됨
-  const CMG_URL    = 'https://store.coupangeats.com/merchant/management/cmg';
+  const CMG_URL    = 'https://store.coupangeats.com/merchant/management/cmg/?cmg_revamp=%2F';
   const MENU_URL   = 'https://store.coupangeats.com/merchant/management/menu';
   const RE_LOGIN   = /store\.coupangeats\.com\/merchant\/login/;
   const RE_ORDERS  = /store\.coupangeats\.com\/merchant\/management\/(orders|home)/;
@@ -31,25 +31,42 @@
     'content/03_coupangeats.js','content/04_auto_login.js','content/05_main.js'
   ];
   const LOGIN_TIMEOUT   = 90000;   // 로그인 + orders 도달 대기 (ms)
-  const COLLECT_TIMEOUT = 300000;  // 수집 완료 대기 — 30개 매장 처리 여유 (ms)
+  const COLLECT_TIMEOUT = 600000;  // orders collect wait; content script has an 8-minute store budget
+  const THROTTLE_COOLDOWN_STEPS = [120000, 240000, 480000];
+  const MAX_LOGIN_THROTTLE_STREAK = 3;
+  const LOGIN_THROTTLE_RETRY_DELAY_MS = 3000;
+  const LOGIN_THROTTLE_ERROR_GRACE_MS = 5000;
   const CMG_TIMEOUT    = 300000;   // CMG는 6일치 × 4초 = 정상 1-2분 → 5분으로 충분
   const MENU_TIMEOUT   = 60000;    // 메뉴/옵션 DOM 스크랩 — 1분으로 충분
-  const DELAY_MIN = 3000;
-  const DELAY_MAX = 6000;
+  const DELAY_MIN = 6000;
+  const DELAY_MAX = 12000;
+  const AUTO_RETRY_DELAY_MIN_MS = 2 * 60 * 60 * 1000;   // 2시간
+  const AUTO_RETRY_DELAY_MAX_MS = 3 * 60 * 60 * 1000;   // 3시간
+  const STOP_GRACE_MS = 10000;
+  const RUNNER_STOP_KEY = 'ce_coupang_runner_stop_requested';
 
   // ── 상태 ──
   let queue        = [];    // [{id, pw, stores:[...], _tr}] — 항상 전체 목록
   let running      = false;
 let stopRequested= false;
+let throttleStreak = 0;
+let loginThrottleStreak = 0;
+let loginThrottleAborted = false;
 let startTs      = 0;
 let elapsedTimer = null;
 let pending         = null;       // 현재 MULTISTORE_COMPLETE 대기 {resolve, settled, payload, _to, _poll}
 let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 타이머
+  let currentWorkTabId = null;
   let retryRound      = 0;          // 실제 재시도 실행 회차
-  const MAX_AUTO_RETRY = 5;
+  let hardThrottleStopped = false;  // 10057 발생 시 당일 추가 수집/재시도 차단
+  let hardThrottleBackfillDate = null;
+  let lastLoginErrText = '';       // 마지막 로그인 에러 스팬 텍스트 (로깅/판단용)
+  const MAX_AUTO_RETRY = 3;
   let selectedIndices = new Set();  // 클릭으로 선택된 계정 인덱스 집합 (비어있으면 = 전체)
   let runMode = 'all';
+  let runDateMode = 'yesterday';
   let runTargetStores = [];
+  let runDateOptions = {};
   const storeStatusRows = new Map();
   const manifestRows = [];
 
@@ -59,7 +76,9 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
     rows:$('rows'), log:$('log'), fill:$('progressFill'),
     mProg:$('mProgress'), mOk:$('mOk'), mWarn:$('mWarn'), mFail:$('mFail'),
     mElapsed:$('mElapsed'), mCurrent:$('mCurrent'), modeLabel:$('modeLabel'),
-    startBtn:$('startBtn'), topHalfBtn:$('topHalfBtn'), bottomHalfBtn:$('bottomHalfBtn'),
+    startBtn:$('startBtn'), todayBtn:$('todayBtn'), topHalfBtn:$('topHalfBtn'), bottomHalfBtn:$('bottomHalfBtn'),
+    topHalfTodayBtn:$('topHalfTodayBtn'), bottomHalfTodayBtn:$('bottomHalfTodayBtn'),
+    customStartDate:$('customStartDate'), customEndDate:$('customEndDate'), customRangeAllBtn:$('customRangeAllBtn'),
     stopBtn:$('stopBtn'), clearChk:$('clearSessionChk'),
     summary:$('summary'),
     sTotal:$('sTotal'), sOk:$('sOk'), sWarn:$('sWarn'), sFail:$('sFail'), sElapsed:$('sElapsed'),
@@ -71,10 +90,30 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
   const rand   = (a,b) => Math.floor(Math.random()*(b-a+1))+a;
   const pad2   = (n) => String(n).padStart(2,'0');
   const fmtMs  = (ms) => { const s=Math.floor(ms/1000); return `${pad2(Math.floor(s/60))}:${pad2(s%60)}`; };
+  const fmtRetryDelay = (ms) => {
+    const s = Math.max(0, Math.ceil(ms / 1000));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (h > 0) return m > 0 ? `${h}시간 ${m}분` : `${h}시간`;
+    return m > 0 ? `${m}분 ${pad2(sec)}초` : `${sec}초`;
+  };
   const nowStr = () => { const d=new Date(); return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`; };
   const getDateStr = (d) => { return `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}`; };
   const getTodayStr = () => getDateStr(new Date());
   const getYesterdayStr = () => { const d=new Date(); d.setDate(d.getDate()-1); return getDateStr(d); };
+  const getRunDateStr = (mode) => mode === 'today' ? getTodayStr() : getYesterdayStr();
+  const getRunDateLabel = (mode) => mode === 'custom' ? '지정기간' : (mode === 'today' ? '오늘' : '어제');
+  const formatInputDate = (d) => `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
+  const parseInputDate = (value) => {
+    const m = String(value || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!m) return null;
+    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    d.setHours(0, 0, 0, 0);
+    if (d.getFullYear() !== Number(m[1]) || d.getMonth() !== Number(m[2]) - 1 || d.getDate() !== Number(m[3])) return null;
+    return d;
+  };
+  const toYmd = (d) => getDateStr(d);
   const normalizeStoreName = (name) => String(name || '').replace(/\s+/g, ' ').trim();
   const storeCompareKey = (name) => {
     let key = String(name || '')
@@ -85,8 +124,68 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
     key = key.replace(/구로디지털단지점/g, '구로디지털점');
     return key;
   };
-  const isTargetBrandStoreName = (name) => /(^|[^가-힣A-Za-z0-9])(도리당|나홀로)/.test(normalizeStoreName(name));
+  const targetBrandKey = (name) => {
+    const normalized = normalizeStoreName(name);
+    const compact = normalized.replace(/\s+/g, '');
+    if (!compact || compact.includes('곱도리당')) return '';
+    if (/(^|[^가-힣A-Za-z0-9])나홀로/.test(normalized) || compact.startsWith('나홀로')) return 'nahollo';
+    if (
+      /(^|[^가-힣A-Za-z0-9])도리당/.test(normalized) ||
+      compact.startsWith('도리당') ||
+      compact.startsWith('닭도리탕전문도리당')
+    ) {
+      return 'doridang';
+    }
+    return '';
+  };
+  const isTargetBrandStoreName = (name) => !!targetBrandKey(name);
   const uniq = (arr) => [...new Set(arr.map(normalizeStoreName).filter(Boolean))];
+
+  function trackWorkTab(tab) {
+    currentWorkTabId = tab?.id ?? null;
+    return tab;
+  }
+
+  async function closeWorkTab(tab, opts = {}) {
+    if (currentWorkTabId === tab?.id) currentWorkTabId = null;
+    if (opts.keepDuringAutoRetry && autoRetryTimer) {
+      log('자동재시도 대기 중 — 크롬 유지를 위해 작업 탭을 닫지 않습니다.', 'info');
+      return;
+    }
+    if (tab) { try { await chrome.tabs.remove(tab.id); } catch (_) {} }
+  }
+
+  async function clearRunnerStopLatch() {
+    try { await chrome.storage.local.remove([RUNNER_STOP_KEY]); }
+    catch (e) { log(`[STOP] 중단 래치 초기화 실패: ${e.message}`, 'err'); }
+  }
+
+  async function requestCurrentWorkStop() {
+    if (autoRetryTimer) { clearInterval(autoRetryTimer); autoRetryTimer = null; }
+    stopRequested = true;
+    el.stopBtn.disabled = true;
+    log('중단 요청됨 — 현재 수집을 중단하고 부분 저장을 최대 10초 기다립니다.', 'err');
+
+    const tabId = currentWorkTabId;
+    const latchPromise = (async () => {
+      try {
+        await chrome.storage.local.set({ [RUNNER_STOP_KEY]: true });
+        await chrome.storage.local.remove(['ce_orders_restart', 'ce_orders_resume', 'ce_orders_batch_reload_count']);
+      } catch (e) {
+        log(`[STOP] 중단 래치 저장 실패: ${e.message}`, 'err');
+      }
+    })();
+
+    if (tabId != null) {
+      try {
+        const response = await chrome.tabs.sendMessage(tabId, { type: 'STOP', runnerName: 'coupang' });
+        if (!response?.success) log('[STOP] 워크탭이 중단 요청을 확인하지 못했습니다.', 'err');
+      } catch (e) {
+        log(`[STOP] 워크탭 메시지 전달 실패: ${e.message}`, 'err');
+      }
+    }
+    await latchPromise;
+  }
 
   function log(msg, cls) {
     const div = document.createElement('div');
@@ -117,8 +216,13 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
   }
 
   function accountTargetStores(acc, targetStores = runTargetStores) {
-    const allowedStores = uniq(acc.stores);
-    const targetSet = new Set((targetStores || []).map(storeCompareKey).filter(Boolean));
+    const allowedStores = uniq(acc.stores).filter(isTargetBrandStoreName);
+    const targetSet = new Set(
+      (targetStores || [])
+        .filter(isTargetBrandStoreName)
+        .map(storeCompareKey)
+        .filter(Boolean)
+    );
     if (!targetSet.size) return allowedStores;
     return allowedStores.filter(store => {
       const key = storeCompareKey(store);
@@ -147,6 +251,7 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
         ordersTried: false,
         cmgTried: false,
         menuTried: false,
+        blocked: false,
         note: '',
         collected_at: ''
       });
@@ -160,24 +265,28 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
         store,
         account_id: acc?.id || '',
         ordersOk: false,
-        cmgOk: false,
-        menuOk: false,
-        ordersTried: false,
-        cmgTried: false,
-        menuTried: false,
-        note: '',
-        collected_at: ''
-      });
+          cmgOk: false,
+          menuOk: false,
+          ordersTried: false,
+          cmgTried: false,
+          menuTried: false,
+          blocked: false,
+          note: '',
+          collected_at: ''
+        });
     }
     return storeStatusRows.get(key);
   }
 
   function categoryPayloadOk(payload, targetStores) {
     if (!payload || payload.timeout || payload.stopped || payload.error || payload.skipped) return false;
+    const rows = Array.isArray(payload.storeResults) ? payload.storeResults : [];
+    const activeRows = rows.filter(r => !(r.blocked || r.hardThrottle || r.status === 'blocked'));
+    if (rows.length > 0 && rows.every(r => r.blocked || r.hardThrottle || r.status === 'blocked')) return false;
+    if (payload.zeroOrders || (activeRows.length > 0 && activeRows.every(r => r.zeroOrders && r.completed && !r.error))) return true;
     const expected = Math.max(1, (targetStores || []).length || Number(payload.storeCount || 0));
     if (Number(payload.completedCount || 0) < expected) return false;
-    const rows = Array.isArray(payload.storeResults) ? payload.storeResults : [];
-    if (rows.length > 0 && rows.some(r => !r.completed || r.status === 'fail' || r.error)) return false;
+    if (activeRows.length > 0 && activeRows.some(r => !r.completed || r.status === 'fail' || r.error)) return false;
     return true;
   }
 
@@ -193,11 +302,83 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
         return resultKey.includes(storeKey) || storeKey.includes(resultKey);
       });
       const completed = result ? !!result.completed : (emptyTargetMiss ? false : !!fallbackOk);
+      const blocked = !!(result?.blocked || result?.hardThrottle || result?.status === 'blocked' || payload?.blocked || payload?.hardThrottle);
       row[`${category}Tried`] = true;
-      row[`${category}Ok`] = completed;
+      row[`${category}Ok`] = blocked ? true : completed;
+      if (blocked) row.blocked = true;
       row.note = result?.note || note || row.note || '';
       row.collected_at = new Date().toISOString();
     });
+  }
+
+  function isHardThrottlePayload(payload) {
+    const rows = Array.isArray(payload?.storeResults) ? payload.storeResults : [];
+    return !!(payload?.blocked || payload?.hardThrottle || rows.some(r => r.blocked || r.hardThrottle || r.status === 'blocked' || String(r.note || '').includes('10057')));
+  }
+
+  const LOGIN_THROTTLE_KEYWORDS = [
+    '10056', '10057', 'ACCESS_DENIED', 'ACCESS_DENY', 'ACCESS_DENIDE',
+    '과도한 요청', '일시적으로 제한', '단시간 내 반복 요청'
+  ];
+  function isLoginThrottleText(txt) {
+    const s = String(txt || '');
+    return LOGIN_THROTTLE_KEYWORDS.some(k => s.includes(k));
+  }
+
+  function isLoginPermissionError(txt) {
+    return /권한이\s*존재하지|처리할\s*권한|권한이\s*없/.test(String(txt || ''));
+  }
+
+  function isLoginCredError(txt) {
+    return /아이디 혹은 비밀번호|비밀번호가 일치하지 않/.test(String(txt || ''));
+  }
+
+  function hardThrottleStoreNames(payload) {
+    const rows = Array.isArray(payload?.storeResults) ? payload.storeResults : [];
+    return uniq(rows
+      .filter(r => r.blocked || r.hardThrottle || r.status === 'blocked' || String(r.note || '').includes('10057'))
+      .map(r => r.storeName)
+      .filter(Boolean));
+  }
+
+  function markStoresBlocked(acc, stores, note) {
+    (stores || []).forEach(store => {
+      const row = ensureStoreStatus(store, acc);
+      ['orders', 'cmg', 'menu'].forEach(category => {
+        row[`${category}Tried`] = true;
+        row[`${category}Ok`] = false;
+      });
+      row.blocked = true;
+      row.note = note || row.note || '';
+      row.collected_at = new Date().toISOString();
+    });
+  }
+
+  function isPartialThrottlePayload(payload) {
+    const rows = Array.isArray(payload?.storeResults) ? payload.storeResults : [];
+    return !!(payload?.partialThrottle || rows.some(r => r.partialThrottle || (r.partial && r.status === 'warn')));
+  }
+
+  function needsThrottleCooldown(res = {}) {
+    return !!(res.blocked || res.hardThrottle || res.ordersTimedOut || res.partialThrottle);
+  }
+
+  async function waitBeforeNextAccount(res) {
+    let d;
+    if (res?.loginThrottle) {
+      d = 10 * 60 * 1000;
+      throttleStreak++;
+      log(`↩ 로그인 쓰로틀 쿨다운 ${Math.round(d / 60000)}분 대기...`, 'info');
+    } else if (needsThrottleCooldown(res)) {
+      d = THROTTLE_COOLDOWN_STEPS[Math.min(throttleStreak, THROTTLE_COOLDOWN_STEPS.length - 1)];
+      throttleStreak++;
+      log(`↩ 쿼다운 ${Math.round(d / 60000)}분 대기...`, 'info');
+    } else {
+      throttleStreak = 0;
+      d = rand(DELAY_MIN, DELAY_MAX);
+      log(`다음 계정까지 ${Math.round(d/1000)}초 대기...`);
+    }
+    await sleep(d);
   }
 
   function markAccountStoresTried(acc, targetStores, note) {
@@ -211,16 +392,47 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
     });
   }
 
+  function markAccountStoresBlocked(acc, targetStores, note) {
+    targetStores.forEach(store => {
+      const row = ensureStoreStatus(store, acc);
+      ['orders', 'cmg', 'menu'].forEach(category => {
+        row[`${category}Tried`] = true;
+        row[`${category}Ok`] = false;
+      });
+      row.blocked = true;
+      row.note = note || row.note || '';
+      row.collected_at = new Date().toISOString();
+    });
+  }
+
+  function closeFailedBadges(i, targetStores, note) {
+    const rows = (targetStores || [])
+      .map(store => storeStatusRows.get(storeCompareKey(store)))
+      .filter(Boolean);
+    const patch = {note: note || '예외 발생', current: false};
+    ['orders', 'cmg', 'menu'].forEach(category => {
+      const ok = rows.length > 0 && rows.every(r => r[`${category}Ok`]);
+      if (!ok) patch[category] = 'fail';
+    });
+    setRow(i, patch);
+  }
+
   function incompleteStores() {
     return [...storeStatusRows.values()]
-      .filter(r => !(r.ordersOk && r.cmgOk && r.menuOk))
+      .filter(r => !r.blocked && !(r.ordersOk && r.cmgOk && r.menuOk))
+      .map(r => r.store);
+  }
+
+  function backfillStores() {
+    return [...storeStatusRows.values()]
+      .filter(r => r.blocked || !(r.ordersOk && r.cmgOk && r.menuOk))
       .map(r => r.store);
   }
 
   function storeRowsToManifestRows() {
     return [...storeStatusRows.values()].map(r => {
       const status = r.ordersOk && r.cmgOk && r.menuOk
-        ? 'ok'
+        ? (r.blocked ? 'warn' : 'ok')
         : (r.ordersOk || r.cmgOk || r.menuOk ? 'warn' : 'fail');
       return {
         account_id: r.account_id,
@@ -229,6 +441,7 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
         ordersOk: r.ordersOk,
         cmgOk: r.cmgOk,
         menuOk: r.menuOk,
+        blocked: !!r.blocked,
         note: r.note || '',
         duration: '-',
         collected_at: r.collected_at || new Date().toISOString()
@@ -361,12 +574,13 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
     el2.className = 'badge ' + cls;
     el2.textContent = txt;
   }
-  function setRow(i, {orders, cmg, menu, dur, note, current, promote}={}) {
+  function setRow(i, {orders, cmg, menu, dur, note, current, promote, blocked}={}) {
     if (orders) setBadge(`ro-${i}`, orders);
     if (cmg)    setBadge(`rc-${i}`, cmg);
     if (menu)   setBadge(`rm-${i}`, menu);
     if (dur != null) { const d = $(`rd-${i}`); if(d) d.textContent = dur; }
     if (note != null) { const n = $(`rn-${i}`); if(n) n.textContent = note; }
+    if (blocked != null && queue[i]?._tr) queue[i]._tr.classList.toggle('blocked', !!blocked);
     el.rows.querySelectorAll('tr.current').forEach(r => r.classList.remove('current'));
     if (current && queue[i]?._tr) queue[i]._tr.classList.add('current');
     // 수집 완료 → 행을 테이블 최상단으로 이동
@@ -380,7 +594,8 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
         const tried = r.ordersTried || r.cmgTried || r.menuTried;
         if (!tried) return;
         done++;
-        if (r.ordersOk && r.cmgOk && r.menuOk) ok++;
+        if (r.blocked) warn++;
+        else if (r.ordersOk && r.cmgOk && r.menuOk) ok++;
         else if (r.ordersOk || r.cmgOk || r.menuOk) warn++;
         else fail++;
       });
@@ -395,6 +610,25 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
     el.mProg.textContent = `${c.done} / ${n}`;
     el.mOk.textContent = c.ok; el.mWarn.textContent = c.warn; el.mFail.textContent = c.fail;
     el.fill.style.width = n ? `${Math.round(c.done/n*100)}%` : '0%';
+  }
+
+  function scheduleAutoRetry(labelPrefix = '↩ 재시도') {
+    if (autoRetryTimer) { clearInterval(autoRetryTimer); autoRetryTimer = null; }
+    const delay = rand(AUTO_RETRY_DELAY_MIN_MS, AUTO_RETRY_DELAY_MAX_MS);
+    const deadline = Date.now() + delay;
+    el.retryBtn.style.display = '';
+    el.retryBtn.textContent = `${labelPrefix} (${fmtRetryDelay(delay)} 후 자동 시작)`;
+    log(`자동 재시도 예약 — ${fmtRetryDelay(delay)} 후 시작`, 'info');
+    autoRetryTimer = setInterval(() => {
+      const remaining = deadline - Date.now();
+      if (remaining > 0) {
+        el.retryBtn.textContent = `${labelPrefix} (${fmtRetryDelay(remaining)} 후 자동 시작)`;
+      } else {
+        clearInterval(autoRetryTimer); autoRetryTimer = null;
+        el.retryBtn.textContent = '↩ 실패 재시도';
+        runRetry();
+      }
+    }, 1000);
   }
 
   // ── 탭 유틸 ──
@@ -522,23 +756,75 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
   // form AND calendar 둘 다 필요 — OR이면 form만 로드돼도 통과 → _readCMGDateRange null → prompt() 10분 블록
   async function waitForWujieApp(tabId, ms = 30000) {
     const deadline = Date.now() + ms;
+    let lastStatus = { ready: false, reason: 'not_checked' };
+    while (Date.now() < deadline) {
+      if (stopRequested) return { ready: false, stopped: true };
+      try {
+        const res = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => {
+            const status = {
+              ready: false,
+              url: location.href,
+              readyState: document.readyState,
+              hasWujie: false,
+              hasShadow: false,
+              hasStoreDropdown: false,
+              hasCalendar: false
+            };
+            const wa = document.querySelector('WUJIE-APP');
+            status.hasWujie = !!wa;
+            status.hasShadow = !!wa?.shadowRoot;
+            if (!wa || !wa.shadowRoot) return status;
+            // form.cmgeats-store-dropdown이 실제로 있어야 true (없으면 _getCMGMatchingStores가 [] 반환해 false positive 발생)
+            // AND 조건: form(매장드롭다운) + calendar(날짜선택) 모두 확인
+            status.hasStoreDropdown = !!wa.shadowRoot.querySelector('form.cmgeats-store-dropdown');
+            status.hasCalendar = !!wa.shadowRoot.querySelector('.calendar-dropdown-input');
+            status.ready = status.hasStoreDropdown && status.hasCalendar;
+            return status;
+          }
+        });
+        lastStatus = res?.[0]?.result || lastStatus;
+        if (lastStatus.ready) return lastStatus;
+      } catch(e) {
+        lastStatus = { ready: false, reason: e.message || String(e) };
+      }
+      await sleep(1200);
+    }
+    return lastStatus;
+  }
+
+  async function waitForOrdersUiReady(tabId, ms = 60000) {
+    const deadline = Date.now() + ms;
     while (Date.now() < deadline) {
       if (stopRequested) return false;
       try {
         const res = await chrome.scripting.executeScript({
           target: { tabId },
           func: () => {
-            const wa = document.querySelector('WUJIE-APP');
-            if (!wa || !wa.shadowRoot) return false;
-            // form.cmgeats-store-dropdown이 실제로 있어야 true (없으면 _getCMGMatchingStores가 [] 반환해 false positive 발생)
-            // AND 조건: form(매장드롭다운) + calendar(날짜선택) 모두 확인
-            return !!(wa.shadowRoot.querySelector('form.cmgeats-store-dropdown') &&
-                      wa.shadowRoot.querySelector('.calendar-dropdown-input'));
+            if (document.querySelector('.dropdown-btn.highlight')) return true;
+            const selectors = [
+              'button.button--defaultOutlined',
+              'button.css-casqo8',
+              'button.e4pgcj01'
+            ];
+            for (const sel of selectors) {
+              for (const btn of document.querySelectorAll(sel)) {
+                if (btn.querySelector('svg') && !btn.disabled && btn.offsetParent !== null) return true;
+              }
+            }
+            for (const btn of document.querySelectorAll('button')) {
+              const path = btn.querySelector('svg path');
+              if (path && path.getAttribute('d')?.includes('M3.11 3.608') && !btn.disabled && btn.offsetParent !== null) {
+                return true;
+              }
+            }
+            return false;
           }
         });
         if (res && res[0] && res[0].result) return true;
       } catch(_) {}
-      await sleep(1200);
+      await sleep(1000);
     }
     return false;
   }
@@ -548,7 +834,7 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
       try {
         chrome.browsingData.remove(
           {origins:['https://store.coupangeats.com','https://advertising.coupangeats.com']},
-          {cookies:true, localStorage:true, cacheStorage:true},
+          {cookies:true, localStorage:true},
           () => resolve(true)
         );
       } catch(e) { log(`세션 초기화 오류(무시): ${e.message}`); resolve(false); }
@@ -558,10 +844,20 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
   // ── MULTISTORE_COMPLETE 수신 ──
   // background.js가 content→runner 탭으로 중계한다.
   // runner 탭은 확장 페이지이므로 chrome.runtime.onMessage로 바로 받는다.
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (msg?.type === 'LIVE_LOG') { log(msg.msg); return; }
+  function isCurrentWorkTabMessage(sender) {
+    return currentWorkTabId != null && sender?.tab?.id === currentWorkTabId;
+  }
+
+  chrome.runtime.onMessage.addListener((msg, sender) => {
+    if (msg?.type === 'LIVE_LOG') {
+      if (isCurrentWorkTabMessage(sender)) log(msg.msg);
+      return;
+    }
     if (!pending || pending.settled) return;
     if (msg?.type === 'MULTISTORE_COMPLETE') {
+      if (!isCurrentWorkTabMessage(sender)) return;
+      const payloadCategory = msg.payload?.category || '';
+      if (pending.category && payloadCategory && payloadCategory !== pending.category) return;
       pending.settled = true;
       pending.payload = msg.payload || {};
       clearTimeout(pending._to);
@@ -570,16 +866,15 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
     }
   });
 
-  // [Bug1 fix] waitMultistore: stopRequested를 500ms마다 폴링해 즉시 resolve
-  // 기존: MULTISTORE_COMPLETE 도착 or 600초 타임아웃만 → 중단 불가
-  // 수정: setInterval로 stopRequested 감지 → 즉각 중단
+  // STOP 후 부분 저장 완료 신호를 기다리고, 유예시간이 지나면 워크탭 종료로 폴백한다.
   function waitMultistore(category, timeoutMs = COLLECT_TIMEOUT) {
     return new Promise(resolve => {
-      const obj = { settled: false, payload: {}, resolve, _to: null, _poll: null };
+      const obj = { category, settled: false, payload: {}, resolve, _to: null, _poll: null, _stopDeadline: 0 };
       pending = obj;
-      // 500ms마다 중단 요청 확인
       obj._poll = setInterval(() => {
         if (stopRequested && !obj.settled) {
+          if (!obj._stopDeadline) obj._stopDeadline = Date.now() + STOP_GRACE_MS;
+          if (Date.now() < obj._stopDeadline) return;
           obj.settled = true;
           obj.payload = { category, stopped: true };
           clearInterval(obj._poll);
@@ -600,8 +895,9 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
 
   // 로그인 결과 감지: orders URL 도달→'ok' / 에러 스팬→'error' / 타임아웃→'timeout'
   // Coupang 로그인 실패 시 <span class="login-error-text"> 가 DOM에 나타남
-  async function waitForLoginResult(tabId, ms) {
+  async function waitForLoginResult(tabId, ms, errorGraceMs = 0) {
     const deadline = Date.now() + ms;
+    const errorEligibleAt = Date.now() + errorGraceMs;
     while (Date.now() < deadline) {
       if (stopRequested) return 'stop';
       const url = await getUrl(tabId);
@@ -612,10 +908,12 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
             target: { tabId },
             func: () => {
               const s = document.querySelector('span.login-error-text');
-              return !!(s && s.offsetParent !== null && s.textContent.trim().length > 0);
+              return (s && s.offsetParent !== null && s.textContent.trim().length > 0)
+                ? s.textContent.trim() : '';
             }
           });
-          if (res?.[0]?.result) return 'error';
+          const txt = res?.[0]?.result;
+          if (txt && Date.now() >= errorEligibleAt) { lastLoginErrText = txt; return 'error'; }
         } catch(_) {}
       }
       await sleep(800);
@@ -628,9 +926,18 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
   // skip.cmg=true    → CMG   수집 건너뜀(이미 완료)
   // skip.menu=true   → 메뉴  수집 건너뜀(이미 완료)
   // 반환: {status, dur, ordersOk, cmgOk, menuOk}
-  async function processAccount(i, workTabId, skip = {}, targetStoresArg = null) {
+  async function processAccount(i, workTabId, skip = {}, targetStoresArg = null, options = {}) {
     const acc = queue[i];
     const targetStores = accountTargetStores(acc, targetStoresArg || runTargetStores);
+    let activeTargetStores = [...targetStores];
+    const targetDateMode = options.targetDateMode || runDateMode;
+    const targetStartDate = options.targetStartDate || '';
+    const targetEndDate = options.targetEndDate || '';
+    const targetDate = options.targetDate || targetEndDate || getRunDateStr(runDateMode);
+    const targetDateLabel = options.targetDateLabel || getRunDateLabel(targetDateMode);
+    const targetDateText = targetDateMode === 'custom' && targetStartDate && targetEndDate
+      ? `${targetStartDate}~${targetEndDate}`
+      : targetDate;
     if (targetStores.length === 0) {
       return {status:'skip', note:'대상 매장 없음', ordersOk:true, cmgOk:true, menuOk:true};
     }
@@ -640,7 +947,7 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
     const retryTag = (skip.orders || skip.cmg) ? ' [재시도]' : '';
     log(`──── [${i+1}/${queue.length}] ${storeDisplay} (${acc.id})${retryTag} ────`, 'info');
     if (acc.stores.length > 1) log('[' + acc.id + '] 수집 매장: ' + acc.stores.join(' / '), 'info');
-    log('[' + acc.id + '] 이번 대상: ' + targetStores.join(' / '), 'info');
+    log('[' + acc.id + '] 이번 대상: ' + targetStores.join(' / ') + ` / 기준일: ${targetDateLabel}(${targetDateText})`, 'info');
 
     // 0) 세션 초기화
     if (el.clearChk.checked) {
@@ -667,21 +974,31 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
     if (r.key === 'login') {
       setRow(i, {orders:'run', note:'로그인중', current:true});
       await waitForLoginReady(workTabId);
+      lastLoginErrText = '';
 
-      // inject + sendMessage + 에러 스팬 감지 → 최대 5회 F5 재시도
-      const MAX_LOGIN = 5;
+      // 에러 스팬은 서버 거절 응답이므로 F5 재시도하지 않는다. timeout만 렌더 실패로 보고 1회 재시도.
+      const MAX_LOGIN = 2;
       let loginDone = false;
+      let loginErrorDetected = false;
+      let retryLoginWithoutReload = false;
       for (let attempt = 1; attempt <= MAX_LOGIN; attempt++) {
         if (stopRequested) {
           markAccountStoresTried(acc, targetStores, '중단됨');
           return {status:'fail', note:'중단됨', ordersOk:false, cmgOk:false};
         }
+        const samePageThrottleRetry = attempt > 1 && retryLoginWithoutReload;
         if (attempt > 1) {
           if (RE_ORDERS.test(await getUrl(workTabId))) { loginDone = true; break; }
-          log(`[${acc.id}] 로그인 재시도 (${attempt}/${MAX_LOGIN}) — F5...`);
-          try { await chrome.tabs.reload(workTabId); } catch(_) {}
-          await sleep(2000);  // reload 시작 대기 — 구 페이지 form false-positive 방지
-          await waitForLoginReady(workTabId);
+          if (samePageThrottleRetry) {
+            retryLoginWithoutReload = false;
+            log(`[${acc.id}] 로그인 일시 오류 확인 재시도 (${attempt}/${MAX_LOGIN}) — ${Math.round(LOGIN_THROTTLE_RETRY_DELAY_MS / 1000)}초 후 같은 페이지 재클릭`, 'info');
+            await sleep(LOGIN_THROTTLE_RETRY_DELAY_MS);
+          } else {
+            log(`[${acc.id}] 로그인 재시도 (${attempt}/${MAX_LOGIN}) — F5...`);
+            try { await chrome.tabs.reload(workTabId); } catch(_) {}
+            await sleep(2000);  // reload 시작 대기 — 구 페이지 form false-positive 방지
+            await waitForLoginReady(workTabId);
+          }
         }
         await injectContent(workTabId);
         await sleep(300);
@@ -693,11 +1010,37 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
         } catch(e) { log(`[${acc.id}] AUTO_LOGIN 오류 (${attempt}/${MAX_LOGIN}): ${e.message}`, 'err'); }
 
         // orders 도달 또는 에러 스팬 감지 대기 (30초)
-        const result = await waitForLoginResult(workTabId, 30000);
+        const result = await waitForLoginResult(workTabId, 30000, samePageThrottleRetry ? LOGIN_THROTTLE_ERROR_GRACE_MS : 0);
         if (result === 'ok')  { loginDone = true; break; }
         if (result === 'error') {
-          log(`[${acc.id}] 로그인 에러 스팬 감지 — 재시도 (${attempt}/${MAX_LOGIN})`,'err');
-          continue;  // → F5 at top of loop
+          loginErrorDetected = true;
+          const throttleErr = isLoginThrottleText(lastLoginErrText);
+          const permissionErr = isLoginPermissionError(lastLoginErrText);
+          if ((permissionErr || (!isLoginCredError(lastLoginErrText) && !throttleErr)) && attempt < MAX_LOGIN) {
+            loginErrorDetected = false;
+            const retryReason = permissionErr ? '권한 오류 문구' : '로그인 에러 문구';
+            lastLoginErrText = '';
+            retryLoginWithoutReload = true;
+            log(`[${acc.id}] ${retryReason} 감지 — 같은 페이지 마우스형 재클릭으로 확인 (${attempt}/${MAX_LOGIN})`, 'info');
+            continue;
+          }
+          if (permissionErr) {
+            log(`[${acc.id}] 로그인 권한 거절 — 재클릭 후에도 동일 문구, 다음 계정 진행 (${attempt}/${MAX_LOGIN})`,'err');
+            break;
+          }
+          if (throttleErr && attempt < MAX_LOGIN) {
+            loginErrorDetected = false;
+            lastLoginErrText = '';
+            retryLoginWithoutReload = true;
+            log(`[${acc.id}] 로그인 일시 오류 감지 — 같은 페이지 재클릭으로 확인 (${attempt}/${MAX_LOGIN})`, 'info');
+            continue;
+          }
+          if (throttleErr || attempt >= MAX_LOGIN) {
+            log(`[${acc.id}] 로그인 에러 스팬 감지 — ${throttleErr ? '동일 오류 재확인, 쓰로틀 확정' : '재시도 한도 도달, 중단'} (${attempt}/${MAX_LOGIN})`,'err');
+            break;
+          }
+          log(`[${acc.id}] 로그인 에러 스팬 감지 — F5 재시도 예정 (${attempt}/${MAX_LOGIN})`,'err');
+          continue;  // → 루프 상단의 F5 reload 로직(attempt>1 분기)이 다음 attempt에서 실행됨
         }
         // 'timeout' or 'stop'
         if (RE_ORDERS.test(await getUrl(workTabId))) { loginDone = true; break; }
@@ -709,16 +1052,37 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
           return {status:'fail', note:'중단됨', ordersOk:false, cmgOk:false};
         }
         const curUrl = await getUrl(workTabId);
-        const note = RE_LOGIN.test(curUrl) ? '로그인 실패(ID/PW 또는 Akamai)' : 'orders 페이지 미도달';
+        // 로그인 에러 스팬은 대부분 연속 로그인 과부하(throttle) 일시 오류 — 자격증명은 유효.
+        // 계정/매장만 백필 대상으로 넘기고 배치 전체는 계속 진행한다.
+        const loginErr = loginErrorDetected && RE_LOGIN.test(curUrl);
+        const loginThrottle = loginErr && isLoginThrottleText(lastLoginErrText);
+        const permissionError = loginErr && isLoginPermissionError(lastLoginErrText);
+        const credError = loginErr && isLoginCredError(lastLoginErrText);
+        const note = loginThrottle
+          ? `로그인 단계 쓰로틀 감지 — 해당 계정 백필 후 다음 계정 진행${lastLoginErrText ? ' ('+lastLoginErrText+')' : ''}`
+          : (permissionError
+            ? `로그인 권한 거절 — 계정/매장 권한 확인 필요${lastLoginErrText ? ' ('+lastLoginErrText+')' : ''}`
+            : (credError
+              ? '로그인 실패 — 아이디/비밀번호 확인 필요'
+              : (loginErr
+                ? `로그인 에러 - 재시도 예정${lastLoginErrText ? ' ('+lastLoginErrText+')' : ''}`
+                : (RE_LOGIN.test(curUrl) ? '로그인 실패(Akamai 또는 일시 오류)' : 'orders 페이지 미도달'))));
         log(`[${acc.id}] ${note}`, 'err');
         markAccountStoresTried(acc, targetStores, note);
-        return {status:'fail', note, ordersOk:false, cmgOk:false};
+        setRow(i, {orders:'warn', note, current:false, promote:true});
+        if (loginThrottle) {
+          return {status:'warn', note, ordersOk:false, cmgOk:false, loginThrottle:true};
+        }
+        return {status:'fail', note, ordersOk:false, cmgOk:false, loginCredError: credError, loginPermissionError: permissionError};
       }
     }
     log(`[${acc.id}] orders 페이지 도달`, 'ok');
 
     // 3) 주문서(orders) 수집
     let ordersOk = false;
+    let prevOrdersTimedOut = false;
+    let partialThrottle = false;
+    let hardThrottle = false;
     if (!skip.orders) {
       setRow(i, {orders:'run', note:'orders 페이지로 이동', current:true});
       // home 착지 케이스 대비: /orders 경로가 아니면 명시 이동 후 대기
@@ -737,13 +1101,34 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
       await waitForPageLoadWithRetry(workTabId, 'orders 페이지');
       setRow(i, {orders:'run', note:'orders 수집중', current:true});
       await injectContent(workTabId);
-      await sleep(600);
-      try { await chrome.tabs.sendMessage(workTabId, {type:'COLLECT', source:'batch', targetStores}); }
+      if (!await waitForOrdersUiReady(workTabId)) {
+        log(`[${acc.id}] orders UI 준비 대기 타임아웃 — 기존 방식으로 진행`, 'info');
+      }
+      try { await chrome.tabs.sendMessage(workTabId, {type:'COLLECT', runnerName:'coupang', source:'batch', targetStores: activeTargetStores, targetDate, targetDateMode, targetStartDate, targetEndDate}); }
       catch(e) { log(`[${acc.id}] COLLECT 전송 실패: ${e.message}`, 'err'); }
 
       let ordersResult = await waitMultistore('orders');
       const op = (pending && pending.payload) || ordersResult || {};
-      if (op.skipped) {
+      prevOrdersTimedOut = !!op.timeout;
+      partialThrottle = isPartialThrottlePayload(op);
+      if (isHardThrottlePayload(op)) {
+        const opRows = Array.isArray(op?.storeResults) ? op.storeResults : [];
+        const payloadNote = opRows.map(r => r.note).find(Boolean) || '';
+        const isRealHardThrottle = !!(op?.hardThrottle || op?.blocked || opRows.some(r => r.hardThrottle || String(r.note || '').includes('10057')));
+        hardThrottle = isRealHardThrottle;
+        const note = isRealHardThrottle ? '10057 발생 - 다음날 백필' : (payloadNote || '수집 중 끊김 - 백필 이월');
+        let blockedStores = hardThrottleStoreNames(op);
+        if (blockedStores.length === 0) blockedStores = [...activeTargetStores];
+        log(`[${acc.id}] ${note} — 현재 매장 패스 후 다음 매장 진행: ${blockedStores.join(' / ') || '미상'}`, 'err');
+        recordCategoryResults('orders', acc, targetStores, op, false, note);
+        markStoresBlocked(acc, blockedStores, note);
+        const blockedKeys = new Set(blockedStores.map(storeCompareKey));
+        activeTargetStores = activeTargetStores.filter(store => !blockedKeys.has(storeCompareKey(store)));
+        ordersOk = activeTargetStores.length > 0
+          ? categoryPayloadOk(op, activeTargetStores)
+          : false;
+        setRow(i, {orders:'warn', note, current:true, blocked:true});
+      } else if (op.skipped) {
         // targetStores가 있는데 건너뜀 → 재시도 대상 (매장명 탐지 실패 등)
         // targetStores가 없고 'not_target_brand' → 진짜 브랜드 아님 → 건너뜀=성공
         const isGenuineSkip = op.reason === 'not_target_brand' && targetStores.length === 0;
@@ -756,7 +1141,7 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
           setRow(i, {orders:'warn', note: '건너뜀→재시도'});
         }
       } else {
-        ordersOk = categoryPayloadOk(op, targetStores);
+        ordersOk = categoryPayloadOk(op, activeTargetStores);
         const orderStatusText = ordersOk ? '완료' : (op.timeout ? '타임아웃' : op.stopped ? '중단' : '미완료');
         log('[' + acc.id + '] orders ' + orderStatusText + ' — ' + (op.completedCount||0) + '/' + (op.storeCount||0) + '개',
             ordersOk ? 'ok' : 'err');
@@ -773,35 +1158,53 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
 
     // 4) CMG(마케팅) 수집 — 실패 시 F5 새로고침 후 최대 3회 시도
     let cmgOk = false;
-    if (!skip.cmg) {
+    if (targetDateMode === 'today') {
+      cmgOk = true;
+      setRow(i, {cmg:'skip', note:'오늘 수집은 CMG 제외'});
+      recordCategoryResults('cmg', acc, activeTargetStores, null, true, '오늘 수집은 CMG 제외');
+      log(`[${acc.id}] 오늘 수집 — CMG 건너뜀`, 'info');
+    } else if (activeTargetStores.length === 0) {
+      // throttle로 대상 매장이 전부 빠진 상태. CMG를 열면 빈 targetStores가
+      // _filterTargetStores의 전체매장 폴백을 타므로 아예 건너뛴다.
+      // 제외된 매장은 orders 단계의 markStoresBlocked로 이미 백필 큐에 있다.
+      cmgOk = true;
+      setRow(i, {cmg:'skip', note:'대상 매장 없음(throttle 제외됨)'});
+      recordCategoryResults('cmg', acc, activeTargetStores, null, true, '대상 매장 없음');
+      log(`[${acc.id}] CMG 건너뜀 (대상 매장 없음)`, 'info');
+    } else if (!skip.cmg) {
       setRow(i, {cmg:'run', note:'CMG 이동중', current:true});
-      await chrome.tabs.update(workTabId, {url: CMG_URL});
-      const cmgNav = await waitUrl(workTabId, {cmg:RE_CMG}, 45000);
+      let cmgNav = null;
+      for (let navTry = 1; navTry <= 2 && !cmgNav && !stopRequested; navTry++) {
+        if (navTry > 1) log(`[${acc.id}] CMG 페이지 URL 재진입 (${navTry}/2)...`, 'info');
+        await chrome.tabs.update(workTabId, {url: CMG_URL});
+        cmgNav = await waitUrl(workTabId, {cmg:RE_CMG}, 30000);
+        if (!cmgNav) await sleep(1200);
+      }
       if (stopRequested) return {status:'fail', note:'중단됨', ordersOk, cmgOk:false};
 
       if (!cmgNav) {
         log(`[${acc.id}] CMG 페이지 이동 실패 — 건너뜀`, 'err');
         setRow(i, {cmg:'fail', note:'CMG 이동 실패'});
-        recordCategoryResults('cmg', acc, targetStores, null, false, 'CMG 이동 실패');
+        recordCategoryResults('cmg', acc, activeTargetStores, null, false, 'CMG 이동 실패');
       } else {
         const MAX_CMG = 3;
         let lastCp = {};
         for (let attempt = 1; attempt <= MAX_CMG && !cmgOk && !stopRequested; attempt++) {
           if (attempt > 1) {
-            log(`[${acc.id}] CMG F5 재시도 (${attempt}/${MAX_CMG})...`);
-            try { await chrome.tabs.reload(workTabId, {bypassCache: true}); } catch(_) {}
-            await sleep(3000);
-            await waitForReload(workTabId, 15000);
-            await waitForPageLoadWithRetry(workTabId, `CMG F5 재로딩 (${attempt}/${MAX_CMG})`);
+            log(`[${acc.id}] CMG URL 재진입 (${attempt}/${MAX_CMG})...`);
+            try { await chrome.tabs.update(workTabId, {url: CMG_URL}); } catch(_) {}
+            await sleep(1500);
+            await waitUrl(workTabId, {cmg:RE_CMG}, 15000);
+            await waitForPageLoadWithRetry(workTabId, `CMG 재진입 로딩 (${attempt}/${MAX_CMG})`);
           } else {
             setRow(i, {cmg:'run', note:'CMG 로딩 대기중', current:true});
             await waitForPageLoadWithRetry(workTabId, 'CMG 페이지');
           }
 
           log(`[${acc.id}] CMG WUJIE-APP 로딩 대기... (${attempt}/${MAX_CMG})`);
-          const wujieReady = await waitForWujieApp(workTabId);
-          if (!wujieReady) {
-            log(`[${acc.id}] ⚠️ WUJIE-APP 미준비 (${attempt}/${MAX_CMG})`, 'err');
+          const wujieStatus = await waitForWujieApp(workTabId);
+          if (!wujieStatus.ready) {
+            log(`[${acc.id}] ⚠️ WUJIE-APP 미준비 (${attempt}/${MAX_CMG}) url=${wujieStatus.url||'-'} ready=${wujieStatus.readyState||'-'} wujie=${!!wujieStatus.hasWujie} shadow=${!!wujieStatus.hasShadow} store=${!!wujieStatus.hasStoreDropdown} calendar=${!!wujieStatus.hasCalendar}`, 'err');
             lastCp = { category: 'cmg', error: true };
             continue;
           }
@@ -811,14 +1214,14 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
           setRow(i, {cmg:'run', note: attempt > 1 ? `CMG 재시도 ${attempt}/${MAX_CMG}` : 'CMG 수집중', current:true});
           await injectContent(workTabId);
            await sleep(200);
-          try { await chrome.tabs.sendMessage(workTabId, {type:'COLLECT', source:'batch', targetStores}); }
+          try { await chrome.tabs.sendMessage(workTabId, {type:'COLLECT', runnerName:'coupang', source:'batch', targetStores: activeTargetStores, targetDate, targetDateMode, targetStartDate, targetEndDate}); }
           catch(e) { log(`[${acc.id}] CMG COLLECT 전송 실패: ${e.message}`, 'err'); lastCp = {category:'cmg', error:true}; continue; }
 
           const cmgResult = await waitMultistore('cmg', CMG_TIMEOUT);
           lastCp = (pending && pending.payload) || cmgResult || {};
 
           if (lastCp.skipped) {
-            const isGenuineCmgSkip = lastCp.reason === 'not_target_brand' && targetStores.length === 0;
+            const isGenuineCmgSkip = lastCp.reason === 'not_target_brand' && activeTargetStores.length === 0;
             cmgOk = isGenuineCmgSkip;
             if (isGenuineCmgSkip) {
               log(`[${acc.id}] CMG 건너뜀(브랜드 아님): ${lastCp.curStoreName||'미탐지'}`, 'info');
@@ -840,103 +1243,118 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
             }
           }
         }
-        recordCategoryResults('cmg', acc, targetStores, lastCp, cmgOk, lastCp?.error ? 'CMG 오류' : '');
+        const isCmgNoAdSkip = !cmgOk
+          && !stopRequested
+          && lastCp?.category === 'cmg'
+          && lastCp.error === true
+          && !lastCp.timeout
+          && !lastCp.stopped
+          && Array.isArray(lastCp.storeResults)
+          && Number(lastCp.storeCount || 0) === 0
+          && Number(lastCp.completedCount || 0) === 0;
+        if (isCmgNoAdSkip) {
+          cmgOk = true;
+          log(`[${acc.id}] CMG 광고 미집행 확정 - 건너뜀 처리(재시도 제외)`, 'info');
+          setRow(i, {cmg:'skip', note:'광고 미집행'});
+        }
+        recordCategoryResults('cmg', acc, activeTargetStores, lastCp, cmgOk,
+          isCmgNoAdSkip ? 'CMG 광고 미집행(건너뜀)' : (lastCp?.error ? 'CMG 오류' : ''));
         if (stopRequested) return {status:'fail', note:'중단됨', ordersOk, cmgOk};
       }
     } else {
       cmgOk = true;
       setRow(i, {cmg:'skip'});
-      recordCategoryResults('cmg', acc, targetStores, null, true, 'CMG 이전 완료');
+      recordCategoryResults('cmg', acc, activeTargetStores, null, true, 'CMG 이전 완료');
       log(`[${acc.id}] CMG 건너뜀 (이전 수집 완료)`, 'info');
     }
 
-    // 4.5) orders 즉시 재시도 — CMG 완료 후 로그인 세션 유지 상태
+    // 4.5) orders 즉시 재시도 제거 — 반복요청 누적 방지를 위해 백필 큐로 이관
     if (!skip.orders && !ordersOk && !stopRequested) {
-      log(`[${acc.id}] orders 실패 → CMG 완료 직후 즉시 재시도 (로그인 유지)`, 'info');
-      setRow(i, {orders:'run', note:'orders 즉시 재시도', current:true});
-      await chrome.tabs.update(workTabId, {url: 'https://store.coupangeats.com/merchant/management/orders'});
-      const ordersNav = await waitUrl(workTabId, {orders: RE_ORDERS}, 25000);
-      if (ordersNav && !stopRequested) {
-        await waitForPageLoadWithRetry(workTabId, 'orders 재시도 페이지');
-        await injectContent(workTabId);
-        await sleep(1500);
-        try { await chrome.tabs.sendMessage(workTabId, {type:'COLLECT', source:'batch', targetStores}); }
-        catch(e) { log(`[${acc.id}] orders 재시도 COLLECT 실패: ${e.message}`, 'err'); }
-        const retryResult = await waitMultistore('orders', CMG_TIMEOUT);
-        const rp = (pending && pending.payload) || retryResult || {};
-        if (rp.skipped) {
-          ordersOk = false;
-          log(`[${acc.id}] orders 재시도 건너뜀→미완료: ${rp.reason||'브랜드 아님'}`, 'info');
-          setRow(i, {orders:'warn'});
-        } else {
-          ordersOk = categoryPayloadOk(rp, targetStores);
-          const retryStatusText = ordersOk ? '완료' : (rp.timeout ? '타임아웃' : rp.stopped ? '중단' : '미완료');
-          log(`[${acc.id}] orders 즉시재시도 ${retryStatusText} — ${rp.completedCount||0}/${rp.storeCount||0}개`,
-              ordersOk ? 'ok' : 'err');
-          setRow(i, {orders: ordersOk ? 'ok' : (rp.timeout ? 'fail' : 'warn')});
-        }
-        recordCategoryResults('orders', acc, targetStores, rp, ordersOk, rp.timeout ? 'orders 재시도 타임아웃' : '');
-      } else {
-        log(`[${acc.id}] orders 재시도 페이지 이동 실패`, 'err');
-      }
+      log(`[${acc.id}] orders 미완료 → 즉시재시도 없이 백필 큐로 이관`, 'info');
+      setRow(i, {orders:'warn', note:'즉시재시도 제거(백필)'});
     }
 
     // 5) 상품관리(메뉴+옵션) 수집
     let menuOk = false;
     if (!skip.menu) {
-      setRow(i, {menu:'run', note:'메뉴 이동중', current:true});
-      await chrome.tabs.update(workTabId, {url: MENU_URL});
-      const menuNav = await waitUrl(workTabId, {menu: RE_MENU}, 15000);
-      if (!menuNav || stopRequested) {
-        log(`[${acc.id}] 메뉴 페이지 이동 실패`, 'err');
-        setRow(i, {menu:'fail', note:'메뉴 이동 실패'});
-        recordCategoryResults('menu', acc, targetStores, null, false, '메뉴 이동 실패');
+      if (activeTargetStores.length === 0) {
+        menuOk = true;
+        setRow(i, {menu:'skip', note:'대상 매장 없음(throttle 제외됨)'});
+        recordCategoryResults('menu', acc, activeTargetStores, null, true, '대상 매장 없음');
+        log(`[${acc.id}] 메뉴 건너뜀 (대상 매장 없음)`, 'info');
       } else {
-        await waitForPageLoadWithRetry(workTabId, '메뉴 페이지');
-        await injectContent(workTabId);
-        await sleep(1000);
-        setRow(i, {menu:'run', note:'상품 수집중', current:true});
-        try { await chrome.tabs.sendMessage(workTabId, {type:'COLLECT', source:'batch', targetStores}); }
-        catch(e) { log(`[${acc.id}] MENU COLLECT 실패: ${e.message}`, 'err'); }
-        const menuResult = await waitMultistore('menu', MENU_TIMEOUT);
-        const mp = (pending && pending.payload) || menuResult || {};
-        if (mp.skipped) {
-          const isGenuineMenuSkip = mp.reason === 'not_target_brand' && targetStores.length === 0;
-          menuOk = isGenuineMenuSkip;
-          if (isGenuineMenuSkip) {
-            log(`[${acc.id}] 메뉴 건너뜀(브랜드 아님): ${mp.curStoreName||'미탐지'}`, 'info');
-            setRow(i, {menu:'skip', note: mp.curStoreName ? '브랜드 아님: ' + mp.curStoreName : '매장명 미탐지'});
-          } else {
-            log(`[${acc.id}] 메뉴 건너뜀→재시도: ${mp.reason||''} (${mp.curStoreName||'미탐지'})`, 'info');
-            setRow(i, {menu:'warn', note: '건너뜀→재시도'});
-          }
-        } else {
-          menuOk = !mp.timeout && !mp.stopped && !mp.error;
-          log(`[${acc.id}] 메뉴 ${menuOk ? '완료' : (mp.timeout ? '타임아웃' : '실패')} — ${mp.completedCount||0}/${mp.storeCount||0}개`,
-              menuOk ? 'ok' : 'err');
-          setRow(i, {menu: menuOk ? 'ok' : (mp.timeout ? 'fail' : 'warn')});
+        setRow(i, {menu:'run', note:'메뉴 이동중', current:true});
+        let menuNav = null;
+        for (let navTry = 1; navTry <= 2 && !menuNav && !stopRequested; navTry++) {
+          if (navTry > 1) log(`[${acc.id}] 메뉴 URL 재진입 (${navTry}/2)...`, 'info');
+          await chrome.tabs.update(workTabId, {url: MENU_URL});
+          menuNav = await waitUrl(workTabId, {menu: RE_MENU}, 20000);
+          if (!menuNav) await sleep(1200);
         }
-        recordCategoryResults('menu', acc, targetStores, mp, menuOk, mp.timeout ? '메뉴 타임아웃' : '');
+        if (!menuNav || stopRequested) {
+          log(`[${acc.id}] 메뉴 페이지 이동 실패`, 'err');
+          setRow(i, {menu:'fail', note:'메뉴 이동 실패'});
+          recordCategoryResults('menu', acc, activeTargetStores, null, false, '메뉴 이동 실패');
+        } else {
+          await waitForPageLoadWithRetry(workTabId, '메뉴 페이지');
+          await injectContent(workTabId);
+          await sleep(1000);
+          setRow(i, {menu:'run', note:'상품 수집중', current:true});
+          try { await chrome.tabs.sendMessage(workTabId, {type:'COLLECT', runnerName:'coupang', source:'batch', targetStores: activeTargetStores, targetDate, targetDateMode, targetStartDate, targetEndDate}); }
+          catch(e) { log(`[${acc.id}] MENU COLLECT 실패: ${e.message}`, 'err'); }
+          const menuResult = await waitMultistore('menu', MENU_TIMEOUT);
+          const mp = (pending && pending.payload) || menuResult || {};
+          if (mp.skipped) {
+            const isGenuineMenuSkip = mp.reason === 'not_target_brand' && activeTargetStores.length === 0;
+            menuOk = isGenuineMenuSkip;
+            if (isGenuineMenuSkip) {
+              log(`[${acc.id}] 메뉴 건너뜀(브랜드 아님): ${mp.curStoreName||'미탐지'}`, 'info');
+              setRow(i, {menu:'skip', note: mp.curStoreName ? '브랜드 아님: ' + mp.curStoreName : '매장명 미탐지'});
+            } else {
+              log(`[${acc.id}] 메뉴 건너뜀→재시도: ${mp.reason||''} (${mp.curStoreName||'미탐지'})`, 'info');
+              setRow(i, {menu:'warn', note: '건너뜀→재시도'});
+            }
+          } else {
+            menuOk = !mp.timeout && !mp.stopped && !mp.error;
+            log(`[${acc.id}] 메뉴 ${menuOk ? '완료' : (mp.timeout ? '타임아웃' : '실패')} — ${mp.completedCount||0}/${mp.storeCount||0}개`,
+                menuOk ? 'ok' : 'err');
+            setRow(i, {menu: menuOk ? 'ok' : (mp.timeout ? 'fail' : 'warn')});
+          }
+          recordCategoryResults('menu', acc, activeTargetStores, mp, menuOk, mp.timeout ? '메뉴 타임아웃' : '');
+        }
       }
       if (stopRequested) return {status:'fail', note:'중단됨', ordersOk, cmgOk, menuOk:false};
     } else {
       menuOk = true;
       setRow(i, {menu:'skip'});
-      recordCategoryResults('menu', acc, targetStores, null, true, '메뉴 이전 완료');
+      recordCategoryResults('menu', acc, activeTargetStores, null, true, '메뉴 이전 완료');
       log(`[${acc.id}] 메뉴 건너뜀 (이전 수집 완료)`, 'info');
     }
 
     const dur = fmtMs(Date.now() - t0);
     const status = ordersOk && cmgOk && menuOk ? 'ok' : (ordersOk || cmgOk || menuOk ? 'warn' : 'fail');
     setRow(i, {dur, note:'', current:false, promote:true});  // 완료 → 최상단 이동
-    return {status, dur, ordersOk, cmgOk, menuOk};
+    return {status, dur, ordersOk, cmgOk, menuOk, ordersTimedOut: !!prevOrdersTimedOut, partialThrottle: !!partialThrottle, hardThrottle: !!hardThrottle, blocked: !!hardThrottle};
   }
 
   // ── 배치 실행 ──
-  async function runBatch(mode = 'all') {
+  async function runBatch(mode = 'all', dateMode = 'yesterday', options = {}) {
     if (running || !queue.length) return;
+    try {
+      const selfTab = await chrome.tabs.getCurrent();
+      if (selfTab) await chrome.tabs.update(selfTab.id, { autoDiscardable: false });
+    } catch (_) {}
     running = true; stopRequested = false;
+    throttleStreak = 0;
+    loginThrottleStreak = 0;
+    loginThrottleAborted = false;
+    hardThrottleStopped = false;
+    hardThrottleBackfillDate = null;
+    await clearRunnerStopLatch();
     runMode = mode;
+    runDateMode = dateMode === 'custom' ? 'custom' : (dateMode === 'today' ? 'today' : 'yesterday');
+    const batchOptions = {...options, targetDateMode: options.targetDateMode || runDateMode};
+    runDateOptions = {...batchOptions};
     if (autoRetryTimer) { clearInterval(autoRetryTimer); autoRetryTimer = null; }
     retryRound = 0;
     manifestRows.length = 0;
@@ -946,17 +1364,17 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
       runTargetStores = pickTargetStores(mode);
     }
     resetStoreStatus(runTargetStores);
-    el.startBtn.disabled = true; el.topHalfBtn.disabled = true; el.bottomHalfBtn.disabled = true; el.stopBtn.disabled = false;
+    el.startBtn.disabled = true; el.todayBtn.disabled = true; el.topHalfBtn.disabled = true; el.bottomHalfBtn.disabled = true; el.topHalfTodayBtn.disabled = true; el.bottomHalfTodayBtn.disabled = true; el.customRangeAllBtn.disabled = true; el.stopBtn.disabled = false;
     el.summary.classList.remove('show');
     startTs = Date.now();
     elapsedTimer = setInterval(() => { el.mElapsed.textContent = fmtMs(Date.now()-startTs); }, 1000);
 
-    // 어제 실패 계정 백필 큐 확인
+    // 어제 기준 정규 배치에서만 전날 실패 백필 큐를 먼저 처리한다.
     const bfqResult = await chrome.storage.local.get(['ce_backfill_queue']);
     const bfq = bfqResult.ce_backfill_queue;
     const bfStores = Array.isArray(bfq?.failedStores) ? bfq.failedStores : [];
     const bfAccIds = Array.isArray(bfq?.failedAccIds) ? bfq.failedAccIds : [];
-    if (bfq && bfq.enqueuedDate === getYesterdayStr() && (bfStores.length > 0 || bfAccIds.length > 0)) {
+    if (runDateMode === 'yesterday' && bfq && bfq.enqueuedDate === getYesterdayStr() && (bfStores.length > 0 || bfAccIds.length > 0)) {
       const backfillTargets = bfStores.length > 0
         ? bfStores
         : uniq(queue.filter(q => bfAccIds.includes(q.id)).flatMap(q => q.stores));
@@ -965,21 +1383,49 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
       resetStoreStatus(backfillTargets);
       let bfWorkTab;
       try {
-        bfWorkTab = await chrome.tabs.create({url:'about:blank', active:true});
+        bfWorkTab = trackWorkTab(await chrome.tabs.create({url:'about:blank', active:true}));
+        try { await chrome.tabs.update(bfWorkTab.id, { autoDiscardable: false }); } catch (_) {}
         const bfRunIndices = targetRunIndices(backfillTargets);
         for (const qi of bfRunIndices) {
           if (stopRequested) break;
           const targetStores = accountTargetStores(queue[qi], backfillTargets);
-          try { await processAccount(qi, bfWorkTab.id, {}, targetStores); }
+          const bfSkip = bfq.targetDateMode === 'custom' ? {cmg:true, menu:true} : {};
+          let res;
+          try { res = await processAccount(qi, bfWorkTab.id, bfSkip, targetStores, {targetDate: bfq.targetDate, targetStartDate: bfq.targetStartDate || '', targetEndDate: bfq.targetEndDate || '', targetDateMode: bfq.targetDateMode || 'yesterday', targetDateLabel: '백필'}); }
           catch(e) {
             log(`[${queue[qi].id}] 백필 예외: ${e.message}`, 'err');
             markAccountStoresTried(queue[qi], targetStores, e.message);
+            res = {status:'fail', note:e.message};
           }
           updateMeta();
-          if (!stopRequested) await sleep(rand(DELAY_MIN, DELAY_MAX));
+          if (res.loginThrottle) {
+            log('로그인 쓰로틀 감지 — 백필 대상 계속 진행', 'err');
+          } else if (res.hardThrottle || res.blocked) {
+            log('10057 감지 — 해당 매장 백필로 표시하고 백필 대상 계속 진행', 'err');
+          }
+          if (res.loginThrottle) {
+            loginThrottleStreak++;
+            if (loginThrottleStreak >= MAX_LOGIN_THROTTLE_STREAK) {
+              loginThrottleAborted = true;
+              log(`⛔ 연속 로그인 스로틀 ${loginThrottleStreak}회 — 배치 중단, 남은 계정 백필 이관 후 자동재시도 대기`, 'err');
+              break;
+            }
+          } else {
+            loginThrottleStreak = 0;
+          }
+          if (res.loginThrottle && hardThrottleStopped) break;
+          if (!stopRequested) await waitBeforeNextAccount(res);
         }
       } catch(e) { log(`백필 예외: ${e.message}`, 'err'); }
-      finally { if (bfWorkTab) { try { await chrome.tabs.remove(bfWorkTab.id); } catch(_) {} } }
+      finally { await closeWorkTab(bfWorkTab); }
+      if (hardThrottleStopped) {
+        finishBatch();
+        return;
+      }
+      if (loginThrottleAborted) {
+        finishBatch();
+        return;
+      }
       log('백필 완료 — 정규 배치 시작', 'info');
       manifestRows.length = 0;
       storeStatusRows.clear();
@@ -989,12 +1435,16 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
     const runIndices = mode === 'all' && selectedIndices.size > 0
       ? [...selectedIndices].sort((a, b) => a - b)
       : targetRunIndices(runTargetStores);
-    log(`${modeText(mode)} 배치 시작 — ${runTargetStores.length}개 매장 / ${runIndices.length}개 계정${selectedIndices.size > 0 && mode === 'all' ? ' (선택 테스트)' : ''}`, 'info');
+    const runDateText = runDateMode === 'custom' && batchOptions.targetStartDate && batchOptions.targetEndDate
+      ? `${batchOptions.targetStartDate}~${batchOptions.targetEndDate}`
+      : getRunDateStr(runDateMode);
+    log(`${modeText(mode)} ${getRunDateLabel(runDateMode)}(${runDateText}) 배치 시작 — ${runTargetStores.length}개 매장 / ${runIndices.length}개 계정${selectedIndices.size > 0 && mode === 'all' ? ' (선택 테스트)' : ''}`, 'info');
 
     // [Bug5 fix] try/finally로 예외 발생 시에도 반드시 finishBatch 호출
     let workTab;
     try {
-      workTab = await chrome.tabs.create({url:'about:blank', active:true});
+      workTab = trackWorkTab(await chrome.tabs.create({url:'about:blank', active:true}));
+      try { await chrome.tabs.update(workTab.id, { autoDiscardable: false }); } catch (_) {}
 
       // [Bug4 fix] runIndices 기준 인덱스(ri) 사용 — queue.length 아닌 runIndices.length 비교
       for (let ri = 0; ri < runIndices.length; ri++) {
@@ -1002,10 +1452,12 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
         if (stopRequested) { log('중단 요청 — 종료', 'err'); break; }
         let res;
         const targetStores = accountTargetStores(queue[i], runTargetStores);
-        try { res = await processAccount(i, workTab.id, {}, targetStores); }
+        const skip = runDateMode === 'custom' ? {cmg:true, menu:true} : {};
+        try { res = await processAccount(i, workTab.id, skip, targetStores, batchOptions); }
         catch(e) {
           log(`[${queue[i].id}] 예외: ${e.message}`, 'err');
           markAccountStoresTried(queue[i], targetStores, e.message);
+          closeFailedBadges(i, targetStores, e.message);
           res = {status:'fail', note:e.message};
         }
 
@@ -1016,24 +1468,40 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
           ordersOk: res.ordersOk ?? false,
           cmgOk:    res.cmgOk    ?? false,
           menuOk:   res.menuOk   ?? false,
+          blocked:  res.blocked  ?? false,
           note: res.note||'',
           duration: res.dur||'-',
           collected_at: new Date().toISOString()
         });
         updateMeta();
 
+        if (res.loginThrottle) {
+          log('로그인 쓰로틀 감지 — 다음 계정 진행', 'err');
+        } else if (res.hardThrottle || res.blocked) {
+          log('10057 감지 — 해당 매장 백필로 표시하고 다음 계정 진행', 'err');
+        }
+        if (res.loginThrottle) {
+          loginThrottleStreak++;
+          if (loginThrottleStreak >= MAX_LOGIN_THROTTLE_STREAK) {
+            loginThrottleAborted = true;
+            log(`⛔ 연속 로그인 스로틀 ${loginThrottleStreak}회 — 배치 중단, 남은 계정 백필 이관 후 자동재시도 대기`, 'err');
+            break;
+          }
+        } else {
+          loginThrottleStreak = 0;
+        }
+        if (res.loginThrottle && hardThrottleStopped) break;
+
         // 마지막 계정이 아닐 때만 대기 (runIndices 기준)
         if (ri < runIndices.length - 1 && !stopRequested) {
-          const d = rand(DELAY_MIN, DELAY_MAX);
-          log(`다음 계정까지 ${Math.round(d/1000)}초 대기...`);
-          await sleep(d);
+          await waitBeforeNextAccount(res);
         }
       }
     } catch(e) {
       log(`배치 예외: ${e.message}`, 'err');
     } finally {
-      if (workTab) { try { await chrome.tabs.remove(workTab.id); } catch(_) {} }
       finishBatch();
+      await closeWorkTab(workTab, {keepDuringAutoRetry: true});
     }
   }
 
@@ -1041,7 +1509,7 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
     running = false;
     clearInterval(elapsedTimer);
     manifestRows.splice(0, manifestRows.length, ...storeRowsToManifestRows());
-    el.startBtn.disabled = false; el.topHalfBtn.disabled = false; el.bottomHalfBtn.disabled = false; el.stopBtn.disabled = true;
+    el.startBtn.disabled = false; el.todayBtn.disabled = false; el.topHalfBtn.disabled = false; el.bottomHalfBtn.disabled = false; el.topHalfTodayBtn.disabled = false; el.bottomHalfTodayBtn.disabled = false; el.customRangeAllBtn.disabled = false; el.stopBtn.disabled = true;
     el.mCurrent.textContent = '-';
 
     const c = counts();
@@ -1050,32 +1518,23 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
     el.sElapsed.textContent = fmtMs(Date.now()-startTs);
     el.summary.classList.add('show');
     el.manifestBtn.style.display = ''; el.logBtn.style.display = '';
-    // 경고/실패 있으면 5초 후 자동 재시도 (retryBtn 클릭 = 취소)
+    if (hardThrottleStopped) {
+      el.retryBtn.style.display = 'none';
+      el.retryBtn.disabled = false;
+    }
+    // 경고/실패 있으면 2~3시간 랜덤 대기 후 자동 재시도 (retryBtn 클릭 = 취소)
     // 단, 사용자가 중단(stopRequested)한 경우엔 자동 재시도 금지 — finishRetry와 동일 가드
-    if (c.warn + c.fail > 0 && !stopRequested) {
-      if (autoRetryTimer) { clearInterval(autoRetryTimer); autoRetryTimer = null; }
-      el.retryBtn.style.display = '';
-      el.retryBtn.textContent = '↩ 재시도 (5초 후 자동 시작)';
-      let countdown = 5;
-      autoRetryTimer = setInterval(() => {
-        countdown--;
-        if (countdown > 0) {
-          el.retryBtn.textContent = '↩ 재시도 (' + countdown + '초 후 자동 시작)';
-        } else {
-          clearInterval(autoRetryTimer); autoRetryTimer = null;
-          el.retryBtn.textContent = '↩ 실패 재시도';
-          runRetry();
-        }
-      }, 1000);
+    if (incompleteStores().length > 0 && !stopRequested && !hardThrottleStopped) {
+      scheduleAutoRetry('↩ 재시도');
     }
     log(`배치 완료 — 성공 ${c.ok} / 경고 ${c.warn} / 실패 ${c.fail}`, c.fail ? 'err' : 'ok');
 
     // 중단으로 인해 아예 실행 안 된 계정 백필 큐 저장
     // (미완료는 finishRetry에서 덮어씀 — 재시도 없이 탭 닫힌 경우 대비)
-    const allIncomplete = incompleteStores();
+    const allIncomplete = backfillStores();
     if (allIncomplete.length > 0) {
-      const targetDate = getYesterdayStr();
-      chrome.storage.local.set({ ce_backfill_queue: { enqueuedDate: getTodayStr(), targetDate, failedStores: allIncomplete } });
+      const targetDate = hardThrottleBackfillDate || runDateOptions.targetDate || runDateOptions.targetEndDate || getRunDateStr(runDateMode);
+      chrome.storage.local.set({ ce_backfill_queue: { enqueuedDate: getTodayStr(), targetDate, targetStartDate: runDateOptions.targetStartDate || '', targetEndDate: runDateOptions.targetEndDate || '', targetDateMode: runDateMode, failedStores: allIncomplete } });
       log(`📋 백필 큐 저장 — 미완료 매장 ${allIncomplete.length}개`, 'info');
     } else {
       chrome.storage.local.remove(['ce_backfill_queue']);
@@ -1093,10 +1552,16 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
     if (!failures.length) { log('재시도할 실패 항목 없음', 'info'); return; }
 
     running = true; stopRequested = false;
+    throttleStreak = 0;
+    loginThrottleStreak = 0;
+    loginThrottleAborted = false;
+    hardThrottleStopped = false;
+    hardThrottleBackfillDate = null;
+    await clearRunnerStopLatch();
     if (autoRetryTimer) { clearInterval(autoRetryTimer); autoRetryTimer = null; }
     retryRound++;
     el.retryBtn.disabled = true; el.stopBtn.disabled = false;
-    el.startBtn.disabled = true; el.topHalfBtn.disabled = true; el.bottomHalfBtn.disabled = true;
+    el.startBtn.disabled = true; el.todayBtn.disabled = true; el.topHalfBtn.disabled = true; el.bottomHalfBtn.disabled = true; el.topHalfTodayBtn.disabled = true; el.bottomHalfTodayBtn.disabled = true; el.customRangeAllBtn.disabled = true;
     startTs = Date.now();
     elapsedTimer = setInterval(() => { el.mElapsed.textContent = fmtMs(Date.now()-startTs); }, 1000);
     const failureSet = new Set(failures.map(storeCompareKey));
@@ -1108,7 +1573,8 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
 
     let workTab;
     try {
-      workTab = await chrome.tabs.create({url:'about:blank', active:true});
+      workTab = trackWorkTab(await chrome.tabs.create({url:'about:blank', active:true}));
+      try { await chrome.tabs.update(workTab.id, { autoDiscardable: false }); } catch (_) {}
       for (let ri = 0; ri < retryIndices.length; ri++) {
         if (stopRequested) { log('중단 요청 — 재시도 종료', 'err'); break; }
         const queueIdx = retryIndices[ri];
@@ -1125,24 +1591,41 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
         if (!skip.orders) setBadge(`ro-${queueIdx}`, 'wait');
         if (!skip.cmg)    setBadge(`rc-${queueIdx}`, 'wait');
         if (!skip.menu)   setBadge(`rm-${queueIdx}`, 'wait');
+        let res;
         try {
-          await processAccount(queueIdx, workTab.id, skip, targetStores);
+          res = await processAccount(queueIdx, workTab.id, skip, targetStores, runDateOptions);
         } catch(e) {
           log(`[${acc.id}] 재시도 예외: ${e.message}`, 'err');
           markAccountStoresTried(acc, targetStores, e.message);
+          closeFailedBadges(queueIdx, targetStores, e.message);
+          res = {status:'fail', note:e.message};
         }
         updateMeta();
+        if (res.loginThrottle) {
+          log('로그인 쓰로틀 감지 — 다음 재시도 대상 진행', 'err');
+        } else if (res.hardThrottle || res.blocked) {
+          log('10057 감지 — 해당 매장 백필로 표시하고 다음 재시도 대상 진행', 'err');
+        }
+        if (res.loginThrottle) {
+          loginThrottleStreak++;
+          if (loginThrottleStreak >= MAX_LOGIN_THROTTLE_STREAK) {
+            loginThrottleAborted = true;
+            log(`⛔ 연속 로그인 스로틀 ${loginThrottleStreak}회 — 배치 중단, 남은 계정 백필 이관 후 자동재시도 대기`, 'err');
+            break;
+          }
+        } else {
+          loginThrottleStreak = 0;
+        }
+        if (res.loginThrottle && hardThrottleStopped) break;
         if (ri < retryIndices.length - 1 && !stopRequested) {
-          const d = rand(DELAY_MIN, DELAY_MAX);
-          log(`다음 계정까지 ${Math.round(d/1000)}초 대기...`);
-          await sleep(d);
+          await waitBeforeNextAccount(res);
         }
       }
     } catch(e) {
       log(`재시도 예외: ${e.message}`, 'err');
     } finally {
-      if (workTab) { try { await chrome.tabs.remove(workTab.id); } catch(_) {} }
       finishRetry();
+      await closeWorkTab(workTab, {keepDuringAutoRetry: true});
     }
   }
 
@@ -1151,28 +1634,16 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
     clearInterval(elapsedTimer);
     manifestRows.splice(0, manifestRows.length, ...storeRowsToManifestRows());
     el.stopBtn.disabled = true;
-    el.startBtn.disabled = false; el.topHalfBtn.disabled = false; el.bottomHalfBtn.disabled = false;
+    el.startBtn.disabled = false; el.todayBtn.disabled = false; el.topHalfBtn.disabled = false; el.bottomHalfBtn.disabled = false; el.topHalfTodayBtn.disabled = false; el.bottomHalfTodayBtn.disabled = false; el.customRangeAllBtn.disabled = false;
     el.mCurrent.textContent = '-';
     const c = counts();
     el.sOk.textContent = c.ok; el.sWarn.textContent = c.warn; el.sFail.textContent = c.fail;
     el.retryBtn.disabled = false;
     const stillFailing = incompleteStores().length > 0;
-    el.retryBtn.style.display = stillFailing ? '' : 'none';
-    if (stillFailing && !stopRequested) {
+    el.retryBtn.style.display = (stillFailing && !hardThrottleStopped) ? '' : 'none';
+    if (stillFailing && !stopRequested && !hardThrottleStopped) {
       if (retryRound < MAX_AUTO_RETRY) {
-        if (autoRetryTimer) { clearInterval(autoRetryTimer); autoRetryTimer = null; }
-        el.retryBtn.textContent = `↩ 재시도 ${retryRound}/${MAX_AUTO_RETRY} (5초 후 자동 시작)`;
-        let countdown = 5;
-        autoRetryTimer = setInterval(() => {
-          countdown--;
-          if (countdown > 0) {
-            el.retryBtn.textContent = `↩ 재시도 ${retryRound}/${MAX_AUTO_RETRY} (${countdown}초 후 자동 시작)`;
-          } else {
-            clearInterval(autoRetryTimer); autoRetryTimer = null;
-            el.retryBtn.textContent = '↩ 실패 재시도';
-            runRetry();
-          }
-        }, 1000);
+        scheduleAutoRetry(`↩ 재시도 ${retryRound}/${MAX_AUTO_RETRY}`);
       } else {
         el.retryBtn.textContent = '↩ 실패 재시도';
         notifyFailures();
@@ -1182,10 +1653,10 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
 
     // 최종 실패 계정을 백필 큐에 저장 → 다음 날 배치 시작 시 자동 재수집
     // 중단됨 포함, 아예 실행 안 된 계정도 포함
-    const allIncompleteR = incompleteStores();
+    const allIncompleteR = backfillStores();
     if (allIncompleteR.length > 0) {
-      const targetDate = getYesterdayStr();
-      chrome.storage.local.set({ ce_backfill_queue: { enqueuedDate: getTodayStr(), targetDate, failedStores: allIncompleteR } });
+      const targetDate = hardThrottleBackfillDate || runDateOptions.targetDate || runDateOptions.targetEndDate || getRunDateStr(runDateMode);
+      chrome.storage.local.set({ ce_backfill_queue: { enqueuedDate: getTodayStr(), targetDate, targetStartDate: runDateOptions.targetStartDate || '', targetEndDate: runDateOptions.targetEndDate || '', targetDateMode: runDateMode, failedStores: allIncompleteR } });
       log(`📋 백필 큐 저장 — 미완료 매장 ${allIncompleteR.length}개 (내일 배치 시 자동 재수집)`, 'info');
     } else {
       chrome.storage.local.remove(['ce_backfill_queue']);
@@ -1197,16 +1668,33 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
 
   // ── 로그 MD 다운로드 ──
   function downloadLog() {
-    const lines = [...el.log.querySelectorAll('.log-line')].map(div => {
-      const t = div.querySelector('.t')?.textContent || '';
-      const msg = div.textContent.replace(t, '').trim();
-      return t + '  ' + msg;
-    });
+    const issueKeywords = [
+      '\uacbd\uace0', '\uc2e4\ud328', '\uc624\ub958', '\ud0c0\uc784\uc544\uc6c3', '\uc81c\ud55c', '\ucc28\ub2e8',
+      'throttle', '10057', '\ubd80\ubd84', '\ubc31\ud544', '\ubbf8\uc644\ub8cc', '\uc7ac\uc2dc\ub3c4 \ubcf4\ub958', '\uc218\uc9d1 \uacb0\uacfc \uc5c6\uc74c'
+    ].map(s => s.replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16))).toLowerCase());
+    const lines = [...el.log.querySelectorAll('.log-line')]
+      .filter(div => {
+        const cls = div.className || '';
+        const text = (div.textContent || '').toLowerCase();
+        return /\b(err|warn)\b/.test(cls) || issueKeywords.some(keyword => text.includes(keyword));
+      })
+      .map(div => {
+        const t = div.querySelector('.t')?.textContent || '';
+        const msg = div.textContent.replace(t, '').trim();
+        return t + '  ' + msg;
+      });
+    if (!lines.length) {
+      log('\ubb38\uc81c \ub85c\uadf8 \uc5c6\uc74c \u2014 \ub85c\uadf8 \uc800\uc7a5 \uc0dd\ub7b5'.replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16))), 'info');
+      return;
+    }
     const ymd = new Date().toISOString().slice(0, 10);
-    const md = '# 쿠팡 수집 로그 (' + ymd + ')\n\n`\n' + lines.join('\n') + '\n`\n';
-    const filename = 'coupang_log_' + ymd.replace(/-/g, '') + '.md';
+    const title = '# ' + '\ucfe0\ud321 \uc218\uc9d1 \ubb38\uc81c \ub85c\uadf8'.replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16))) + ' (' + ymd + ')';
+    const md = title + '\n\n`\n' + lines.join('\n') + '\n`\n';
+    const filename = 'coupang_issue_log_' + ymd.replace(/-/g, '') + '.md';
     chrome.runtime.sendMessage({type:'DOWNLOAD_CSV', content:md, filename, mimeType:'text/plain'}, resp => {
-      log(resp?.success ? ('로그 저장: ' + filename) : '로그 저장 실패', resp?.success ? 'ok' : 'err');
+      const okMsg = '\ubb38\uc81c \ub85c\uadf8 \uc800\uc7a5: '.replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16))) + filename;
+      const failMsg = '\ubb38\uc81c \ub85c\uadf8 \uc800\uc7a5 \uc2e4\ud328'.replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+      log(resp?.success ? okMsg : failMsg, resp?.success ? 'ok' : 'err');
     });
   }
 
@@ -1274,7 +1762,7 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
     }
     queue = [...idMap.values()].filter(acc => acc.stores.length > 0);
     selectedIndices.clear();
-    el.startBtn.textContent = '▶ 전체 수집 시작';
+    el.startBtn.textContent = '▶ 어제 수집 시작';
     el.modeLabel.textContent = `총 ${queue.length}개 계정 — 행/필터 클릭으로 복수 선택`;
     buildRows();
     buildFilterList('');
@@ -1284,6 +1772,10 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
   // ── 초기화 ──
   async function init() {
     await loadQueue();
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    if (el.customStartDate && !el.customStartDate.value) el.customStartDate.value = formatInputDate(yesterday);
+    if (el.customEndDate && !el.customEndDate.value) el.customEndDate.value = formatInputDate(yesterday);
     // 검색 입력 → 필터 실시간 갱신
     const filterSearch = document.getElementById('filterSearch');
     if (filterSearch) {
@@ -1291,16 +1783,45 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
     }
   }
 
+  function runCustomRangeAll() {
+    const startDate = parseInputDate(el.customStartDate?.value);
+    const endDate = parseInputDate(el.customEndDate?.value);
+    if (!startDate || !endDate) {
+      log('지정기간 주문서 수집 실패 — 시작일/종료일을 모두 입력해주세요.', 'err');
+      return;
+    }
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (startDate > endDate) {
+      log('지정기간 주문서 수집 실패 — 시작일이 종료일보다 늦습니다.', 'err');
+      return;
+    }
+    if (endDate > today) {
+      log('지정기간 주문서 수집 실패 — 미래 날짜는 수집할 수 없습니다.', 'err');
+      return;
+    }
+    const targetStartDate = toYmd(startDate);
+    const targetEndDate = toYmd(endDate);
+    runBatch('all', 'custom', {
+      targetDate: targetEndDate,
+      targetStartDate,
+      targetEndDate,
+      targetDateMode: 'custom',
+      targetDateLabel: '지정기간'
+    });
+  }
+
   el.menuBtn.addEventListener('click', () => {
     chrome.tabs.create({ url: 'https://store.coupangeats.com/merchant/management/menu/', active: true });
   });
-  el.startBtn.addEventListener('click', () => runBatch('all'));
-  el.topHalfBtn.addEventListener('click', () => runBatch('top50'));
-  el.bottomHalfBtn.addEventListener('click', () => runBatch('bottom50'));
-  el.stopBtn.addEventListener('click', () => {
-    if (autoRetryTimer) { clearInterval(autoRetryTimer); autoRetryTimer = null; }
-    stopRequested = true; log('중단 요청됨 — 현재 수집 완료 후 멈춥니다.','err');
-  });
+  el.startBtn.addEventListener('click', () => runBatch('all', 'yesterday'));
+  el.todayBtn.addEventListener('click', () => runBatch('all', 'today'));
+  el.topHalfBtn.addEventListener('click', () => runBatch('top50', 'yesterday'));
+  el.bottomHalfBtn.addEventListener('click', () => runBatch('bottom50', 'yesterday'));
+  el.topHalfTodayBtn.addEventListener('click', () => runBatch('top50', 'today'));
+  el.bottomHalfTodayBtn.addEventListener('click', () => runBatch('bottom50', 'today'));
+  el.customRangeAllBtn.addEventListener('click', runCustomRangeAll);
+  el.stopBtn.addEventListener('click', () => { void requestCurrentWorkStop(); });
   el.manifestBtn.addEventListener('click', downloadManifest);
   el.retryBtn.addEventListener('click', () => {
     if (autoRetryTimer) {
@@ -1343,7 +1864,9 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
     const autoMode = autoModeParam === 'bottom50'
       ? 'bottom50'
       : (autoModeParam === 'top50' ? 'top50' : 'all');
-    log('자동 시작 모드 (auto=1) — 인터넷 연결 확인 중...', 'info');
+    const autoDateParam = (params.get('date') || params.get('dateMode') || 'yesterday').toLowerCase();
+    const autoDateMode = autoDateParam === 'today' ? 'today' : 'yesterday';
+    log(`auto start (auto=1, ${modeText(autoMode)} ${getRunDateLabel(autoDateMode)}) - checking internet...`, 'info');
 
     async function tryAutoRun() {
       const online = await waitForInternet(30000);
@@ -1352,13 +1875,13 @@ let autoRetryTimer  = null;       // 배치 완료 후 자동 재시도 대기 �
         setTimeout(() => location.reload(), 10000);
         return;
       }
-      log('인터넷 연결 확인 — 3초 후 전체 수집 시작', 'info');
+      log('internet ready - auto collection starts in 3s', 'info');
       await sleep(3000);
-      await runBatch(autoMode);
+      await runBatch(autoMode, autoDateMode);
 
       // 성공 0 + 경고 0 이면 인터넷 오류로 판단 → 10초 후 새로고침 재시도
       const c = counts();
-      if (c.done > 0 && c.ok === 0 && c.warn === 0) {
+      if (!stopRequested && c.done > 0 && c.ok === 0 && c.warn === 0) {
         log('전체 수집 실패 — 인터넷 오류 의심, 10초 후 재시도...', 'err');
         setTimeout(() => location.reload(), 10000);
       }

@@ -18,11 +18,11 @@ import pendulum
 from modules.extract.crawling_toorder_sales_report_daily_date import run_crawling_single_date
 from modules.transform.utility.paths import ANALYTICS_DB, DOWN_DIR
 from modules.transform.utility.store_normalize import normalize as _normalize_store_names
+from modules.transform.utility.account import get_default_account
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TOORDER_ID = os.getenv("TOORDER_ID", "doridang15")
-DEFAULT_TOORDER_PW = os.getenv("TOORDER_PW", "ehfl5233!")
+DEFAULT_TOORDER_ID, DEFAULT_TOORDER_PW = get_default_account("toorder")
 TOORDER_ID = DEFAULT_TOORDER_ID
 TOORDER_PW = DEFAULT_TOORDER_PW
 
@@ -575,8 +575,91 @@ def _load_channel_daily_df(src_xlsx: Path, sheets: list[str]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
 
 
+def _load_datedetail_daily_df(src_xlsx: Path, sheet_names: list[str]) -> pd.DataFrame:
+    target_sheets = [s for s in sheet_names if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(s))]
+    if not target_sheets:
+        target_sheets = [s for s in sheet_names if str(s) != "종합"]
+    if not target_sheets:
+        raise ValueError(f"일별상세 날짜 시트를 찾지 못했습니다: {sheet_names}")
+
+    frames = []
+    for sheet in target_sheets:
+        raw = pd.read_excel(src_xlsx, sheet_name=sheet, engine="openpyxl", header=None)
+        if raw.shape[0] < 7 or raw.shape[1] < 6:
+            continue
+
+        date_text = str(raw.iloc[1, 0]).strip()
+        m = re.search(r"\d{4}-\d{2}-\d{2}", date_text) or re.search(
+            r"\d{4}-\d{2}-\d{2}", str(sheet)
+        )
+        extracted_date = m.group(0) if m else None
+
+        store_names = raw.iloc[2].ffill()
+        store_tags = raw.iloc[3].ffill()
+        metric_names = raw.iloc[5]
+        channel_rows = raw.iloc[6:].copy()
+        channel_rows = channel_rows.loc[channel_rows.iloc[:, 0].notna()]
+
+        rows: list[dict[str, object]] = []
+        seen_store_blocks: set[tuple[str, int]] = set()
+        for start_col in range(1, raw.shape[1] - 3, 4):
+            store_name = str(store_names.iloc[start_col]).strip()
+            if not store_name or store_name.lower() == "nan" or store_name == "합계":
+                continue
+
+            metric_block = [str(v).strip() for v in metric_names.iloc[start_col:start_col + 4]]
+            if metric_block[:4] != ["총 매출", "매출액", "배달료", "영수 건수"]:
+                continue
+
+            block_key = (store_name, start_col)
+            if block_key in seen_store_blocks:
+                continue
+            seen_store_blocks.add(block_key)
+
+            tag_value = store_tags.iloc[start_col]
+            tag = None if pd.isna(tag_value) else str(tag_value).strip()
+            row: dict[str, object] = {
+                "매장": store_name,
+                "매장 태그": tag,
+                "매장_1": store_name,
+                "매장 태그_1": tag,
+                "매장_2": store_name,
+                "매장 태그_2": tag,
+                "매장_3": store_name,
+                "매장 태그_3": tag,
+            }
+
+            for _, channel_row in channel_rows.iterrows():
+                channel = str(channel_row.iloc[0]).strip()
+                if not channel or channel.lower() == "nan" or channel == "합계":
+                    continue
+                values = channel_row.iloc[start_col:start_col + 4].tolist()
+                suffixes = ["", "_1", "_2", "_3"]
+                for suffix, value in zip(suffixes, values):
+                    row[f"{channel}{suffix}"] = value
+
+            if extracted_date:
+                row["일자"] = extracted_date
+            rows.append(row)
+
+        if rows:
+            frames.append(pd.DataFrame(rows))
+
+    if not frames:
+        raise ValueError(f"일별상세 시트에서 데이터를 읽지 못했습니다: {src_xlsx}")
+    return pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+
+
 def _load_grp_df_from_xls(src_xlsx: Path) -> pd.DataFrame:
     xls = pd.ExcelFile(src_xlsx, engine="openpyxl")
+    if "종합" in xls.sheet_names and any(
+        re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(name)) for name in xls.sheet_names
+    ):
+        preview = pd.read_excel(src_xlsx, sheet_name="종합", engine="openpyxl", header=None, nrows=1)
+        title = str(preview.iloc[0, 0]).strip() if not preview.empty else ""
+        if "일별상세" in title:
+            return _load_datedetail_daily_df(src_xlsx, xls.sheet_names)
+
     sheets = _pick_grp_sheet(xls.sheet_names)
 
     if all("채널별(일)매출보고서" in str(s) for s in sheets):

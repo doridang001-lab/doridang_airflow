@@ -1,101 +1,218 @@
-"""
-쿠팡이츠 직수집(coupang_macro/orders) -> unified_sales 교정 파이프라인.
-
-TEST_STORES에 한해 쿠팡이츠 행을 제거하고 직수집 데이터로 대체한다.
-"""
+"""쿠팡 macro orders -> unified_sales 교정 파이프라인."""
 
 from __future__ import annotations
 
-import hashlib
+from modules.transform.utility.process_lock import unified_writer
 import logging
 import re
-from datetime import timedelta
-from glob import glob
+from collections import Counter
+from datetime import datetime, timedelta
 
 import pandas as pd
 import pendulum
 
+from modules.transform.utility.paths import COUPANG_ORDERS_DB, COUPANG_ORDERS_DETAIL_DB
 from modules.transform.pipelines.db.DB_UnifiedSales_common import (
+    DELIVERY_PLATFORM_FAMILIES,
     UNIFIED_COLUMNS,
     UNIFIED_ROOT,
+    clear_manual_fallback_marker,
+    clear_manual_partial_marker,
+    clear_manual_reingest_marker,
+    detect_manual_partial_collection,
+    delivery_baseline_summary,
+    fill_missing_manual_item_name,
     _load_store_map,
     _lookup_store_meta,
     _make_unified_pk,
-    _to_int_series,
     _unified_daily_path,
+    iter_unified_sales_files,
+    list_manual_reingest_dates,
+    notify_manual_fallback,
+    notify_manual_missing_all,
+    notify_manual_partial,
+    record_manual_fallback_marker,
+    record_manual_partial_marker,
+    save_unified_parquet,
 )
-from modules.transform.utility.paths import ANALYTICS_DB
+from modules.transform.pipelines.db.DB_ItemIdAllocator import allocate_manual_item_ids
 
 logger = logging.getLogger(__name__)
 
 COUPANG_SOURCE = "쿠팡수동"
 COUPANG_PLATFORM = "쿠팡이츠"
-COUPANG_REPLACED_PLATFORMS = {COUPANG_PLATFORM, "쿠팡 포장"}
-
-_DEDUP_COLUMNS = [
-    "store_id",
-    "order_id",
-    "order_date",
-    "menu_name",
-    "menu_qty",
-    "menu_price",
-    "menu_options",
-    "total_price",
-    "is_cancelled",
-]
+COUPANG_PLATFORMS = DELIVERY_PLATFORM_FAMILIES[COUPANG_SOURCE]
+COUPANG_OPTIONS_DB = COUPANG_ORDERS_DETAIL_DB / "options"
+POSFEED_ORDERS_DB = COUPANG_ORDERS_DETAIL_DB.parent / "posfeed_sales"
+POSFEED_DETAIL_DB = COUPANG_ORDERS_DETAIL_DB.parent / "posfeed_sales_detail"
+_RAW_DEDUP_NUMERIC_COLS = {"total_price", "menu_qty", "menu_price"}
+_ITEM_NAME_OVERRIDE_COL = "_coupang_item_name_override"
+_OBSERVED_PRICE_CATALOG: dict[tuple[str, str, str], int] | None = None
+_SCOPED_PRICE_CATALOG: dict[tuple[str, str], dict[str, int]] = {}
 
 
 def reconcile_coupang_for_test_stores(
     stores: list[str],
     sale_date: str | None = None,
     lookback_days: int | None = 7,
+    include_reingest_markers: bool = False,
 ) -> str:
     """TEST_STORES의 쿠팡이츠 행을 coupang_macro 직수집 기준으로 교정."""
-    dates = _resolve_coupang_target_dates(stores, sale_date, lookback_days)
-    if not dates:
-        return "쿠팡수동 교정 스킵 | 대상 날짜 없음"
-    ym_list = sorted({date[:7] for date in dates})
+    base_dates = _resolve_target_dates(stores, sale_date, lookback_days)
 
-    total_added = 0
     total_removed = 0
+    total_added = 0
+    processed_dates = 0
+    fallback_events: list[dict] = []
+    partial_events: list[dict] = []
+    missing_events: list[dict] = []
     store_map = _load_store_map()
 
     for store in stores:
-        for ym in ym_list:
-            coupang_files = _find_coupang_files(store, ym)
-            if not coupang_files:
-                logger.warning("쿠팡 수집 파일 없음, 기존 쿠팡이츠 행 유지: store=%s ym=%s", store, ym)
+        dates = _target_dates_for_store(
+            store,
+            base_dates,
+            sale_date,
+            lookback_days,
+            include_reingest_markers=include_reingest_markers,
+        )
+        if not dates:
+            continue
+        processed_dates += len(dates)
+        for ym in sorted({d[:7] for d in dates}):
+            frames = [
+                frame
+                for frame in (_read_coupang_month(store, ym), _read_coupang_month(store, _next_ym(ym)))
+                if not frame.empty
+            ]
+            raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            if raw.empty:
+                for date in dates:
+                    if date[:7] != ym:
+                        continue
+                    removed, added = _upsert_daily(pd.DataFrame(columns=UNIFIED_COLUMNS), date, store)
+                    clear_manual_reingest_marker(COUPANG_SOURCE, store, date)
+                    _record_coupang_fallback_event(date, store, fallback_events, missing_events)
+                    total_removed += removed
+                    total_added += added
                 continue
 
-            opt_map = _find_options_map(store, ym)
-            df_raw = _deduplicate_raw_orders(_read_coupang_files(coupang_files))
-            if df_raw.empty:
-                logger.warning("쿠팡 수집 데이터 없음, 기존 쿠팡이츠 행 유지: store=%s ym=%s", store, ym)
-                continue
-
-            _assert_required_columns(df_raw, store, ym)
-            brand = _parse_brand_from_path(coupang_files[0])
-            parsed = df_raw["order_date"].map(_parse_coupang_datetime)
-            df_raw = df_raw.copy()
-            df_raw["sale_date"] = parsed.map(lambda value: value[0])
-            df_raw["order_time"] = parsed.map(lambda value: value[1])
+            raw = raw.copy()
+            raw["sale_date"] = raw["order_date"].map(_parse_order_date)
+            raw["order_time"] = raw["order_date"].map(_parse_order_time)
+            raw = _deduplicate_raw(raw, store, ym)
 
             for date in dates:
                 if date[:7] != ym:
                     continue
-                df_day = df_raw[df_raw["sale_date"] == date].copy()
-                if df_day.empty:
-                    logger.info("쿠팡 데이터 없음, 기존 쿠팡이츠 행 유지: store=%s date=%s", store, date)
+                day = raw[raw["sale_date"] == date].copy()
+                if day.empty:
+                    removed, added = _upsert_daily(pd.DataFrame(columns=UNIFIED_COLUMNS), date, store)
+                    clear_manual_reingest_marker(COUPANG_SOURCE, store, date)
+                    _record_coupang_fallback_event(date, store, fallback_events, missing_events)
+                    total_removed += removed
+                    total_added += added
                     continue
 
-                df_unified = _transform_to_unified(df_day, store, brand, store_map, opt_map)
-                df_unified = _recalculate_order_fields(df_unified)
-                removed, added = _upsert_daily(df_unified, date, store)
+                frames = []
+                for brand, brand_df in day.groupby("_source_brand", sort=False):
+                    frames.append(_transform_to_unified(brand_df, store, str(brand).strip(), store_map))
+                new_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=UNIFIED_COLUMNS)
+
+                if not new_df.empty:
+                    manual_total = int(
+                        pd.to_numeric(new_df["total_price"], errors="coerce")
+                        .fillna(0)
+                        .sum()
+                    )
+                    partial = detect_manual_partial_collection(
+                        date,
+                        store,
+                        COUPANG_PLATFORMS,
+                        COUPANG_SOURCE,
+                        manual_total,
+                    )
+                    if partial:
+                        partial["platform"] = COUPANG_PLATFORM
+                        if record_manual_partial_marker(
+                            COUPANG_SOURCE,
+                            store,
+                            date,
+                            partial,
+                        ):
+                            partial_events.append(partial)
+                        logger.warning(
+                            "쿠팡수동 부분수집 의심: store=%s date=%s 수동=%d %s=%d 부족=%d",
+                            store,
+                            date,
+                            partial["manual_total"],
+                            partial.get("baseline_label") or "POS",
+                            partial.get("baseline_total") or partial["pos_total"],
+                            partial["gap"],
+                        )
+                    else:
+                        clear_manual_partial_marker(COUPANG_SOURCE, store, date)
+
+                removed, added = _upsert_daily(new_df, date, store)
+                clear_manual_reingest_marker(COUPANG_SOURCE, store, date)
+                if new_df.empty:
+                    _record_coupang_fallback_event(
+                        date,
+                        store,
+                        fallback_events,
+                        missing_events,
+                    )
+                else:
+                    clear_manual_fallback_marker(COUPANG_SOURCE, store, date)
                 total_removed += removed
                 total_added += added
-                logger.info("쿠팡 교정 완료: store=%s date=%s | 제거=%d 추가=%d", store, date, removed, added)
 
-    return f"쿠팡수동 교정 완료 | 제거={total_removed}행 추가={total_added}행"
+    if processed_dates == 0:
+        return "쿠팡수동 교정 스킵 | 대상 날짜 없음"
+    notify_manual_fallback("쿠팡수동", fallback_events)
+    notify_manual_partial("쿠팡수동", partial_events)
+    notify_manual_missing_all("쿠팡수동", missing_events)
+    return (
+        f"쿠팡수동 교정 완료 | 제거={total_removed}행 추가={total_added}행 "
+        f"폴백={len(fallback_events)}건 부분수집={len(partial_events)}건 "
+        f"무데이터={len(missing_events)}건"
+    )
+
+
+def _record_coupang_fallback_event(
+    date: str,
+    store: str,
+    events: list[dict],
+    missing: list[dict] | None = None,
+) -> None:
+    clear_manual_partial_marker(COUPANG_SOURCE, store, date)
+    baseline = delivery_baseline_summary(date, store, COUPANG_PLATFORMS, COUPANG_SOURCE)
+    amount = baseline["baseline_total"]
+    order_cnt = baseline["baseline_order_cnt"]
+    rows = baseline["baseline_rows"]
+    if rows <= 0:
+        event = {
+            "date": date,
+            "store": store,
+            "platform": COUPANG_PLATFORM,
+            "rows": 0,
+            "alert_suppressed": True,
+            "reason": "no_delivery_baseline",
+            **baseline,
+        }
+        record_manual_fallback_marker(COUPANG_SOURCE, store, date, event)
+        return
+    event = {
+        "date": date,
+        "store": store,
+        "platform": COUPANG_PLATFORM,
+        "total_price": amount,
+        "order_cnt": order_cnt,
+        "rows": rows,
+        **baseline,
+    }
+    if record_manual_fallback_marker(COUPANG_SOURCE, store, date, event):
+        events.append(event)
 
 
 def enforce_coupang_manual_only_for_test_stores(
@@ -103,345 +220,688 @@ def enforce_coupang_manual_only_for_test_stores(
     sale_date: str | None = None,
     lookback_days: int | None = 7,
 ) -> str:
-    """TEST_STORES의 쿠팡이츠 최종 방어막."""
-    if not stores:
-        return "TEST_STORES 없음 - 쿠팡수동 최종 정리 스킵"
-
-    dates = _resolve_coupang_target_dates(stores, sale_date, lookback_days)
+    """TEST_STORES의 쿠팡이츠는 쿠팡수동만 남긴다."""
+    dates = _resolve_target_dates(stores, sale_date, lookback_days)
     if not dates:
         return "쿠팡수동 최종 정리 스킵 | 대상 날짜 없음"
 
     store_set = {str(store).strip() for store in stores if str(store).strip()}
     total_removed = 0
-    changed_files = 0
-
+    changed = 0
     for date in dates:
-        daily_path = _unified_daily_path(date)
-        if not daily_path.exists():
-            logger.info("쿠팡수동 최종 정리 스킵, 파일 없음: %s", daily_path)
+        path = _unified_daily_path(date)
+        if not path.exists():
             continue
-
-        df = pd.read_parquet(daily_path).reindex(columns=UNIFIED_COLUMNS, fill_value="")
-        remove_mask = (
-            df["store"].fillna("").astype(str).str.strip().isin(store_set)
-            & df["platform"].fillna("").astype(str).str.strip().isin(COUPANG_REPLACED_PLATFORMS)
-            & ~df["source"].fillna("").astype(str).str.strip().eq(COUPANG_SOURCE)
-        )
+        df = pd.read_parquet(path).reindex(columns=UNIFIED_COLUMNS, fill_value="")
+        store_s = df["store"].fillna("").astype(str).str.strip()
+        platform_s = df["platform"].fillna("").astype(str).str.strip()
+        source_s = df["source"].fillna("").astype(str).str.strip()
+        date_s = df["sale_date"].fillna("").astype(str).str.strip()
+        in_family = store_s.isin(store_set) & platform_s.isin(COUPANG_PLATFORMS)
+        is_manual = source_s.eq(COUPANG_SOURCE)
+        manual_keys = set(zip(store_s[in_family & is_manual], date_s[in_family & is_manual]))
+        row_keys = pd.Series(list(zip(store_s, date_s)), index=df.index)
+        has_manual = row_keys.isin(manual_keys)
+        remove_mask = in_family & ~is_manual & has_manual
         removed = int(remove_mask.sum())
-        if removed == 0:
-            logger.info("쿠팡수동 최종 정리 변경 없음: %s", daily_path.name)
+        if not removed:
+            for store in store_set:
+                clear_manual_reingest_marker(COUPANG_SOURCE, store, date)
             continue
-
-        df_out = df[~remove_mask].reset_index(drop=True)
-        _write_unified_daily(df_out, daily_path)
+        out = df[~remove_mask].reset_index(drop=True)
+        _write_daily(path, out)
         total_removed += removed
-        changed_files += 1
-        logger.warning(
-            "쿠팡수동 최종 정리: %s | 제거=%d | stores=%s",
-            daily_path.name,
-            removed,
-            sorted(df.loc[remove_mask, "store"].dropna().astype(str).unique().tolist()),
-        )
+        changed += 1
+        for store in store_set:
+            clear_manual_reingest_marker(COUPANG_SOURCE, store, date)
 
-    return f"쿠팡수동 최종 정리 완료 | 파일={changed_files} 제거={total_removed}행"
+    return f"쿠팡수동 최종 정리 완료 | 파일={changed} 제거={total_removed}행"
 
 
-def _resolve_coupang_target_dates(
+def _resolve_target_dates(
     stores: list[str],
     sale_date: str | None,
     lookback_days: int | None,
 ) -> list[str]:
-    """교정 대상 날짜 결정.
+    today = pendulum.now("Asia/Seoul").strftime("%Y-%m-%d")
 
-    - sale_date 지정: 단일 날짜
-    - lookback_days 정수: 최근 N일
-    - lookback_days None: 쿠팡수동 원천과 기존 unified 쿠팡수동/중복 날짜 전체
-    """
     if sale_date:
-        return [str(sale_date)]
-
+        return [] if str(sale_date) == today else [str(sale_date)]
     if lookback_days is not None:
-        kst_now = pendulum.now("Asia/Seoul")
-        return [
-            (kst_now - timedelta(days=i)).strftime("%Y-%m-%d")
-            for i in range(lookback_days)
-        ]
+        now = pendulum.now("Asia/Seoul")
+        dates = {
+            (now - timedelta(days=i)).strftime("%Y-%m-%d")
+            for i in range(1, lookback_days + 1)
+        }
+        return sorted(
+            d for d in dates
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) and d != today
+        )
 
     dates: set[str] = set()
     for store in stores:
-        dates.update(_collect_coupang_source_dates(store))
-    dates.update(_collect_existing_unified_coupang_manual_dates(stores))
-    dates.update(_collect_existing_coupang_duplicate_dates(stores))
-    return sorted(d for d in dates if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d))
+        dates.update(_collect_source_dates(store))
+    dates.update(_collect_existing_dates(stores))
+    return sorted(
+        d for d in dates
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) and d != today
+    )
 
 
-def _find_all_coupang_files(store: str) -> list[str]:
-    base = ANALYTICS_DB / "coupang_macro" / "orders"
-    pattern = str(base / "brand=*" / f"store={store}" / "ym=*" / "orders_*.parquet")
-    return sorted(glob(pattern))
+def _target_dates_for_store(
+    store: str,
+    base_dates: list[str],
+    sale_date: str | None,
+    lookback_days: int | None,
+    *,
+    include_reingest_markers: bool = False,
+) -> list[str]:
+    """기본 날짜에 해당 매장의 재수집 마커만 더한다."""
+    if lookback_days is None and not sale_date:
+        return _resolve_target_dates([store], sale_date, lookback_days)
+    dates = set(base_dates)
+    if include_reingest_markers and not sale_date:
+        dates.update(list_manual_reingest_dates(COUPANG_SOURCE, [store]))
+    today = pendulum.now("Asia/Seoul").strftime("%Y-%m-%d")
+    return sorted(
+        d for d in dates
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) and d != today
+    )
 
 
-def _collect_coupang_source_dates(store: str) -> set[str]:
+def _collect_source_dates(store: str) -> set[str]:
     dates: set[str] = set()
-    for file_path in _find_all_coupang_files(store):
+    for path in COUPANG_ORDERS_DB.glob(f"brand=*/store={store}/ym=*/orders_*.parquet"):
         try:
-            df = pd.read_parquet(file_path, columns=["order_date"])
+            df = pd.read_parquet(path, columns=["order_date"])
         except Exception as exc:
-            logger.warning("쿠팡 날짜 수집 실패: %s | %s", file_path, exc)
+            logger.warning("쿠팡 날짜 수집 실패: %s | %s", path, exc)
             continue
-        parsed = df["order_date"].map(_parse_coupang_datetime)
-        dates.update(date for date, _ in parsed if date)
+        dates.update(d for d in df["order_date"].map(_parse_order_date) if d)
     return dates
 
 
-def _collect_existing_unified_coupang_manual_dates(stores: list[str]) -> set[str]:
+def _collect_existing_dates(stores: list[str]) -> set[str]:
     store_set = {str(store).strip() for store in stores if str(store).strip()}
-    if not store_set or not UNIFIED_ROOT.exists():
-        return set()
-
     dates: set[str] = set()
-    for path in sorted(UNIFIED_ROOT.glob("unified_sales_*.parquet")):
+    for path in iter_unified_sales_files():
         try:
             df = pd.read_parquet(path, columns=["sale_date", "store", "platform", "source"])
         except Exception as exc:
             logger.warning("unified 쿠팡수동 날짜 수집 실패: %s | %s", path, exc)
             continue
-
         mask = (
             df["store"].fillna("").astype(str).str.strip().isin(store_set)
-            & df["platform"].fillna("").astype(str).str.strip().isin(COUPANG_REPLACED_PLATFORMS)
-            & df["source"].fillna("").astype(str).str.strip().eq(COUPANG_SOURCE)
+            & df["platform"].fillna("").astype(str).str.strip().isin(COUPANG_PLATFORMS)
         )
         if mask.any():
             dates.update(df.loc[mask, "sale_date"].fillna("").astype(str).str.strip().tolist())
     return dates
 
 
-def _collect_existing_coupang_duplicate_dates(stores: list[str]) -> set[str]:
-    store_set = {str(store).strip() for store in stores if str(store).strip()}
-    if not store_set or not UNIFIED_ROOT.exists():
-        return set()
+def _next_ym(ym: str) -> str:
+    y, m = map(int, ym.split("-"))
+    return f"{y + 1}-01" if m == 12 else f"{y}-{m + 1:02d}"
 
-    dates: set[str] = set()
-    for path in sorted(UNIFIED_ROOT.glob("unified_sales_*.parquet")):
+
+def _read_coupang_month(store: str, ym: str) -> pd.DataFrame:
+    frames = []
+    for path in sorted(COUPANG_ORDERS_DB.glob(f"brand=*/store={store}/ym={ym}/orders_{ym}.parquet")):
         try:
-            df = pd.read_parquet(path, columns=["sale_date", "store", "platform", "source"])
+            df = pd.read_parquet(path).fillna("")
         except Exception as exc:
-            logger.warning("unified 쿠팡 중복 날짜 수집 실패: %s | %s", path, exc)
+            logger.warning("쿠팡 원천 로드 실패: %s | %s", path, exc)
             continue
-
-        df = df.copy()
-        df["sale_date"] = df["sale_date"].fillna("").astype(str).str.strip()
-        df["store"] = df["store"].fillna("").astype(str).str.strip()
-        df["platform"] = df["platform"].fillna("").astype(str).str.strip()
-        df["source"] = df["source"].fillna("").astype(str).str.strip()
-        sub = df[
-            df["store"].isin(store_set)
-            & df["platform"].isin(COUPANG_REPLACED_PLATFORMS)
-        ]
-        if sub.empty:
-            continue
-
-        source_sets = sub.groupby(["sale_date", "store", "platform"])["source"].agg(set)
-        for (sale_date, _, _), sources in source_sets.items():
-            if COUPANG_SOURCE in sources and any(source != COUPANG_SOURCE for source in sources):
-                dates.add(str(sale_date).strip())
-    return dates
+        df["_source_brand"] = _parse_brand_from_path(path)
+        df["_src_path"] = str(path)
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def _find_coupang_files(store: str, ym: str) -> list[str]:
-    base = ANALYTICS_DB / "coupang_macro" / "orders"
-    pattern = str(base / "brand=*" / f"store={store}" / f"ym={ym}" / f"orders_{ym}.parquet")
-    return sorted(glob(pattern))
-
-
-def _find_options_map(store: str, ym: str) -> dict[str, int]:
-    base = ANALYTICS_DB / "coupang_macro" / "options"
-    pattern = str(base / "brand=*" / f"store={store}" / f"ym={ym}" / "options.csv")
-    files = sorted(glob(pattern))
-    if not files:
-        logger.warning("쿠팡 options.csv 없음: store=%s ym=%s", store, ym)
-        return {}
-
-    try:
-        df = pd.read_csv(files[0], dtype=str, encoding="utf-8-sig").fillna("")
-    except Exception as exc:
-        logger.warning("options.csv 로드 실패: %s | %s", files[0], exc)
-        return {}
-
-    if not {"옵션명", "옵션가격"}.issubset(df.columns):
-        logger.warning("options.csv 컬럼 누락: %s", files[0])
-        return {}
-
-    df["option_price"] = pd.to_numeric(df["옵션가격"], errors="coerce").fillna(0).astype(int)
-    price_counts = df.groupby("옵션명")["option_price"].nunique()
-    ambiguous = set(price_counts[price_counts > 1].index.astype(str))
-    if ambiguous:
-        logger.warning("가격 충돌 옵션은 0원 처리: %s", sorted(ambiguous)[:20])
-
-    result: dict[str, int] = {}
-    for _, row in df.iterrows():
-        name = str(row["옵션명"]).strip()
-        if not name:
-            continue
-        result[name] = 0 if name in ambiguous else int(row["option_price"])
-    return result
-
-
-def _read_coupang_files(files: list[str]) -> pd.DataFrame:
-    dfs = []
-    for file_path in files:
-        try:
-            df = pd.read_parquet(file_path)
-            df["_src_path"] = file_path
-            dfs.append(df)
-        except Exception as exc:
-            logger.warning("쿠팡 파일 읽기 실패: %s | %s", file_path, exc)
-    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-
-
-def _canonical_order_keys(df: pd.DataFrame) -> pd.DataFrame:
-    keys = pd.DataFrame(index=df.index)
-    numeric_cols = {"menu_qty", "menu_price", "total_price", "매출액", "취소금액"}
-    for col in _DEDUP_COLUMNS:
-        if col not in df.columns:
-            keys[col] = ""
-            continue
-        if col in numeric_cols:
-            values = pd.to_numeric(df[col], errors="coerce")
-            keys[col] = values.round(6).astype("string").fillna("")
-        else:
-            keys[col] = df[col].fillna("").astype(str).str.strip()
-    return keys
-
-
-def _deduplicate_raw_orders(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    work = df.copy()
-    if "collected_at" in work.columns:
-        work["_collected_at_sort"] = pd.to_datetime(work["collected_at"], errors="coerce", utc=True)
-        work = work.sort_values("_collected_at_sort", ascending=False, na_position="last", kind="mergesort")
-
-    keys = _canonical_order_keys(work)
-    before = len(work)
-    work = work.loc[~keys.duplicated(keep="first")].drop(columns=["_collected_at_sort"], errors="ignore")
-    removed = before - len(work)
-    if removed:
-        logger.warning("쿠팡 원천 중복 방어 제거: %d행", removed)
-    return work.reset_index(drop=True)
-
-
-def _assert_required_columns(df: pd.DataFrame, store: str, ym: str) -> None:
-    required = {"order_date", "order_id", "menu_name", "menu_qty", "menu_price", "menu_options", "total_price"}
-    missing = sorted(required - set(df.columns))
-    if missing:
-        raise KeyError(f"쿠팡 수집 컬럼 누락: store={store} ym={ym} missing={missing}")
-
-
-def _parse_brand_from_path(file_path: str) -> str:
-    match = re.search(r"brand=([^/\\]+)", file_path)
+def _parse_brand_from_path(path) -> str:
+    match = re.search(r"brand=([^/\\]+)", str(path))
     return match.group(1) if match else ""
 
 
-def _parse_coupang_datetime(value) -> tuple[str, str]:
-    if not isinstance(value, str):
-        return "", ""
-    match = re.match(r"\s*(\d{4})\.(\d{1,2})\.(\d{1,2})\s+(\d{1,2}):(\d{2})", str(value).strip())
+def _parse_order_date(value: str) -> str:
+    text = str(value).strip()
+    match = re.match(r"(\d{4})\.(\d{1,2})\.(\d{1,2})", text)
     if not match:
-        return "", ""
-    year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
-    hour, minute = int(match.group(4)), int(match.group(5))
-    return f"{year:04d}-{month:02d}-{day:02d}", f"{hour:02d}:{minute:02d}:00"
+        return ""
+    return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
 
 
-def _order_amount(order_df: pd.DataFrame) -> int:
-    sales = pd.to_numeric(order_df.get("매출액", pd.Series(index=order_df.index)), errors="coerce").fillna(0)
-    positive_sales = sales[sales > 0]
-    if not positive_sales.empty:
-        return int(round(float(positive_sales.iloc[0])))
+def _parse_order_time(value: str) -> str:
+    text = str(value).strip()
+    match = re.match(r"\d{4}\.\d{1,2}\.\d{1,2}\s+(\d{1,2}):(\d{2})", text)
+    if not match:
+        return ""
+    return f"{int(match.group(1)):02d}:{int(match.group(2)):02d}:00"
 
-    totals = pd.to_numeric(order_df.get("total_price", pd.Series(index=order_df.index)), errors="coerce").fillna(0)
-    positive_totals = totals[totals > 0]
-    if not positive_totals.empty:
-        return int(round(float(positive_totals.max())))
+
+def _deduplicate_raw(df: pd.DataFrame, store: str, ym: str) -> pd.DataFrame:
+    if {"order_id", "collected_at"}.issubset(df.columns):
+        order_key = _clean_text_series(df["order_id"], df.index)
+        collected_at = pd.to_datetime(df["collected_at"], errors="coerce", utc=True)
+        valid = order_key.ne("") & collected_at.notna()
+        if valid.any():
+            latest_by_order = collected_at[valid].groupby(order_key[valid]).transform("max")
+            keep_latest = ~valid
+            keep_latest.loc[valid] = collected_at.loc[valid].eq(latest_by_order)
+            latest_dropped = int((~keep_latest).sum())
+            if latest_dropped:
+                logger.warning(
+                    "쿠팡 원천 최신 주문 스냅샷 적용: store=%s ym=%s 제거=%d행",
+                    store,
+                    ym,
+                    latest_dropped,
+                )
+            df = df.loc[keep_latest].copy()
+
+    cols = [
+        "_src_path",
+        "order_date",
+        "order_id",
+        "delivery_type",
+        "order_status",
+        "order_summary",
+        "total_price",
+        "is_cancelled",
+        "item_menu",
+        "menu_name",
+        "menu_qty",
+        "menu_price",
+        "menu_options",
+    ]
+    cols = [col for col in cols if col in df.columns]
+    before = len(df)
+    key = pd.DataFrame(index=df.index)
+    for col in cols:
+        values = df[col]
+        if col in _RAW_DEDUP_NUMERIC_COLS:
+            key[col] = pd.to_numeric(
+                values.astype(str).str.replace(",", "", regex=False).str.strip(),
+                errors="coerce",
+            ).astype("Float64").astype(str)
+        else:
+            key[col] = values.fillna("").astype(str).str.strip()
+            key[col] = key[col].replace({"nan": "", "None": "", "<NA>": ""})
+    out = df[~key.duplicated(keep="last")].copy()
+    dropped = before - len(out)
+    if dropped:
+        logger.warning("쿠팡 원천 중복 제거: store=%s ym=%s 제거=%d행", store, ym, dropped)
+    return out
+
+
+def _clean_text_series(value, index: pd.Index) -> pd.Series:
+    if isinstance(value, pd.Series):
+        series = value.reindex(index)
+    else:
+        series = pd.Series(value, index=index)
+    return (
+        series.fillna("")
+        .astype(str)
+        .str.strip()
+        .replace({"nan": "", "None": "", "<NA>": ""})
+    )
+
+
+def _numeric_series(value, index: pd.Index, default: int = 0) -> pd.Series:
+    if isinstance(value, pd.Series):
+        series = value.reindex(index)
+    else:
+        series = pd.Series(value, index=index)
+    return pd.to_numeric(
+        series.fillna("").astype(str).str.replace(",", "", regex=False).str.strip(),
+        errors="coerce",
+    ).fillna(default)
+
+
+def _strip_options_apply_menu(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if re.search(r"\b외\s*\d+\s*개\b", text):
+        return ""
+    if "/" in text:
+        text = text.rsplit("/", 1)[-1].strip()
+    return text
+
+
+def _load_option_parent_map(brand: str, store: str, ym: str) -> dict[str, str]:
+    path = COUPANG_OPTIONS_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}" / "options.csv"
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_csv(path, dtype=str, encoding="utf-8-sig").fillna("")
+    except Exception as exc:
+        logger.warning("쿠팡 options 로드 실패, 부모 메뉴 fallback 스킵: %s | %s", path, exc)
+        return {}
+
+    required = {"옵션명", "적용메뉴"}
+    if not required.issubset(df.columns):
+        return {}
+
+    option_to_menus: dict[str, set[str]] = {}
+    for _, row in df.iterrows():
+        option = str(row.get("옵션명", "")).strip()
+        menu = _strip_options_apply_menu(str(row.get("적용메뉴", "")).strip())
+        if not option or not menu:
+            continue
+        option_to_menus.setdefault(option, set()).add(menu)
+
+    return {
+        option: next(iter(menus))
+        for option, menus in option_to_menus.items()
+        if len(menus) == 1
+    }
+
+
+def _read_csv_utf8_sig(path) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, dtype=str, encoding="utf-8-sig").fillna("")
+    except UnicodeDecodeError:
+        return pd.read_csv(path, dtype=str, encoding="cp949").fillna("")
+
+
+def _strip_posfeed_item_name(value: str) -> str:
+    return re.sub(r"^'\+\s*", "", str(value or "").strip())
+
+
+def _posfeed_order_paths(brand: str, store: str, ym: str) -> list:
+    candidates = [
+        POSFEED_ORDERS_DB / f"brand={brand}" / f"store={brand} {store}".strip() / f"ym={ym}" / "posfeed_orders.csv",
+        POSFEED_ORDERS_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}" / "posfeed_orders.csv",
+    ]
+    seen = set()
+    paths = []
+    for path in candidates:
+        if path not in seen and path.exists():
+            paths.append(path)
+            seen.add(path)
+    if paths:
+        return paths
+    return sorted(POSFEED_ORDERS_DB.glob(f"brand={brand}/store=*/ym={ym}/posfeed_orders.csv"))
+
+
+def _load_posfeed_order_price_lines(
+    brand: str,
+    store: str,
+    ym: str,
+    order_ids: set[str],
+) -> dict[str, list[dict]]:
+    if not order_ids:
+        return {}
+
+    order_frames = []
+    for path in _posfeed_order_paths(brand, store, ym):
+        try:
+            orders = _read_csv_utf8_sig(path)
+        except Exception as exc:
+            logger.warning("쿠팡수동 posfeed 주문 로드 실패: %s | %s", path, exc)
+            continue
+        required = {"외부 주문 번호", "주문 코드"}
+        if not required.issubset(orders.columns):
+            continue
+        mask = orders["외부 주문 번호"].fillna("").astype(str).str.strip().isin(order_ids)
+        if not mask.any():
+            continue
+        part = orders.loc[mask, ["외부 주문 번호", "주문 코드"]].copy()
+        detail_path = POSFEED_DETAIL_DB / path.relative_to(POSFEED_ORDERS_DB)
+        part["_detail_path"] = str(detail_path.parent / "posfeed_order_item.csv")
+        order_frames.append(part)
+
+    if not order_frames:
+        return {}
+
+    order_map = pd.concat(order_frames, ignore_index=True)
+    order_map["외부 주문 번호"] = order_map["외부 주문 번호"].astype(str).str.strip()
+    order_map["주문 코드"] = order_map["주문 코드"].astype(str).str.strip()
+    result: dict[str, list[dict]] = {}
+    for detail_path, group in order_map.groupby("_detail_path", sort=False):
+        path = pd.io.common.stringify_path(detail_path)
+        try:
+            items = _read_csv_utf8_sig(path)
+        except Exception as exc:
+            logger.warning("쿠팡수동 posfeed 상세 로드 실패: %s | %s", path, exc)
+            continue
+        required = {"주문코드", "상품명", "수량", "단품가격", "합계"}
+        if not required.issubset(items.columns):
+            continue
+        code_to_order = group.drop_duplicates("주문 코드").set_index("주문 코드")["외부 주문 번호"].to_dict()
+        items = items[items["주문코드"].astype(str).str.strip().isin(code_to_order)].copy()
+        if items.empty:
+            continue
+        items["_order_id"] = items["주문코드"].astype(str).str.strip().map(code_to_order)
+        items["_item_name"] = items["상품명"].map(_strip_posfeed_item_name)
+        items = items[
+            items["_item_name"].ne("")
+            & ~items["_item_name"].eq("배달비")
+        ].copy()
+        if items.empty:
+            continue
+        items["_qty"] = _numeric_series(items["수량"], items.index, default=1).astype(int).clip(lower=1)
+        items["_unit_price"] = _numeric_series(items["단품가격"], items.index).astype(int)
+        items["_line_sum"] = _numeric_series(items["합계"], items.index).astype(int)
+        for order_id, order_items in items.groupby("_order_id", sort=False):
+            paid_count = int(order_items["_line_sum"].ne(0).sum())
+            if paid_count < 2:
+                continue
+            result[str(order_id).strip()] = [
+                {
+                    "item_name": row["_item_name"],
+                    "qty": int(row["_qty"]),
+                    "unit_price": int(row["_unit_price"]),
+                }
+                for _, row in order_items.iterrows()
+            ]
+    return result
+
+
+def _stable_observed_price(values: list[int]) -> int:
+    prices = [int(v) for v in values if int(v) > 0]
+    if not prices:
+        return 0
+    counts = Counter(prices)
+    price, count = counts.most_common(1)[0]
+    if len(counts) == 1 or (count >= 3 and count / len(prices) >= 0.9):
+        return int(price)
     return 0
 
 
-def _is_cancelled_order(order_df: pd.DataFrame) -> bool:
-    if "is_cancelled" not in order_df.columns:
-        return False
-    return order_df["is_cancelled"].fillna("").astype(str).str.strip().str.upper().eq("Y").any()
+def _build_observed_price_catalog() -> dict[tuple[str, str, str], int]:
+    observations: dict[tuple[str, str, str], list[int]] = {}
+
+    def add(brand: str, store: str, name: str, price: int) -> None:
+        name = str(name or "").strip()
+        price = int(price or 0)
+        if not name or name == "배달비" or price <= 0:
+            return
+        for key in ((brand, store, name), (brand, "", name), ("", "", name)):
+            observations.setdefault(key, []).append(price)
+
+    for path in sorted(POSFEED_DETAIL_DB.glob("brand=*/store=*/ym=*/posfeed_order_item.csv")):
+        try:
+            items = _read_csv_utf8_sig(path)
+        except Exception:
+            continue
+        if not {"상품명", "단품가격"}.issubset(items.columns):
+            continue
+        brand = next((part.split("=", 1)[1] for part in path.parts if part.startswith("brand=")), "")
+        store = next((part.split("=", 1)[1] for part in path.parts if part.startswith("store=")), "")
+        prices = _numeric_series(items["단품가격"], items.index).astype(int)
+        for name, price in zip(items["상품명"].map(_strip_posfeed_item_name), prices):
+            add(brand, store, name, int(price))
+
+    for path in sorted(COUPANG_OPTIONS_DB.glob("brand=*/store=*/ym=*/options.csv")):
+        try:
+            options = _read_csv_utf8_sig(path)
+        except Exception:
+            continue
+        if not {"옵션명", "옵션가격"}.issubset(options.columns):
+            continue
+        brand = next((part.split("=", 1)[1] for part in path.parts if part.startswith("brand=")), "")
+        store = next((part.split("=", 1)[1] for part in path.parts if part.startswith("store=")), "")
+        prices = _numeric_series(options["옵션가격"], options.index).astype(int)
+        for name, price in zip(options["옵션명"].astype(str).str.strip(), prices):
+            add(brand, store, name, int(price))
+
+    return {
+        key: price
+        for key, values in observations.items()
+        if (price := _stable_observed_price(values)) > 0
+    }
 
 
-def _group_ids(order_df: pd.DataFrame) -> pd.Series:
-    prices = pd.to_numeric(order_df["menu_price"], errors="coerce")
-    group_ids = []
-    current = -1
-    for has_price in prices.notna().tolist():
-        if has_price or current < 0:
-            current += 1
-        group_ids.append(current)
-    return pd.Series(group_ids, index=order_df.index)
+def _observed_price_catalog() -> dict[tuple[str, str, str], int]:
+    global _OBSERVED_PRICE_CATALOG
+    if _OBSERVED_PRICE_CATALOG is None:
+        _OBSERVED_PRICE_CATALOG = _build_observed_price_catalog()
+    return _OBSERVED_PRICE_CATALOG
 
 
-def _calc_order_total_price(order_df: pd.DataFrame, amount: int, opt_map: dict[str, int]) -> pd.Series:
-    result = pd.Series(0, index=order_df.index, dtype=int)
-    if order_df.empty or amount <= 0:
-        return result
+def _lookup_observed_price(brand: str, store: str, item_name: str) -> int:
+    item_name = str(item_name or "").strip()
+    if not item_name:
+        return 0
+    catalog = _scoped_observed_price_catalog(brand, store)
+    price = catalog.get(item_name, 0)
+    if price:
+        return int(price)
+    return 0
 
-    group_ids = _group_ids(order_df)
-    groups = [(gid, order_df.loc[group_ids == gid]) for gid in group_ids.drop_duplicates().tolist()]
-    weights: list[float] = []
-    main_indexes: list[int] = []
-    for _, group in groups:
-        prices = pd.to_numeric(group["menu_price"], errors="coerce")
-        main_idx = prices[prices.notna()].index[0] if prices.notna().any() else group.index[0]
-        qty = pd.to_numeric(group.loc[main_idx, "menu_qty"], errors="coerce")
-        qty_value = float(qty) if pd.notna(qty) and float(qty) > 0 else 1.0
-        price_value = float(prices.loc[main_idx]) if pd.notna(prices.loc[main_idx]) else 0.0
-        weights.append(price_value * qty_value)
-        main_indexes.append(main_idx)
 
-    total_weight = sum(weights)
-    remaining_amount = int(amount)
-    for pos, ((_, group), weight, main_idx) in enumerate(zip(groups, weights, main_indexes)):
-        if pos < len(groups) - 1 and total_weight > 0:
-            group_amount = int(round(amount * weight / total_weight))
-        elif total_weight <= 0 and pos < len(groups) - 1:
-            group_amount = 0
+def _scoped_observed_price_catalog(brand: str, store: str) -> dict[str, int]:
+    key = (str(brand or "").strip(), str(store or "").strip())
+    if key in _SCOPED_PRICE_CATALOG:
+        return _SCOPED_PRICE_CATALOG[key]
+
+    observations: dict[str, list[int]] = {}
+
+    def add(name: str, price: int) -> None:
+        name = str(name or "").strip()
+        price = int(price or 0)
+        if not name or name == "배달비" or price <= 0:
+            return
+        observations.setdefault(name, []).append(price)
+
+    store_candidates = [store, f"{brand} {store}".strip()]
+    for store_name in dict.fromkeys(s for s in store_candidates if s):
+        for path in sorted(POSFEED_DETAIL_DB.glob(f"brand={brand}/store={store_name}/ym=*/posfeed_order_item.csv")):
+            try:
+                items = _read_csv_utf8_sig(path)
+            except Exception:
+                continue
+            if not {"상품명", "단품가격"}.issubset(items.columns):
+                continue
+            prices = _numeric_series(items["단품가격"], items.index).astype(int)
+            for name, price in zip(items["상품명"].map(_strip_posfeed_item_name), prices):
+                add(name, int(price))
+
+        for path in sorted(COUPANG_OPTIONS_DB.glob(f"brand={brand}/store={store_name}/ym=*/options.csv")):
+            try:
+                options = _read_csv_utf8_sig(path)
+            except Exception:
+                continue
+            if not {"옵션명", "옵션가격"}.issubset(options.columns):
+                continue
+            prices = _numeric_series(options["옵션가격"], options.index).astype(int)
+            for name, price in zip(options["옵션명"].astype(str).str.strip(), prices):
+                add(name, int(price))
+
+    result = {
+        name: price
+        for name, values in observations.items()
+        if (price := _stable_observed_price(values)) > 0
+    }
+    _SCOPED_PRICE_CATALOG[key] = result
+    return result
+
+
+def _resolve_parent_menu(df: pd.DataFrame, brand: str, store: str) -> pd.Series:
+    index = df.index
+    parent = _clean_text_series(df.get("item_menu", ""), index)
+    raw_menu = _clean_text_series(df.get("menu_name", ""), index)
+    parent = parent.mask(parent.eq(""), raw_menu)
+
+    missing = parent.eq("")
+    if missing.any():
+        option = _clean_text_series(df.get("menu_options", ""), index)
+        sale_date = _clean_text_series(df.get("sale_date", ""), index)
+        for ym in sorted({date[:7] for date in sale_date[missing].tolist() if len(date) >= 7}):
+            option_map = _load_option_parent_map(brand, store, ym)
+            if not option_map:
+                continue
+            ym_mask = missing & sale_date.str.startswith(ym)
+            mapped = option[ym_mask].map(option_map).fillna("")
+            update_mask = pd.Series(False, index=index)
+            update_mask.loc[mapped.index] = mapped.ne("")
+            if update_mask.any():
+                update_index = update_mask[update_mask].index
+                parent.loc[update_index] = mapped.loc[update_index]
+                missing = parent.eq("")
+
+    summary = _clean_text_series(df.get("order_summary", ""), index).str.replace(
+        r"\s*외\s*\d+건$",
+        "",
+        regex=True,
+    ).str.strip()
+    parent = parent.mask(parent.eq(""), summary)
+    return parent
+
+
+def _copy_order_base_row(group: pd.DataFrame) -> pd.Series:
+    price = _numeric_series(group.get("menu_price", 0), group.index).astype(int)
+    if price.gt(0).any():
+        return group.loc[price[price.gt(0)].index[0]].copy()
+    return group.iloc[0].copy()
+
+
+def _rows_from_posfeed_lines(group: pd.DataFrame, lines: list[dict], parent_menu: str) -> list[pd.Series]:
+    base = _copy_order_base_row(group)
+    rows = []
+    for seq, line in enumerate(lines):
+        row = base.copy()
+        item_name = str(line.get("item_name") or "").strip()
+        row["menu_name"] = parent_menu or item_name
+        row["item_menu"] = parent_menu or item_name
+        row["menu_options"] = item_name
+        row["menu_qty"] = int(line.get("qty") or 1)
+        row["menu_price"] = int(line.get("unit_price") or 0)
+        row[_ITEM_NAME_OVERRIDE_COL] = item_name
+        if seq > 0:
+            row["매출액"] = None
+            row["total_price"] = None
+        rows.append(row)
+    return rows
+
+
+def _apply_catalog_prices_to_order(group: pd.DataFrame, brand: str, store: str) -> list[pd.Series]:
+    rows = [row.copy() for _, row in group.iterrows()]
+    if not rows:
+        return rows
+
+    index = group.index
+    parent_menu = _resolve_parent_menu(group, brand, store)
+    menu_price = _numeric_series(group.get("menu_price", 0), index).astype(int)
+    option_name = _clean_text_series(group.get("menu_options", ""), index)
+    catalog_price = option_name.map(lambda value: _lookup_observed_price(brand, store, value)).astype(int)
+
+    original_to_pos = {idx: pos for pos, idx in enumerate(index)}
+    added_option_by_parent: dict[str, int] = {}
+    extra_rows: list[pd.Series] = []
+
+    for idx in index:
+        pos = original_to_pos[idx]
+        price = int(menu_price.loc[idx])
+        option = str(option_name.loc[idx]).strip()
+        observed = int(catalog_price.loc[idx])
+        parent = str(parent_menu.loc[idx]).strip()
+
+        rows[pos][_ITEM_NAME_OVERRIDE_COL] = ""
+        if price <= 0 and observed > 0:
+            rows[pos]["menu_price"] = observed
+            rows[pos][_ITEM_NAME_OVERRIDE_COL] = option
+            added_option_by_parent[parent] = added_option_by_parent.get(parent, 0) + observed
+            continue
+
+        if price > 0 and observed > 0 and option:
+            rows[pos]["menu_price"] = max(price - observed, 0)
+            option_row = rows[pos].copy()
+            option_row["menu_price"] = observed
+            option_row["menu_options"] = option
+            option_row["item_menu"] = parent
+            option_row["menu_name"] = parent
+            option_row[_ITEM_NAME_OVERRIDE_COL] = option
+            option_row["매출액"] = None
+            option_row["total_price"] = None
+            extra_rows.append(option_row)
+
+    if added_option_by_parent:
+        for parent, added_sum in added_option_by_parent.items():
+            candidate_indices = [
+                idx
+                for idx in index
+                if str(parent_menu.loc[idx]).strip() == parent and int(menu_price.loc[idx]) > 0
+            ]
+            if not candidate_indices:
+                continue
+            target_pos = original_to_pos[candidate_indices[0]]
+            current = int(_numeric_series(pd.Series([rows[target_pos].get("menu_price", 0)]), pd.Index([0])).iloc[0])
+            rows[target_pos]["menu_price"] = max(current - int(added_sum), 0)
+
+    rows.extend(extra_rows)
+    return rows
+
+
+def _prepare_coupang_price_lines(df: pd.DataFrame, brand: str, store: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out_rows = []
+    df = df.copy()
+    if _ITEM_NAME_OVERRIDE_COL not in df.columns:
+        df[_ITEM_NAME_OVERRIDE_COL] = ""
+    df["_order_id_key"] = df["order_id"].fillna("").astype(str).str.strip()
+    df["_ym_key"] = df["sale_date"].fillna("").astype(str).str[:7]
+
+    posfeed_by_order: dict[str, list[dict]] = {}
+    for ym, ym_df in df.groupby("_ym_key", sort=False):
+        if not ym:
+            continue
+        order_ids = set(ym_df["_order_id_key"].dropna().astype(str).str.strip())
+        posfeed_by_order.update(_load_posfeed_order_price_lines(brand, store, ym, order_ids))
+
+    for order_id, group in df.groupby("_order_id_key", sort=False):
+        parent = _resolve_parent_menu(group, brand, store).replace("", pd.NA).dropna()
+        parent_name = str(parent.iloc[0]).strip() if not parent.empty else ""
+        posfeed_lines = posfeed_by_order.get(order_id)
+        if posfeed_lines:
+            out_rows.extend(_rows_from_posfeed_lines(group, posfeed_lines, parent_name))
         else:
-            group_amount = remaining_amount
-        remaining_amount -= group_amount
+            out_rows.extend(_apply_catalog_prices_to_order(group, brand, store))
 
-        opt_rows = [idx for idx in group.index if idx != main_idx]
-        opt_prices = pd.Series(
-            {
-                idx: opt_map.get(str(group.loc[idx, "menu_options"]).strip(), 0)
-                for idx in opt_rows
-            },
-            dtype=int,
-        )
-        paid_opts = opt_prices[opt_prices > 0]
-        opt_alloc = pd.Series(0, index=group.index, dtype=int)
-        if not paid_opts.empty:
-            opt_remaining = group_amount
-            opt_total = int(paid_opts.sum())
-            for opt_pos, idx in enumerate(paid_opts.index):
-                if opt_pos < len(paid_opts) - 1 and opt_total > 0:
-                    value = int(round(group_amount * int(paid_opts.loc[idx]) / opt_total))
-                else:
-                    value = opt_remaining
-                opt_alloc.loc[idx] = value
-                opt_remaining -= value
-        opt_alloc.loc[main_idx] = group_amount - int(opt_alloc.sum())
-        result.loc[group.index] = opt_alloc.loc[group.index].astype(int)
+    if not out_rows:
+        return df.drop(columns=["_order_id_key", "_ym_key"], errors="ignore")
+    out = pd.DataFrame(out_rows).reset_index(drop=True)
+    return out.drop(columns=["_order_id_key", "_ym_key"], errors="ignore")
 
-    diff = int(amount) - int(result.sum())
-    if diff and len(result) > 0:
-        result.loc[main_indexes[-1]] = int(result.loc[main_indexes[-1]]) + diff
-    return result.astype(int)
+
+def _allocate_order_amount(
+    out: pd.DataFrame,
+    amount: int,
+    indices: pd.Index,
+) -> None:
+    if len(indices) == 0:
+        return
+
+    unit_price = pd.to_numeric(out.loc[indices, "unit_price"], errors="coerce").fillna(0).astype(int)
+    qty = pd.to_numeric(out.loc[indices, "qty"], errors="coerce").fillna(1).astype(int)
+    weights = (unit_price * qty).astype(int)
+    target_indices = weights[weights.gt(0)].index
+    if len(target_indices) == 0:
+        target_indices = pd.Index([indices[0]])
+        weights = pd.Series([1], index=target_indices)
+    else:
+        weights = weights.loc[target_indices]
+
+    if amount == 0:
+        out.loc[target_indices, "total_price"] = 0
+        return
+
+    weight_sum = int(weights.sum())
+    if weight_sum == amount:
+        allocations = weights.astype(int)
+    elif weight_sum > 0:
+        raw = weights.astype(float) * (amount / weight_sum)
+        allocations = raw.round().astype(int)
+        diff = int(amount - allocations.sum())
+        if diff:
+            adjust_idx = weights.abs().sort_values(ascending=False).index[0]
+            allocations.loc[adjust_idx] = int(allocations.loc[adjust_idx] + diff)
+    else:
+        allocations = pd.Series([amount], index=target_indices, dtype=int)
+
+    out.loc[target_indices, "total_price"] = allocations.astype(int)
 
 
 def _transform_to_unified(
@@ -449,21 +909,8 @@ def _transform_to_unified(
     store: str,
     brand: str,
     store_map: dict,
-    opt_map: dict[str, int],
 ) -> pd.DataFrame:
-    active_parts = []
-    amount_by_order: dict[str, int] = {}
-    for order_id, group in df.groupby("order_id", sort=False):
-        amount = _order_amount(group)
-        if _is_cancelled_order(group) or amount <= 0:
-            continue
-        active_parts.append(group)
-        amount_by_order[str(order_id).strip()] = amount
-
-    if not active_parts:
-        return pd.DataFrame(columns=UNIFIED_COLUMNS)
-
-    df = pd.concat(active_parts, ignore_index=False).copy()
+    df = _prepare_coupang_price_lines(df, brand, store)
     out = pd.DataFrame(index=df.index)
     out["sale_date"] = df["sale_date"]
     out["ym"] = df["sale_date"].str[:7]
@@ -471,87 +918,114 @@ def _transform_to_unified(
     out["brand"] = brand
     out["store"] = store
     out["platform"] = COUPANG_PLATFORM
+    delivery_type = df.get("delivery_type", "").fillna("").astype(str).str.strip()
+    out["order_type"] = delivery_type.map(lambda v: "배달_포장" if "포장" in v else "배달")
     out["order_id"] = df["order_id"].fillna("").astype(str).str.strip()
     out["order_time"] = df["order_time"]
-    out["sale_type"] = "정상"
-    out["order_type"] = df["delivery_type"].map(lambda value: "배달_포장" if str(value).strip() == "포장" else "배달") if "delivery_type" in df.columns else "배달"
-    out["menu_name"] = df["menu_name"].fillna("").astype(str).str.strip()
-    out["item_name"] = df["menu_options"].fillna("").astype(str).str.strip()
-    out["qty"] = _to_int_series(df["menu_qty"]).replace(0, 1)
-    out["discount_amount"] = 0
-
-    total_price = pd.Series(0, index=df.index, dtype=int)
-    for order_id, group in df.groupby("order_id", sort=False):
-        key = str(order_id).strip()
-        total_price.loc[group.index] = _calc_order_total_price(group, amount_by_order.get(key, 0), opt_map)
-    out["total_price"] = total_price
-    out["unit_price"] = out["total_price"]
-
+    parent_menu = _resolve_parent_menu(df, brand, store)
+    out["menu_name"] = parent_menu
     out["item_seq"] = out.groupby("order_id").cumcount().add(1).astype(int).astype(str)
-    out["item_id"] = out["item_name"].map(lambda value: hashlib.md5(value.encode()).hexdigest() if value else "")
+    option_name = _clean_text_series(df.get("menu_options", ""), df.index)
+    raw_menu_price = _clean_text_series(df.get("menu_price", ""), df.index)
+    priced_menu = _numeric_series(df.get("menu_price", ""), df.index).gt(0) | (
+        raw_menu_price.ne("") & raw_menu_price.str.lower().ne("nan")
+    )
+    item_name = option_name.mask(priced_menu | option_name.eq(""), parent_menu)
+    if _ITEM_NAME_OVERRIDE_COL in df.columns:
+        override = _clean_text_series(df[_ITEM_NAME_OVERRIDE_COL], df.index)
+        item_name = item_name.mask(override.ne(""), override)
+    out["item_name"] = fill_missing_manual_item_name(
+        item_name,
+        source=COUPANG_SOURCE,
+        label="쿠팡",
+        store=store,
+        sale_date=out["sale_date"],
+        order_id=out["order_id"],
+    )
+    out["qty"] = _numeric_series(df.get("menu_qty", 1), df.index, default=1).astype(int)
+    out["unit_price"] = _numeric_series(df.get("menu_price", 0), df.index).astype(int)
+    out["total_price"] = 0
+    out["discount_amount"] = 0
+    out["sale_type"] = df.get("is_cancelled", "").fillna("").astype(str).str.strip().str.upper().map(
+        lambda value: "취소" if value == "Y" else "정상"
+    )
+    out["item_id"] = allocate_manual_item_ids(
+        out[["source", "brand", "store", "item_name", "unit_price"]]
+    )
     out["담당자"] = _lookup_store_meta(store_map, store, "담당자")
     out["region"] = _lookup_store_meta(store_map, store, "region")
     out["실오픈일"] = _lookup_store_meta(store_map, store, "실오픈일")
     out["collected_at"] = pendulum.now("Asia/Seoul").isoformat()
+
+    maechul = (
+        pd.to_numeric(
+            df["매출액"].astype(str).str.replace(",", "", regex=False).str.strip(),
+            errors="coerce",
+        )
+        if "매출액" in df.columns
+        else pd.Series(float("nan"), index=df.index)
+    )
+    fallback_amount = pd.to_numeric(df["total_price"], errors="coerce").fillna(0)
+    out["order_cnt"] = 0
+    for order_id, group in out.groupby("order_id", sort=False):
+        if group.empty:
+            continue
+        indices = group.index
+        is_cancel = bool(out.loc[indices, "sale_type"].eq("취소").any())
+        order_sales = maechul.loc[indices]
+        # 쿠팡 정산 매출액은 부분취소가 이미 차감된 순액이고 전체취소는 0/결측이다.
+        if order_sales.notna().any():
+            amount = order_sales.fillna(0).sum()
+        elif is_cancel:
+            amount = 0
+        else:
+            amount = fallback_amount.loc[indices].iloc[0]
+        _allocate_order_amount(out, int(amount), indices)
+        if not is_cancel:
+            amount_rows = out.loc[indices, "total_price"].astype(int)
+            order_cnt_idx = amount_rows.abs().sort_values(ascending=False).index[0]
+            out.at[order_cnt_idx, "order_cnt"] = 1
+
+    out["_pk"] = _make_unified_pk(out)
     return out.reindex(columns=UNIFIED_COLUMNS, fill_value="")
 
 
-def _recalculate_order_fields(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    df = df.copy()
-    df["order_cnt"] = 0
-    representative_indexes = []
-    for _, group in df.groupby("order_id", sort=False):
-        menu_match = group["item_name"].fillna("").astype(str).str.strip().eq(
-            group["menu_name"].fillna("").astype(str).str.strip()
-        )
-        if menu_match.any():
-            representative_indexes.append(group[menu_match].index[0])
-            continue
-        unit_price = pd.to_numeric(group["unit_price"], errors="coerce").fillna(0)
-        representative_indexes.append(unit_price.idxmax())
-
-    if representative_indexes:
-        df.loc[representative_indexes, "order_cnt"] = df.loc[representative_indexes, "sale_type"].map(
-            lambda value: 0 if str(value) == "취소" else 1
-        )
-    df["_pk"] = _make_unified_pk(df)
-    return df
-
-
+@unified_writer
 def _upsert_daily(df_new: pd.DataFrame, date: str, store: str) -> tuple[int, int]:
     UNIFIED_ROOT.mkdir(parents=True, exist_ok=True)
-    daily_path = _unified_daily_path(date)
-
-    if daily_path.exists():
-        df_existing = pd.read_parquet(daily_path).reindex(columns=UNIFIED_COLUMNS, fill_value="")
-        remove_mask = (
-            df_existing["store"].fillna("").astype(str).str.strip().eq(store)
-            & df_existing["platform"].fillna("").astype(str).str.strip().isin(COUPANG_REPLACED_PLATFORMS)
-        )
-        removed_count = int(remove_mask.sum())
-        df_existing = df_existing[~remove_mask]
+    path = _unified_daily_path(date)
+    if path.exists():
+        try:
+            existing = pd.read_parquet(path).reindex(columns=UNIFIED_COLUMNS, fill_value="")
+        except Exception as exc:
+            logger.warning("쿠팡수동 교정 스킵, 기존 parquet 로드 실패: %s | %s", path, exc)
+            return 0, 0
+        store_s = existing["store"].fillna("").astype(str).str.strip()
+        platform_s = existing["platform"].fillna("").astype(str).str.strip()
+        source_s = existing["source"].fillna("").astype(str).str.strip()
+        remove_mask = store_s.eq(store) & platform_s.isin(COUPANG_PLATFORMS)
+        if df_new is None or df_new.empty:
+            remove_mask = remove_mask & source_s.eq(COUPANG_SOURCE)
+        removed = int(remove_mask.sum())
+        existing = existing[~remove_mask]
     else:
-        df_existing = pd.DataFrame(columns=UNIFIED_COLUMNS)
-        removed_count = 0
+        existing = pd.DataFrame(columns=UNIFIED_COLUMNS)
+        removed = 0
 
-    df_out = pd.concat([df_existing, df_new], ignore_index=True)
-    if "_pk" in df_out.columns:
-        before = len(df_out)
-        df_out = df_out.drop_duplicates(subset=["_pk"], keep="last").reset_index(drop=True)
-        dropped = before - len(df_out)
-        if dropped:
-            logger.warning("쿠팡 교정 저장 중 _pk 중복 %d행 제거", dropped)
+    if df_new is None or df_new.empty:
+        _write_daily(path, existing.reset_index(drop=True))
+        return removed, 0
 
-    _write_unified_daily(df_out, daily_path)
-    return removed_count, len(df_new)
+    out = pd.concat([existing, df_new], ignore_index=True)
+    if "_pk" in out.columns:
+        out = out.drop_duplicates(subset=["_pk"], keep="last").reset_index(drop=True)
+    _write_daily(path, out)
+    return removed, len(df_new)
 
 
-def _write_unified_daily(df: pd.DataFrame, daily_path) -> None:
-    df = df.reindex(columns=UNIFIED_COLUMNS, fill_value="")
+def _write_daily(path, df: pd.DataFrame) -> None:
     for col in ("qty", "unit_price", "total_price", "discount_amount", "order_cnt"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-    df.to_parquet(daily_path, index=False, engine="pyarrow")
+    out = df.reindex(columns=UNIFIED_COLUMNS, fill_value="")
+    save_unified_parquet(out, path)

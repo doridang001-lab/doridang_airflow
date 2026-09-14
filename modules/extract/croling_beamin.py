@@ -30,7 +30,6 @@ stats_df = run_baemin_crawling(account_df, mode="stats")
 
 import socket
 import subprocess
-import tempfile
 import time
 import random
 import re
@@ -43,12 +42,18 @@ from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
+import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
 from modules.transform.utility.selenium_uc import launch_uc_chrome
+
+
+def _short_error(exc: Exception) -> str:
+    text = str(exc).splitlines()[0].strip()
+    return text[:240]
 
 
 # ============================================================================
@@ -83,6 +88,9 @@ STAT_LABELS = [
     "조리시간준수율",
     "주문접수율",
     "최근별점",
+    "영업시간운영률",
+    "주문취소율",
+    "준비시간정확도",
 ]
 
 
@@ -115,10 +123,23 @@ BATCH_SIZE_RANGE = (1, 2)
 # 상수 - 경로 (Docker 환경 고려)
 # ============================================================================
 BASE_DIR = os.getenv("AIRFLOW_HOME", Path.cwd())
-CHROME_PROFILE_DIR = Path(os.getenv("CHROME_PROFILE_DIR", f"{BASE_DIR}/chrome_profiles"))
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", f"{BASE_DIR}/download"))
 
+
+def _default_chrome_profile_dir() -> Path:
+    if os.getenv("AIRFLOW_HOME") or os.getenv("IS_DOCKER"):
+        return DOWNLOAD_DIR / "chrome_profiles"
+    return Path(f"{BASE_DIR}/chrome_profiles")
+
+
+CHROME_PROFILE_DIR = Path(os.getenv("CHROME_PROFILE_DIR", str(_default_chrome_profile_dir())))
+
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    CHROME_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+except PermissionError:
+    CHROME_PROFILE_DIR = Path(os.getenv("TEMP_DIR", f"{BASE_DIR}/temp")) / "chrome_profiles"
+    CHROME_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================================
@@ -237,33 +258,6 @@ def _detect_chrome_major_version() -> int | None:
         return None
 
 
-def _kill_chrome_by_profile(profile_path: str, account_id: str = "") -> None:
-    """주어진 user-data-dir을 점유한 Chrome 프로세스를 강제 종료한다.
-
-    이전 실패 런치가 Chrome을 살려둔 채 ChromeDriver만 포기한 경우,
-    같은 프로필로 재시도하면 Chrome이 프로필 잠금 경합으로 'chrome not reachable'이 된다.
-    런치 직전에 해당 프로필을 쥔 모든 Chrome을 제거해 이를 방지한다.
-    """
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", f"--user-data-dir={profile_path}"],
-            capture_output=True, text=True, timeout=5,
-        )
-        pids = [p for p in result.stdout.strip().split() if p.isdigit()]
-        if pids:
-            log(f"프로필 점유 Chrome {len(pids)}개 제거: {pids}", account_id)
-        for pid_str in pids:
-            try:
-                subprocess.run(["pkill", "-9", "-P", pid_str], capture_output=True, timeout=3)
-                os.kill(int(pid_str), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, ValueError):
-                pass
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
 def clean_chrome_cache(account_id: str):
     """Chrome 캐시만 삭제 (쿠키는 유지 → 세션 재사용 가능).
 
@@ -271,13 +265,10 @@ def clean_chrome_cache(account_id: str):
     SingletonLock 등 잠금 파일도 제거 (비정상 종료 후 재실행 크래시 방지).
     """
     profile_root = CHROME_PROFILE_DIR / account_id
-    # 이 프로필을 점유한 Chrome 프로세스 제거 (좀비가 아닌 살아있는 고아 Chrome 차단)
-    _kill_chrome_by_profile(str(profile_root.absolute()), account_id)
-
     # 잠금 파일 제거 (이전 비정상 종료 후 남은 파일 → Chrome 즉시 종료 원인)
-    for lock_name in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
+    for lock_name in ["SingletonLock", "SingletonCookie", "SingletonSocket", "DevToolsActivePort"]:
         lock_file = profile_root / lock_name
-        if lock_file.exists():
+        if lock_file.exists() or lock_file.is_symlink():
             try:
                 lock_file.unlink()
                 log(f"잠금 해제: {lock_name}", account_id)
@@ -285,15 +276,6 @@ def clean_chrome_cache(account_id: str):
                 pass
 
     profile_default = profile_root / "Default"
-    # LevelDB 잠금 해제 (비정상 종료 후 남은 Default/LOCK → 프로필 열기 실패 원인)
-    db_lock = profile_default / "LOCK"
-    if db_lock.exists():
-        try:
-            db_lock.unlink()
-            log("DB 잠금 해제: Default/LOCK", account_id)
-        except Exception:
-            pass
-
     for cache_dir in ["Cache", "GPUCache", "Code Cache"]:
         target = profile_default / cache_dir
         if target.exists():
@@ -306,14 +288,23 @@ def _ensure_xvfb_display() -> str:
 
     이미 실행 중이면 재사용. 실패 시 빈 문자열 반환.
     """
-    display = ":99"
-    # 이미 :99 디스플레이가 떠 있으면 재사용 (매 launch마다 중복 Xvfb spawn → 프로세스 churn 방지)
-    if Path("/tmp/.X11-unix/X99").exists():
-        return display
+    display = "127.0.0.1:99"
+    # /tmp가 Windows bind mount일 수 있어 X11 Unix socket 대신 TCP display를 사용한다.
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", r"Xvfb :99"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode == 0:
+            return display
+    except Exception:
+        pass
     try:
         # Popen: 백그라운드 실행 (run은 프로세스 종료까지 블로킹 → 사용 불가)
         subprocess.Popen(
-            ["Xvfb", display, "-screen", "0", "1920x1080x24", "-ac"],
+            ["Xvfb", ":99", "-screen", "0", "1920x1080x24", "-ac", "-listen", "tcp", "-nolisten", "unix"],
             stderr=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
         )
@@ -326,7 +317,25 @@ def _ensure_xvfb_display() -> str:
 
 
 def launch_browser(account_id: str):
-    import undetected_chromedriver as uc
+    from modules.transform.utility.process_lock import named_lock
+    lock = named_lock("baemin_session:" + str(account_id), timeout=120)
+    lock.acquire()
+    try:
+        driver = _launch_browser_unlocked(account_id)
+    except BaseException:
+        lock.release()
+        raise
+    original_quit = driver.quit
+    def close_session():
+        try:
+            return original_quit()
+        finally:
+            lock.release()
+    driver.quit = close_session
+    return driver
+
+
+def _launch_browser_unlocked(account_id: str):
     """브라우저 실행 (Xvfb 가상 디스플레이 사용, 비-헤드리스).
 
     배민 봇 탐지가 headless 모드를 감지해 metrics API를 차단하므로
@@ -334,11 +343,6 @@ def launch_browser(account_id: str):
     """
     _reap_zombie_children()          # 이전 launch가 남긴 좀비 회수 (cannot-connect 누적 방지)
     clean_chrome_cache(account_id)   # 세션 유지 + 캐시만 정리 (OOM 방지)
-    primary_temp_profile: Path | None = None
-    profile_root = CHROME_PROFILE_DIR / account_id
-    if any((profile_root / name).exists() for name in ("SingletonLock", "SingletonCookie", "SingletonSocket")):
-        primary_temp_profile = Path(tempfile.mkdtemp(prefix=f"chrome_{account_id}_"))
-        log(f"프로필 잠금 잔존 감지, 임시 프로필 사용: {primary_temp_profile}", account_id)
 
     # Xvfb 가상 디스플레이 설정
     display = _ensure_xvfb_display()
@@ -347,70 +351,59 @@ def launch_browser(account_id: str):
         log(f"브라우저 실행 시도 (Xvfb {display})", account_id)
     else:
         log(f"브라우저 실행 시도 (headless fallback)", account_id)
-        if primary_temp_profile is None:
-            primary_temp_profile = Path(tempfile.mkdtemp(prefix=f"chrome_{account_id}_"))
-            log(f"headless fallback 임시 프로필 사용: {primary_temp_profile}", account_id)
 
-    def _build_options(profile_path_override: Path | None = None):
-        options = uc.ChromeOptions()
+    options = uc.ChromeOptions()
+    options.page_load_strategy = "eager"
 
-        chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/google-chrome")
-        if Path(chrome_bin).exists():
-            options.binary_location = chrome_bin
-            log(f"Chrome 바이너리: {chrome_bin}", account_id)
-        else:
-            log(f"경고: Chrome 바이너리를 찾을 수 없음 ({chrome_bin})", account_id)
+    chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/google-chrome")
+    if Path(chrome_bin).exists():
+        options.binary_location = chrome_bin
+        log(f"Chrome 바이너리: {chrome_bin}", account_id)
+    else:
+        log(f"경고: Chrome 바이너리를 찾을 수 없음 ({chrome_bin})", account_id)
 
-        if not display:
-            options.add_argument('--headless=new')   # Xvfb 없을 때만 헤드리스
-        options.add_argument('--no-sandbox')
-        options.add_argument('--no-zygote')           # Chrome 148+ Docker 크래시 방지
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-gpu')
-        options.add_argument('--disable-software-rasterizer')
-        options.add_argument('--disable-blink-features=AutomationControlled')
-        options.add_argument('--disk-cache-size=1')           # 캐시 최소화 (OOM 방지)
-        options.add_argument('--disable-extensions')
-        options.add_argument('--disable-default-apps')
-        options.add_argument('--no-first-run')
-        options.add_argument('--disable-background-networking')
-        options.add_argument('--disable-sync')
-        options.add_argument('--mute-audio')
-        options.add_argument('--js-flags=--max-old-space-size=512')  # JS 힙 512MB (256 → 512: 크래시 방지)
-        w, h = random.choice(WINDOW_SIZES)
-        options.add_argument(f'--window-size={w},{h}')
-        options.add_argument('--lang=ko-KR')
-        options.add_argument(f'--user-agent={DEFAULT_WIN_CHROME_UA}')
-
-        profile_path = profile_path_override or (CHROME_PROFILE_DIR / account_id)
-        profile_path.mkdir(parents=True, exist_ok=True)
-        options.add_argument(f'--user-data-dir={profile_path.absolute()}')
-        return options
+    if not display:
+        options.add_argument('--headless=new')   # Xvfb 없을 때만 헤드리스
+    options.add_argument('--no-sandbox')
+    options.add_argument('--no-zygote')           # Chrome 148+ Docker 크래시 방지
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--disable-blink-features=AutomationControlled')
+    options.add_argument('--disk-cache-size=1')           # 캐시 최소화 (OOM 방지)
+    options.add_argument('--disable-extensions')
+    options.add_argument('--disable-default-apps')
+    options.add_argument('--no-first-run')
+    options.add_argument('--disable-background-networking')
+    options.add_argument('--disable-sync')
+    options.add_argument('--mute-audio')
+    options.add_argument('--js-flags=--max-old-space-size=1024')  # JS 힙 1GB (512→1024: 렌더러 행/OOM 방지)
+    w, h = random.choice(WINDOW_SIZES)
+    options.add_argument(f'--window-size={w},{h}')
+    options.add_argument('--lang=ko-KR')
+    options.add_argument(f'--user-agent={DEFAULT_WIN_CHROME_UA}')
+    
+    profile_path = CHROME_PROFILE_DIR / account_id
+    profile_path.mkdir(parents=True, exist_ok=True)
+    options.add_argument(f'--user-data-dir={profile_path.absolute()}')
     
     try:
         driver = launch_uc_chrome(
-            _build_options(primary_temp_profile),
+            options,
             account_id=account_id,
             chrome_bin=os.getenv("CHROME_BIN", "/usr/bin/google-chrome"),
             log_fn=lambda msg: log(msg, account_id),
+            prefer_standard=os.getenv("BAEMIN_PREFER_STANDARD_CHROME", "1").lower()
+            not in {"0", "false", "no"},
+            command_timeout_sec=int(os.getenv("BAEMIN_WEBDRIVER_COMMAND_TIMEOUT_SEC", "90")),
         )
-        if primary_temp_profile:
-            driver._doridang_temp_profile = str(primary_temp_profile)
+        try:
+            driver.set_page_load_timeout(45)
+            driver.set_script_timeout(60)  # execute_script 행 시 무한 대기 방지
+        except Exception:
+            pass
         log(f"브라우저 실행 성공", account_id)
         return driver
     except Exception as e:
-        if is_driver_crash_error(e) or "undetected_chromedriver" in str(e):
-            temp_profile = Path(tempfile.mkdtemp(prefix=f"chrome_{account_id}_"))
-            log(f"브라우저 실행 실패 후 임시 프로필 재시도: {temp_profile}", account_id)
-            driver = launch_uc_chrome(
-                _build_options(temp_profile),
-                account_id=account_id,
-                chrome_bin=os.getenv("CHROME_BIN", "/usr/bin/google-chrome"),
-                log_fn=lambda msg: log(msg, account_id),
-            )
-            driver._doridang_temp_profile = str(temp_profile)
-            log(f"브라우저 실행 성공 (프로필 초기화 후)", account_id)
-            return driver
         log(f"브라우저 실행 실패: {e}", account_id)
         raise
 
@@ -433,10 +426,33 @@ def is_on_success_page(url: str) -> bool:
         return False
 
 
+def is_on_main_dashboard(url: str) -> bool:
+    """우리가게NOW ShopSelect가 있는 메인 대시보드 URL인지 확인한다."""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        return parsed.hostname == "self.baemin.com" and parsed.path in ("", "/")
+    except Exception:
+        return False
+
+
+def ensure_main_dashboard(driver, account_id: str | None = None) -> None:
+    """shops/{store_id} 같은 복원 URL을 버리고 NOW 메인으로 이동한다."""
+    if is_on_main_dashboard(driver.current_url):
+        return
+    log("  NOW 메인 대시보드로 이동", account_id)
+    driver.set_page_load_timeout(45)
+    driver.get(MAIN_URL)
+
+
 def login_baemin(driver, account_id: str, password: str) -> bool:
     """배민 로그인"""
     log(f"로그인 시도", account_id)
     wait = WebDriverWait(driver, 30)
+    try:
+        driver.set_page_load_timeout(20)
+    except Exception:
+        pass
     
     try:
         driver.get(LOGIN_URL)
@@ -457,11 +473,32 @@ def login_baemin(driver, account_id: str, password: str) -> bool:
                 log(f"  [실패] 인터넷 복구 실패", account_id)
                 return False
         else:
-            log(f"  [실패] 로그인 페이지 이동 실패: {e}", account_id)
-            return False
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
+            current_url = ""
+            try:
+                current_url = driver.current_url
+            except Exception:
+                pass
+            if is_on_success_page(current_url):
+                log(f"  로그인 세션 확인 성공: {current_url}", account_id)
+                return True
+            try:
+                driver.find_element(By.NAME, "id")
+                log(f"  로그인 DOM 확인 후 계속 진행", account_id)
+            except Exception:
+                log(f"  [실패] 로그인 페이지 이동 실패: {_short_error(e)}", account_id)
+                return False
 
     # 세션 재사용으로 이미 로그인된 경우 (프로필 쿠키 유효 → self.baemin.com/ 리다이렉트)
     if is_on_success_page(driver.current_url):
+        try:
+            ensure_main_dashboard(driver, account_id)
+            random_delay("page_load")
+        except Exception as e:
+            log(f"  NOW 메인 이동 확인 생략(계속 진행): {_short_error(e)}", account_id)
         log("  이미 로그인 상태 (세션 재사용)", account_id)
         return True
 
@@ -503,10 +540,23 @@ def login_baemin(driver, account_id: str, password: str) -> bool:
         random_delay("login_wait")
         current_url = driver.current_url
     except WebDriverException as e:
-        log(f"  [실패] WebDriver 세션 끊김 (Chrome 크래시 추정): {e}", account_id)
+        try:
+            driver.execute_script("window.stop();")
+            current_url = driver.current_url
+        except Exception:
+            current_url = ""
+        if is_on_success_page(current_url):
+            log(f"  로그인 URL 매칭 성공: {current_url}", account_id)
+            return True
+        log(f"  WebDriver 세션 끊김 감지(재로그인 대상): {_short_error(e)}", account_id)
         return False
 
     if is_on_success_page(current_url):
+        try:
+            ensure_main_dashboard(driver, account_id)
+            random_delay("page_load")
+        except Exception as e:
+            log(f"  NOW 메인 이동 확인 생략(계속 진행): {_short_error(e)}", account_id)
         log(f"  로그인 성공 (URL 매칭)", account_id)
         return True
 
@@ -519,7 +569,7 @@ def login_baemin(driver, account_id: str, password: str) -> bool:
         current_url = driver.current_url
         page_title = driver.title
     except WebDriverException as e:
-        log(f"  [실패] WebDriver 세션 끊김 (재확인 중): {e}", account_id)
+        log(f"  WebDriver 세션 끊김 감지(재확인 중): {e}", account_id)
         return False
     log(f"  로그인 재확인 URL={current_url}, title={page_title}", account_id)
     
@@ -541,13 +591,42 @@ def login_baemin(driver, account_id: str, password: str) -> bool:
 # ============================================================================
 
 # 비율로 저장할 항목 (익스텐션과 동일: ÷100 소수 저장)
-RATIO_LABELS = {"조리시간준수율", "주문접수율", "최근재주문율"}
+RATIO_LABELS = {"조리시간준수율", "주문접수율", "최근재주문율", "영업시간운영률", "주문취소율"}
 
 _COLLECT_METRICS_JS = r"""
 return (function() {
-    const LABELS = ['조리소요시간','주문접수시간','최근재주문율','조리시간준수율','주문접수율','최근별점'];
-    const RATIO  = new Set(['조리시간준수율','주문접수율','최근재주문율']);
+    const LABELS = ['조리소요시간','주문접수시간','최근재주문율','조리시간준수율','주문접수율','최근별점','영업시간운영률','주문취소율','준비시간정확도'];
+    const STATUS_LABELS = ['영업시간운영률','주문취소율','준비시간정확도','주문접수시간','최근재주문율','최근별점'];
+    const RATIO  = new Set(['조리시간준수율','주문접수율','최근재주문율','영업시간운영률','주문취소율']);
     const result = {};
+    const textOf = el => (el && (el.innerText || el.textContent) || '').replace(/\s+/g, ' ').trim();
+    const normalizeLabel = value => String(value || '').replace(/\s+/g, '').trim();
+    const applyMetric = (label, rawVal, rawRank = '', status = '', detail = '') => {
+        if (!LABELS.includes(label)) return;
+        const numMatch = String(rawVal || '').match(/[\d.]+/);
+        let numStr = numMatch ? numMatch[0] : '';
+        if (numStr && RATIO.has(label)) numStr = String(parseFloat(numStr) / 100);
+        const rankMatch = String(rawRank || '').match(/^(상위|하위)\s*([\d.]+)%$/);
+        result[label] = numStr;
+        result[label + '_순위구분'] = rankMatch ? rankMatch[1] : '';
+        result[label + '_순위비율'] = rankMatch ? String(parseFloat(rankMatch[2]) / 100) : '';
+        if (STATUS_LABELS.includes(label)) result[label + '_상태'] = status || 'null';
+        if (label === '주문취소율') result['주문취소율_상세'] = detail || 'null';
+    };
+
+    const newItems = document.querySelectorAll('.WooriShopNowCard-module__rcFf .ShopNowListItem-module__XJ1P');
+    for (const item of newItems) {
+        const title = item.querySelector('.ShopNowListItem-module__Thvi')?.cloneNode(true);
+        title?.querySelectorAll('.ShopNowListItem-module__miOL, .Tooltip_c_qx9u_5wgk4r8, [data-atelier-component="NotificationBadge"]').forEach(el => el.remove());
+        const label = normalizeLabel(textOf(title));
+        applyMetric(
+            label,
+            textOf(item.querySelector('.ShopNowListItem-module__kLp1')),
+            '',
+            textOf(item.querySelector('[data-atelier-component="Badge"]')),
+            textOf(item.querySelector('.ShopNowListItem-module__qElw'))
+        );
+    }
 
     // 실제 DOM 구조 기반:
     // .WooriShopNowItem-module__TKcC
@@ -562,20 +641,12 @@ return (function() {
         const spans = item.querySelectorAll('span');
         if (spans.length < 2) continue;
 
-        const label = spans[0].textContent.trim();
+        const label = normalizeLabel(spans[0].textContent);
         if (!LABELS.includes(label)) continue;
 
         const rawVal  = spans[1].textContent.trim();
         const rawRank = spans.length > 2 ? spans[2].textContent.trim() : '';
-
-        const numMatch = rawVal.match(/[\d.]+/);
-        let numStr = numMatch ? numMatch[0] : '';
-        if (numStr && RATIO.has(label)) numStr = String(parseFloat(numStr) / 100);
-
-        const rankMatch = rawRank.match(/^(상위|하위)\s*([\d.]+)%$/);
-        result[label]               = numStr;
-        result[label + '_순위구분'] = rankMatch ? rankMatch[1] : '';
-        result[label + '_순위비율'] = rankMatch ? String(parseFloat(rankMatch[2]) / 100) : '';
+        applyMetric(label, rawVal, rawRank);
     }
     return result;
 })();
@@ -905,11 +976,88 @@ def navigate_to_store(driver, store_id: str) -> bool:
         return False
 
 
-def select_store_by_id(driver, store_id: str) -> bool:
-    """드롭다운에서 store_id를 선택하고 실제 전환을 확인한다.
+def navigate_to_store_now(driver, store_id: str, return_state: bool = False):
+    """NOW 지표 페이지로 매장을 전환한다 (URL 이동 우선, 드롭다운은 최후 폴백).
 
-    React 앱 호환: nativeInputValueSetter + input/change 이벤트.
-    전환 미확인 시 Selenium Select 방식으로 1회 재시도.
+    React-controlled ShopSelect 드롭다운은 멀티매장 계정에서 전환이
+    되돌아가는 문제가 있어, 우가클/변경이력/광고 단계와 동일한
+    '직접 URL 이동 + F5 새로고침' 검증된 패턴을 우선 사용한다.
+
+    단계:
+      1) https://self.baemin.com/shops/{store_id}/ 직접 이동 + F5 → NOW 데이터 확인
+      2) 검증된 shop 서브페이지 1회 방문으로 active-shop 컨텍스트를 설정한 뒤
+         메인 대시보드로 이동 → NOW 데이터 확인
+      3) 기존 ShopSelect 드롭다운 선택 폴백
+    각 단계는 wait_for_metrics_state 로 실제 전환 성공/정상 빈값을 판정한다.
+    반환: True=성공, False=실패. return_state=True이면 상태 dict를 반환한다.
+    """
+    def _result(state: dict | None = None):
+        if return_state:
+            return state or {"status": "missing", "reason": "navigation_failed"}
+        return bool(state and state.get("status") in ("loaded", "no_data"))
+
+    # 1) shop 홈 직접 이동 + F5 (SPA 빈 화면 대비)
+    try:
+        url = f"https://self.baemin.com/shops/{store_id}/"
+        log(f"NOW 매장 전환(직접 이동): {url}")
+        driver.set_page_load_timeout(45)
+        try:
+            driver.get(url)
+        except Exception as e:
+            log(f"  NOW shop 홈 로드 지연(F5 시도): {_short_error(e)}")
+        time.sleep(random.uniform(1.5, 2.5))
+        try:
+            driver.refresh()
+        except Exception:
+            pass
+        state = wait_for_metrics_state(driver, timeout=45)
+        if state["status"] in ("loaded", "no_data"):
+            return _result(state)
+        log(f"  NOW shop 홈에 지표 미렌더 → active-shop 컨텍스트 방식 시도 ({store_id})")
+    except Exception as e:
+        log(f"  NOW 직접 이동 지연(계속): {_short_error(e)}")
+
+    # 2) 검증된 서브페이지 방문으로 active-shop 설정 후 메인 대시보드 진입
+    try:
+        ctx_url = f"https://self.baemin.com/shops/{store_id}/stat/marketing/woori-shop-click"
+        log(f"NOW 매장 전환(active-shop 설정): {ctx_url}")
+        driver.set_page_load_timeout(45)
+        try:
+            driver.get(ctx_url)
+        except Exception:
+            pass
+        time.sleep(random.uniform(1.5, 2.5))
+        driver.get(MAIN_URL)
+        time.sleep(random.uniform(1.5, 2.5))
+        try:
+            driver.refresh()
+        except Exception:
+            pass
+        state = wait_for_metrics_state(driver, timeout=45)
+        if state["status"] in ("loaded", "no_data"):
+            return _result(state)
+        log(f"  active-shop 방식도 지표 미렌더 → 드롭다운 폴백 ({store_id})")
+    except Exception as e:
+        log(f"  NOW active-shop 방식 지연(계속): {_short_error(e)}")
+
+    # 3) 최후 폴백: 기존 ShopSelect 드롭다운 선택
+    try:
+        ensure_main_dashboard(driver)
+    except Exception:
+        pass
+    if not select_store_by_id(driver, store_id):
+        return _result()
+    state = wait_for_metrics_state(driver, timeout=45)
+    return _result(state if state["status"] in ("loaded", "no_data") else None)
+
+
+def select_store_by_id(driver, store_id: str) -> bool:
+    """ShopSelect 드롭다운으로 store_id를 선택한다 (URL 이동 폴백 전용).
+
+    NOW 매장 전환은 navigate_to_store_now 의 URL 이동 방식을 우선 사용한다.
+    이 함수는 그 최후 폴백으로만 호출되며, native <select>의 <option>을
+    ActionChains 로 클릭하는 방식(항상 not interactable 에러)은 제거하고
+    JS nativeInputValueSetter + Selenium Select 만 사용한다.
     반환: True=성공, False=실패
     """
     def _js_set(sel_el):
@@ -954,12 +1102,13 @@ def select_store_by_id(driver, store_id: str) -> bool:
         )
 
         # 시도 1: JS nativeInputValueSetter
+        log(f"드롭다운 전환 시도(JS change): {store_id}")
         _js_set(sel_elem)
         time.sleep(1.5)
         if _verify():
             return True
 
-        # 시도 2: Selenium Select (실제 DOM 클릭 방식)
+        # 시도 2: Selenium Select 폴백
         log(f"JS 방식 전환 실패 → Selenium Select 재시도 ({store_id})")
         sel_elem = WebDriverWait(driver, 5).until(
             EC.presence_of_element_located(
@@ -979,34 +1128,101 @@ def select_store_by_id(driver, store_id: str) -> bool:
         return False
 
 
+def _snapshot_now_metrics_state(driver) -> dict:
+    """NOW 지표 DOM의 현재 상태를 loaded/no_data/missing으로 분류한다."""
+    return driver.execute_script(r"""
+        const LABELS = ['조리소요시간','주문접수시간','최근재주문율',
+                        '조리시간준수율','주문접수율','최근별점',
+                        '영업시간운영률','주문취소율','준비시간정확도'];
+        const textOf = el => (el && (el.innerText || el.textContent) || '').replace(/\s+/g, ' ').trim();
+        const normalizeLabel = value => String(value || '').replace(/\s+/g, '').trim();
+        const bodyText = (document.body && document.body.innerText || '').replace(/\s+/g, ' ').trim();
+        const emptyTextMarkers = [
+            '데이터가 없습니다', '데이터 없음', '조회된 데이터가 없습니다',
+            '판매 내역이 없습니다', '주문 내역이 없습니다', '운영 정보가 없습니다'
+        ];
+        if (emptyTextMarkers.some(marker => bodyText.includes(marker))) {
+            return {status: 'no_data', reason: 'empty_text', itemCount: 0, labels: [], values: []};
+        }
+
+        const newItems = Array.from(document.querySelectorAll('.WooriShopNowCard-module__rcFf .ShopNowListItem-module__XJ1P'));
+        const oldItems = Array.from(document.querySelectorAll('.WooriShopNowItem-module__TKcC'));
+        const rows = [
+            ...newItems.map(item => {
+                const title = item.querySelector('.ShopNowListItem-module__Thvi')?.cloneNode(true);
+                title?.querySelectorAll('.ShopNowListItem-module__miOL, .Tooltip_c_qx9u_5wgk4r8, [data-atelier-component="NotificationBadge"]').forEach(el => el.remove());
+                return {
+                    label: normalizeLabel(textOf(title)),
+                    value: textOf(item.querySelector('.ShopNowListItem-module__kLp1'))
+                };
+            }),
+            ...oldItems.map(item => {
+                const spans = Array.from(item.querySelectorAll('span')).map(span => textOf(span));
+                return {label: normalizeLabel(spans[0] || ''), value: spans[1] || ''};
+            })
+        ].filter(row => LABELS.includes(row.label));
+        const values = rows.map(row => row.value).filter(value => /[\d.]/.test(value));
+        const itemCount = newItems.length + oldItems.length;
+
+        if (values.length > 0) {
+            return {
+                status: 'loaded',
+                reason: 'metric_values',
+                itemCount: itemCount,
+                labels: rows.map(row => row.label),
+                values: values
+            };
+        }
+        if (rows.length > 0) {
+            return {
+                status: 'no_data',
+                reason: 'metric_labels_without_values',
+                itemCount: itemCount,
+                labels: rows.map(row => row.label),
+                values: []
+            };
+        }
+        return {status: 'missing', reason: 'metric_dom_missing', itemCount: itemCount, labels: [], values: []};
+    """)
+
+
+def wait_for_metrics_state(driver, timeout: int = 45) -> dict:
+    """NOW 지표가 로드되거나 정상 빈값 DOM 근거가 확인될 때까지 대기한다."""
+    def _has_data(d):
+        state = _snapshot_now_metrics_state(d)
+        return state if state.get("status") == "loaded" else False
+
+    last_state: dict = {"status": "missing", "reason": "not_checked"}
+    for attempt in range(2):
+        try:
+            state = WebDriverWait(driver, timeout).until(_has_data)
+            return state
+        except TimeoutException:
+            try:
+                last_state = _snapshot_now_metrics_state(driver) or last_state
+            except Exception as state_exc:
+                last_state = {"status": "missing", "reason": f"state_check_failed: {state_exc}"}
+            if last_state.get("status") == "no_data":
+                return last_state
+            if attempt == 0:
+                log(f"메트릭 데이터 로드 지연({timeout}초) → 새로고침 재시도")
+                try:
+                    driver.set_page_load_timeout(45)
+                    driver.refresh()
+                except Exception as refresh_exc:
+                    log(f"메트릭 데이터 새로고침 지연: {refresh_exc}")
+                    return {"status": "missing", "reason": f"refresh_failed: {refresh_exc}"}
+                time.sleep(random.uniform(3.0, 5.0))
+    return last_state
+
+
 def wait_for_metrics_data(driver, timeout: int = 45) -> bool:
     """WooriShopNowItem의 값 span에 실제 데이터가 채워질 때까지 폴링 대기.
 
     DOM 요소 존재가 아니라 label+value span에 실제 텍스트가 있는지 확인.
     timeout 초 초과 시 새로고침 후 1회 재시도. 반환: True=성공, False=실패.
     """
-    def _has_data(d):
-        return d.execute_script(r"""
-            const LABELS = ['조리소요시간','주문접수시간','최근재주문율',
-                            '조리시간준수율','주문접수율','최근별점'];
-            const items = document.querySelectorAll('.WooriShopNowItem-module__TKcC');
-            if (!items.length) return false;
-            const spans = items[0].querySelectorAll('span');
-            return spans.length >= 2
-                && LABELS.includes(spans[0].textContent.trim())
-                && spans[1].textContent.trim() !== '';
-        """)
-
-    for attempt in range(2):
-        try:
-            WebDriverWait(driver, timeout).until(_has_data)
-            return True
-        except TimeoutException:
-            if attempt == 0:
-                log(f"메트릭 데이터 로드 {timeout}초 초과 → 새로고침 재시도")
-                driver.refresh()
-                time.sleep(random.uniform(3.0, 5.0))
-    return False
+    return wait_for_metrics_state(driver, timeout=timeout).get("status") == "loaded"
 
 
 # ============================================================================
@@ -1074,7 +1290,7 @@ def wait_for_page(driver, css_selector: str, timeout: int = 60) -> bool:
             return True
         except TimeoutException:
             if attempt == 0:
-                log(f"페이지 로드 {timeout}초 초과 → 새로고침 재시도")
+                log(f"페이지 응답 지연({timeout}초) → 새로고침 재시도")
                 try:
                     driver.refresh()
                     time.sleep(random.uniform(3.0, 5.0))
@@ -1089,18 +1305,18 @@ def wait_for_page(driver, css_selector: str, timeout: int = 60) -> bool:
                         except WebDriverException:
                             pass  # 다음 attempt에서 재시도
                     else:
-                        log(f"새로고침 중 브라우저 크래시: {e}")
+                        log(f"페이지 새로고침 지연, 현재 단계 복구 대상: {_short_error(e)}")
                         return False
         except WebDriverException as e:
             if _is_network_error(e):
                 if wait_for_internet():
                     continue  # 인터넷 복구 → 현재 attempt 재시도
                 return False
-            log(f"브라우저 연결 끊김 (attempt={attempt}): {e}")
+            log(f"브라우저 연결 끊김 (attempt={attempt}): {_short_error(e)}")
             return False
         except Exception as e:
             # urllib3.exceptions.MaxRetryError 등 Chrome OOM 크래시
-            log(f"브라우저 연결 끊김 (attempt={attempt}): {e}")
+            log(f"브라우저 연결 끊김 (attempt={attempt}): {_short_error(e)}")
             return False
     return False
 
@@ -1159,7 +1375,7 @@ def logout_baemin(driver, account_id: str):
         time.sleep(random.uniform(2.0, 3.0))
         log("로그아웃 완료", account_id)
     except Exception as e:
-        log(f"로그아웃 실패 (warn only): {e}", account_id)
+        log(f"로그아웃 생략(세션 종료 중): {_short_error(e)}", account_id)
 
 
 # ============================================================================
@@ -1189,20 +1405,101 @@ def _reap_zombie_children() -> int:
     return reaped
 
 
+def _descendant_pids(pid: int) -> list[int]:
+    """pid의 모든 자손 pid를 깊은 순서(손자 → 자식)로 반환한다. /proc 기반, 의존성 없음."""
+    children: dict[int, list[int]] = {}
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat", "r") as fh:
+                    stat = fh.read()
+                # comm에 공백/괄호가 올 수 있어 마지막 ')' 뒤에서 ppid를 읽는다.
+                ppid = int(stat[stat.rfind(")") + 2:].split()[1])
+            except Exception:
+                continue
+            children.setdefault(ppid, []).append(int(entry))
+    except Exception:
+        return []
+    out: list[int] = []
+    stack = [pid]
+    while stack:
+        cur = stack.pop()
+        for child in children.get(cur, []):
+            out.append(child)
+            stack.append(child)
+    return list(reversed(out))
+
+
 def _kill_pid_tree(pid) -> None:
-    """주어진 pid와 그 자식(렌더러 등)을 SIGKILL로 종료한다."""
+    """주어진 pid와 모든 자손(렌더러·GPU·crashpad 등)을 SIGKILL로 종료한다.
+
+    직계 자식만 죽이면(pkill -P) 손자인 렌더러들이 PID 1로 재부모돼 살아남는다.
+    2026-09-12 워커에서 고아 chrome 325개(12.6GiB)가 이렇게 쌓여 메모리가 고갈됐다.
+    """
     if not pid:
         return
     try:
-        subprocess.run(["pkill", "-9", "-P", str(pid)], capture_output=True, timeout=5)
-    except Exception:
-        pass
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return
+    for target in _descendant_pids(pid) + [pid]:
+        try:
+            os.kill(target, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        except Exception:
+            pass
+
+
+_ORPHAN_CHROME_COMMS = ("chrome", "chromedriver", "chrome_crashpad", "undetected_chromedriver", "Xvfb")
+
+
+def reap_orphan_chrome(min_age_sec: int = 120, account_id: str = "SYSTEM") -> int:
+    """부모를 잃고 PID 1에 재부모된 chrome 계열 프로세스 트리를 SIGKILL로 정리한다.
+
+    chromedriver가 죽으면 세션은 이미 못 쓰므로 PID 1 밑의 chrome 계열은 전부 고아다.
+    실행 중 세션의 chrome은 chromedriver 밑에 있어 대상이 아니다. 컨테이너(리눅스) 전용.
+    """
+    if not os.path.isdir("/proc"):
+        return 0
     try:
-        os.kill(int(pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, ValueError):
-        pass
+        clk = os.sysconf("SC_CLK_TCK")
+        with open("/proc/uptime") as fh:
+            uptime = float(fh.read().split()[0])
     except Exception:
-        pass
+        return 0
+    roots: list[int] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as fh:
+                stat = fh.read()
+            comm = stat[stat.find("(") + 1 : stat.rfind(")")]
+            rest = stat[stat.rfind(")") + 2 :].split()
+            ppid = int(rest[1])
+            start_ticks = int(rest[19])
+        except Exception:
+            continue
+        if ppid != 1 or not comm.startswith(_ORPHAN_CHROME_COMMS):
+            continue
+        if uptime - start_ticks / clk < min_age_sec:
+            continue
+        roots.append(int(entry))
+    killed = 0
+    for pid in roots:
+        for target in _descendant_pids(pid) + [pid]:
+            try:
+                os.kill(target, signal.SIGKILL)
+                killed += 1
+            except Exception:
+                pass
+    if killed:
+        log(f"고아 chrome 프로세스 {killed}개 정리 (루트 {len(roots)}개)", account_id)
+    _reap_zombie_children()
+    return killed
 
 
 def quit_driver_safely(driver, account_id: str = "SYSTEM") -> None:
@@ -1218,7 +1515,6 @@ def quit_driver_safely(driver, account_id: str = "SYSTEM") -> None:
     browser_pid = getattr(driver, "browser_pid", None)
     service = getattr(driver, "service", None)
     service_pid = getattr(getattr(service, "process", None), "pid", None)
-    temp_profile = getattr(driver, "_doridang_temp_profile", None)
 
     try:
         driver.quit()
@@ -1227,12 +1523,15 @@ def quit_driver_safely(driver, account_id: str = "SYSTEM") -> None:
 
     _kill_pid_tree(browser_pid)
     _kill_pid_tree(service_pid)
-    if temp_profile:
-        shutil.rmtree(temp_profile, ignore_errors=True)
 
     n = _reap_zombie_children()
     if n:
         log(f"좀비 프로세스 {n}개 회수", account_id)
+    # 세션 종료 때마다 다른 세션이 남긴 고아 chrome도 걷어낸다(안전망).
+    try:
+        reap_orphan_chrome(account_id=account_id)
+    except Exception:
+        pass
 
 
 # ============================================================================
@@ -1260,8 +1559,8 @@ _DRIVER_CRASH_KEYWORDS = (
 
 def is_driver_crash_error(exc: Exception) -> bool:
     """예외가 Chrome/chromedriver 프로세스 사망(연결 끊김) 계열인지 판별."""
-    msg = str(exc)
-    return any(keyword in msg for keyword in _DRIVER_CRASH_KEYWORDS)
+    msg = str(exc).lower()
+    return any(keyword.lower() in msg for keyword in _DRIVER_CRASH_KEYWORDS)
 
 
 def restart_driver_if_dead(driver, account_id: str, password: str):

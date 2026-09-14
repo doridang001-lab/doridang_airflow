@@ -5,20 +5,27 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
+import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from glob import glob
 from pathlib import Path
 
 import pandas as pd
-import pendulum
 
+from modules.transform.pipelines.db.DB_UnifiedSales_common import (
+    record_manual_reingest_marker,
+)
+from modules.transform.pipelines.db.beamin_store_io import replace_covered_date_range
 from modules.transform.utility.paths import (
     COLLECT_DB,
     COUPANG_ORDERS_DB,
     COUPANG_ORDERS_DETAIL_DB,
     DOWN_DIR,
+    TEMP_DIR,
 )
 from modules.transform.utility.store_normalize import lookup_store_key
 
@@ -28,31 +35,209 @@ KNOWN_BRANDS = ["도리당", "나홀로"]
 CMG_DIR = COUPANG_ORDERS_DETAIL_DB / "cmg"
 OPTIONS_DIR = COUPANG_ORDERS_DETAIL_DB / "options"
 COLLECT_SRC = COLLECT_DB / "영업관리부_수집"
+MISPLACED_MARKETING_SRC = COLLECT_DB / "마케팅_수집"
 ARCHIVE_DIR = COLLECT_SRC / "_archived"
+COUPANG_RAW_PREFIXES = ("orders", "cmg", "options")
+ORDER_DEDUP_COLUMNS = [
+    "order_date",
+    "order_id",
+    "delivery_type",
+    "order_status",
+    "order_summary",
+    "total_price",
+    "is_cancelled",
+    "item_menu",
+    "menu_name",
+    "menu_qty",
+    "menu_price",
+    "menu_options",
+]
+ORDER_DEDUP_NUMERIC_COLUMNS = {"total_price", "menu_qty", "menu_price"}
+ORDER_INTERNAL_COLUMNS = ["_ingest_source_path", "_ingest_source"]
+COUPANG_LOAD_LOCK_DIR = TEMP_DIR / "locks" / "coupang_macro_load.lock"
+COUPANG_EXTRA_DOWNLOAD_DIRS_ENV = "COUPANG_EXTRA_DOWNLOAD_DIRS"
+
+
+def _remove_stale_coupang_lock(lock_dir: Path) -> bool:
+    """Remove only our known stale lock shape."""
+    if not lock_dir.exists():
+        return True
+    try:
+        children = list(lock_dir.iterdir())
+    except OSError:
+        return False
+
+    for child in children:
+        if child.name != "owner.json" or not child.is_file():
+            return False
+    for child in children:
+        child.unlink(missing_ok=True)
+    try:
+        lock_dir.rmdir()
+        return True
+    except OSError:
+        return False
+
+
+@contextmanager
+def _coupang_load_lock(
+    timeout_sec: float = 900,
+    stale_sec: float = 7200,
+    wait_interval_sec: float = 5,
+):
+    """Serialize Coupang source ingestion across DAGs that share the same loader."""
+    lock_dir = COUPANG_LOAD_LOCK_DIR
+    owner_path = lock_dir / "owner.json"
+    lock_dir.parent.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    acquired = False
+
+    while True:
+        try:
+            lock_dir.mkdir()
+            owner_path.write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "created_at": pd.Timestamp.now(tz="Asia/Seoul").isoformat(),
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            acquired = True
+            logger.info("쿠팡 원천 적재 lock 획득: %s", lock_dir)
+            break
+        except FileExistsError:
+            try:
+                age = time.time() - lock_dir.stat().st_mtime
+            except OSError:
+                age = 0
+            if stale_sec > 0 and age > stale_sec and _remove_stale_coupang_lock(lock_dir):
+                logger.warning("stale 쿠팡 원천 적재 lock 제거: %s", lock_dir)
+                continue
+            if time.monotonic() - started >= timeout_sec:
+                raise TimeoutError(f"쿠팡 원천 적재 lock 대기 시간 초과: {lock_dir}")
+            time.sleep(wait_interval_sec)
+
+    try:
+        yield
+    finally:
+        if acquired:
+            try:
+                owner_path.unlink(missing_ok=True)
+                lock_dir.rmdir()
+                logger.info("쿠팡 원천 적재 lock 해제: %s", lock_dir)
+            except OSError as exc:
+                logger.warning("쿠팡 원천 적재 lock 해제 실패: %s | %s", lock_dir, exc)
+
+
+def _path_key(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path.absolute())
+
+
+def _extra_download_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    raw = os.getenv(COUPANG_EXTRA_DOWNLOAD_DIRS_ENV, "").strip()
+    if raw:
+        dirs.extend(Path(part.strip()) for part in raw.split(";") if part.strip())
+
+    if os.name == "nt":
+        dirs.append(Path.home() / "Downloads")
+    else:
+        dirs.append(Path("/opt/airflow/user_downloads"))
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    for path in dirs:
+        key = _path_key(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def _raw_source_dirs(include_collect: bool = True) -> list[tuple[str, Path]]:
+    dirs: list[tuple[str, Path]] = [("down", DOWN_DIR)]
+    if include_collect:
+        dirs.append(("collect", COLLECT_SRC))
+
+    known = {_path_key(path) for _, path in dirs}
+    extra_idx = 1
+    for path in _extra_download_dirs():
+        key = _path_key(path)
+        if key in known:
+            continue
+        known.add(key)
+        source = "downloads" if extra_idx == 1 else f"downloads_{extra_idx}"
+        dirs.append((source, path))
+        extra_idx += 1
+    return dirs
 
 
 def _iter_source_files(prefix: str) -> list[dict[str, Path]]:
-    """Collect files from `E:/down` and `Collect_Data/...`, with source tags."""
-    down_pattern = str(DOWN_DIR / f"coupangeats_{prefix}_*.csv")
-    collect_pattern = str(COLLECT_SRC / f"coupangeats_{prefix}_*.csv")
+    """Collect files from raw download dirs and `Collect_Data/...`, with source tags."""
+    pattern = f"coupangeats_{prefix}_*.csv"
 
     items: list[dict[str, Path]] = []
-    seen: set[Path] = set()
-    for item in sorted(glob(down_pattern)):
-        path = Path(item)
-        if path in seen:
-            continue
-        seen.add(path)
-        items.append({"path": path, "source": "down"})
-
-    for item in sorted(glob(collect_pattern)):
-        path = Path(item)
-        if path in seen:
-            continue
-        seen.add(path)
-        items.append({"path": path, "source": "collect"})
+    seen: set[str] = set()
+    for source, source_dir in _raw_source_dirs(include_collect=True):
+        for item in sorted(glob(str(source_dir / pattern))):
+            path = Path(item)
+            key = _path_key(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append({"path": path, "source": source})
 
     return items
+
+
+def _collect_dest_path(src: Path) -> Path:
+    dest = COLLECT_SRC / src.name
+    if not dest.exists():
+        return dest
+
+    stem = src.stem
+    suffix = src.suffix
+    idx = 1
+    while True:
+        candidate = COLLECT_SRC / f"{stem}.{idx}{suffix}"
+        if not candidate.exists():
+            return candidate
+        idx += 1
+
+
+def move_misplaced_coupang_marketing_to_collect() -> list[dict[str, str]]:
+    """Move Coupang raw CSVs accidentally saved in marketing collection dir."""
+    try:
+        if _path_key(MISPLACED_MARKETING_SRC) == _path_key(COLLECT_SRC):
+            return []
+    except OSError:
+        return []
+
+    if not MISPLACED_MARKETING_SRC.exists():
+        return []
+
+    COLLECT_SRC.mkdir(parents=True, exist_ok=True)
+    moved: list[dict[str, str]] = []
+    for prefix in COUPANG_RAW_PREFIXES:
+        pattern = f"coupangeats_{prefix}_*.csv"
+        for src in sorted(MISPLACED_MARKETING_SRC.glob(pattern)):
+            if not src.is_file():
+                continue
+            dest = _collect_dest_path(src)
+            try:
+                shutil.move(str(src), str(dest))
+                moved.append({"source": str(src), "dest": str(dest)})
+                logger.warning("misplaced coupang csv moved to collect: %s -> %s", src, dest)
+            except Exception as exc:
+                logger.warning("failed to move misplaced coupang csv %s: %s", src, exc)
+    return moved
 
 
 def _resolve_brand_store(display_name: str) -> tuple[str, str]:
@@ -119,6 +304,91 @@ def _orders_partition_dir(brand: str, store: str, ym: str) -> Path:
     return COUPANG_ORDERS_DB / f"brand={brand}" / f"store={store}" / f"ym={ym}"
 
 
+def _partition_value(path: Path, prefix: str) -> str:
+    token = f"{prefix}="
+    for part in path.parts:
+        if part.startswith(token):
+            return part[len(token):].strip()
+    return ""
+
+
+def _is_canonical_orders_file(path: Path) -> bool:
+    return bool(re.fullmatch(r"orders_\d{4}-\d{2}\.parquet", path.name))
+
+
+def _coupang_sale_date(series: pd.Series) -> pd.Series:
+    matched = series.fillna("").astype(str).str.extract(r"(\d{4})\.(\d{2})\.(\d{2})")
+    return (matched[0] + "-" + matched[1] + "-" + matched[2]).fillna("")
+
+
+def _deduplicate_orders(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """동일 주문/메뉴옵션 행은 원본 저장 단계에서 1건만 남긴다."""
+    if df.empty:
+        return df, 0
+
+    before = len(df)
+    subset = [col for col in ORDER_DEDUP_COLUMNS if col in df.columns]
+    if subset:
+        key = _normalized_dedup_key(df, subset)
+        out = df[~key.duplicated(keep="last")].copy()
+    elif "_row_hash" in df.columns:
+        out = df.drop_duplicates(subset=["_row_hash"], keep="last").copy()
+    else:
+        out = df.drop_duplicates(keep="last").copy()
+    return out.reset_index(drop=True), before - len(out)
+
+
+def _ensure_item_menu_column(df: pd.DataFrame) -> pd.DataFrame:
+    """과거 쿠팡 orders 입력은 item_menu가 없으므로 menu_name으로 보완한다."""
+    if df.empty:
+        return df
+    out = df.copy()
+    if "item_menu" not in out.columns:
+        out["item_menu"] = ""
+    if "menu_name" not in out.columns:
+        out["menu_name"] = ""
+    item_menu = out["item_menu"].fillna("").astype(str).str.strip()
+    menu_name = out["menu_name"].fillna("").astype(str).str.strip()
+    out["item_menu"] = item_menu.mask(item_menu.eq("") | item_menu.eq("nan"), menu_name)
+    return out
+
+
+def _normalized_dedup_key(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    key = pd.DataFrame(index=df.index)
+    for col in columns:
+        if col not in df.columns:
+            key[col] = ""
+            continue
+        values = df[col]
+        if col in ORDER_DEDUP_NUMERIC_COLUMNS:
+            key[col] = pd.to_numeric(
+                values.astype(str).str.replace(",", "", regex=False).str.strip(),
+                errors="coerce",
+            ).astype("Float64").astype(str)
+        else:
+            key[col] = values.fillna("").astype(str).str.strip()
+            key[col] = key[col].replace({"nan": "", "None": "", "<NA>": ""})
+    return key
+
+
+def _record_reingest_dates(store: str, new_df: pd.DataFrame, info: dict) -> None:
+    row_dates = (
+        _coupang_sale_date(new_df["order_date"]).reset_index(drop=True)
+        if "order_date" in new_df.columns
+        else pd.Series(dtype=str)
+    )
+    for date in info.get("covered_dates", []):
+        record_manual_reingest_marker(
+            "쿠팡수동",
+            store,
+            date,
+            {
+                "rows": int(row_dates.eq(date).sum()),
+                "removed": int(info.get("removed", 0)),
+            },
+        )
+
+
 def _dataset_partition_dir(root_dir: Path, brand: str, store: str, ym: str) -> Path:
     return root_dir / f"brand={brand}" / f"store={store}" / f"ym={ym}"
 
@@ -146,216 +416,25 @@ def _cleanup_sources(loaded_files: list[dict[str, Path]]) -> None:
             continue
 
         source = str(item["source"])
-        if source == "down":
+        if source in {"down", "collect"} or source.startswith("downloads"):
             try:
                 path.unlink()
-                logger.info("deleted from DOWN_DIR: %s", path)
+                logger.info("deleted from %s: %s", source, path)
             except Exception as exc:  # pragma: no cover - 운영 환경 처리
                 logger.warning("failed to delete %s: %s", path, exc)
-        elif source == "collect":
-            target = _archive_path(path)
-            try:
-                shutil.move(path, target)
-                logger.info("archived collect data: %s -> %s", path, target)
-            except Exception as exc:  # pragma: no cover - 운영 환경 처리
-                logger.warning("failed to archive %s: %s", path, exc)
         else:
             logger.warning("unknown source tag for %s: %s", path, source)
-
-
-COUPANG_ORDER_DEDUP_COLUMNS = [
-    "store_id",
-    "order_id",
-    "order_date",
-    "menu_name",
-    "menu_qty",
-    "menu_price",
-    "menu_options",
-    "total_price",
-    "is_cancelled",
-]
-
-
-def _canonical_coupang_order_keys(df: pd.DataFrame) -> pd.DataFrame:
-    keys = pd.DataFrame(index=df.index)
-    numeric_cols = {"menu_qty", "menu_price", "total_price", "매출액", "취소금액"}
-    for col in COUPANG_ORDER_DEDUP_COLUMNS:
-        if col not in df.columns:
-            keys[col] = ""
-            continue
-        if col in numeric_cols:
-            values = pd.to_numeric(df[col], errors="coerce")
-            keys[col] = values.round(6).astype("string").fillna("")
-        else:
-            keys[col] = df[col].fillna("").astype(str).str.strip()
-    return keys
-
-
-def _deduplicate_coupang_orders(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    if df.empty:
-        return df, 0
-
-    before = len(df)
-    work = df.copy()
-    if "collected_at" in work.columns:
-        work["_collected_at_sort"] = pd.to_datetime(work["collected_at"], errors="coerce", utc=True)
-        work = work.sort_values("_collected_at_sort", ascending=False, na_position="last", kind="mergesort")
-
-    keys = _canonical_coupang_order_keys(work)
-    deduped = work.loc[~keys.duplicated(keep="first")].drop(columns=["_collected_at_sort"], errors="ignore")
-    deduped = deduped.reset_index(drop=True)
-    return deduped, before - len(deduped)
-
-
-def repair_coupang_orders_parquet(
-    dry_run: bool = True,
-    stores: list[str] | None = None,
-    ym: str | None = None,
-    backup: bool = True,
-) -> str:
-    """쿠팡 orders parquet 중복을 정규화된 주문 라인 기준으로 제거한다."""
-    files = sorted(COUPANG_ORDERS_DB.rglob("orders_*.parquet"))
-    if stores:
-        store_set = {str(store).strip() for store in stores if str(store).strip()}
-        files = [path for path in files if any(f"store={store}" in str(path) for store in store_set)]
-    if ym:
-        ym_token = str(ym).strip()
-        files = [path for path in files if f"ym={ym_token}" in str(path)]
-
-    if not files:
-        return f"수정 대상 없음 | {COUPANG_ORDERS_DB}"
-
-    total_before = 0
-    total_after = 0
-    changed_files = 0
-    examples: list[str] = []
-    backup_root = COUPANG_ORDERS_DETAIL_DB / "_repair_backup" / pendulum.now("Asia/Seoul").format("YYYYMMDD_HHmmss")
-    for path in files:
-        try:
-            df = pd.read_parquet(path)
-        except Exception as exc:
-            logger.warning("parquet 로드 실패, 스킵: %s | %s", path, exc)
-            continue
-
-        before = len(df)
-        deduped, removed = _deduplicate_coupang_orders(df)
-        after = len(deduped)
-        total_before += before
-        total_after += after
-        if removed:
-            changed_files += 1
-            if len(examples) < 10:
-                examples.append(f"{path.name}:{before}->{after}(-{removed})")
-            if not dry_run:
-                if backup:
-                    backup_path = backup_root / path.relative_to(COUPANG_ORDERS_DB)
-                    backup_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(path, backup_path)
-                deduped.to_parquet(path, index=False, engine="pyarrow")
-                logger.info("repair 저장: %s | %d -> %d행 (%d 제거)", path, before, after, removed)
-            else:
-                logger.info("repair dry-run: %s | %d -> %d행 (%d 제거)", path, before, after, removed)
-
-    mode = "DRY-RUN" if dry_run else "수정 완료"
-    removed_total = total_before - total_after
-    sample = " | ".join(examples)
-    suffix = f" | 예시={sample}" if sample else ""
-    backup_msg = f" | 백업={backup_root}" if (backup and not dry_run and changed_files) else ""
-    return f"{mode} | 파일={len(files)} 변경파일={changed_files} 제거={removed_total}행 ({total_before}->{total_after}){backup_msg}{suffix}"
-
-
-def migrate_jungdong_partition(dry_run: bool = True, ym: str | None = "2026-06", backup: bool = True) -> str:
-    """store=중동점 orders 파티션을 store=해운대중동점으로 병합한다."""
-    src_base = COUPANG_ORDERS_DB / "brand=도리당" / "store=중동점"
-    dst_base = COUPANG_ORDERS_DB / "brand=도리당" / "store=해운대중동점"
-
-    if not src_base.exists():
-        return f"중동점 파티션 없음, 스킵 | {src_base}"
-
-    src_files = sorted(src_base.rglob("orders_*.parquet"))
-    if ym:
-        ym_token = str(ym).strip()
-        src_files = [path for path in src_files if path.parent.name == f"ym={ym_token}"]
-
-    if not src_files:
-        target = f"ym={ym}" if ym else "전체 ym"
-        return f"수정 대상 없음 | {src_base} | {target}"
-
-    backup_root = COUPANG_ORDERS_DETAIL_DB / "_partition_migration_backup" / pendulum.now("Asia/Seoul").format("YYYYMMDD_HHmmss")
-    operations: list[dict] = []
-    affected_ym_dirs: set[Path] = set()
-    results: list[str] = []
-
-    for src_path in src_files:
-        ym_part = src_path.parent.name
-        dst_dir = dst_base / ym_part
-        dst_path = dst_dir / src_path.name
-
-        src_df = pd.read_parquet(src_path)
-        if "order_id" not in src_df.columns:
-            return f"중단: source order_id 컬럼 없음 | {src_path}"
-
-        if dst_path.exists():
-            dst_df = pd.read_parquet(dst_path)
-            if "order_id" not in dst_df.columns:
-                return f"중단: target order_id 컬럼 없음 | {dst_path}"
-            new_ids = set(src_df["order_id"].dropna().astype(str).unique())
-            keep_old = dst_df[~dst_df["order_id"].astype(str).isin(new_ids)]
-            merged = pd.concat([keep_old, src_df], ignore_index=True)
-            before_msg = f"dst={len(dst_df)}행/{dst_df['order_id'].nunique()}건"
-        else:
-            dst_df = pd.DataFrame()
-            merged = src_df
-            before_msg = "dst=없음"
-
-        operations.append({"src_path": src_path, "dst_path": dst_path, "merged": merged})
-        affected_ym_dirs.add(src_path.parent)
-        results.append(
-            f"{ym_part}: src={len(src_df)}행/{src_df['order_id'].nunique()}건, "
-            f"{before_msg}, merged={len(merged)}행/{merged['order_id'].nunique()}건, "
-            f"delete={src_path.parent}"
-        )
-
-    if dry_run:
-        return f"DRY-RUN | 백업예정={backup_root} | " + " | ".join(results)
-
-    for operation in operations:
-        src_path = operation["src_path"]
-        dst_path = operation["dst_path"]
-        merged = operation["merged"]
-
-        if backup:
-            src_backup = backup_root / src_path.relative_to(COUPANG_ORDERS_DB)
-            src_backup.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_path, src_backup)
-            if dst_path.exists():
-                dst_backup = backup_root / dst_path.relative_to(COUPANG_ORDERS_DB)
-                dst_backup.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(dst_path, dst_backup)
-
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
-        merged.astype(str).to_parquet(dst_path, index=False)
-        logger.info("migrated jungdong orders: %s -> %s (%d행)", src_path, dst_path, len(merged))
-
-    for ym_dir in sorted(affected_ym_dirs, key=lambda path: str(path), reverse=True):
-        shutil.rmtree(ym_dir)
-        logger.info("deleted source ym partition: %s", ym_dir)
-
-    try:
-        src_base.rmdir()
-        logger.info("deleted empty source store partition: %s", src_base)
-    except OSError:
-        logger.info("source store partition remains because it is not empty: %s", src_base)
-
-    backup_msg = f" | 백업={backup_root}" if backup else ""
-    return f"완료{backup_msg} | " + " | ".join(results)
 
 
 def _load_orders(files: list[dict[str, Path]]) -> dict:
     loaded_files: list[dict[str, Path]] = []
     outputs: list[str] = []
+    blocked_outputs: list[dict] = []
+    blocked_source_paths: set[str] = set()
+    append_only_outputs: list[dict] = []
     grouped_rows: dict[tuple[str, str, str], list[dict]] = {}
     total_rows = 0
+    blocked_rows = 0
 
     for item in files:
         path = Path(item["path"])
@@ -383,6 +462,8 @@ def _load_orders(files: list[dict[str, Path]]) -> dict:
 
             row_dict = row.astype(str).to_dict()
             row_dict["_row_hash"] = _row_hash_from_series(row.astype(str))
+            row_dict["_ingest_source_path"] = str(path)
+            row_dict["_ingest_source"] = str(source)
             grouped_rows.setdefault((brand, store, ym), []).append(row_dict)
             file_rows += 1
 
@@ -395,41 +476,102 @@ def _load_orders(files: list[dict[str, Path]]) -> dict:
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"orders_{ym}.parquet"
 
-        new_df = pd.DataFrame(rows)
-        new_df, removed_new = _deduplicate_coupang_orders(new_df)
-        if removed_new:
-            logger.warning("orders csv 내부 중복 제거: %s | %d행", out_path, removed_new)
-
+        raw_new_df = pd.DataFrame(rows).fillna("").astype(str)
+        source_paths = set(raw_new_df.get("_ingest_source_path", pd.Series(dtype=str)).tolist())
+        new_df = raw_new_df.drop(columns=ORDER_INTERNAL_COLUMNS, errors="ignore")
+        new_df = _ensure_item_menu_column(new_df)
         if out_path.exists():
             try:
-                existing = pd.read_parquet(out_path)
+                existing = _ensure_item_menu_column(pd.read_parquet(out_path))
             except Exception as exc:
                 logger.error("failed to read existing orders parquet %s: %s", out_path, exc)
                 existing = pd.DataFrame()
-
-            if not existing.empty and "order_id" in existing.columns and "order_id" in new_df.columns:
-                new_ids = set(new_df["order_id"].dropna().astype(str).unique())
-                keep = existing[~existing["order_id"].astype(str).isin(new_ids)]
-                combined = pd.concat([keep, new_df], ignore_index=True)
-            else:
-                combined = pd.concat([existing, new_df], ignore_index=True)
-                combined, removed = _deduplicate_coupang_orders(combined)
-                if removed:
-                    logger.warning("orders parquet 중복 제거: %s | %d행", out_path, removed)
         else:
-            combined = new_df
+            existing = pd.DataFrame()
+
+        new_dates = _coupang_sale_date(new_df["order_date"])
+        existing_dates = (
+            _coupang_sale_date(existing["order_date"])
+            if not existing.empty and "order_date" in existing.columns
+            else pd.Series(dtype=str)
+        )
+        combined, info = replace_covered_date_range(
+            existing,
+            new_df,
+            existing_dates,
+            new_dates,
+            order_key="order_id",
+        )
+        shrunk_dates = sorted(
+            set(info.get("shrunk_dates", []))
+            | set(info.get("partial_shrunk_dates", []))
+        )
+        if shrunk_dates:
+            logger.warning(
+                "coupang reingest order counts shrank; preserving existing rows and "
+                "appending only non-duplicates: %s/%s ym=%s "
+                "dates=%s details=%s sources=%s",
+                brand,
+                store,
+                ym,
+                shrunk_dates,
+                info.get("shrink_details", {}),
+                sorted(source_paths),
+            )
+            existing_for_append = existing.reset_index(drop=True)
+            existing_date_values = (
+                existing_dates.fillna("").astype(str).str.strip().reset_index(drop=True)
+            )
+            preserved_existing = existing_for_append.loc[
+                existing_date_values.isin(shrunk_dates)
+            ].copy()
+            combined = pd.concat([combined, preserved_existing], ignore_index=True)
+            append_only_outputs.append(
+                {
+                    "path": str(out_path),
+                    "brand": brand,
+                    "store": store,
+                    "ym": ym,
+                    "dates": shrunk_dates,
+                    "details": info.get("shrink_details", {}),
+                    "sources": sorted(source_paths),
+                }
+            )
+            info = {
+                **info,
+                "removed": 0,
+                "append_only": True,
+                "append_only_dates": shrunk_dates,
+            }
+
+        combined = _ensure_item_menu_column(combined)
+        combined, dropped = _deduplicate_orders(combined)
+        if dropped:
+            logger.warning("dropped duplicate coupang order rows: %s (%d rows)", out_path, dropped)
 
         combined = combined.astype(str)
         combined.to_parquet(out_path, index=False)
+        _record_reingest_dates(store, new_df, info)
         outputs.append(str(out_path))
         logger.info("saved orders parquet: %s (%d rows)", out_path, len(combined))
+
+    if blocked_source_paths:
+        loaded_files = [
+            item
+            for item in loaded_files
+            if str(Path(item["path"])) not in blocked_source_paths
+        ]
 
     return {
         "files_found": len(files),
         "files_loaded": len(loaded_files),
-        "rows_loaded": total_rows,
+        "rows_loaded": max(0, total_rows - blocked_rows),
         "outputs": outputs,
         "loaded_files": loaded_files,
+        "blocked_files": sorted(blocked_source_paths),
+        "blocked_outputs": blocked_outputs,
+        "rows_blocked": blocked_rows,
+        "append_only_outputs": append_only_outputs,
     }
 
 
@@ -513,8 +655,130 @@ def _load_csv_dataset(
     }
 
 
+def repair_coupang_orders_duplicates() -> str:
+    """기존 쿠팡 orders parquet의 중복 행을 저장 기준과 동일하게 정리한다."""
+    files = sorted(
+        path
+        for path in COUPANG_ORDERS_DB.glob("brand=*/store=*/ym=*/orders_*.parquet")
+        if _is_canonical_orders_file(path)
+    )
+    if not files:
+        return f"쿠팡 orders parquet 없음 | {COUPANG_ORDERS_DB}"
+
+    skipped = 0
+    frames: list[pd.DataFrame] = []
+    originals: dict[str, pd.DataFrame] = {}
+    for path in files:
+        try:
+            df = _ensure_item_menu_column(pd.read_parquet(path))
+        except Exception as exc:
+            skipped += 1
+            logger.warning("쿠팡 orders parquet 로드 실패, 스킵: %s | %s", path, exc)
+            continue
+        originals[str(path)] = df
+        if df.empty:
+            continue
+        brand = _partition_value(path, "brand")
+        store = _partition_value(path, "store")
+        work = df.copy()
+        work["_path"] = str(path)
+        work["_rel"] = str(path.relative_to(COUPANG_ORDERS_DB))
+        work["_row"] = range(len(work))
+        work["_brand"] = brand
+        work["_partition_store"] = store
+        work["_norm_store"] = (lookup_store_key(brand, store) or store).replace(" ", "")
+        work["_canonical_store_partition"] = (
+            work["_partition_store"].astype(str).str.replace(r"\s+", "", regex=True).eq(
+                work["_norm_store"]
+            )
+        )
+        frames.append(work)
+
+    total_before = sum(len(df) for df in originals.values())
+    if not frames:
+        return (
+            f"쿠팡 orders 중복 정리 완료 | 파일=0/{len(files)} "
+            f"스킵={skipped} 행={total_before}->{total_before} 제거=0"
+        )
+
+    all_rows = pd.concat(frames, ignore_index=True)
+    key_columns = ["_brand", "_norm_store", *ORDER_DEDUP_COLUMNS]
+    key = _normalized_dedup_key(all_rows, key_columns)
+    rank = pd.DataFrame(
+        {
+            "_canonical_store_partition": all_rows["_canonical_store_partition"].astype(int),
+            "_rel": all_rows["_rel"].astype(str),
+            "_row": all_rows["_row"].astype(int),
+        },
+        index=all_rows.index,
+    )
+    ordered = rank.sort_values(
+        ["_canonical_store_partition", "_rel", "_row"],
+        kind="stable",
+    ).index
+    keep_ordered = ~key.loc[ordered].duplicated(keep="last")
+    keep = pd.Series(False, index=all_rows.index)
+    keep.loc[ordered[keep_ordered.to_numpy()]] = True
+    remove = all_rows[~keep]
+
+    changed = 0
+    total_after = total_before - len(remove)
+    if remove.empty:
+        return (
+            f"쿠팡 orders 중복 정리 완료 | 파일=0/{len(files)} "
+            f"스킵={skipped} 행={total_before}->{total_after} 제거=0"
+        )
+
+    for path_text, group in remove.groupby("_path"):
+        path = Path(path_text)
+        df = originals[path_text]
+        drop_rows = set(group["_row"].astype(int).tolist())
+        fixed = df.loc[[idx for idx in range(len(df)) if idx not in drop_rows]].reset_index(
+            drop=True
+        )
+        if fixed.empty:
+            path.unlink(missing_ok=True)
+        else:
+            fixed.astype(str).to_parquet(path, index=False)
+        changed += 1
+        logger.warning("쿠팡 orders 중복 정리: %s 제거=%d", path, len(drop_rows))
+
+    return (
+        f"쿠팡 orders 중복 정리 완료 | 파일={changed}/{len(files)} "
+        f"스킵={skipped} 행={total_before}->{total_after} 제거={total_before - total_after}"
+    )
+
+
+def move_coupang_down_to_collect() -> str:
+    """Move coupang CSV files from download dirs → COLLECT_SRC (영업관리부_수집).
+
+    DB_CollectionCompare_Dags에서만 호출. 적재는 DB_CoupangMacro_Load_Dags가 담당.
+    """
+    COLLECT_SRC.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for prefix in COUPANG_RAW_PREFIXES:
+        pattern = f"coupangeats_{prefix}_*.csv"
+        for _, source_dir in _raw_source_dirs(include_collect=False):
+            for item in sorted(glob(str(source_dir / pattern))):
+                src = Path(item)
+                dest = _collect_dest_path(src)
+                try:
+                    shutil.move(str(src), str(dest))
+                    logger.info("moved to collect: %s -> %s", src.name, dest)
+                    moved += 1
+                except Exception as exc:
+                    logger.warning("failed to move %s: %s", src, exc)
+    return f"이동 완료: {moved}개"
+
+
 def load_coupang_macro_partition() -> str:
-    """Load Coupang macro raw CSV files from DOWN_DIR/Collect_Data and clean sources."""
+    """Load Coupang macro raw CSV files from configured source dirs and clean sources."""
+    with _coupang_load_lock():
+        return _load_coupang_macro_partition_unlocked()
+
+
+def _load_coupang_macro_partition_unlocked() -> str:
+    misplaced_moved = move_misplaced_coupang_marketing_to_collect()
     order_files = _iter_source_files("orders")
     cmg_files = _iter_source_files("cmg")
     options_files = _iter_source_files("options")
@@ -529,6 +793,8 @@ def load_coupang_macro_partition() -> str:
                 "orders": {"files_found": 0, "files_loaded": 0, "rows_loaded": 0, "outputs": []},
                 "cmg": {"files_found": 0, "files_loaded": 0, "rows_loaded": 0, "outputs": []},
                 "options": {"files_found": 0, "files_loaded": 0, "rows_loaded": 0, "outputs": []},
+                "misplaced_moved_count": len(misplaced_moved),
+                "misplaced_moved_files": misplaced_moved,
             },
             ensure_ascii=False,
         )
@@ -555,6 +821,19 @@ def load_coupang_macro_partition() -> str:
     loaded_files.extend(options_result["loaded_files"])
     _cleanup_sources(loaded_files)
 
+    if order_result.get("blocked_outputs"):
+        raise RuntimeError(
+            "쿠팡 orders 재적재 차단: 기존 주문 수보다 적은 원천 파일이 감지되었습니다. "
+            + json.dumps(
+                {
+                    "blocked_outputs": order_result.get("blocked_outputs", []),
+                    "blocked_files": order_result.get("blocked_files", []),
+                    "rows_blocked": order_result.get("rows_blocked", 0),
+                },
+                ensure_ascii=False,
+            )
+        )
+
     return json.dumps(
         {
             "status": "ok",
@@ -563,6 +842,10 @@ def load_coupang_macro_partition() -> str:
                 "files_loaded": order_result["files_loaded"],
                 "rows_loaded": order_result["rows_loaded"],
                 "outputs": order_result["outputs"],
+                "blocked_outputs": order_result.get("blocked_outputs", []),
+                "blocked_files": order_result.get("blocked_files", []),
+                "rows_blocked": order_result.get("rows_blocked", 0),
+                "append_only_outputs": order_result.get("append_only_outputs", []),
             },
             "cmg": {
                 "files_found": cmg_result["files_found"],
@@ -578,6 +861,8 @@ def load_coupang_macro_partition() -> str:
             },
             "cleaned_count": len(loaded_files),
             "cleaned_files": [str(item["path"]) for item in loaded_files],
+            "misplaced_moved_count": len(misplaced_moved),
+            "misplaced_moved_files": misplaced_moved,
         },
         ensure_ascii=False,
     )

@@ -18,6 +18,7 @@ from modules.transform.utility.paths import (
     STORE_SALES_DAILY_ACTUALS_CSV,
     STORE_SALES_TARGET_DIR,
 )
+from modules.transform.pipelines.db.DB_UnifiedSales_common import iter_unified_sales_files
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +117,7 @@ def run_daily_actuals(**context) -> str:
     # 처리 대상 parquet 결정
     if not existing_dates:
         # 최초 실행: 전체 backfill
-        target_paths = sorted(UNIFIED_SALES_DIR.glob("unified_sales_*.parquet"))
+        target_paths = iter_unified_sales_files()
         logger.info("최초 실행 — 전체 parquet %d개 처리", len(target_paths))
     else:
         date_suffix = exec_date.replace("-", "")[2:]  # "2026-04-21" → "260421"

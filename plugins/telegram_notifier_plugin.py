@@ -14,6 +14,10 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_SUPPRESS_GENERIC_FAILURE_TASKS = {
+    ("DB_Beamin_Macro_Dags_Retry", "notify_and_trigger_next"),
+}
+
 
 def _send(text):
     try:
@@ -57,6 +61,10 @@ def _is_final_retry(ti) -> bool:
     return try_number >= max_tries
 
 
+def _suppress_generic_failure_alert(ti) -> bool:
+    return (getattr(ti, "dag_id", ""), getattr(ti, "task_id", "")) in _SUPPRESS_GENERIC_FAILURE_TASKS
+
+
 class _Listener:
     @hookimpl
     def on_task_instance_failed(self, previous_state, task_instance, error=None, session=None):
@@ -64,6 +72,13 @@ class _Listener:
             ti = task_instance
 
             if _has_custom_task_callback(ti):
+                return
+            if _suppress_generic_failure_alert(ti):
+                logger.info(
+                    "[TelegramPlugin] suppressed generic failure alert: dag_id=%s task_id=%s",
+                    getattr(ti, "dag_id", ""),
+                    getattr(ti, "task_id", ""),
+                )
                 return
             if not _is_final_retry(ti):
                 return

@@ -42,6 +42,7 @@ from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
+import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -156,6 +157,7 @@ _ORDER_COLUMNS = [
     "order_summary",
     "total_price",
     "is_cancelled",
+    "item_menu",
     "menu_name",
     "menu_qty",
     "menu_price",
@@ -414,7 +416,6 @@ def _attach_to_real_chrome(account_id: str):
 
 
 def launch_browser(account_id: str):
-    import undetected_chromedriver as uc
     # ── attach 모드: 환경변수가 있으면 실제(호스트) 크롬에 붙어서 사용 ──
     attached = _attach_to_real_chrome(account_id)
     if attached is not None:
@@ -1937,6 +1938,7 @@ def _parse_order_card(driver, card, store_id: str, store_name: str, collected_at
                 for opt in menu["options"]:
                     rows.append({
                         **base,
+                        "item_menu": menu["name"],
                         "menu_name": menu["name"],
                         "menu_qty": menu["qty"],
                         "menu_price": menu["price"] if first_opt else "",
@@ -1946,7 +1948,15 @@ def _parse_order_card(driver, card, store_id: str, store_name: str, collected_at
                     first_opt = False
                     first_row = False
         else:
-            rows.append({**base, "menu_name": "", "menu_qty": "", "menu_price": "", "menu_options": "", **settlement})
+            rows.append({
+                **base,
+                "item_menu": "",
+                "menu_name": "",
+                "menu_qty": "",
+                "menu_price": "",
+                "menu_options": "",
+                **settlement,
+            })
 
     except Exception as exc:
         log(f"_parse_order_card error: {exc}", "")

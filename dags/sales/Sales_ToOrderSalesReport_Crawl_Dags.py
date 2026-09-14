@@ -22,6 +22,7 @@ from pathlib import Path
 import pandas as pd
 import pendulum
 from airflow import DAG
+from airflow.exceptions import AirflowException
 from airflow.operators.python import PythonOperator
 
 from modules.extract.crawling_toorder_sales_report import (
@@ -31,6 +32,8 @@ from modules.extract.crawling_toorder_sales_report import (
 from modules.transform.utility.paths import ANALYTICS_DB, DOWN_DIR
 from modules.transform.utility.schedule import SMD_TOORDER_SALES_REPORT_TIME
 from modules.transform.utility.notifier import on_failure_callback
+from modules.transform.utility.account import get_default_account
+from modules.transform.utility.dag_defaults import COLLECT_DAGRUN_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +41,7 @@ logger = logging.getLogger(__name__)
 # 설정
 # ============================================================
 
-TOORDER_ID = "doridang15"
-TOORDER_PW = "ehfl5233!"
+TOORDER_ID, TOORDER_PW = get_default_account("toorder")
 
 LOOKBACK_DAYS = 7
 BACKFILL_START = "2026-01-01"
@@ -133,6 +135,17 @@ def crawl_reports(**context) -> str:
             )
 
     context["ti"].xcom_push(key="downloaded_files", value=downloaded)
+
+    # 수집 대상이 있는데 한 건도 못 받았으면 실패다.
+    # 2026-09-05~09-10: 투오더 날짜 입력 선택자가 깨져 매일 0/N 으로 끝났는데도
+    # 태스크가 success로 마감돼, 6일치 결측을 아무도 모른 채 지나갔다.
+    if date_list and not downloaded:
+        reasons = {f.get("error") for f in failed if f.get("error")}
+        raise AirflowException(
+            f"투오더 종합보고서 {len(date_list)}일 전부 수집 실패 "
+            f"(사유: {', '.join(sorted(reasons)) or '알 수 없음'})"
+        )
+
     return f"{len(downloaded)}건 다운로드 완료"
 
 
@@ -236,6 +249,7 @@ with DAG(
     start_date=pendulum.datetime(2026, 1, 1, tz="Asia/Seoul"),
     catchup=False,
     max_active_runs=1,
+    dagrun_timeout=COLLECT_DAGRUN_TIMEOUT,
     tags=["01_crawling", "toorder", "sales_report", "daily"],
     default_args={
         "retries": 1,

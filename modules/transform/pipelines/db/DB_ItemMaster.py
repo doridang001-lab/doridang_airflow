@@ -26,7 +26,7 @@ import pandas as pd
 
 from modules.extract.extract_db import db_read_table as read_table
 from modules.load.load_postgre_db import postgre_db_save
-from modules.transform.utility.paths import FIN_PRODUCT_CSV_PATH, ITEM_MASTER_CHECKPOINT_DIR, LOCAL_DB, MART_DB
+from modules.transform.utility.paths import FIN_PRODUCT_CSV_PATH, ITEM_MASTER_CHECKPOINT_DIR, LOCAL_DB, MART_DB, existing_fin_product_csv_path
 
 logger = logging.getLogger(__name__)
 
@@ -78,15 +78,16 @@ def _item_pk(store: str, platform: str, item_id: str) -> str:
 
 @lru_cache(maxsize=1)
 def _load_fin_product_master() -> pd.DataFrame:
-    """fin_product_grp.csv 로드 (판매단가/제외 플래그 매핑 용도)."""
+    """fin_product_grp_input.csv 로드 (판매단가/제외 플래그 매핑 용도)."""
     try:
-        if not FIN_PRODUCT_CSV_PATH.exists():
+        source_path = existing_fin_product_csv_path()
+        if not source_path.exists():
             return pd.DataFrame(columns=["상품코드", "판매단가", "exclude_check"])
     except Exception:
         return pd.DataFrame(columns=["상품코드", "판매단가", "exclude_check"])
 
     try:
-        df = pd.read_csv(FIN_PRODUCT_CSV_PATH, dtype=str).fillna("")
+        df = pd.read_csv(source_path, dtype=str).fillna("")
     except Exception:
         return pd.DataFrame(columns=["상품코드", "판매단가", "exclude_check"])
 
@@ -409,7 +410,7 @@ def classify_by_llm_items(items: list[dict]) -> dict[str, dict]:
         "너는 한국 F&B 주문 상품(메인/옵션/사이드/음료/추가/요청사항)을 분류하는 전문가야.\n"
         "입력에는 item_name(원문), item_name_norm(정규화), menu_name(가능하면), brand(가능하면), qty, unit_price 관련 값이 포함될 수 있어.\n"
         "- 가능하면 unit_price_each(단가) 기준으로 판단해. (unit_price_total/qty에서 계산된 값일 수 있어)\n"
-        "- fin_unit_price(=fin_product_grp.csv 판매단가)가 있으면 단가가 그 근처인지 참고해.\n"
+        "- fin_unit_price(=fin_product_grp_input.csv 판매단가)가 있으면 단가가 그 근처인지 참고해.\n"
         "- exclude_check=Y이면 타브랜드/제외 상품일 수 있으니 보수적으로 '미분류'로 두고 confidence를 낮게 줘.\n"
         "- 단가가 0이면 '요청사항' 또는 '옵션'일 가능성이 높아.\n"
         "- 용량/수량(예: 350ml, 1개 등)은 분류에 크게 영향 없으니 무시해.\n"
@@ -518,7 +519,7 @@ def extract_new_orders(limit: int | None = None, skip_dedup: bool = False) -> pd
     ).fillna(0).astype(int)
     df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0).astype(int)
 
-    # fin_product_grp.csv(판매단가)와 비교해 unit_price(총액/단가) 혼선을 완화
+    # fin_product_grp_input.csv(판매단가)와 비교해 unit_price(총액/단가) 혼선을 완화
     # - 과거 데이터: unit_price가 "총액"으로 들어온 케이스가 있어 qty로 나눈 값이 단가에 더 근접할 수 있음
     # - 신규 데이터(보정 이후): unit_price가 이미 "단가"인 케이스가 있어 그대로 쓰는 편이 안전
     fin_df = _load_fin_product_master()

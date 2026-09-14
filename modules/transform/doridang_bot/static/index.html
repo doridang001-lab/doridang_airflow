@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>도리당봇</title>
+  <link rel="stylesheet" href="/static/chat.css?v=20260909-dialogue">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" aria-label="대화 세션">
+      <div class="home-row">
+        <button id="home-button" class="home-button" type="button" aria-label="홈">
+          <img src="/static/logo.png" alt="">
+        </button>
+        <span>도리당봇</span>
+      </div>
+      <div class="sidebar-head">
+        <strong>대화 기록</strong>
+        <button id="new-session-button" class="new-session" type="button">새 대화</button>
+      </div>
+      <div class="side-tabs">
+        <a
+          class="side-tab"
+          href="https://app.powerbi.com/groups/me/reports/8c5edd6a-0f50-4ef7-8577-153cec638716/b3b0769b6b20106b665a?ctid=849b5035-01a1-48ed-9a23-5bb83c6d0873&experience=power-bi"
+          target="_blank"
+          rel="noopener noreferrer"
+        >도리당센터</a>
+      </div>
+      <nav id="session-list" class="session-list"></nav>
+    </aside>
+    <main class="app">
+      <header class="topbar">
+        <div>
+          <h1>도리당봇</h1>
+          <p id="session-title">Flow 프로젝트 분석</p>
+        </div>
+        <span id="state" class="state">대기</span>
+      </header>
+      <section id="messages" class="messages" aria-live="polite"></section>
+      <form id="chat-form" class="composer">
+        <textarea id="message-input" rows="2" placeholder="담당자와 업무를 편하게 물어보세요"></textarea>
+        <button id="send-button" type="submit" aria-label="전송">↑</button>
+      </form>
+    </main>
+  </div>
+  <script src="/static/chat.js?v=20260909-verified"></script>
+</body>
+</html>

@@ -3,12 +3,12 @@
 
 처리 요약:
 1) OKPOS 상품조회.xlsx 로드
-2) fin_product_grp.csv와 비교 → 신규/변경 감지
-3) LLM(Ollama)으로 수동분류 + is_main_candidate 자동 분류
+2) fin_product_grp_input.csv와 비교 → 신규/변경 감지
+3) 신규/변경 상품 초안 분류
 4) CSV에 append (llm_check=Y)
-5) 이메일 알림 → 사용자가 검토 후 llm_check 직접 N으로 수정
+5) 이메일 알림 → map DAG/review 파일에서 표준명과 수동분류 검수
 
-스케줄: DB_FIN_PRODUCT_TIME (매일 10:35, OKPOS Product 완료 후)
+스케줄: DB_FIN_PRODUCT_TIME (매일 10:00, UnifiedSales 및 상품 map 완료 후)
 """
 
 import logging
@@ -23,14 +23,12 @@ from modules.transform.utility.schedule import DB_FIN_PRODUCT_TIME
 from modules.transform.pipelines.db.DB_FinProduct import (
     load_okpos_product_xlsx,
     detect_product_changes,
-    build_fin_product_grp_train_json,
     classify_with_llm,
     update_product_master,
     send_alert_email,
     finalize_unionpos_pending,
     apply_review_approvals,
     build_fin_product_mart,
-    build_launch_tracking,
 )
 from modules.transform.utility.notifier import on_failure_callback
 
@@ -78,47 +76,36 @@ with DAG(
     )
 
     t3 = PythonOperator(
-        task_id="build_fin_product_grp_train_json",
-        python_callable=build_fin_product_grp_train_json,
-    )
-
-    t4 = PythonOperator(
         task_id="classify_with_llm",
         python_callable=classify_with_llm,
         op_kwargs={"enable_llm": ENABLE_LLM},
     )
 
-    t5 = PythonOperator(
+    t4 = PythonOperator(
         task_id="update_product_master",
         python_callable=update_product_master,
     )
 
-    t6 = PythonOperator(
+    t5 = PythonOperator(
         task_id="send_alert_email",
         python_callable=send_alert_email,
     )
 
-    t7 = PythonOperator(
+    t6 = PythonOperator(
         task_id="finalize_unionpos_pending",
         python_callable=finalize_unionpos_pending,
         op_kwargs={"enable_llm": ENABLE_LLM},
     )
 
-    t8 = PythonOperator(
+    t7 = PythonOperator(
         task_id="apply_review_approvals",
         python_callable=apply_review_approvals,
     )
 
-    t9 = PythonOperator(
+    t8 = PythonOperator(
         task_id="build_fin_product_mart",
         python_callable=build_fin_product_mart,
         trigger_rule="all_done",
     )
 
-    t10 = PythonOperator(
-        task_id="build_launch_tracking",
-        python_callable=build_launch_tracking,
-        trigger_rule="all_done",
-    )
-
-    t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7 >> t8 >> t9 >> t10
+    t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7 >> t8

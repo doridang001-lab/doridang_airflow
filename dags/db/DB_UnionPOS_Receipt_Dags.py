@@ -10,7 +10,7 @@ UnionPOS 영수증 원본 자동 수집 DAG
   - unionpos_receipt_list.csv  : 영수증 헤더
   - unionpos_receipt_items.csv : 영수증 상세품목
 
-스케줄: 매일 07:55 (DB_UNIONPOS_RECEIPT_TIME)
+스케줄: 매일 06:20 (DB_UNIONPOS_RECEIPT_TIME)
 인증: UnionPOS ID/PW (파이프라인 상수)
 """
 
@@ -23,6 +23,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 
 from modules.transform.utility.notifier import enqueue_heal_task, send_telegram
+from modules.transform.utility.mail_recipients import MAIL_CMJ_PM
 from modules.transform.utility.schedule import DB_UNIONPOS_RECEIPT_TIME
 from modules.transform.pipelines.db.DB_UnionPOS_Receipt import (
     resolve_sale_dates,
@@ -43,7 +44,7 @@ MANUAL_DATE_RANGE: tuple | None = None
 # None → 어제 1일만 (기본), int → 최근 N일 전체 (collect_and_save upsert으로 중복 방지)
 # Backfill: conf {"sale_date": "YYYY-MM-DD"} 또는 {"sale_date_from": "...", "sale_date_to": "..."}
 LOOKBACK_DAYS: int | None = 7
-_ALERT_EMAILS = ["a17019@kakao.com"]
+_ALERT_EMAILS = [MAIL_CMJ_PM]
 
 
 def _on_failure_callback(context):
@@ -95,6 +96,7 @@ with DAG(
     t2 = PythonOperator(
         task_id="collect_and_save",
         python_callable=collect_and_save,
+        pool="selenium_pool",
         retries=2,
         retry_delay=timedelta(minutes=3),
     )

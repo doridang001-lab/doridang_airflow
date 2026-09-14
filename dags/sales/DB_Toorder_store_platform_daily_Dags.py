@@ -1,14 +1,17 @@
 """
-ToOrder datedetail monthly recollection DAG.
+ToOrder datedetail store/platform daily sales DAG.
 
-- Default: recollect 2025-07-01 through yesterday in KST by month spans.
+- Default: collect the day after the latest parquet date through yesterday in KST.
+  If the parquet is missing or unreadable, collect missing dates in LOOKBACK_DAYS.
 - conf ``month``: collect that month only, for example {"month": "2025-07"}.
 - conf ``sale_date_from`` and ``sale_date_to``: collect the inclusive range.
+- conf ``backfill``: recollect 2025-07-01 through yesterday in KST.
 """
 
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pandas as pd
 import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -16,6 +19,7 @@ from airflow.operators.python import PythonOperator
 from modules.transform.pipelines.sales.DB_Toorder_store_platform_daily import (
     cleanup_datedetail_xlsx,
     run_toorder_store_platform_daily,
+    toorder_partial_dates,
 )
 from modules.transform.utility.paths import ANALYTICS_DB
 from modules.transform.utility.schedule import DB_TOORDER_STORE_PLATFORM_TIME
@@ -23,6 +27,61 @@ from modules.transform.utility.notifier import on_failure_callback
 
 PARQUET_PATH = ANALYTICS_DB / "toorder_daily_store_platform" / "toorder_store_platform_daily.parquet"
 DEFAULT_DATE_FROM = "2025-07-01"
+LOOKBACK_DAYS = 3
+
+
+def _parquet_has_date(date_str: str) -> bool:
+    if not PARQUET_PATH.exists():
+        return False
+    try:
+        dates = pd.read_parquet(PARQUET_PATH, columns=["date"])
+    except Exception:
+        return False
+    return date_str in set(dates["date"].astype(str))
+
+
+def _parquet_max_date() -> str | None:
+    if not PARQUET_PATH.exists():
+        return None
+    try:
+        dates = pd.read_parquet(PARQUET_PATH, columns=["date"])
+    except Exception:
+        return None
+    parsed = pd.to_datetime(dates["date"], errors="coerce").dropna()
+    if parsed.empty:
+        return None
+    return parsed.max().strftime("%Y-%m-%d")
+
+
+def _default_date_bounds() -> tuple[str, str]:
+    today = pendulum.now("Asia/Seoul")
+    yesterday = today.subtract(days=1).format("YYYY-MM-DD")
+    lookback_start = today.subtract(days=LOOKBACK_DAYS).format("YYYY-MM-DD")
+    partial_dates = toorder_partial_dates(
+        PARQUET_PATH,
+        date_from=lookback_start,
+        date_to=yesterday,
+    )
+    if partial_dates:
+        ordered = sorted(partial_dates)
+        return ordered[0], ordered[-1]
+
+    max_date = _parquet_max_date()
+    if max_date:
+        next_date = pendulum.parse(max_date, tz="Asia/Seoul").add(days=1).format("YYYY-MM-DD")
+        if next_date <= yesterday:
+            return next_date, yesterday
+        return yesterday, yesterday
+
+    candidates = [
+        today.subtract(days=i).format("YYYY-MM-DD")
+        for i in range(1, LOOKBACK_DAYS + 1)
+    ]
+    missing = [date_str for date_str in candidates if not _parquet_has_date(date_str)]
+    if missing:
+        ordered = sorted(missing)
+        return ordered[0], ordered[-1]
+    return yesterday, yesterday
 
 
 def resolve_dates(**context) -> str:
@@ -30,9 +89,12 @@ def resolve_dates(**context) -> str:
     month = conf.get("month")
     sale_date_from = conf.get("sale_date_from")
     sale_date_to = conf.get("sale_date_to")
+    backfill = conf.get("backfill")
 
     if month and (sale_date_from or sale_date_to):
         raise ValueError("month and sale_date_from/sale_date_to cannot be used together.")
+    if backfill and (month or sale_date_from or sale_date_to):
+        raise ValueError("backfill cannot be used with month or sale_date_from/sale_date_to.")
 
     if month:
         start = datetime.strptime(f"{month}-01", "%Y-%m-%d")
@@ -49,9 +111,11 @@ def resolve_dates(**context) -> str:
             raise ValueError(f"sale_date_from({sale_date_from}) is after sale_date_to({sale_date_to}).")
         date_from = sale_date_from
         date_to = sale_date_to
-    else:
+    elif backfill:
         date_from = DEFAULT_DATE_FROM
         date_to = pendulum.now("Asia/Seoul").subtract(days=1).format("YYYY-MM-DD")
+    else:
+        date_from, date_to = _default_date_bounds()
 
     context["ti"].xcom_push(key="date_from", value=date_from)
     context["ti"].xcom_push(key="date_to", value=date_to)
@@ -67,6 +131,7 @@ def collect_and_save(**context) -> str:
         date_from=date_from,
         date_to=date_to,
         log_prefix="[1st] ",
+        force_download=True,
     )
 
 

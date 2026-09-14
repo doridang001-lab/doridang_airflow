@@ -8,11 +8,12 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from modules.transform.utility.io import read_csv_glob
 from modules.transform.utility.paths import COLLECT_DB, ONEDRIVE_DB, LOCAL_DB, TEMP_DIR
-from modules.transform.utility.io import load_data, send_email, text_to_html, create_sub_order_id_simple
+from modules.transform.utility.io import load_data, send_email, text_to_html, create_sub_order_id_simple, resolve_mail_recipients
 from modules.load.load_local_db import local_db_save
 from modules.load.backup_to_onedrive import backup_to_onedrive
 from modules.transform.utility.io import load_files, preprocess_df, save_to_csv, join_dataframes, validate_and_alert_settlement
 from modules.transform.utility.store_name_mapping import normalize_store_names
+from modules.transform.utility.mail_recipients import MAIL_CMJ_PM, apply_manager_mail_variables
 
 from modules.transform.utility.io import (
     load_files, 
@@ -25,7 +26,7 @@ from modules.transform.utility.io import (
 # ============================================================
 # 🔧 이메일 발송 모드 설정
 # ============================================================
-TEST_MODE = False  # True: 테스트용(a17019@kakao.com), False: 실전용(직원 이메일)
+TEST_MODE = False  # True: 테스트용(MAIL_CMJ_PM), False: 실전용(직원 이메일)
 
 # 실전 모드에서도 개발자 참조 메일을 받을지 여부
 DEV_CC_IN_PROD = True
@@ -45,16 +46,12 @@ def get_recipients(manager_email=None):
     """
     if TEST_MODE:
         # 테스트 모드: 개발자 메일만
-        return ["a17019@kakao.com"]
+        return resolve_mail_recipients(MAIL_CMJ_PM)
     else:
         # 실전 모드: 담당자 실제 이메일 + (옵션) 개발자 참조
-        recipients = []
-        if manager_email and pd.notna(manager_email) and manager_email.strip():
-            recipients.append(manager_email)
         if DEV_CC_IN_PROD:
-            # 개발자 참조 메일 추가
-            recipients.extend(["a17019@kakao.com"])
-        return recipients
+            return resolve_mail_recipients(manager_email, MAIL_CMJ_PM)
+        return resolve_mail_recipients(manager_email)
 
 
 # ============================================================
@@ -837,6 +834,7 @@ def preprocess_join_orders_with_stores(
         print(f"  - 컬럼: {list(employee_df.columns) if employee_df is not None else 'N/A'}")
     
     if employee_df is not None and len(employee_df) > 0:
+        employee_df = apply_manager_mail_variables(employee_df)
         print(f"\n[직원정보] 로드: {len(employee_df)}건")
         print(f"[직원정보] 컬럼: {list(employee_df.columns)}")
         

@@ -21,6 +21,7 @@ from modules.transform.utility.paths import LOCAL_DB
 
 import sys
 from modules.transform.utility.notifier import on_failure_callback
+from modules.transform.utility.account import get_default_account
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 filename = os.path.basename(__file__)
@@ -32,8 +33,7 @@ pipeline_module = importlib.import_module(pipeline_module_path)
 run_toorder_voc_crawling = pipeline_module.run_toorder_voc_crawling
 DOWNLOAD_DIR = pipeline_module.DOWNLOAD_DIR
 
-TOORDER_ID = "doridang15"
-TOORDER_PW = "ehfl5233!"
+TOORDER_ID, TOORDER_PW = get_default_account("toorder")
 
 
 # ============================================================

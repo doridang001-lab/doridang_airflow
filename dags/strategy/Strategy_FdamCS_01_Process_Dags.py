@@ -34,6 +34,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from modules.transform.utility.paths import DOWN_DIR, TEMP_DIR
 from modules.transform.utility.io import SMP_FDAM_CS_TIME
+from modules.transform.utility.mail_recipients import (
+    MAIL_CEO,
+    MAIL_CMJ_PM,
+    MAIL_OH_NAYOUNG,
+    MAIL_SIM_SUNGJUN_1,
+    MAIL_SIM_SUNGJUN_2,
+    resolve_mail_recipients,
+)
 from modules.load.load_gsheet import save_to_gsheet
 from modules.transform.utility.store_name_mapping import normalize_store_names, normalize_for_join
 from modules.transform.utility.notifier import on_failure_callback
@@ -82,17 +90,16 @@ MEMO_REQUIRED_KEYS = ['업체:', '이슈유형:', '완료예정일:', '지연사
 
 # ── 운영 수신자 ──────────────────────────────────────────────
 # 보낼 이메일 (TO): 담당자 이메일 외 항상 포함할 수신자 목록
-CS_ALERT_TO_EMAILS  = ["simjeong01@kakao.com", "simjeong00@kakao.com"]
+CS_ALERT_TO_EMAILS  = [MAIL_SIM_SUNGJUN_1, MAIL_SIM_SUNGJUN_2]
 
 # 참조 이메일 (CC): 항상 참조로 추가 — 없으면 빈 리스트
-CS_ALERT_CC_EMAILS  = ['bulu1017@kakao.com', 'a17019@kakao.com', 'siw22222@kakao.com']
-# siw22222@kakao.com 대표님 이메일
+CS_ALERT_CC_EMAILS  = [MAIL_OH_NAYOUNG, MAIL_CMJ_PM, MAIL_CEO]
 
 # ── 테스트 설정 ──────────────────────────────────────────────
 # True  → 아래 테스트 주소로만 발송 (담당자·CC 무시)
 # False → 운영 모드: 담당자 + TO_EMAILS 에 발송, CC_EMAILS 참조
 CS_ALERT_TEST_MODE  = False
-CS_ALERT_TEST_EMAIL = 'a17019@kakao.com'   # 테스트 수신 주소
+CS_ALERT_TEST_EMAIL = MAIL_CMJ_PM   # 테스트 수신 주소
 
 # ============================================================
 # 매장 → 매입처 매핑
@@ -1595,16 +1602,23 @@ def _build_overdue_email_html(df: pd.DataFrame, today_str: str) -> str:
 def _send_cs_alert_email(subject: str, html_content: str,
                          to_emails: list, cc_emails: list = None):
     """CS 알림 전용 SMTP 발송 — TO / CC 헤더 분리 지원"""
+    import logging
     import smtplib
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
     from airflow.hooks.base import BaseHook
 
+    logger = logging.getLogger(__name__)
+
     conn = BaseHook.get_connection(CS_ALERT_EMAIL_CONN_ID)
     from_email = conn.extra_dejson.get('from_email') or conn.login
 
-    cc_list = cc_emails or []
-    to_list = to_emails if to_emails else []
+    cc_list = resolve_mail_recipients(cc_emails)
+    to_list = resolve_mail_recipients(to_emails)
+    all_recipients = resolve_mail_recipients(to_list, cc_list)
+    if not all_recipients:
+        print(f"  📧 수신자 없음 - 발송 스킵: {subject}")
+        return
 
     msg = MIMEMultipart('alternative')
     msg['Subject'] = subject
@@ -1615,13 +1629,16 @@ def _send_cs_alert_email(subject: str, html_content: str,
 
     msg.attach(MIMEText(html_content, 'html', 'utf-8'))
 
-    all_recipients = to_list + cc_list
     print(f"  📧 발송: TO={to_list} | CC={cc_list}")
 
-    with smtplib.SMTP(conn.host, conn.port) as server:
-        server.starttls()
-        server.login(conn.login, conn.password)
-        server.sendmail(from_email, all_recipients, msg.as_string())
+    try:
+        with smtplib.SMTP(conn.host, conn.port) as server:
+            server.starttls()
+            server.login(conn.login, conn.password)
+            server.sendmail(from_email, all_recipients, msg.as_string())
+    except Exception as exc:
+        logger.error("CS 알림 메일 발송 실패 - DAG 진행을 위해 실패를 반환값으로 처리: %s", exc)
+        return f"메일 발송 실패: {exc}"
 
     return f"TO={to_list} CC={cc_list}"
 
@@ -2008,7 +2025,7 @@ def cleanup_files(**context):
 def check_data_freshness(**context):
     """
     Google Sheets의 uploaded_at 컬럼 최대값이 오늘 날짜인지 확인.
-    당일 데이터가 없으면 a17019@kakao.com 에만 이메일 알림.
+    당일 데이터가 없으면 MAIL_CMJ_PM 에만 이메일 알림.
     프담 매크로 로그인 실패로 데이터 미수집 시 조기 감지 목적.
     """
     import gspread
@@ -2073,7 +2090,7 @@ def check_data_freshness(**context):
 
 
 def _send_freshness_alert_email(today_str: str, max_date, reason: str):
-    """프담 데이터 수집 이상 감지 알림 이메일 발송 (a17019@kakao.com 단독 수신)"""
+    """프담 데이터 수집 이상 감지 알림 이메일 발송 (MAIL_CMJ_PM 단독 수신)"""
     max_date_text = max_date if max_date else "알 수 없음"
     html = f"""<!DOCTYPE html>
 <html>
@@ -2134,10 +2151,10 @@ def _send_freshness_alert_email(today_str: str, max_date, reason: str):
     _send_cs_alert_email(
         subject=subject,
         html_content=html,
-        to_emails=['a17019@kakao.com'],
+        to_emails=[MAIL_CMJ_PM],
         cc_emails=[],
     )
-    print(f"[데이터신선도] 알림 이메일 발송 완료 → a17019@kakao.com")
+    print(f"[데이터신선도] 알림 이메일 발송 완료 → {MAIL_CMJ_PM}")
 
 
 # ============================================================
@@ -2170,6 +2187,8 @@ with DAG(
     t2_download = PythonOperator(
         task_id='download_cs_excel',
         python_callable=download_cs_excel,
+        retries=2,
+        retry_delay=pd.Timedelta(minutes=3),
         execution_timeout=pd.Timedelta(minutes=15),
     )
 

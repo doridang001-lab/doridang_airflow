@@ -19,7 +19,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeout, Error as PlaywrightError
 
 from modules.transform.utility.paths import RAW_UNIONPOS_SALES
 from modules.transform.utility.playwright_launcher import launch_chromium
@@ -43,28 +43,57 @@ _RETRY_BASE_WAIT = 5  # 초; 실제 대기: 5, 15
 # ── 로그인 ────────────────────────────────────────────────────────────────────
 
 def _login(page: Page) -> None:
-    page.goto(UNIONPOS_LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+    page.goto(UNIONPOS_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
     page.fill("#userId", UNIONPOS_ID)
     page.fill("#password", UNIONPOS_PW)
     page.click("#btnLogin")
+    deadline = time.time() + 60
+    last_url = page.url
+    while time.time() < deadline:
+        if page.is_closed():
+            raise PlaywrightTimeout("UnionPOS 로그인 중 페이지가 닫혔습니다")
+        last_url = page.url
+        if "/v2/" in last_url:
+            logger.info(f"UnionPOS 로그인 완료 | URL: {page.url}")
+            return
+        try:
+            if page.locator("#startDate").count() > 0:
+                logger.info(f"UnionPOS 로그인 완료 | URL: {page.url}")
+                return
+        except Exception:
+            pass
+        time.sleep(1)
     # /v2/ 경로로 이동 완료될 때까지 대기 (루트 URL에서 멈추는 경우 방지)
-    page.wait_for_url("**/v2/**", timeout=30000)
-    logger.info(f"UnionPOS 로그인 완료 | URL: {page.url}")
+    raise PlaywrightTimeout(f"UnionPOS 로그인 후 /v2/ 이동 타임아웃 | last_url={last_url}")
 
 
 # ── 날짜 설정 ─────────────────────────────────────────────────────────────────
 
 def _set_date_input(page: Page, start: str, end: str) -> None:
     """#startDate / #endDate 입력 필드를 직접 조작 (fn_SetDate 미사용)"""
-    page.evaluate(
-        """([s, e]) => {
+    for attempt in range(3):
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+            page.wait_for_selector("#startDate", state="visible", timeout=15000)
+            page.wait_for_selector("#endDate", state="visible", timeout=15000)
+            applied = page.evaluate(
+                """([s, e]) => {
             var si = document.getElementById('startDate');
             var ei = document.getElementById('endDate');
+            if (!si || !ei) return false;
             if (si) { si.removeAttribute('readonly'); si.value = s; si.setAttribute('readonly', 'readonly'); }
             if (ei) { ei.removeAttribute('readonly'); ei.value = e; ei.setAttribute('readonly', 'readonly'); }
+            return si.value === s && ei.value === e;
         }""",
-        [start, end],
-    )
+                [start, end],
+            )
+            if not applied:
+                raise PlaywrightTimeout("UnionPOS date inputs were replaced during navigation")
+            return
+        except PlaywrightError as exc:
+            if "Execution context was destroyed" not in str(exc) or attempt == 2:
+                raise
+            logger.warning("UnionPOS navigation interrupted date entry; waiting for new document")
 
 
 def _set_date_and_search(page: Page, sale_date: str) -> None:
@@ -94,13 +123,50 @@ def _set_date_and_search(page: Page, sale_date: str) -> None:
 
 
 def _click_search(page: Page) -> None:
-    for sel in ["button.btn-search", "button:has-text('조회')", "button:has-text('검색')",
-                "input[type='button'][value='조회']"]:
+    selectors = [
+        "button.btn-search",
+        "button:has-text('조회')",
+        "button:has-text('검색')",
+        "a:has-text('조회')",
+        "a:has-text('검색')",
+        "input[type='button'][value='조회']",
+        "input[type='submit'][value='조회']",
+        "[onclick*='search']",
+        "[onclick*='Search']",
+        "[onclick*='fn_']",
+    ]
+    for sel in selectors:
         try:
             page.click(sel, timeout=3000)
             return
         except PlaywrightTimeout:
             continue
+        except Exception:
+            continue
+    try:
+        clicked = page.evaluate(
+            """() => {
+                const labels = ['조회', '검색'];
+                const nodes = Array.from(document.querySelectorAll('button,a,input,[onclick]'));
+                const target = nodes.find((el) => {
+                    const text = (el.innerText || el.value || el.getAttribute('title') || '').trim();
+                    const onclick = el.getAttribute('onclick') || '';
+                    return labels.some((label) => text.includes(label)) || /search|Search/.test(onclick);
+                });
+                if (!target) return false;
+                target.click();
+                return true;
+            }"""
+        )
+        if clicked:
+            return
+    except Exception:
+        pass
+    try:
+        page.keyboard.press("Enter")
+        return
+    except Exception:
+        pass
     logger.error("조회 버튼을 찾지 못했습니다")
     raise PlaywrightTimeout("조회 버튼 미발견")
 
@@ -342,6 +408,20 @@ def _click_next_page(page: Page) -> bool:
 
 # ── Task 함수 ─────────────────────────────────────────────────────────────────
 
+def _load_sale_dates_from_xcom(context) -> list:
+    """UnionPOS 일반/Today DAG 양쪽의 날짜 XCom을 로드한다."""
+    ti = context["ti"]
+    sale_dates = ti.xcom_pull(task_ids="resolve_dates", key="sale_dates")
+    source_task_id = "resolve_dates"
+    if not sale_dates:
+        sale_dates = ti.xcom_pull(task_ids="resolve_today", key="sale_dates")
+        source_task_id = "resolve_today"
+    if not sale_dates:
+        raise ValueError("sale_dates XCom 값이 없습니다.")
+    logger.info("sale_dates XCom 로드: task_id=%s, sale_dates=%s", source_task_id, sale_dates)
+    return sale_dates
+
+
 def resolve_sale_dates(manual_date_range=None, lookback_days=None, **context) -> str:
     """실행 날짜 결정 (MANUAL_DATE_RANGE > conf > lookback > yesterday)"""
     if manual_date_range is not None:
@@ -383,9 +463,7 @@ def resolve_sale_dates(manual_date_range=None, lookback_days=None, **context) ->
 
 def collect_and_save(**context) -> str:
     """UnionPOS 영수증 목록 + 상세품목 수집 후 파티션 CSV 저장 (Playwright, 최대 3회 재시도)"""
-    sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates")
-    if not sale_dates:
-        raise ValueError("sale_dates XCom 값이 없습니다.")
+    sale_dates = _load_sale_dates_from_xcom(context)
 
     saved_files, status_by_date = _collect_and_save_dates(sale_dates, context)
     context["ti"].xcom_push(key="saved_files", value=saved_files)
@@ -453,7 +531,17 @@ def _collect_session(
 
     for sale_date in sale_dates:
         logger.info(f"=== UnionPOS 수집 시작: {sale_date} ===")
-        page.goto(UNIONPOS_RECEIPT_URL, wait_until="domcontentloaded", timeout=30000)
+        try:
+            page.goto(UNIONPOS_RECEIPT_URL, wait_until="domcontentloaded", timeout=60000)
+        except PlaywrightTimeout:
+            if page.is_closed():
+                raise
+            try:
+                if page.locator("#startDate").count() == 0:
+                    raise
+                logger.warning("UnionPOS 영수증 화면 이동 타임아웃이나 날짜 필드 감지됨 — 계속 진행")
+            except Exception:
+                raise
 
         _set_date_and_search(page, sale_date)
 
@@ -632,7 +720,7 @@ def write_log(**context) -> str:
     saved_files = context["ti"].xcom_pull(task_ids="collect_and_save", key="saved_files") or []
     recovered_files = context["ti"].xcom_pull(task_ids="verify_missing", key="recovered_files") or []
     saved_files = list(dict.fromkeys([*saved_files, *recovered_files]))
-    sale_dates  = context["ti"].xcom_pull(task_ids="resolve_dates",    key="sale_dates")  or []
+    sale_dates  = _load_sale_dates_from_xcom(context)
     log_path    = RAW_UNIONPOS_SALES / "log.parquet"
 
     try:
@@ -681,9 +769,7 @@ def write_log(**context) -> str:
 
 def verify_missing(**context) -> str:
     """수집 후 raw 파일과 수집 상태를 확인하고, 실패 의심 날짜만 1회 재수집."""
-    sale_dates = context["ti"].xcom_pull(task_ids="resolve_dates", key="sale_dates") or []
-    if not sale_dates:
-        return "검증 스킵 (sale_dates 없음)"
+    sale_dates = _load_sale_dates_from_xcom(context)
 
     status_by_date = context["ti"].xcom_pull(
         task_ids="collect_and_save",

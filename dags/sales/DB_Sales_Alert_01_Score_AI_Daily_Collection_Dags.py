@@ -18,6 +18,7 @@ from typing import List
 
 import pendulum
 from airflow import DAG
+from airflow.exceptions import AirflowSkipException
 from airflow.operators.python import PythonOperator
 
 from modules.transform.utility.schedule import AI_DAILY_COLLECTION_TIME
@@ -38,21 +39,24 @@ from modules.transform.ai_daily_collection_integrator import (
 from modules.transform.utility.paths import ANALYTICS_DB, DOWN_DIR
 from modules.transform.utility.mailer import send_email
 from modules.transform.utility.notifier import on_failure_callback
+from modules.transform.utility.account import get_default_account
+from modules.transform.utility.mail_recipients import MAIL_CMJ_PM, MAIL_OH_NAYOUNG
 
 
 DAG_ID = "DB_Sales_Alert_01_Score_AI_Daily_Collection"
 
-TOORDER_ID = os.getenv("TOORDER_ID", "doridang15")
-TOORDER_PW = os.getenv("TOORDER_PW", "ehfl5233!")
+TOORDER_ID, TOORDER_PW = get_default_account("toorder")
 
 DEST_DIR = ANALYTICS_DB / "ai_daily_collection"
 DOWNLOAD_DIR = DOWN_DIR / "toorder_sales_report_date"
 INTEGRATED_XLSX = DEST_DIR / "종합보고서_일별매출보고서_통합.xlsx"
 DAILY_SUMMARY_CSV = DEST_DIR / "종합보고서_일별매출보고서_일별합계.csv"
+TOORDER_SELENIUM_POOL = "toorder_selenium_serial"
+MAX_STALE_DAYS = int(os.getenv("AI_DAILY_COLLECTION_MAX_STALE_DAYS", "3"))
 
 logger = logging.getLogger(__name__)
 
-ALERT_TO_EMAILS = ["a17019@kakao.com", "bulu1017@kakao.com"] # 이메일 수신자 리스트 (조민준 pm, 오나영 차장)
+ALERT_TO_EMAILS = [MAIL_CMJ_PM, MAIL_OH_NAYOUNG]
 POWERBI_DASHBOARD_URL = "https://app.powerbi.com/groups/me/reports/07a40f9d-e54a-40db-9b5e-6a2648206cab/a640e3550e57c3103a85?experience=power-bi"
 FINAL_CLEANUP_TARGETS = [
     Path(r"E:\down\종합보고서_일별매출보고서_260513_raw.xlsx"),
@@ -60,9 +64,28 @@ FINAL_CLEANUP_TARGETS = [
 ]
 
 
-def collect_ai_daily_sales_report(**context) -> str:
+def _target_date_from_context(context) -> str:
     kst = pendulum.timezone("Asia/Seoul")
-    today = pendulum.now(kst).subtract(days=1).format("YYYY-MM-DD")
+    logical_date = context.get("logical_date") or context.get("execution_date")
+    dag_run = context.get("dag_run")
+    if logical_date is None and dag_run is not None:
+        logical_date = getattr(dag_run, "logical_date", None) or getattr(dag_run, "execution_date", None)
+    if logical_date is None:
+        logical_date = pendulum.now(kst)
+    if not hasattr(logical_date, "in_timezone"):
+        logical_date = pendulum.instance(logical_date)
+    return logical_date.in_timezone(kst).subtract(days=1).format("YYYY-MM-DD")
+
+
+def collect_ai_daily_sales_report(**context) -> str:
+    today = _target_date_from_context(context)
+    kst = pendulum.timezone("Asia/Seoul")
+    target_day = pendulum.from_format(today, "YYYY-MM-DD", tz=kst).start_of("day")
+    oldest_allowed = pendulum.now(kst).subtract(days=MAX_STALE_DAYS).start_of("day")
+    if target_day < oldest_allowed:
+        raise AirflowSkipException(
+            f"stale AI daily collection run skipped: target_date={today}, oldest_allowed={oldest_allowed.to_date_string()}"
+        )
 
     DEST_DIR.mkdir(parents=True, exist_ok=True)
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -163,8 +186,7 @@ def export_daily_summary_csv_task(**context) -> str:
 
 
 def build_ai_score_sheet_task(**context) -> str:
-    kst = pendulum.timezone("Asia/Seoul")
-    target_date = pendulum.now(kst).subtract(days=1).format("YYYY-MM-DD")
+    target_date = _target_date_from_context(context)
     result = build_ai_score_sheet(INTEGRATED_XLSX, target_date=target_date)
     logger.info(
         "AI 점수/진단 시트 생성 완료: %s (target_date=%s grade=%s total_score=%s)",
@@ -251,8 +273,7 @@ def _build_recent_daily_mtd_avg_trend(target_date: str, days: int = 30) -> List[
 
 
 def send_ai_sales_alert_email_task(**context) -> str:
-    kst = pendulum.timezone("Asia/Seoul")
-    target_date = pendulum.now(kst).subtract(days=1).format("YYYY-MM-DD")
+    target_date = _target_date_from_context(context)
 
     # 통합 엑셀에는 룰 기반 AI_진단 시트를 남기되, 이메일 문구는 LLM(Ollama)로 고품질 생성(실패 시 룰 폴백)
     scorecard = build_ai_score_sheet(INTEGRATED_XLSX, target_date=target_date)
@@ -325,6 +346,7 @@ with DAG(
     t1 = PythonOperator(
         task_id="collect_ai_daily_sales_report",
         python_callable=collect_ai_daily_sales_report,
+        pool=TOORDER_SELENIUM_POOL,
     )
 
     t2 = PythonOperator(

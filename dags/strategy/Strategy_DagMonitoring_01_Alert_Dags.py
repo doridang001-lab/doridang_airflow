@@ -6,7 +6,7 @@ DAG 모니터링 - DAG 실행 현황 점검 및 대시보드 스냅샷 저장 DA
     2. apply_failure_rules    : FAIL/WARN/OK 판정 규칙 적용
     3. save_monitoring_results: OneDrive CSV + dashboard snapshot 저장
 
-스케줄: 수동 실행 전용 (data/dashboard 스냅샷 자동 저장 중지)
+스케줄: 매일 15:00 실행 (SMP_DAG_MONITORING_TIME)
 """
 
 import importlib
@@ -16,6 +16,7 @@ import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
+from modules.transform.utility.schedule import SMP_DAG_MONITORING_TIME
 from modules.transform.utility.notifier import on_failure_callback
 
 # ============================================================
@@ -34,8 +35,8 @@ save_monitoring_results = _pipeline.save_monitoring_results
 # ============================================================
 with DAG(
     dag_id=Path(__file__).stem,
-    description="DAG 성공/실패 현황을 수동 점검하고 대시보드 스냅샷을 저장",
-    schedule=None,
+    description="DAG 성공/실패 현황을 5분마다 점검하고 대시보드 스냅샷을 저장",
+    schedule=SMP_DAG_MONITORING_TIME,
     start_date=pendulum.datetime(2025, 1, 1, tz="Asia/Seoul"),
     catchup=False,
     max_active_runs=1,

@@ -4,6 +4,7 @@ set -euo pipefail
 # Git push 안전 스크립트
 # Usage:
 #   ./gitpush.sh "커밋 메시지"   → 브랜치 자동 생성 + push + gh pr create
+#   ./gitpush.sh "커밋 메시지" -- path/to/file.py ... → 지정 파일만 stage + push + gh pr create
 #   ./gitpush.sh                  → 메시지 자동 추론 + 위와 동일
 #   ./gitpush.sh --create-branch  → (하위 호환) 브랜치 생성 후 push (PR 없음)
 
@@ -48,11 +49,18 @@ function auto_commit_message() {
 # ── 인수 파싱 ──────────────────────────────────────────────
 LEGACY_MODE=false
 USER_MSG=""
+PATHS=()
 
 if [ "${1:-}" == "--create-branch" ]; then
     LEGACY_MODE=true
 elif [ -n "${1:-}" ]; then
     USER_MSG="$1"
+    shift
+fi
+
+if [ "${1:-}" == "--" ]; then
+    shift
+    PATHS=("$@")
 fi
 
 # ── 저장소 확인 ───────────────────────────────────────────
@@ -62,7 +70,11 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-CHANGED_FILES=$(git status --porcelain --untracked-files=normal | awk '{print $2}' | uniq | sed '/^$/d')
+if [ "${#PATHS[@]}" -gt 0 ]; then
+    CHANGED_FILES=$(printf "%s\n" "${PATHS[@]}" | sed '/^$/d')
+else
+    CHANGED_FILES=$(git status --porcelain --untracked-files=normal | awk '{print $2}' | uniq | sed '/^$/d')
+fi
 
 if [ -z "$CHANGED_FILES" ]; then
     echo "✅ 변경된 파일이 없습니다."
@@ -121,7 +133,11 @@ fi
 
 echo ""
 echo "📝 스테이징 및 커밋..."
-git add .
+if [ "${#PATHS[@]}" -gt 0 ]; then
+    git add -- "${PATHS[@]}"
+else
+    git add .
+fi
 git commit -m "$COMMIT_MSG"
 
 echo ""

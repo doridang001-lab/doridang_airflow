@@ -1,7 +1,8 @@
-"""Auto click topHalfBtn on Coupang runner.html via Chrome DevTools Protocol."""
+"""Auto click a button on Coupang runner.html via Chrome DevTools Protocol."""
 
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import logging
@@ -12,17 +13,65 @@ import struct
 import time
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
 import urllib.error
 
 logger = logging.getLogger(__name__)
 
 RUNNER_URL_SUFFIX = "/runner.html"
-RUNNER_URL_FALLBACK = "chrome-extension://ocpdgnoaajajnlehamcalfcpholjhfbe/runner.html"
-BUTTON_ID = "topHalfBtn"
+DEFAULT_INSTALLED_EXTENSION_DIR = (
+    Path.home()
+    / "OneDrive - 주식회사 도리당"
+    / "Extention"
+    / "doridang_collector_개발용"
+)
+DEFAULT_BUILD_EXTENSION_DIR = (
+    DEFAULT_INSTALLED_EXTENSION_DIR
+    if DEFAULT_INSTALLED_EXTENSION_DIR.exists()
+    else Path(r"C:\airflow\coupang_extension_build")
+)
+BUILD_EXTENSION_DIR = Path(os.getenv("COUPANG_EXTENSION_DIR") or DEFAULT_BUILD_EXTENSION_DIR)
+CHROME_PROFILE_NAME = os.getenv("COUPANG_CHROME_PROFILE", "Default")
+DEFAULT_EXTENSION_ID = os.getenv("COUPANG_EXTENSION_ID", "ocpdgnoaajajnlehamcalfcpholjhfbe")
+DEFAULT_BUTTON_ID = "topHalfBtn"
 DEBUG_ENDPOINT = "http://127.0.0.1:9222"
 TIMEOUT_SECONDS = 60
 POLL_INTERVAL_SECONDS = 0.5
+EXIT_BLOCKED_BY_CLIENT = 2
+
+
+class RunnerPageBlockedError(RuntimeError):
+    """Raised when Chrome opens a blocked error document instead of runner.html."""
+
+
+def _is_runner_tab_url(url: str, expected_runner_url: str | None = None) -> bool:
+    parsed = urllib.parse.urlparse(str(url or ""))
+    if parsed.scheme != "chrome-extension" or not parsed.netloc:
+        return False
+    if parsed.path.rstrip("/") != RUNNER_URL_SUFFIX:
+        return False
+
+    if not expected_runner_url:
+        return True
+
+    expected = urllib.parse.urlparse(expected_runner_url)
+    return (
+        parsed.scheme == expected.scheme
+        and parsed.netloc == expected.netloc
+        and parsed.path.rstrip("/") == expected.path.rstrip("/")
+    )
+
+
+def _runner_base_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(str(url or ""))
+    return f"{parsed.scheme}://{parsed.netloc}{RUNNER_URL_SUFFIX}"
+
+
+def _is_blocked_runner_page(page_state: dict[str, Any]) -> bool:
+    location_href = str(page_state.get("locationHref") or "")
+    body_text = str(page_state.get("bodyText") or "")
+    return location_href.startswith("chrome-error://") and "ERR_BLOCKED_BY_CLIENT" in body_text
 
 
 def _http_json(url: str, method: str = "GET") -> Any:
@@ -39,35 +88,149 @@ def _fetch_tabs() -> list[dict]:
     return _http_json(f"{DEBUG_ENDPOINT}/json")
 
 
-def _find_runner_url() -> str:
-    """extension ID를 동적으로 탐색해 runner.html URL을 반환."""
-    tabs = _fetch_tabs()
-    for tab in tabs:
-        url = str(tab.get("url", ""))
-        if url.startswith("chrome-extension://") and url.endswith(RUNNER_URL_SUFFIX):
-            return url
-    return RUNNER_URL_FALLBACK
+def _path_key(path: Path) -> str:
+    try:
+        return str(path.resolve()).casefold()
+    except OSError:
+        return str(path.absolute()).casefold()
 
 
-def _ensure_runner_tab() -> str:
-    runner_url = _find_runner_url()
-    tabs = _fetch_tabs()
+def _runner_url_from_loaded_extensions(tabs: list[dict]) -> str | None:
     for tab in tabs:
         url = str(tab.get("url", ""))
-        if url.startswith("chrome-extension://") and url.endswith(RUNNER_URL_SUFFIX):
-            ws_url = tab.get("webSocketDebuggerUrl")
-            if ws_url:
-                logger.info("existing runner tab found: %s", url)
-                return ws_url
+        if _is_runner_tab_url(url):
+            return _runner_base_url(url)
+
+    for tab in tabs:
+        url = str(tab.get("url", ""))
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme == "chrome-extension" and parsed.netloc:
+            return f"chrome-extension://{parsed.netloc}/runner.html"
+
+    return None
+
+
+def _chrome_profile_dir() -> Path:
+    local_app_data = os.getenv("LOCALAPPDATA")
+    if not local_app_data:
+        raise RuntimeError("LOCALAPPDATA is not set; cannot inspect Chrome profile")
+    return Path(local_app_data) / "Google" / "Chrome" / "User Data" / CHROME_PROFILE_NAME
+
+
+def _iter_chrome_preference_files() -> list[Path]:
+    profile_dir = _chrome_profile_dir()
+    return [
+        profile_dir / "Secure Preferences",
+        profile_dir / "Preferences",
+    ]
+
+
+def _build_extension_ids_from_chrome_preferences() -> list[str]:
+    target_key = _path_key(BUILD_EXTENSION_DIR)
+    candidates: list[str] = []
+
+    for pref_path in _iter_chrome_preference_files():
+        if not pref_path.exists():
+            continue
+        try:
+            data = json.loads(pref_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Chrome preference read failed: %s | %s", pref_path, exc)
+            continue
+
+        settings = data.get("extensions", {}).get("settings", {})
+        if not isinstance(settings, dict):
+            continue
+        for extension_id, config in settings.items():
+            if not isinstance(config, dict):
+                continue
+            extension_path = config.get("path")
+            if not extension_path:
+                continue
+            if _path_key(Path(str(extension_path))) == target_key:
+                candidates.append(str(extension_id))
+
+    return list(dict.fromkeys(candidates))
+
+
+def _runner_url_from_chrome_preferences() -> str | None:
+    extension_ids = _build_extension_ids_from_chrome_preferences()
+    if not extension_ids:
+        return None
+    if len(extension_ids) > 1:
+        logger.warning("multiple Coupang build extension IDs found; using first: %s", extension_ids)
+    return f"chrome-extension://{extension_ids[0]}/runner.html"
+
+
+def _runner_url_from_default_extension() -> str | None:
+    if not DEFAULT_EXTENSION_ID:
+        return None
+    return f"chrome-extension://{DEFAULT_EXTENSION_ID}/runner.html"
+
+
+def _find_runner_url(tabs: list[dict] | None = None) -> str:
+    """현재 로드되었거나 등록된 확장 ID로 runner.html URL을 반환."""
+    if tabs is None:
+        tabs = _fetch_tabs()
+
+    preference_url = _runner_url_from_chrome_preferences()
+    if preference_url:
+        return preference_url
+
+    loaded_url = _runner_url_from_loaded_extensions(tabs)
+    if loaded_url:
+        return loaded_url
+
+    fallback_url = _runner_url_from_default_extension()
+    if fallback_url:
+        logger.warning(
+            "Coupang build extension ID not found for %s; using configured extension ID: %s",
+            BUILD_EXTENSION_DIR,
+            DEFAULT_EXTENSION_ID,
+        )
+        return fallback_url
+
+    raise RuntimeError(f"Unable to find Coupang runner extension ID for {BUILD_EXTENSION_DIR}.")
+
+
+def _existing_runner_websockets(tabs: list[dict], expected_runner_url: str | None = None) -> list[str]:
+    ws_urls: list[str] = []
+    for tab in tabs:
+        url = str(tab.get("url", ""))
+        if not _is_runner_tab_url(url, expected_runner_url):
+            continue
+        ws_url = tab.get("webSocketDebuggerUrl")
+        if ws_url:
+            logger.info("existing runner tab found: %s", url)
+            ws_urls.append(str(ws_url))
+    return ws_urls
+
+
+def _ensure_runner_tabs() -> list[str]:
+    expected_runner_url = _runner_url_from_chrome_preferences() or _runner_url_from_default_extension()
+    start = time.time()
+    tabs: list[dict] = []
+    while time.time() - start < 10:
+        tabs = _fetch_tabs()
+        ws_urls = _existing_runner_websockets(tabs, expected_runner_url)
+        if ws_urls:
+            return ws_urls
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+    runner_url = _find_runner_url(tabs)
 
     logger.info("runner tab not found, create one: %s", runner_url)
     encoded = urllib.parse.quote(runner_url, safe="")
     new_tab = _http_json(f"{DEBUG_ENDPOINT}/json/new?{encoded}", method="PUT")
     ws_url = new_tab.get("webSocketDebuggerUrl") if isinstance(new_tab, dict) else None
     if ws_url:
-        return ws_url
+        return [str(ws_url)]
 
     raise RuntimeError("Unable to open runner.html tab with websocket endpoint")
+
+
+def _ensure_runner_tab() -> str:
+    return _ensure_runner_tabs()[0]
 
 
 def _recv_exact(sock: socket.socket, n: int, timeout: float = 5.0) -> bytes:
@@ -232,12 +395,16 @@ class _RawWebSocket:
             self._sock = None
 
 
-def _evaluate_button_state(ws: _RawWebSocket) -> tuple[bool, bool]:
+def _evaluate_button_state(ws: _RawWebSocket, button_id: str) -> tuple[bool, bool, bool]:
     script = (
         "(()=>{"
-        f"const b=document.querySelector('#{BUTTON_ID}');"
-        "if(!b){return {exists:false,enabled:false};}"
-        "return {exists:true,enabled:!b.disabled};"
+        "const bodyText=(document.body&&document.body.innerText||'').slice(0,1000);"
+        "const locationHref=location.href;"
+        f"const b=document.querySelector('#{button_id}');"
+        "const stop=document.querySelector('#stopBtn');"
+        "const alreadyRunning=!!(stop && !stop.disabled);"
+        "if(!b){return {exists:false,enabled:false,alreadyRunning,locationHref,bodyText};}"
+        "return {exists:true,enabled:!b.disabled,alreadyRunning,locationHref,bodyText};"
         "})()"
     )
     result = ws.call(
@@ -254,14 +421,22 @@ def _evaluate_button_state(ws: _RawWebSocket) -> tuple[bool, bool]:
 
     value = (result.get("result") or {}).get("result") or {}
     parsed = value.get("value") or {}
-    return bool(parsed.get("exists")), bool(parsed.get("enabled"))
+    if _is_blocked_runner_page(parsed):
+        raise RunnerPageBlockedError(
+            "runner.html opened as Chrome blocked error page: ERR_BLOCKED_BY_CLIENT"
+        )
+    return (
+        bool(parsed.get("exists")),
+        bool(parsed.get("enabled")),
+        bool(parsed.get("alreadyRunning")),
+    )
 
 
-def _click_button(ws: _RawWebSocket) -> None:
+def _click_button(ws: _RawWebSocket, button_id: str) -> None:
     result = ws.call(
         "Runtime.evaluate",
         {
-            "expression": f"(()=>{{document.getElementById('{BUTTON_ID}').click(); return true;}})()",
+            "expression": f"(()=>{{document.getElementById('{button_id}').click(); return true;}})()",
             "returnByValue": True,
         },
         timeout=5.0,
@@ -270,34 +445,60 @@ def _click_button(ws: _RawWebSocket) -> None:
         raise RuntimeError(f"button click failed: {result['error']}")
 
 
-def run_autoclick() -> int:
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Auto click a button on Coupang runner.html")
+    parser.add_argument(
+        "--button-id",
+        default=DEFAULT_BUTTON_ID,
+        help=f"runner.html button id to click (default: {DEFAULT_BUTTON_ID})",
+    )
+    return parser.parse_args()
+
+
+def run_autoclick(button_id: str = DEFAULT_BUTTON_ID) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    ws_url = _ensure_runner_tab()
-    logger.info("connected runner tab: %s", ws_url)
+    logger.info("target button id: %s", button_id)
 
-    ws = _RawWebSocket(ws_url)
     try:
-        ws.call("Runtime.enable")
-        start = time.time()
-        while time.time() - start < TIMEOUT_SECONDS:
-            exists, enabled = _evaluate_button_state(ws)
-            if not exists:
-                logger.info("topHalfBtn not found yet, waiting")
-            elif enabled:
-                logger.info("topHalfBtn is enabled. clicking")
-                _click_button(ws)
-                logger.info("clicked topHalfBtn")
-                return 0
-            else:
-                logger.info("topHalfBtn exists but disabled")
-            time.sleep(POLL_INTERVAL_SECONDS)
-    finally:
-        ws.close()
+        ws_urls = _ensure_runner_tabs()
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        return 1
+    logger.info("candidate runner tabs: %s", len(ws_urls))
 
-    logger.error("timeout waiting topHalfBtn enabled for %ss", TIMEOUT_SECONDS)
+    start = time.time()
+    while time.time() - start < TIMEOUT_SECONDS:
+        for ws_url in ws_urls:
+            logger.info("connected runner tab: %s", ws_url)
+            ws = _RawWebSocket(ws_url)
+            try:
+                ws.call("Runtime.enable")
+                try:
+                    exists, enabled, already_running = _evaluate_button_state(ws, button_id)
+                except RunnerPageBlockedError as exc:
+                    logger.error("%s", exc)
+                    return EXIT_BLOCKED_BY_CLIENT
+                if already_running:
+                    logger.info("runner batch is already running; treating autoclick as successful")
+                    return 0
+                if not exists:
+                    logger.info("%s not found yet, waiting", button_id)
+                elif enabled:
+                    logger.info("%s is enabled. clicking", button_id)
+                    _click_button(ws, button_id)
+                    logger.info("clicked %s", button_id)
+                    return 0
+                else:
+                    logger.info("%s exists but disabled", button_id)
+            finally:
+                ws.close()
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+    logger.error("timeout waiting %s enabled for %ss", button_id, TIMEOUT_SECONDS)
     return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(run_autoclick())
+    args = _parse_args()
+    raise SystemExit(run_autoclick(button_id=args.button_id))

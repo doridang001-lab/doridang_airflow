@@ -15,15 +15,22 @@ OneDrive 확장 폴더를 Claude가 직접 못 고치게 막혀 있어, 완성�
 | `popup.js` | `popup.js` | 덮어쓰기 (대시보드 버튼 핸들러) |
 | `runner.html` | `runner.html` | **신규** |
 | `runner.js` | `runner.js` | **신규** |
+| `content/02_baemin.js` | `content/02_baemin.js` | 덮어쓰기 (옵션명 정가 유입 방지) |
 | `content/06_batch.js` | `content/06_batch.js` | **신규** |
 
-> 기존 `content/00~05_*.js`, `accounts.js`, `02_baemin.js`, `03_coupangeats.js`, `04_auto_login.js`, `05_main.js`는 **그대로 둡니다** (수집 로직 손대지 않음).
+> 위 표에 없는 기존 content script와 `accounts.js`는 그대로 둡니다.
+
+> ⚠️ **`content/02_baemin.js` 원본은 여기가 아니라
+> `C:\Users\민준\OneDrive - 주식회사 도리당\Extention\doridang_collector_개발용\content\02_baemin.js` 입니다.**
+> 배민 수동수집(`baemin_manual.html`)은 그 폴더에서만 동작하므로, 배민 관련 수정은 개발용 폴더에서 하고
+> 이 빌드 폴더의 사본은 거기서 복사해 맞춥니다(반대 방향으로 덮어쓰지 마세요).
 
 PowerShell 한 줄 복사 예시:
 ```powershell
 $src = "C:\airflow\coupang_extension_build"
 $dst = "C:\Users\민준\OneDrive - 주식회사 도리당\Extention\doridang_collector_1.3"
 Copy-Item "$src\manifest.json","$src\background.js","$src\popup.html","$src\popup.js","$src\runner.html","$src\runner.js" $dst -Force
+Copy-Item "$src\content\02_baemin.js" "$dst\content" -Force
 Copy-Item "$src\content\06_batch.js" "$dst\content" -Force
 ```
 

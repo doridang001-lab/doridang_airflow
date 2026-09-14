@@ -780,6 +780,7 @@ def load_data(
 
 # 이메일 함수 (mailer.py에서 re-export → 기존 import 호환)
 from modules.transform.utility.mailer import text_to_html, send_email
+from modules.transform.utility.mail_recipients import resolve_mail_recipients
 
 
 def create_sub_order_id_simple(

@@ -17,6 +17,38 @@ STABILITY_PROFILES: dict[str, dict[str, Any]] = {
         "orders_validation_retry": 2,
         "max_parallel_accounts": 2,
         "driver_restart_every_stores": 4,
+        "login_attempts": 2,
+        "login_retry_wait_range": (1.0, 3.0),
+        "max_session_recovery_per_account": 2,
+    },
+    "safe_memory": {
+        "initial_stagger_range": (30.0, 80.0),
+        "account_wait_range": (60.0, 140.0),
+        "orders_validation_retry": 2,
+        "max_parallel_accounts": 1,
+        "driver_restart_every_stores": 1,  # 매장마다 신선한 세션 (렌더러 행 누적 차단)
+        "login_attempts": 3,
+        "login_retry_wait_range": (5.0, 20.0),
+        "max_session_recovery_per_account": 4,  # 렌더러 타임아웃 복구 여유
+    },
+    "safe_daily": {
+        "initial_stagger_range": (10.0, 40.0),
+        "account_wait_range": (25.0, 60.0),
+        "orders_validation_retry": 2,
+        "max_parallel_accounts": 1,
+        "driver_restart_every_stores": 2,
+        "login_attempts": 3,
+        "login_retry_wait_range": (5.0, 20.0),
+        "max_session_recovery_per_account": 4,
+    },
+    "today_orders": {
+        "initial_stagger_range": (0.0, 5.0),
+        "account_wait_range": (10.0, 25.0),
+        "orders_validation_retry": 2,
+        "max_parallel_accounts": 1,
+        "driver_restart_every_stores": 1,
+        "login_attempts": 2,
+        "login_retry_wait_range": (3.0, 8.0),
         "max_session_recovery_per_account": 2,
     },
     "bulk_70": {
@@ -25,6 +57,8 @@ STABILITY_PROFILES: dict[str, dict[str, Any]] = {
         "orders_validation_retry": 1,
         "max_parallel_accounts": 4,
         "driver_restart_every_stores": 8,
+        "login_attempts": 2,
+        "login_retry_wait_range": (1.0, 3.0),
         "max_session_recovery_per_account": 2,
     },
 }

@@ -1,17 +1,16 @@
-"""Combined dashboard server for Beamin Macro and DAG monitoring."""
+"""Combined dashboard server for DAG and harness monitoring."""
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from modules.transform.dashboard import db_beamin_macro_dashboard as beamin_dashboard
 from modules.transform.dashboard.dag_monitoring_dashboard import DagMonitoringDashboardService
+from modules.transform.dashboard.harness_monitoring_dashboard import HarnessMonitoringDashboardService
 
 logger = logging.getLogger(__name__)
 
@@ -89,15 +88,15 @@ def _render_index() -> str:
   <div class="page">
     <div class="card">
       <h1>Dashboard Hub</h1>
-      <p>Use the DAG monitoring view for pipeline health and task logs. The Beamin macro dashboard stays available as a separate route.</p>
+      <p>Use the monitoring views for pipeline health, task logs, and harness state.</p>
       <div class="links">
         <a href="/dag-monitoring">
           <strong>Airflow DAG Monitoring</strong>
           <span>One-screen status, failure sorting, task drill-down, and copy-ready errors.</span>
         </a>
-        <a href="/db-beamin-macro">
-          <strong>DB_Beamin_Macro Dashboard</strong>
-          <span>Live store progress and collection logs for the Beamin macro DAG.</span>
+        <a href="/harness-monitoring">
+          <strong>Harness Monitoring</strong>
+          <span>Phase and step flow, blocked/error states, and stale pending work.</span>
         </a>
       </div>
     </div>
@@ -107,8 +106,8 @@ def _render_index() -> str:
 
 
 class CombinedDashboardHandler(BaseHTTPRequestHandler):
-    beamin_service: beamin_dashboard.DashboardService
     dag_service: DagMonitoringDashboardService
+    harness_service: HarnessMonitoringDashboardService
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -121,32 +120,6 @@ class CombinedDashboardHandler(BaseHTTPRequestHandler):
 
         if route == "/":
             self._send_bytes(_render_index().encode("utf-8"), content_type="text/html; charset=utf-8")
-            return
-
-        if route in {"/db-beamin-macro", f"/{beamin_dashboard.HTML_FILENAME}"}:
-            snapshot = self.beamin_service.get_snapshot()
-            html_payload = snapshot.get("html") or "<html><body>dashboard warming up</body></html>"
-            self._send_bytes(html_payload.encode("utf-8"), content_type="text/html; charset=utf-8")
-            return
-        if route == "/api/db-beamin-macro/summary":
-            snapshot = self.beamin_service.get_snapshot()
-            self._send_json(snapshot.get("overview") or {})
-            return
-        if route == "/api/db-beamin-macro/stores":
-            snapshot = self.beamin_service.get_snapshot()
-            self._send_json(snapshot.get("stores") or [])
-            return
-        if route == "/api/db-beamin-macro/logs":
-            snapshot = self.beamin_service.get_snapshot()
-            self._send_json(snapshot.get("live_logs") or [])
-            return
-        if route == "/api/db-beamin-macro/snapshot":
-            snapshot = dict(self.beamin_service.get_snapshot())
-            snapshot.pop("html", None)
-            self._send_json(snapshot)
-            return
-        if route == "/api/db-beamin-macro/events":
-            self._stream_beamin_events(query)
             return
 
         if route == "/dag-monitoring":
@@ -168,6 +141,13 @@ class CombinedDashboardHandler(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
 
+        if route == "/harness-monitoring":
+            self._send_bytes(self.harness_service.render_html().encode("utf-8"), content_type="text/html; charset=utf-8")
+            return
+        if route == "/api/harness-monitoring/snapshot":
+            self._send_json(self.harness_service.get_snapshot())
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND, "not found")
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -183,51 +163,15 @@ class CombinedDashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _stream_beamin_events(self, query: dict[str, list[str]]) -> None:
-        try:
-            since = int((query.get("since") or ["0"])[0] or "0")
-        except ValueError:
-            since = 0
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
-        try:
-            self.wfile.write(b": connected\n\n")
-            self.wfile.flush()
-            while True:
-                snapshot = self.beamin_service.wait_for_snapshot(since)
-                if snapshot is None:
-                    self.wfile.write(b": keepalive\n\n")
-                    self.wfile.flush()
-                    continue
-                snapshot = dict(snapshot)
-                since = int(snapshot.get("snapshot_id") or since)
-                snapshot.pop("html", None)
-                payload = json.dumps(snapshot, ensure_ascii=False)
-                message = f"id: {since}\nevent: snapshot\ndata: {payload}\n\n".encode("utf-8")
-                self.wfile.write(message)
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            logger.info("Beamin SSE client disconnected.")
-
-
 def run_server(
     *,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
-    refresh_seconds: int = beamin_dashboard.DEFAULT_REFRESH_SECONDS,
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
-    refresh_seconds = int(os.getenv("BEAMIN_DASHBOARD_REFRESH_SECONDS", str(refresh_seconds)))
 
-    beamin_service = beamin_dashboard.DashboardService(refresh_seconds=refresh_seconds)
-    beamin_service.refresh_once()
-    beamin_service.start()
-
-    CombinedDashboardHandler.beamin_service = beamin_service
     CombinedDashboardHandler.dag_service = DagMonitoringDashboardService()
+    CombinedDashboardHandler.harness_service = HarnessMonitoringDashboardService()
 
     server = ThreadingHTTPServer((host, port), CombinedDashboardHandler)
     logger.info("Starting combined dashboard server on http://%s:%s", host, port)
@@ -236,7 +180,6 @@ def run_server(
     except KeyboardInterrupt:
         logger.info("Dashboard server interrupted.")
     finally:
-        beamin_service.stop()
         server.server_close()
 
 

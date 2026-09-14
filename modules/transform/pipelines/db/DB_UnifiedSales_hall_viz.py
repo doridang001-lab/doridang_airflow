@@ -14,12 +14,13 @@ unified_sales - 홀용 시각화 전용 누적 테이블 생성/갱신.
 
 from __future__ import annotations
 
+from modules.transform.utility.process_lock import unified_writer
 import logging
 from datetime import datetime
 
 import pandas as pd
 
-from modules.transform.pipelines.db.DB_UnifiedSales_common import UNIFIED_ROOT, _unified_daily_path
+from modules.transform.pipelines.db.DB_UnifiedSales_common import UNIFIED_ROOT, _unified_daily_path, iter_unified_sales_files, save_unified_parquet
 from modules.transform.utility.paths import MART_DB
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,7 @@ def _aggregate_one_day(date_str: str) -> pd.DataFrame:
     return agg.reindex(columns=HALL_VIZ_COLUMNS, fill_value=0)
 
 
+@unified_writer
 def _upsert_rows(new_rows: pd.DataFrame) -> int:
     if new_rows is None or new_rows.empty:
         return 0
@@ -117,7 +119,7 @@ def _upsert_rows(new_rows: pd.DataFrame) -> int:
     merged["객단가_t"] = pd.to_numeric(merged["객단가_t"], errors="coerce").fillna(0.0).astype(float)
 
     merged = merged.sort_values(["sale_date", "order_type"]).reset_index(drop=True)
-    merged.to_parquet(HALL_VIZ_PATH, index=False, engine="pyarrow")
+    save_unified_parquet(merged, HALL_VIZ_PATH)
     return len(new_rows)
 
 
@@ -155,7 +157,7 @@ def run_lookback_hall_viz(days: int = 7) -> str:
 
 def backfill_hall_viz() -> str:
     """UNIFIED_ROOT의 모든 unified_sales_*.parquet 기준으로 hall_viz를 재생성(overwrite)."""
-    files = sorted(UNIFIED_ROOT.glob("unified_sales_*.parquet")) if UNIFIED_ROOT.exists() else []
+    files = iter_unified_sales_files()
     if not files:
         msg = f"hall_viz backfill 스킵 (unified_sales parquet 없음) | {UNIFIED_ROOT}"
         logger.warning(msg)
@@ -188,7 +190,7 @@ def backfill_hall_viz() -> str:
     df = df.reindex(columns=HALL_VIZ_COLUMNS, fill_value=0).sort_values(["sale_date", "order_type"]).reset_index(drop=True)
 
     HALL_VIZ_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(HALL_VIZ_PATH, index=False, engine="pyarrow")
+    save_unified_parquet(df, HALL_VIZ_PATH)
     result = f"hall_viz backfill 완료 | dates={df['sale_date'].nunique()} rows={len(df)}"
     logger.info(result)
     return result

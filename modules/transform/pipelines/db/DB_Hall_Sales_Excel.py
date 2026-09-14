@@ -31,11 +31,6 @@ MKT_CSV   = MART_DB / "hall_sales_target" / "hall_marketing_target.csv"
 XLSX_DIR  = MART_DB / "hall_sales_target"
 LLM_LOG_MD = XLSX_DIR / "llm_log.md"
 
-_MKT_COLS = ["플레이스_유입", "홍보물_배포", "쿠폰_회수건수", "인스타_노출", "당근_노출", "네이버_오더"]
-_SALE_CHECK_COLS = ["매출", "영수건수", "점심_매출", "점심_영수건수", "저녁_매출", "저녁_영수건수"]
-_ALERT_TO = "puding83@kakao.com"
-_ALERT_CC = "a17019@kakao.com"
-
 # Windows 경로 (로그 안내용)
 _WIN_BASE = str(XLSX_DIR)
 
@@ -125,31 +120,26 @@ def _section(ws, row, title):
     c.alignment = _LEFT
 
 
-def _save_workbook_replace(wb: Workbook, path, retries: int = 5):
-    import time
-
+def _save_workbook_replace(wb: Workbook, path, allow_unique_fallback: bool = False):
     tmp_path = path.with_name(f".{path.stem}.tmp{path.suffix}")
     tmp_path.unlink(missing_ok=True)
     wb.save(tmp_path)
     tmp_path.chmod(0o666)
-    last_exc = None
-    for attempt in range(1, retries + 1):
-        try:
-            if path.exists():
-                path.chmod(0o666)
-                path.unlink()
-            tmp_path.replace(path)
+    try:
+        if path.exists():
             path.chmod(0o666)
-            return path
-        except PermissionError as exc:
-            last_exc = exc
-            if attempt >= retries:
-                break
-            wait_sec = min(10, attempt * 2)
-            logger.warning("Excel 파일 덮어쓰기 재시도: %s (wait=%ss)", path, wait_sec)
-            time.sleep(wait_sec)
-
-    raise PermissionError(f"파일이 열려 있거나 OneDrive에서 잠겨 있어 덮어쓸 수 없습니다: {path}") from last_exc
+            path.unlink()
+        tmp_path.replace(path)
+        saved_path = path
+    except PermissionError:
+        if not allow_unique_fallback:
+            raise
+        saved_path = path.with_name(
+            f"{path.stem}_{datetime.now().strftime('%H%M%S')}{path.suffix}"
+        )
+        tmp_path.replace(saved_path)
+    saved_path.chmod(0o666)
+    return saved_path
 
 
 # ── 데이터 로드 ────────────────────────────────────────────────
@@ -191,6 +181,16 @@ def _mkt_weekly_targets(ym, week_start, mkt_monthly):
     t   = mkt_monthly.get(ym, {})
     dim = calendar.monthrange(int(ym[:4]), int(ym[5:]))[1]
     return {k: round(v / dim * cnt) for k, v in t.items()}
+
+
+def _mkt_weekly_targets_span(week_start, mkt_monthly):
+    """주가 걸친 모든 달의 일할 target을 합산."""
+    yms = {(week_start + timedelta(days=i)).strftime("%Y-%m") for i in range(7)}
+    out: dict[str, int] = {}
+    for ym in yms:
+        for k, v in _mkt_weekly_targets(ym, week_start, mkt_monthly).items():
+            out[k] = out.get(k, 0) + v
+    return out
 
 
 # ── Ollama 진단 ────────────────────────────────────────────────
@@ -270,151 +270,6 @@ def append_weekly_ai_log(log_date: str | None = None) -> str:
     return f"완료: {LLM_LOG_MD}"
 
 
-def _build_missing_html(missing: list, csv_path: str) -> str:
-    rows_html = "\n".join(
-        f"<tr><td style='padding:6px 12px;border:1px solid #ddd'>{label}</td>"
-        f"<td style='padding:6px 12px;border:1px solid #ddd;color:#c0392b'>{reason}</td></tr>"
-        for label, reason in missing
-    )
-    return f"""<html>
-<head><meta charset="UTF-8"></head>
-<body style="font-family:'Malgun Gothic',Arial,sans-serif;margin:24px;line-height:1.7">
-<div style="border-left:4px solid #e74c3c;padding:16px;background:#fdf3f3;border-radius:4px">
-  <h2 style="margin:0 0 8px;color:#c0392b">홀 실적 데이터 미입력 알림</h2>
-  <p>아래 항목의 마케팅 또는 OKPOS 실적 데이터가 입력되지 않았습니다. 확인 후 다시 실행해주세요.</p>
-  <table style="border-collapse:collapse;margin:12px 0">
-    <tr style="background:#c0392b;color:#fff">
-      <th style="padding:6px 12px;border:1px solid #ddd">항목</th>
-      <th style="padding:6px 12px;border:1px solid #ddd">사유</th>
-    </tr>
-    {rows_html}
-  </table>
-  <p style="font-size:13px;color:#555">파일 경로: <code>{csv_path}</code></p>
-  <p style="font-size:13px;color:#555">
-    입력 항목: 플레이스_유입 / 홍보물_배포 / 쿠폰_회수건수 / 인스타_노출 / 당근_노출 / 네이버_오더
-  </p>
-</div>
-<p style="color:#aaa;font-size:11px;margin-top:20px">본 메일은 Airflow DAG에서 자동 발송되었습니다.</p>
-</body>
-</html>"""
-
-
-def _build_complete_html(check_dates: list, csv_path: str) -> str:
-    start_date = check_dates[0].strftime("%Y-%m-%d")
-    end_date = check_dates[-1].strftime("%Y-%m-%d")
-    return f"""<html>
-<head><meta charset="UTF-8"></head>
-<body style="font-family:'Malgun Gothic',Arial,sans-serif;margin:24px;line-height:1.7">
-<div style="border-left:4px solid #27ae60;padding:16px;background:#f3fbf6;border-radius:4px">
-  <h2 style="margin:0 0 8px;color:#1e8449">홀 실적 데이터 입력 확인 완료</h2>
-  <p>최근 7일 마케팅 데이터와 OKPOS 주간 실적이 문제없이 입력되었습니다.</p>
-  <p style="font-size:13px;color:#555">마케팅 확인 기간: {start_date} ~ {end_date}</p>
-  <p style="font-size:13px;color:#555">파일 경로: <code>{csv_path}</code></p>
-</div>
-<p style="color:#aaa;font-size:11px;margin-top:20px">본 메일은 Airflow DAG에서 자동 발송되었습니다.</p>
-</body>
-</html>"""
-
-
-def _check_sale_input(today: date) -> list:
-    if not SALE_CSV.exists():
-        logger.warning("hall_sale_target.csv 없음: %s", SALE_CSV)
-        return [("OKPOS 주간 실적", "hall_sale_target.csv 파일 없음")]
-
-    df = pd.read_csv(SALE_CSV, dtype=str)
-    if "입력날짜" not in df.columns:
-        return [("OKPOS 주간 실적", "입력날짜 컬럼 없음")]
-
-    df["입력날짜"] = pd.to_datetime(df["입력날짜"], errors="coerce")
-    target_date = pd.Timestamp(today).date()
-    row = df[df["입력날짜"].dt.date == target_date].copy()
-    if row.empty:
-        return [("OKPOS 주간 실적", f"{target_date.strftime('%Y-%m-%d')} 행 없음")]
-
-    for col in _SALE_CHECK_COLS:
-        if col in row.columns:
-            row[col] = _to_number(row[col])
-
-    total = sum(row[col].sum() for col in _SALE_CHECK_COLS if col in row.columns)
-    if total == 0:
-        return [("OKPOS 주간 실적", "매출/영수건수 전체 0")]
-
-    return []
-
-
-def check_marketing_input(**context) -> None:
-    """마케팅 최근 7일과 OKPOS 주간 실적 미입력 여부를 HTML 이메일로 알린다."""
-    del context
-
-    from modules.transform.utility.mailer import send_email
-
-    today = date.today()
-    check_dates = sorted([today - timedelta(days=i) for i in range(1, 8)])
-
-    if not MKT_CSV.exists():
-        logger.warning("hall_marketing_target.csv 없음: %s", MKT_CSV)
-        missing = [(d.strftime("%Y-%m-%d (%a)"), "마케팅 CSV 파일 없음") for d in check_dates]
-        missing.extend(_check_sale_input(today))
-        html = _build_missing_html(missing, str(MKT_CSV))
-        send_email(
-            subject="[홀 실적 데이터 미입력] 확인 요청",
-            html_content=html,
-            to_emails=_ALERT_TO,
-            cc_emails=_ALERT_CC,
-        )
-        return
-
-    df = pd.read_csv(MKT_CSV, dtype=str)
-    if "기준일자" in df.columns:
-        df["_기준일"] = pd.to_datetime(df["기준일자"], errors="coerce")
-    else:
-        df["_기준일"] = pd.Series(pd.NaT, index=df.index)
-    if "입력날짜" in df.columns:
-        df["_기준일"] = df["_기준일"].fillna(pd.to_datetime(df["입력날짜"], errors="coerce"))
-
-    for col in _MKT_COLS:
-        if col in df.columns:
-            df[col] = _to_number(df[col])
-
-    entered = set(df["_기준일"].dt.date.dropna())
-    missing = []
-    for check_date in check_dates:
-        if check_date not in entered:
-            missing.append((check_date.strftime("%Y-%m-%d (%a)"), "마케팅 행 없음"))
-            continue
-
-        row = df[df["_기준일"].dt.date == check_date]
-        total = sum(row[col].sum() for col in _MKT_COLS if col in row.columns)
-        if total == 0:
-            missing.append((check_date.strftime("%Y-%m-%d (%a)"), "마케팅 전체 항목 0"))
-
-    missing.extend(_check_sale_input(today))
-
-    if not missing:
-        logger.info("마케팅/OKPOS 실적 입력 확인 완료 - 미입력 항목 없음")
-        html = _build_complete_html(check_dates, str(MKT_CSV))
-        send_email(
-            subject="[홀 실적 데이터 입력 완료] 마케팅/OKPOS 입력 문제 없음",
-            html_content=html,
-            to_emails=_ALERT_CC,
-        )
-        return
-
-    missing_dates = []
-    for label, _ in missing:
-        first = label.split()[0]
-        missing_dates.append(first[5:] if len(first) >= 10 and first[4] == "-" else first)
-    missing_dates_str = ", ".join(missing_dates)
-    html = _build_missing_html(missing, str(MKT_CSV))
-    send_email(
-        subject=f"[홀 실적 데이터 미입력] {missing_dates_str} 확인 요청",
-        html_content=html,
-        to_emails=_ALERT_TO,
-        cc_emails=_ALERT_CC,
-    )
-    logger.info("마케팅/OKPOS 실적 미입력 알림 발송: %s", missing_dates_str)
-
-
 # ── 메인 함수 ──────────────────────────────────────────────────
 
 def build_weekly_report_excel(monthly_targets: dict,
@@ -428,10 +283,12 @@ def build_weekly_report_excel(monthly_targets: dict,
     mkt_df  = _load_mkt()
 
     # ── 최신 주 결정 ──────────────────────────────────────────
-    latest    = sale_df.sort_values("입력날짜").iloc[-1]
-    ym        = latest["기준월"]          # "2026-05"
-    wk_label  = latest["기준주"]          # "5월5주차"
-    entry_dt  = latest["입력날짜"]        # 입력날짜(Timestamp)
+    sale_df    = sale_df.sort_values(["입력날짜", "기준월"])
+    entry_dt   = sale_df["입력날짜"].max()
+    week_rows  = sale_df[sale_df["입력날짜"] == entry_dt]
+    latest     = week_rows.iloc[-1]
+    ym         = latest["기준월"]
+    wk_label   = latest["기준주"]
     week_start = (entry_dt - timedelta(days=7)).date()
     week_end   = (entry_dt - timedelta(days=1)).date()
 
@@ -440,7 +297,7 @@ def build_weekly_report_excel(monthly_targets: dict,
     # ── 월 누계 (매출) ────────────────────────────────────────
     mrows = sale_df[sale_df["기준월"] == ym]
     ms = lambda c: int(mrows[c].sum())
-    ws = lambda c: int(latest[c])
+    ws = lambda c: int(week_rows[c].sum())
 
     mt = monthly_targets.get(ym, {})
 
@@ -462,7 +319,7 @@ def build_weekly_report_excel(monthly_targets: dict,
     mm  = lambda c: int(mkt_month[c].sum()) if c in mkt_month.columns else 0
     mw  = lambda c: int(mkt_week[c].sum())  if c in mkt_week.columns and not mkt_week.empty else 0
     mmt = marketing_monthly_targets.get(ym, {})
-    mwt = _mkt_weekly_targets(ym, week_start, marketing_monthly_targets)
+    mwt = _mkt_weekly_targets_span(week_start, marketing_monthly_targets)
 
     # ── AI 진단 ───────────────────────────────────────────────
     def pct(a, t): return f"{a/t*100:.1f}%" if t else "N/A"
@@ -517,23 +374,29 @@ def build_weekly_report_excel(monthly_targets: dict,
     _header_row(ws_, 5, HEADERS)
     ws_.row_dimensions[5].height = 18
 
-    def _ms_aov(prefix_매출, prefix_cnt):
-        """월 누계 테이블단가 = 누계매출/누계영수건수"""
-        total = ms(prefix_매출)
-        cnt   = ms(prefix_cnt)
+    def _aov(rows, col_매출, col_cnt):
+        """테이블단가 = 매출합/영수건수합."""
+        total = int(rows[col_매출].sum())
+        cnt   = int(rows[col_cnt].sum())
         return int(total / cnt) if cnt else 0
+
+    def _ms_aov(col_매출, col_cnt):
+        return _aov(mrows, col_매출, col_cnt)
+
+    def _ws_aov(col_매출, col_cnt):
+        return _aov(week_rows, col_매출, col_cnt)
 
     sale_rows = [
         # (label, m_tgt, m_act, w_tgt, w_act, num_fmt, show_m, show_w)
         ("전체 매출",    mt.get("sale",0),          ms("매출"),          wt_sale,   ws("매출"),         _FMT_KRW, True,  True),
         ("영수건수",     mt.get("orders",0),          ms("영수건수"),     wt_cnt,    ws("영수건수"),     _FMT_NUM, True,  True),
-        ("테이블단가",   mt.get("aov",0),             _ms_aov("매출","영수건수"), mt.get("aov",0), ws("테이블_객단가"), _FMT_KRW, True,  True),
+        ("테이블단가",   mt.get("aov",0),             _ms_aov("매출","영수건수"), mt.get("aov",0), _ws_aov("매출","영수건수"), _FMT_KRW, True,  True),
         ("점심 매출",    mt.get("lunch_sale",0),      ms("점심_매출"),     wt_lunch,  ws("점심_매출"),    _FMT_KRW, True,  True),
         ("점심 영수건수",mt.get("lunch_orders",0),    ms("점심_영수건수"), wt_l_cnt,  ws("점심_영수건수"),_FMT_NUM, True,  True),
-        ("점심 테이블단가",mt.get("lunch_aov",0),     _ms_aov("점심_매출","점심_영수건수"), mt.get("lunch_aov",0), ws("점심_테이블_객단가"), _FMT_KRW, True,  True),
+        ("점심 테이블단가",mt.get("lunch_aov",0),     _ms_aov("점심_매출","점심_영수건수"), mt.get("lunch_aov",0), _ws_aov("점심_매출","점심_영수건수"), _FMT_KRW, True,  True),
         ("저녁 매출",    mt.get("dinner_sale",0),     ms("저녁_매출"),     wt_dinner, ws("저녁_매출"),    _FMT_KRW, True,  True),
         ("저녁 영수건수",mt.get("dinner_orders",0),   ms("저녁_영수건수"), wt_d_cnt,  ws("저녁_영수건수"),_FMT_NUM, True,  True),
-        ("저녁 테이블단가",mt.get("dinner_aov",0),    _ms_aov("저녁_매출","저녁_영수건수"), mt.get("dinner_aov",0), ws("저녁_테이블_객단가"), _FMT_KRW, True,  True),
+        ("저녁 테이블단가",mt.get("dinner_aov",0),    _ms_aov("저녁_매출","저녁_영수건수"), mt.get("dinner_aov",0), _ws_aov("저녁_매출","저녁_영수건수"), _FMT_KRW, True,  True),
     ]
     r = 6
     for lbl, m_t, m_a, w_t, w_a, fmt, sm, sw in sale_rows:
@@ -591,7 +454,7 @@ def build_weekly_report_excel(monthly_targets: dict,
     output_path = XLSX_DIR / f"hall_weekly_report_{today_str}.xlsx"
     latest_path = XLSX_DIR / "hall_weekly_report.xlsx"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path = _save_workbook_replace(wb, output_path)
+    output_path = _save_workbook_replace(wb, output_path, allow_unique_fallback=True)
     _save_workbook_replace(wb, latest_path)   # 고정 파일명 — Excel/PowerBI 참조용
 
     win_path = str(output_path)

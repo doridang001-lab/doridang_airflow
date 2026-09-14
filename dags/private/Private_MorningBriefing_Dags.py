@@ -2,15 +2,14 @@
 출근길 AI 브리핑 DAG
 
 처리 흐름:
-    1. collect_briefing_data : Google Calendar + 어제 FAIL/WARN DAG + git/작업 스케줄러 상태 수집
+    1. collect_briefing_data : Flow Calendar + 어제 FAIL/WARN DAG + git 상태 수집
     2. generate_briefing     : gpt-oss로 DAG 원인 분석 → 전체 우선순위 브리핑 생성
     3. send_briefing         : Telegram 전송
 
-스케줄: 평일 오전 브리핑 (SMP_MORNING_BRIEFING_TIME), 작업 스케줄러 요약은 월요일만 포함
+스케줄: 평일 오전 8:50 (SMP_MORNING_BRIEFING_TIME)
 
 사전 준비:
     - Airflow Variables: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (notifier.py와 공유, 이미 세팅됨)
-    - Google Calendar token: scripts/generate_calendar_token.py 실행 (최초 1회, 없으면 일정 섹션 생략)
 """
 
 import importlib
@@ -33,7 +32,7 @@ send_briefing = _pipeline.send_briefing
 
 with DAG(
     dag_id=Path(__file__).stem,
-    description="출근길 AI 브리핑 — Calendar·DAG 실패·git·작업 스케줄러 상태 → gpt-oss 요약 → Telegram",
+    description="출근길 AI 브리핑 — Flow 일정·DAG 실패·git 상태 → gpt-oss 요약 → Telegram",
     schedule=SMP_MORNING_BRIEFING_TIME,
     start_date=pendulum.datetime(2025, 1, 1, tz="Asia/Seoul"),
     catchup=False,
@@ -50,7 +49,7 @@ with DAG(
     task_collect = PythonOperator(
         task_id="collect_briefing_data",
         python_callable=collect_briefing_data,
-        execution_timeout=pendulum.duration(minutes=3),
+        execution_timeout=pendulum.duration(minutes=15),
     )
 
     task_generate = PythonOperator(

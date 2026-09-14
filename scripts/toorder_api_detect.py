@@ -20,8 +20,10 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
+from modules.transform.utility.account import get_pw
+
 ACCOUNT_ID = "doridang15"
-PASSWORD = "ehfl5233!"
+PASSWORD = get_pw("toorder", ACCOUNT_ID)
 LOGIN_URL = "https://ceo.toorder.co.kr/auth/login?returnTo=%2Fdashboard"
 SALES_REPORT_URL = "https://ceo.toorder.co.kr/dashboard/sales-report/orderkinds"
 

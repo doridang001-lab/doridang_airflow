@@ -8,6 +8,8 @@ from typing import Any
 
 import pendulum
 
+from modules.transform.pipelines.db.DB_Beamin_retry import merge_failed_payloads
+
 
 DAG_SOURCE = Path(__file__).resolve().parents[1] / "dags" / "db" / "DB_Beamin_Macro_Dags.py"
 
@@ -24,6 +26,10 @@ def _load_helpers():
         "_count_failed_items",
         "_task_duration_seconds",
         "_has_validation_issue",
+        "_target_date_from_context",
+        "_normalize_collect_task_ids",
+        "_pull_batch_values",
+        "_pull_batch_failures",
         "_build_collection_notification",
     ):
         matches = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name]
@@ -42,6 +48,7 @@ def _load_helpers():
         "_NOTIFY_TASK_ID": "notify_collection_result",
         "_CORE_TASK_IDS": {"load_accounts", "collect_all", "collect_shop_change", "retry_failed"},
         "_VALIDATION_TASK_IDS": {"validate_orders", "validate_ad_funnel", "validate_toorder"},
+        "merge_failed_payloads": merge_failed_payloads,
         "logger": SimpleNamespace(info=lambda *args, **kwargs: None),
     }
     exec(compile(module_ast, str(DAG_SOURCE), "exec"), namespace)
@@ -71,10 +78,17 @@ class _FakeDagRun:
 
 
 class _FakeTI:
-    def __init__(self, returns: dict, failed: dict | None = None, validation: list | None = None):
+    def __init__(
+        self,
+        returns: dict,
+        failed: dict | None = None,
+        validation: list | None = None,
+        residual_failed: dict | None = None,
+    ):
         self._returns = returns
         self._failed = failed or {}
         self._validation = validation or []
+        self._residual_failed = residual_failed
         self.run_id = "manual__test"
         self.execution_date = pendulum.datetime(2026, 6, 6, 10, 25, tz="Asia/Seoul")
 
@@ -83,12 +97,19 @@ class _FakeTI:
             return self._failed
         if task_ids == "collect_all" and key == "validation":
             return self._validation
+        if task_ids == "retry_failed" and key == "residual_failed":
+            return self._residual_failed
         if key == "return_value":
             return self._returns.get(task_ids)
         return None
 
 
-def _build_context(returns: dict, failed: dict | None = None, validation: list | None = None):
+def _build_context(
+    returns: dict,
+    failed: dict | None = None,
+    validation: list | None = None,
+    residual_failed: dict | None = None,
+):
     task_ids = (
         "load_accounts",
         "collect_all",
@@ -100,7 +121,7 @@ def _build_context(returns: dict, failed: dict | None = None, validation: list |
     )
     tasks = [_FakeTaskInstance(task_id) for task_id in task_ids]
     dag_run = _FakeDagRun(tasks)
-    ti = _FakeTI(returns, failed=failed, validation=validation)
+    ti = _FakeTI(returns, failed=failed, validation=validation, residual_failed=residual_failed)
     return {"ti": ti, "dag_run": dag_run, "logical_date": ti.execution_date}
 
 
@@ -125,13 +146,15 @@ def test_notify_task_id_and_all_done_trigger_are_wired():
 
     assert notify_ids == ["notify_collection_result"]
     assert "trigger_rule=TriggerRule.ALL_DONE" in source
-    assert ">> t7" in source
+    assert "load_task >> init_staging_task" in source
+    assert "retry_task >> export_task >> upload_task >> notify_task" in source
 
 
-def test_notify_delivery_and_problem_sections_are_present():
+def test_collection_task_logs_and_emails_but_does_not_send_telegram():
     source = DAG_SOURCE.read_text(encoding="utf-8")
 
-    assert "send_telegram(body)" in source
+    assert "send_telegram(" not in source
+    assert "on_failure_callback_no_telegram" in source
     assert "_send_alert(subject=subject, body=body" in source
     assert "html_content=html_body" in source
     assert "[복구된 경고]" in source
@@ -153,6 +176,7 @@ def test_notify_treats_toorder_missing_and_recovered_warnings_as_success():
     context = _build_context(
         returns,
         failed={"accounts": [], "stores": ["a", "b", "c"], "orders": [], "ads": []},
+        residual_failed={"accounts": [], "stores": [], "orders": [], "ads": []},
     )
 
     def fake_extract(task_instance, max_lines=8):
@@ -171,8 +195,12 @@ def test_notify_treats_toorder_missing_and_recovered_warnings_as_success():
     assert "[문제 로그]" not in body
     assert "[복구된 경고]" in body
     assert "dashboard not ready" in body
+    assert "원본 수집 실패 신호" in body
+    assert "최종 잔여 실패 accounts=0, stores=0, orders=0, ads=0" in body
     assert should_email is False
     assert "복구된 경고" in html_body
+    assert "원본 수집 실패 신호" in html_body
+    assert "최종 잔여 실패" in html_body
 
 
 def test_notify_keeps_partial_success_for_unrecovered_problem():
@@ -186,7 +214,11 @@ def test_notify_keeps_partial_success_for_unrecovered_problem():
         "validate_ad_funnel": "ad_funnel 빈값 검증: 총 3매장 / 빈값 0건 / 재수집 후 잔존 0건",
         "validate_toorder": "토더 교차검증[2026-06-05]: 비교 3개 매장 / 불일치 1개",
     }
-    context = _build_context(returns)
+    context = _build_context(
+        returns,
+        failed={"accounts": [], "stores": ["a"], "orders": [], "ads": []},
+        residual_failed={"accounts": [], "stores": ["a"], "orders": [], "ads": []},
+    )
 
     def fake_extract(task_instance, max_lines=8):
         if task_instance.task_id == "collect_all":
@@ -202,3 +234,46 @@ def test_notify_keeps_partial_success_for_unrecovered_problem():
     assert "invalid session" in body
     assert should_email is True
     assert "문제 로그" in html_body
+
+
+def test_notify_treats_low_settle_rate_as_informational_success():
+    # 배민 정산정보(입금예정금액)는 통상 09:00 KST 전후에 게시된다. 00시대 자동
+    # 수집은 rate=0%가 정상 패턴이고 주문은 이미 정상 저장되므로, 이 신호만으로
+    # 부분성공 처리하지 않는다(별도 정산 재수집 파이프라인이 이후 채운다).
+    namespace = _load_helpers()
+    returns = {
+        "load_accounts": "계정 1개",
+        "collect_all": "성공 1/1 계정",
+        "collect_shop_change": "성공 1/1 계정 / store_fail=0",
+        "retry_failed": "재시도 완료: accounts=0 stores=0 orders=0 ads=0",
+        "validate_orders": "orders 검증 총 1건(일치 1, 불일치 0, 미확인 0)",
+        "validate_ad_funnel": "ad_funnel 빈값 검증: 총 1매장 / 빈값 0건 / 재수집 후 잔존 0건",
+        "validate_toorder": "토더 교차검증[2026-08-05]: 비교 1개 매장 / 불일치 0개",
+    }
+    context = _build_context(
+        returns,
+        failed={"accounts": [], "stores": [], "orders": [], "ads": []},
+        residual_failed={"accounts": [], "stores": [], "orders": [], "ads": []},
+        validation=[
+            {
+                "matched": True,
+                "status": "배달완료",
+                "store": "역삼점",
+                "settle_rate": 0.5,
+                "settle_count": 5,
+                "settle_denominator": 10,
+                "retried": 1,
+            }
+        ],
+    )
+    namespace["_extract_log_signals"] = lambda task_instance, max_lines=8: ([], 0, [])
+
+    subject, body, html_body, should_email = namespace["_build_collection_notification"](context)
+
+    assert "부분성공" not in subject
+    assert "성공" in subject
+    assert "정산정보 미게시" in body
+    assert "역삼점" in body
+    assert "50.0%" in body
+    assert should_email is False
+    assert "정산정보 미게시" in html_body

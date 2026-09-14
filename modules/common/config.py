@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 from urllib.parse import quote_plus
 
+from modules.transform.utility.mail_recipients import MAIL_CMJ_PM
+
 # 환경 변수로 Docker 여부 판단 (Airflow에서 설정)
 def _detect_docker() -> bool:
     env = os.getenv("IS_DOCKER")
@@ -67,7 +69,7 @@ STORES = [
 ]
 
 # 관리자 이메일
-ADMIN_EMAIL = ["a17019@kakao.com"]
+ADMIN_EMAIL = [MAIL_CMJ_PM]
 
 # 구글 인증 경로
 GSHEET_CRED_PATH = os.path.join(

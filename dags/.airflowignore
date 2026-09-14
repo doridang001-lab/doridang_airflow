@@ -1,0 +1,10 @@
+# Airflow parses every Python file under dags/. Keep ad-hoc scripts elsewhere.
+(^|.*/)tmp_.*\.py$
+(^|.*/).*_tmp\.py$
+(^|.*/)debug_.*\.py$
+(^|.*/).*_debug\.py$
+(^|.*/)scratch_.*\.py$
+(^|.*/).*_scratch\.py$
+(^|.*/)__pycache__($|/.*)
+(^|.*/).*\.bak$
+(^|.*/).*\.orig$

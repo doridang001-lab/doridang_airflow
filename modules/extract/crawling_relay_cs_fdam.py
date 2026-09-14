@@ -8,7 +8,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from webdriver_manager.chrome import ChromeDriverManager
 import pandas as pd
 import os
@@ -31,6 +31,12 @@ def _safe_current_url(driver) -> str:
 
 
 def _is_driver_disconnected_error(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if current is not exc and _is_driver_disconnected_error(current):
+            return True
+        current = current.__cause__ or current.__context__
+
     if isinstance(exc, (MaxRetryError, ConnectionRefusedError, BrokenPipeError)):
         return True
 
@@ -45,6 +51,16 @@ def _is_driver_disconnected_error(exc: BaseException) -> bool:
         "invalid session id",
     ]
     return any(m in msg for m in markers)
+
+
+def _is_driver_session_alive(driver) -> bool:
+    try:
+        driver.execute_script("return 1")
+        return True
+    except Exception as exc:
+        if _is_driver_disconnected_error(exc):
+            return False
+        return False
 
 
 def _create_chrome_service_with_retry(max_attempts: int = 3, base_sleep_sec: int = 5) -> Service:
@@ -169,6 +185,388 @@ def wait_page_ready(driver, timeout: int = 30):
         print(f"⚠️ 페이지 로딩 대기 중 이슈: {e}")
 
 
+def _is_visible(element) -> bool:
+    try:
+        return (
+            element.is_displayed()
+            and element.is_enabled()
+            and element.size.get("width", 0) > 0
+            and element.size.get("height", 0) > 0
+        )
+    except Exception:
+        return False
+
+
+def _iter_elements_in_frames(driver, by: str, value: str):
+    elements = []
+    try:
+        elements.extend(driver.find_elements(by, value))
+    except Exception:
+        pass
+
+    for frame in driver.find_elements(By.TAG_NAME, "iframe"):
+        try:
+            driver.switch_to.frame(frame)
+            elements.extend(driver.find_elements(by, value))
+        except Exception:
+            pass
+        finally:
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+    return elements
+
+
+def _is_login_spinner_only(driver) -> bool:
+    """초기 화면이 로그인 폼 없이 스피너만 보이는 상태인지 판별."""
+    try:
+        html = driver.page_source.lower()
+        if "login_form_id" not in html:
+            return False
+    except Exception:
+        return False
+
+    try:
+        if driver.find_elements(By.CSS_SELECTOR, "input#login_form_id, input[name='login_form_id'], input[placeholder*='ID를 입력해주세요'], input[name='id'], input[type='text'], input[type='password']"):
+            return False
+    except Exception:
+        pass
+
+    try:
+        spin_el = driver.find_elements(By.CSS_SELECTOR, "#root .ant-spin-spinning")
+        return any(el.is_displayed() for el in spin_el)
+    except Exception:
+        return False
+
+
+def _collect_console_logs(driver, download_dir: str | None, tag: str) -> None:
+    if not download_dir:
+        return
+
+    try:
+        logs = driver.get_log("browser")
+    except Exception:
+        return
+
+    if not logs:
+        return
+
+    try:
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(download_dir, f"debug_console_{tag}_{ts}.log")
+        with open(log_path, "w", encoding="utf-8") as f:
+            for item in logs:
+                f.write(f"{item.get('level', '')} {item.get('timestamp', '')} {item.get('message', '')}\n")
+        print(f"  📋 브라우저 콘솔 로그 저장: {log_path}")
+    except Exception as err:
+        print(f"  ⚠️ 콘솔 로그 저장 실패: {err}")
+
+
+def _collect_debug_page(driver, download_dir: str | None, tag: str) -> None:
+    if not download_dir:
+        return
+
+    try:
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        screenshot_path = os.path.join(download_dir, f"debug_{tag}_{ts}.png")
+        driver.save_screenshot(screenshot_path)
+        print(f"  📸 디버그 스크린샷 저장: {screenshot_path}")
+
+        html_path = os.path.join(download_dir, f"debug_{tag}_{ts}.html")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+        print(f"  📄 페이지 소스 저장: {html_path}")
+
+        try:
+            body_text = driver.find_element(By.TAG_NAME, "body").text
+        except Exception:
+            try:
+                body_text = driver.execute_script("return document.body ? document.body.innerText : ''")
+            except Exception:
+                body_text = ""
+        print(f"  📝 body 텍스트 (앞 500자):\n{body_text[:500]}")
+
+        _collect_console_logs(driver, download_dir, tag)
+    except Exception as debug_err:
+        print(f"  ⚠️ 디버그 수집 실패: {debug_err}")
+
+
+def _find_visible_element_with_wait(
+    driver,
+    locators: list[tuple[str, str]],
+    timeout: int = 40,
+    poll_interval: float = 0.8,
+    allow_hidden: bool = False,
+):
+    deadline = time.time() + timeout
+    last_candidates = []
+    while time.time() < deadline:
+        try:
+            for by, value in locators:
+                candidates = _iter_elements_in_frames(driver, by, value)
+                if candidates:
+                    last_candidates = candidates
+                for element in candidates:
+                    if _is_visible(element):
+                        return element
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+
+    if allow_hidden and last_candidates:
+        return last_candidates[0]
+    raise TimeoutException(f"요소 탐색 타임아웃: {locators}")
+
+
+def _safe_get_value(element) -> str:
+    try:
+        return (element.get_attribute("value") or "").strip()
+    except Exception:
+        return ""
+
+
+def _first_value_from_locators(driver, locators, allow_hidden: bool = False):
+    first_candidate = None
+    for by, value in locators:
+        try:
+            for candidate in _iter_elements_in_frames(driver, by, value):
+                candidate_value = _safe_get_value(candidate)
+                if candidate_value:
+                    return candidate_value, candidate
+                if allow_hidden and first_candidate is None:
+                    first_candidate = candidate
+        except Exception:
+            pass
+    if allow_hidden and first_candidate is not None:
+        return "", first_candidate
+    return "", None
+
+
+def _print_login_values(driver, id_locators, pw_locators):
+    id_value, id_element = _first_value_from_locators(driver, id_locators, allow_hidden=True)
+    pw_value, pw_element = _first_value_from_locators(driver, pw_locators, allow_hidden=True)
+    print(f"  🧾 현재 입력값: ID='{id_value}', PW=({len(pw_value)}자리)")
+    if id_element is not None:
+        try:
+            print(f"     └─ id 입력창: visible={id_element.is_displayed()}, class={id_element.get_attribute('class')[:40]}")
+        except Exception:
+            pass
+
+
+def _has_login_inputs(driver) -> bool:
+    login_locators = [
+        (By.ID, "login_form_id"),
+        (By.NAME, "login_form_id"),
+        (By.CSS_SELECTOR, "input#loginId"),
+        (By.CSS_SELECTOR, "input[name='id']"),
+        (By.CSS_SELECTOR, "input[placeholder*='아이디']"),
+        (By.CSS_SELECTOR, "input[placeholder*='ID']"),
+        (By.CSS_SELECTOR, "input[placeholder*='ID를 입력해주세요']"),
+        (By.CSS_SELECTOR, "input[name='username']"),
+        (By.CSS_SELECTOR, "input[autocomplete='username']"),
+        (By.CSS_SELECTOR, "input[type='text']"),
+        (By.CSS_SELECTOR, "input#login_form_pw"),
+        (By.NAME, "login_form_pw"),
+        (By.CSS_SELECTOR, "input[name='password']"),
+        (By.CSS_SELECTOR, "input[autocomplete='current-password']"),
+        (By.CSS_SELECTOR, "input[type='password']"),
+    ]
+
+    for by, value in login_locators:
+        try:
+            if _iter_elements_in_frames(driver, by, value):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _safe_body_text(driver) -> str:
+    try:
+        return (driver.find_element(By.TAG_NAME, "body").text or "").strip().lower()
+    except Exception:
+        try:
+            txt = driver.execute_script("return document.body ? document.body.innerText : ''")
+            return (txt or "").strip().lower()
+        except Exception:
+            return ""
+
+
+def _has_login_marker_text(text: str) -> bool:
+    lowered = (text or "").lower()
+    markers = [
+        "login",
+        "로그인",
+        "server list",
+        "서버 목록",
+        "id를 입력해주세요",
+        "비밀번호를 입력해주세요",
+        "login_form_id",
+        "login_form_pw",
+    ]
+    return any(marker in lowered for marker in markers)
+
+
+def _is_login_page(driver) -> bool:
+    if _has_login_inputs(driver):
+        return True
+    return _has_login_marker_text(_safe_body_text(driver))
+
+
+def _collect_menu_nodes(driver):
+    selectors = [
+        "//div[@role='menuitem' and contains(@class,'ant-menu-submenu-title')]",
+        "//div[@role='menuitem']",
+        "//li[@role='menuitem']",
+        "//li[contains(@class,'ant-menu-submenu')]",
+        "//li[contains(@class,'ant-menu-item')]",
+        "//*[contains(@class,'ant-menu') and contains(@class,'ant-menu-dark')]//li",
+        "//*[contains(@class,'ant-menu-submenu') and .//*[contains(@class,'ant-menu-item')]]",
+    ]
+    nodes = []
+    seen = set()
+    for selector in selectors:
+        try:
+            for node in _iter_elements_in_frames(driver, By.XPATH, selector):
+                key = id(node)
+                if key in seen:
+                    continue
+                seen.add(key)
+                nodes.append(node)
+        except Exception:
+            pass
+    return nodes
+
+
+def _wait_for_menu_nodes(driver, timeout: int = 60, poll_interval: float = 1.5) -> list:
+    end = time.time() + timeout
+    while time.time() < end:
+        menu_nodes = _collect_menu_nodes(driver)
+        if menu_nodes:
+            return menu_nodes
+        time.sleep(poll_interval)
+    return []
+
+
+def _has_menu_text(nodes, keyword: str) -> bool:
+    for node in nodes:
+        try:
+            text = (node.text or "").strip()
+            if keyword in text.replace("\n", ""):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _wait_for_login_success(driver, pre_url: str, timeout: int = 30) -> bool:
+    end = time.time() + timeout
+    stable_non_login = 0
+    while time.time() < end:
+        if _is_login_page(driver):
+            stable_non_login = 0
+            time.sleep(0.8)
+            continue
+
+        if _collect_menu_nodes(driver):
+            return True
+
+        stable_non_login += 1
+        if stable_non_login >= 3:
+            return True
+
+        time.sleep(0.8)
+    return False
+
+
+def _find_login_input(
+    driver,
+    locators: list[tuple[str, str]],
+    *,
+    timeout: int = 70,
+    debug_dir: str | None = None,
+) -> tuple:
+    deadline = time.time() + timeout
+    last_refresh = 0
+    refresh_wait = 12
+    first_spin_seen = None
+
+    while time.time() < deadline:
+        try:
+            element = _find_visible_element_with_wait(
+                driver,
+                locators,
+                timeout=5,
+                poll_interval=0.5,
+                allow_hidden=False,
+            )
+            return element, "visible"
+        except TimeoutException:
+            pass
+
+        now = time.time()
+        if _is_login_spinner_only(driver):
+            if first_spin_seen is None:
+                first_spin_seen = now
+                print("  ⚠️ 로그인 화면에서 스피너만 표시됨")
+
+            if now - last_refresh >= refresh_wait:
+                print("  ♻️ 스피너 고착으로 로그인 화면 새로고침")
+                try:
+                    driver.refresh()
+                    wait_page_ready(driver, timeout=30)
+                    time.sleep(2.0)
+                except Exception as err:
+                    print(f"  ⚠️ 새로고침 실패: {err}")
+                last_refresh = now
+
+            if now - first_spin_seen >= 45:
+                break
+        else:
+            first_spin_seen = None
+        time.sleep(0.5)
+
+    for by, value in locators:
+        try:
+            candidates = _iter_elements_in_frames(driver, by, value)
+            if candidates:
+                return candidates[0], "hidden"
+        except Exception:
+            pass
+
+    _collect_debug_page(driver, debug_dir, "login_input_wait_retry")
+    raise TimeoutException(f"로그인 입력창 탐색 타임아웃: {locators}")
+
+
+def _type_safely(driver, element, value: str) -> None:
+    try:
+        element.click()
+        element.clear()
+        element.send_keys(value)
+        return
+    except Exception:
+        pass
+
+    try:
+        driver.execute_script(
+            """
+            const el = arguments[0];
+            const value = arguments[1];
+            el.focus();
+            el.value = '';
+            el.value = value;
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+            el.dispatchEvent(new Event('blur', {bubbles: true}));
+            """,
+            element,
+            value,
+        )
+    except Exception as e:
+        raise RuntimeError(f"입력 필드 입력 실패: {e}") from e
+
+
 def login_relay_fms(driver, user_id: str, password: str, server_name: str = "도리당", server_number: str = "10625", download_dir: str = None):
     try:
         driver.get("https://erp.relayfms.com/login")
@@ -178,119 +576,214 @@ def login_relay_fms(driver, user_id: str, password: str, server_name: str = "도
         time.sleep(2.0)
 
         print("📝 ID 입력 중...")
-        id_input = wait.until(EC.presence_of_element_located((By.ID, "login_form_id")))
-        id_input.clear()
-        id_input.send_keys(user_id)
-        time.sleep(0.5)
+        id_locators = [
+            (By.ID, "login_form_id"),
+            (By.NAME, "login_form_id"),
+            (By.CSS_SELECTOR, "input#loginId"),
+            (By.CSS_SELECTOR, "input[name='id']"),
+            (By.CSS_SELECTOR, "input[placeholder*='아이디']"),
+            (By.CSS_SELECTOR, "input[placeholder*='ID']"),
+            (By.CSS_SELECTOR, "input[type='text']"),
+            (By.CSS_SELECTOR, "input[autocomplete='username']"),
+        ]
+        pw_locators = [
+            (By.ID, "login_form_pw"),
+            (By.NAME, "login_form_pw"),
+            (By.CSS_SELECTOR, "input#password"),
+            (By.CSS_SELECTOR, "input[name='password']"),
+            (By.CSS_SELECTOR, "input[type='password']"),
+            (By.CSS_SELECTOR, "input[autocomplete='current-password']"),
+        ]
+        login_button_locators = [
+            (By.XPATH, "//button[contains(@class, 'ant-btn-primary') and "
+             "(.//span[text()='Login'] or .//span[text()='로그인'] or @type='submit')]"),
+            (By.XPATH, "//button[contains(@class, 'ant-btn') and "
+             "(.//span[text()='Login'] or .//span[text()='로그인'] or @type='submit')]"),
+            (By.XPATH, "//button[contains(normalize-space(.), '로그인')]"),
+            (By.XPATH, "//button[contains(normalize-space(.), 'Login')]"),
+            (By.XPATH, "//button[@type='submit']"),
+            (By.CSS_SELECTOR, "button[type='submit']"),
+        ]
 
-        print("🔒 PW 입력 중...")
-        pw_input = driver.find_element(By.ID, "login_form_pw")
-        pw_input.clear()
-        pw_input.send_keys(password)
-        time.sleep(0.5)
+        server_name_locators = [
+            (By.ID, "login_form_server_name"),
+            (By.NAME, "login_form_server_name"),
+            (By.CSS_SELECTOR, "input[name='serverName']"),
+            (By.CSS_SELECTOR, "input[placeholder*='서버']"),
+        ]
+        server_number_locators = [
+            (By.ID, "login_form_server_number"),
+            (By.NAME, "login_form_server_number"),
+            (By.CSS_SELECTOR, "input[name='serverNumber']"),
+        ]
 
-        # ✅ 서버 목록 버튼 대기 - 실패해도 계속 진행
-        print("🔧 서버 목록 버튼 대기 중...")
-        try:
-            # 페이지에 있는 모든 버튼 출력 (디버깅)
-            all_buttons = driver.find_elements(By.TAG_NAME, "button")
-            print(f"  현재 버튼 수: {len(all_buttons)}")
-            for btn in all_buttons[:10]:
-                print(f"  버튼: text='{btn.text}' class='{btn.get_attribute('class')[:40]}'")
+        login_success = False
+        for login_attempt in range(1, 3):
+            if login_attempt > 1:
+                print(f"  🔄 로그인 페이지 재진입 후 재시도 ({login_attempt}/2)")
+                driver.get("https://erp.relayfms.com/login")
+                wait_page_ready(driver, timeout=30)
+                time.sleep(2.0)
 
-            WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable(
-                (By.XPATH, "//button[.//span[text()='Server List' or text()='서버 목록']]")
-                )
+            print(f"📝 ID 입력 중... (시도 {login_attempt}/2)")
+            try:
+                id_input, id_state = _find_login_input(driver, id_locators, timeout=80, debug_dir=download_dir)
+                print(f"  🧭 ID 입력창 탐색 모드: {id_state}")
+            except TimeoutException as exc:
+                print("  ❌ 로그인 ID 입력창 탐색 실패")
+                if not _is_driver_session_alive(driver):
+                    raise RuntimeError("Selenium 드라이버 연결이 끊어졌습니다(ID 입력창 탐색 중).") from exc
+                _collect_debug_page(driver, download_dir, "login_id_not_found")
+                if _has_login_inputs(driver):
+                    print("  ⚠️ 입력창 후보는 존재하나 고정 selector 미탐지. 재검색 모드로 전환")
+                    _print_login_values(driver, id_locators, pw_locators)
+                raise RuntimeError("로그인 페이지에서 ID 입력창을 찾지 못했습니다.") from exc
+
+            _type_safely(driver, id_input, user_id)
+            time.sleep(0.5)
+
+            print("🔒 PW 입력 중...")
+            try:
+                pw_input, pw_state = _find_login_input(driver, pw_locators, timeout=30, debug_dir=download_dir)
+                print(f"  🧭 PW 입력창 탐색 모드: {pw_state}")
+            except TimeoutException as exc:
+                if not _is_driver_session_alive(driver):
+                    raise RuntimeError("Selenium 드라이버 연결이 끊어졌습니다(PW 입력창 탐색 중).") from exc
+                _collect_debug_page(driver, download_dir, "login_pw_not_found")
+                raise RuntimeError("로그인 페이지에서 비밀번호 입력창을 찾지 못했습니다.") from exc
+
+            _type_safely(driver, pw_input, password)
+            time.sleep(0.5)
+
+            current_server_name, _ = _first_value_from_locators(driver, server_name_locators, allow_hidden=True)
+            current_server_number, _ = _first_value_from_locators(driver, server_number_locators, allow_hidden=True)
+
+            if not (
+                current_server_name.strip() == server_name.strip()
+                and current_server_number.strip() == server_number.strip()
+            ):
+                print("🔧 서버 목록 버튼 대기 중...")
+                try:
+                    # 페이지에 있는 모든 버튼 출력 (디버깅)
+                    all_buttons = driver.find_elements(By.TAG_NAME, "button")
+                    print(f"  현재 버튼 수: {len(all_buttons)}")
+                    for btn in all_buttons[:10]:
+                        print(f"  버튼: text='{btn.text}' class='{btn.get_attribute('class')[:40]}'")
+
+                    server_list_btn = _find_visible_element_with_wait(
+                        driver,
+                        [
+                            (By.XPATH, "//button[.//span[text()='Server List' or text()='서버 목록']"),
+                            (By.XPATH, "//button[contains(normalize-space(.), 'Server List') or contains(normalize-space(.), '서버 목록')]"),
+                        ],
+                        timeout=15,
+                        poll_interval=0.5,
+                    )
+                    print("🔧 서버 목록 추가 작업 시작...")
+                    add_server_to_list(driver, server_name, server_number)
+                except Exception as e:
+                    print(f"⚠️ 서버 목록 버튼 없음 또는 실패 (스킵): {e.__class__.__name__}")
+                    _collect_debug_page(driver, download_dir, "server_list_button_error")
+            else:
+                print(f"✅ 서버 값 일치 확인으로 Server List 스킵: name='{current_server_name}', number='{current_server_number}'")
+
+            # ✅ 서버 모달 닫힌 후 폼 필드가 리셋될 수 있으므로 재확인·재입력
+            time.sleep(1.0)
+            try:
+                id_field, _ = _find_login_input(driver, id_locators, timeout=10, debug_dir=download_dir)
+                pw_field, _ = _find_login_input(driver, pw_locators, timeout=10, debug_dir=download_dir)
+                id_val = id_field.get_attribute("value") or ""
+                pw_val = pw_field.get_attribute("value") or ""
+                if not id_val:
+                    print("  ⚠️ ID 필드 비어있음 → 재입력")
+                    id_field.clear()
+                    id_field.send_keys(user_id)
+                    time.sleep(0.3)
+                if not pw_val:
+                    print("  ⚠️ PW 필드 비어있음 → 재입력")
+                    pw_field.clear()
+                    pw_field.send_keys(password)
+                    time.sleep(0.3)
+            except Exception as e:
+                print(f"  ⚠️ 폼 필드 재확인 중 오류: {e}")
+
+            pre_url = driver.current_url
+
+            print("🚀 로그인 버튼 클릭 중...")
+            try:
+                login_button = _find_visible_element_with_wait(driver, login_button_locators, timeout=20)
+            except TimeoutException as exc:
+                print("  ⚠️ 로그인 버튼 탐색 실패, Enter fallback로 진행")
+                if not _is_driver_session_alive(driver):
+                    raise RuntimeError("Selenium 드라이버 연결이 끊어졌습니다(로그인 버튼 탐색 중).") from exc
+                _collect_debug_page(driver, download_dir, "login_button_not_found")
+                raise RuntimeError("로그인 버튼을 찾지 못했습니다.") from exc
+
+            driver.execute_script("arguments[0].click();", login_button)
+
+            if _wait_for_login_success(driver, pre_url, timeout=60):
+                print(f"✅ 로그인 완료 확인: {_safe_current_url(driver)}")
+                login_success = True
+                break
+
+            # 에러 메시지 확인
+            err_els = driver.find_elements(
+                By.XPATH,
+                "//*[contains(@class,'ant-form-item-explain') or contains(@class,'ant-message-error') or contains(@class,'ant-alert-error')]"
             )
-            print("🔧 서버 목록 추가 작업 시작...")
-            add_server_to_list(driver, server_name, server_number)
-        except Exception as e:
-            print(f"⚠️ 서버 목록 버튼 없음 (스킵): {e.__class__.__name__}")
+            for el in err_els[:3]:
+                print(f"  ❗ 에러 메시지: {el.text}")
+            _print_login_values(driver, id_locators, pw_locators)
+            _collect_debug_page(driver, download_dir, f"login_not_completed_attempt_{login_attempt}")
 
-        # ✅ 서버 모달 닫힌 후 폼 필드가 리셋될 수 있으므로 재확인·재입력
-        time.sleep(1.0)
-        try:
-            id_field = driver.find_element(By.ID, "login_form_id")
-            pw_field = driver.find_element(By.ID, "login_form_pw")
-            id_val = id_field.get_attribute("value") or ""
-            pw_val = pw_field.get_attribute("value") or ""
-            if not id_val:
-                print("  ⚠️ ID 필드 비어있음 → 재입력")
-                id_field.clear()
-                id_field.send_keys(user_id)
-                time.sleep(0.3)
-            if not pw_val:
-                print("  ⚠️ PW 필드 비어있음 → 재입력")
-                pw_field.clear()
-                pw_field.send_keys(password)
-                time.sleep(0.3)
-        except Exception as e:
-            print(f"  ⚠️ 폼 필드 재확인 중 오류: {e}")
-
-        pre_url = driver.current_url
-
-        print("🚀 로그인 버튼 클릭 중...")
-        login_button = wait.until(
-            EC.element_to_be_clickable(
-                (By.XPATH,
-                 "//button[contains(@class, 'ant-btn-primary') and "
-                 "(.//span[text()='Login'] or .//span[text()='로그인'] or @type='submit')]")
-            )
-        )
-        driver.execute_script("arguments[0].click();", login_button)
-
-        post_wait = WebDriverWait(driver, 60)
-
-        try:
-            post_wait.until(lambda d: d.current_url != pre_url)
-            print(f"✅ URL 변경 확인: {_safe_current_url(driver)}")
-        except Exception as e:
-            if isinstance(e, WebDriverException) and _is_driver_disconnected_error(e):
-                raise RuntimeError("Selenium 드라이버 연결이 끊어졌습니다(로그인 직후).") from e
-
-            print(f"⚠️ URL 미변경, 현재: {_safe_current_url(driver)}")
-            # ✅ Enter 키 폴백: 버튼 클릭이 안 먹혔을 경우
+            # Enter 키 폴백: 버튼 클릭이 안 먹혔을 경우
             print("  🔄 Enter 키로 로그인 재시도...")
             try:
-                pw_field = driver.find_element(By.ID, "login_form_pw")
+                pw_field, _ = _find_login_input(driver, pw_locators, timeout=10, debug_dir=download_dir)
                 pw_field.send_keys(Keys.RETURN)
                 time.sleep(3.0)
-                if driver.current_url != pre_url:
+                if _wait_for_login_success(driver, pre_url, timeout=15):
                     print(f"  ✅ Enter 키로 로그인 성공: {driver.current_url}")
-                else:
-                    # 에러 메시지 확인
-                    err_els = driver.find_elements(
-                        By.XPATH,
-                        "//*[contains(@class,'ant-form-item-explain') or contains(@class,'ant-message-error') or contains(@class,'ant-alert-error')]"
-                    )
-                    for el in err_els[:3]:
-                        print(f"  ❗ 에러 메시지: {el.text}")
-                    print(f"  ⚠️ Enter 키 후에도 URL 미변경: {driver.current_url}")
+                    login_success = True
+                    break
+
+                print(f"  ⚠️ Enter 키 후에도 로그인 미완료: {driver.current_url}")
+                _collect_debug_page(driver, download_dir, f"login_enter_not_completed_attempt_{login_attempt}")
             except Exception as enter_err:
                 if isinstance(enter_err, WebDriverException) and _is_driver_disconnected_error(enter_err):
                     raise RuntimeError("Selenium 드라이버 연결이 끊어졌습니다(Enter 재시도 중).") from enter_err
                 print(f"  ⚠️ Enter 키 재시도 실패: {enter_err}")
+                _collect_debug_page(driver, download_dir, f"login_enter_failed_attempt_{login_attempt}")
+
+        if not login_success:
+            raise RuntimeError(
+                "로그인 실패: 인증 미성립(로그인 화면 잔존). "
+                "자격증명·서버선택 상태를 확인하세요."
+            )
 
         wait_page_ready(driver, timeout=30)
 
 # login_relay_fms 내 사이드 메뉴 대기 부분 수정
 
-        print("⏳ 사이드 메뉴 로딩 대기 중...")
+        print("⏳ 사이드 메뉴 로딩 중...")
         menu_loaded = False
         for attempt in range(3):
             try:
-                WebDriverWait(driver, 30).until(
-                    EC.presence_of_element_located((
-                        By.XPATH,
-                        "//div[@role='menuitem' and contains(@class,'ant-menu-submenu-title')]"
-                    ))
-                )
-                print("✅ 사이드 메뉴 로딩 완료")
-                menu_loaded = True
-                break
-            except Exception:
-                print(f"  ⚠️ 사이드 메뉴 대기 실패 (시도 {attempt+1}/3), 페이지 새로고침...")
+                menus = _wait_for_menu_nodes(driver, timeout=45, poll_interval=1.5)
+                print(f"  메뉴 후보 수: {len(menus)}")
+                if _has_menu_text(menus, "CS관리") or _has_menu_text(menus, "매장CS"):
+                    print("✅ 사이드 메뉴 로딩 완료")
+                    menu_loaded = True
+                    break
+
+                if menus:
+                    print("  메뉴는 보이나 CS관리 항목 미탐색. 새로고침 후 재시도")
+                else:
+                    print("  메뉴 미탐색. 새로고침 후 재시도")
+            except Exception as err:
+                print(f"  ⚠️ 사이드 메뉴 대기 실패 (시도 {attempt+1}/3): {err}")
+
+            if attempt < 2:
                 driver.refresh()
                 wait_page_ready(driver, timeout=30)
                 time.sleep(3.0)
@@ -299,7 +792,7 @@ def login_relay_fms(driver, user_id: str, password: str, server_name: str = "도
             print("⚠️ 사이드 메뉴 미로딩 → 디버깅 정보 수집")
             
             # 현재 URL 확인
-            print(f"  현재 URL: {driver.current_url}")
+            print(f"  현재 URL: {_safe_current_url(driver)}")
             
             # 스크린샷 저장
             screenshot_path = os.path.join(download_dir, "debug_screenshot.png")
@@ -314,11 +807,17 @@ def login_relay_fms(driver, user_id: str, password: str, server_name: str = "도
             print(f"  📄 페이지 소스 저장: {debug_html_path}")
             
             # body 텍스트 출력 (핵심)
-            body_text = driver.find_element(By.TAG_NAME, 'body').text
+            body_text = _safe_body_text(driver)
             print(f"  📝 body 텍스트 (앞 500자):\n{body_text[:500]}")
             
             # 혹시 에러 메시지나 로그인 페이지로 돌아갔는지 확인
-            if 'login' in driver.current_url.lower():
+            if _is_login_page(driver) or _has_login_marker_text(body_text):
+                print("  ❌ 로그인 화면 잔존 → 로그인 실패")
+                raise RuntimeError(
+                    "로그인 실패: 인증 미성립(로그인 화면 잔존). "
+                    "자격증명·서버선택 상태를 확인하세요."
+                )
+            if 'login' in _safe_current_url(driver).lower():
                 print("  ❌ 로그인 페이지로 돌아감 → 로그인 실패")
                 raise RuntimeError(
                     "로그인 실패: 로그인 페이지에서 벗어나지 못함. "
@@ -406,14 +905,41 @@ def add_server_to_list(driver, server_name: str = "도리당", server_number: st
 def expand_submenu_and_click_item(driver, submenu_text: str, item_text: str, timeout: int = 20):
     wait = WebDriverWait(driver, timeout)
 
-    submenu_title = wait.until(
-        EC.presence_of_element_located((
-            By.XPATH,
-            "//div[@role='menuitem' and contains(@class,'ant-menu-submenu-title')"
-            " and .//span[contains(@class,'ant-menu-title-content')]"
-            f"[.//span[contains(normalize-space(.), '{submenu_text}')]]]"
-        ))
-    )
+    end = time.time() + timeout
+    submenu_title = None
+    submenu_xpaths = [
+        "//div[@role='menuitem' and contains(@class,'ant-menu-submenu-title')]",
+        "//div[contains(@class,'ant-menu-submenu-title')]",
+        "//li[contains(@class,'ant-menu-submenu')]",
+        "//li[@role='menuitem' and contains(@class,'ant-menu-submenu')]",
+        "//div[@role='menuitem']",
+        "//li[@role='menuitem']",
+    ]
+
+    while time.time() < end:
+        for xpath in submenu_xpaths:
+            try:
+                for candidate in _iter_elements_in_frames(driver, By.XPATH, xpath):
+                    try:
+                        text = (candidate.text or "").replace("\n", "")
+                        if submenu_text not in text:
+                            continue
+                        if _is_visible(candidate):
+                            submenu_title = candidate
+                            break
+                    except Exception:
+                        pass
+                if submenu_title:
+                    break
+            except Exception:
+                pass
+        if submenu_title:
+            break
+        time.sleep(0.5)
+
+    if submenu_title is None:
+        raise TimeoutException(f"사이드메뉴 '{submenu_text}' 탐색 실패")
+
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", submenu_title)
     time.sleep(0.2)
 
@@ -439,23 +965,46 @@ def expand_submenu_and_click_item(driver, submenu_text: str, item_text: str, tim
 
     popup_id = submenu_title.get_attribute("aria-controls")
 
+    item = None
     if popup_id:
-        popup = wait.until(EC.presence_of_element_located((By.ID, popup_id)))
-        item_xpath = (
-            f"//*[@id='{popup_id}']"
-            "//li[@role='menuitem' and .//span[contains(@class,'ant-menu-title-content')]"
-            f"[contains(normalize-space(.), '{item_text}')]]"
-        )
-        item = wait.until(EC.element_to_be_clickable((By.XPATH, item_xpath)))
-    else:
-        item_xpath = (
-            "//li[contains(@class,'ant-menu-submenu') and .//div[@role='menuitem']"
-            "  [.//span[contains(@class,'ant-menu-title-content')]"
-            f"   [.//span[contains(normalize-space(.), '{submenu_text}')]]]]"
-            "//li[@role='menuitem' and .//span[contains(@class,'ant-menu-title-content')]"
-            f"[contains(normalize-space(.), '{item_text}')]]"
-        )
-        item = wait.until(EC.element_to_be_clickable((By.XPATH, item_xpath)))
+        popup_path = [
+            f"//*[@id='{popup_id}']//li[@role='menuitem' and contains(normalize-space(.), '{item_text}')]",
+            f"//*[@id='{popup_id}']//li[contains(@class,'ant-menu-item') and contains(normalize-space(.), '{item_text}')]",
+            f"//*[@id='{popup_id}']//a[contains(normalize-space(.), '{item_text}')]",
+        ]
+        for path in popup_path:
+            try:
+                item = wait.until(EC.element_to_be_clickable((By.XPATH, path)))
+                if item:
+                    break
+            except Exception:
+                pass
+
+    if item is None:
+        item_end = time.time() + timeout
+        item_xpaths = [
+            "//li[@role='menuitem' and contains(normalize-space(.), '{item_text}')]",
+            "//li[contains(@class,'ant-menu-item') and contains(normalize-space(.), '{item_text}')]",
+            "//a[contains(normalize-space(.), '{item_text}')]",
+        ]
+        while time.time() < item_end:
+            for path_tmpl in item_xpaths:
+                try:
+                    path = path_tmpl.format(item_text=item_text)
+                    for candidate in _iter_elements_in_frames(driver, By.XPATH, path):
+                        if _is_visible(candidate):
+                            item = candidate
+                            break
+                    if item:
+                        break
+                except Exception:
+                    pass
+            if item:
+                break
+            time.sleep(0.5)
+
+    if item is None:
+        raise TimeoutException(f"사이드 메뉴 항목 '{item_text}' 탐색 실패")
 
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", item)
     time.sleep(0.1)
@@ -475,17 +1024,15 @@ def navigate_to_cs_market(driver, max_retries: int = 3):
             print(f"📂 CS관리 메뉴 클릭 중... (시도 {attempt+1}/{max_retries})")
             
             # 메뉴 존재 확인
-            menus = driver.find_elements(
-                By.XPATH, 
-                "//div[@role='menuitem' and contains(@class,'ant-menu-submenu-title')]"
-            )
+            menus = _wait_for_menu_nodes(driver, timeout=60, poll_interval=1.5)
             print(f"  🔎 현재 서브메뉴 수: {len(menus)}")
             
             if len(menus) == 0:
                 print("  ⚠️ 메뉴 없음 → 새로고침 후 재시도")
-                driver.refresh()
-                wait_page_ready(driver, timeout=30)
-                time.sleep(5.0)
+                if attempt < max_retries - 1:
+                    driver.refresh()
+                    wait_page_ready(driver, timeout=30)
+                    time.sleep(5.0)
                 continue
             
             expand_submenu_and_click_item(driver, submenu_text="CS관리", item_text="매장CS")
@@ -501,11 +1048,11 @@ def navigate_to_cs_market(driver, max_retries: int = 3):
             else:
                 # 디버깅 정보 출력
                 try:
-                    menus = driver.find_elements(By.XPATH, "//div[@role='menuitem' and contains(@class,'ant-menu-submenu-title')]")
+                    menus = _collect_menu_nodes(driver)
                     print(f"  🔎 최종 서브메뉴 수: {len(menus)}")
                     for m in menus[:10]:
                         try:
-                            txt = m.find_element(By.XPATH, ".//span[contains(@class,'ant-menu-title-content')]").text
+                            txt = (m.text or "").strip().replace("\n", " / ")
                             print(f"   - {txt}")
                         except Exception:
                             pass
@@ -590,15 +1137,17 @@ def run_relay_cs_crawling(
     if download_dir is None:
         raise ValueError("download_dir 필수")
 
+    download_dir = os.path.abspath(download_dir)
     os.makedirs(download_dir, exist_ok=True)
     last_error: Exception | None = None
 
-    for attempt in range(1, 3):
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
         driver = None
         try:
             if attempt > 1:
                 sleep_sec = 5 * attempt
-                print(f"🔁 크롤링 재시도 {attempt}/2 (대기 {sleep_sec}s)")
+                print(f"🔁 크롤링 재시도 {attempt}/{max_attempts} (대기 {sleep_sec}s)")
                 time.sleep(sleep_sec)
 
             print("=" * 60)
@@ -629,4 +1178,5 @@ def run_relay_cs_crawling(
                     pass
                 print("✅ 드라이버 종료")
 
-    raise RuntimeError(f"Relay CS 크롤링 재시도(2회) 모두 실패: {last_error}") from last_error
+    raise RuntimeError(f"Relay CS 크롤링 재시도({max_attempts}회) 모두 실패: {last_error}") from last_error
+

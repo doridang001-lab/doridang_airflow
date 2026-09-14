@@ -21,6 +21,7 @@ import pendulum
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
+from modules.transform.utility.account import load_automation_account_df
 from modules.transform.utility.paths import DDANGYO_POLICY_CSV_PATH, ONEDRIVE_DB, POLICY_LOG_PATH
 
 logger = logging.getLogger(__name__)
@@ -169,19 +170,9 @@ def load_ddangyo_accounts(**context) -> List[Dict[str, str]]:
         logger.warning(f"sales_employee.csv 파일이 없습니다: {EMPLOYEE_CSV_PATH}")
         return []
 
-    try:
-        df = pd.read_csv(EMPLOYEE_CSV_PATH, encoding="utf-8-sig", dtype=str)
-    except Exception as e:
-        logger.warning(f"sales_employee.csv 로드 실패: {e}")
-        return []
-
-    if PLATFORM_COL not in df.columns:
-        logger.warning(f"컬럼 '{PLATFORM_COL}'이 없습니다. 컬럼 목록: {df.columns.tolist()}")
-        return []
-
-    filtered = df[df[PLATFORM_COL].str.strip() == PLATFORM_NAME]
+    filtered = load_automation_account_df(platform=PLATFORM_NAME)
     if filtered.empty:
-        logger.warning(f"플랫폼='{PLATFORM_NAME}' 계정이 없습니다.")
+        logger.warning(f"플랫폼='{PLATFORM_NAME}' 자동화 연결 계정이 없습니다.")
         return []
 
     accounts = []

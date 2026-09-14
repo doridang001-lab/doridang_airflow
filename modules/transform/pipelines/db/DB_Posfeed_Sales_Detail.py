@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+import pendulum
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -25,19 +26,47 @@ from airflow.exceptions import AirflowSkipException
 
 from modules.transform.utility.paths import ANALYTICS_DB
 from modules.transform.utility.analytics import read_analytics_partition
-from modules.transform.utility.selenium_uc import configure_uc_data_path
+from modules.transform.utility.selenium_uc import launch_uc_chrome
 from modules.load.load_onedrive import onedrive_csv_save
 
 logger = logging.getLogger(__name__)
 
+
+def _get_airflow_variable(key: str) -> str:
+    try:
+        from airflow.models import Variable
+
+        return (Variable.get(key, default_var=None) or "").strip()
+    except Exception:
+        return ""
+
+
+def _resolve_secret(key: str, default: str) -> str:
+    return (os.getenv(key) or _get_airflow_variable(key) or default).strip()
+
+
 # ============================================================
 # 상수
 # ============================================================
-POSFEED_ID = "siw2222@naver.com"
-POSFEED_PW = "ehfl8877!!"
+POSFEED_ID = _resolve_secret("POSFEED_ID", "siw2222@naver.com")
+POSFEED_PW = _resolve_secret("POSFEED_PW", "ehfl8877!!")
 LOGIN_URL   = "https://admin.posfeed.co.kr/#/login?redirect=%2Fdashboard"
 ORDER_DETAIL_URL = "https://admin.posfeed.co.kr/#/order/edit/{code}"
 HEADLESS_MODE = os.getenv("AIRFLOW_HOME") is not None
+_LOGIN_ID_LOCATORS = (
+    (By.NAME, "username"),
+    (By.CSS_SELECTOR, 'input[autocomplete="username"]'),
+    (By.CSS_SELECTOR, 'input[aria-label="Username"]'),
+    (By.CSS_SELECTOR, 'input[placeholder="Username"]'),
+    (By.CSS_SELECTOR, 'input[type="text"], input[type="email"]'),
+)
+_LOGIN_PW_LOCATORS = (
+    (By.NAME, "password"),
+    (By.CSS_SELECTOR, 'input[autocomplete="current-password"]'),
+    (By.CSS_SELECTOR, 'input[aria-label="Password"]'),
+    (By.CSS_SELECTOR, 'input[placeholder="Password"]'),
+    (By.CSS_SELECTOR, 'input[type="password"]'),
+)
 
 # 장시간 실행 시 Chrome/driver 누적으로 크래시가 나는 케이스가 있어
 # 매 N개 매장마다 주기적으로 재시작해 안정성을 높인다. (0이면 비활성화)
@@ -84,11 +113,10 @@ def _launch_browser() -> uc.Chrome:
     """다운로드 설정 없는 경량 Chrome 브라우저 실행"""
     _kill_chrome_processes()
     logger.info("브라우저 실행 (headless=%s)", HEADLESS_MODE)
-    configure_uc_data_path()
 
     def _make_options() -> uc.ChromeOptions:
         options = uc.ChromeOptions()
-        chrome_bin = os.getenv("CHROME_BIN")
+        chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/google-chrome")
         if chrome_bin and Path(chrome_bin).exists():
             options.binary_location = chrome_bin
         if HEADLESS_MODE:
@@ -99,71 +127,105 @@ def _launch_browser() -> uc.Chrome:
         options.add_argument("--window-size=1920,1080")
         return options
 
-    chrome_version = _get_chrome_version()
-    try:
-        kwargs = {"options": _make_options()}
-        if chrome_version:
-            kwargs["version_main"] = chrome_version
-        driver = uc.Chrome(**kwargs)
+    def _finalize_driver(driver: uc.Chrome) -> uc.Chrome:
         driver.set_window_size(1920, 1080)
-        # Avoid getting stuck in a long page load; if the site freezes, we want a Selenium-level timeout
-        # (so Airflow execution_timeout is used as a last resort, not the primary breaker).
         try:
             driver.set_page_load_timeout(int(os.getenv("POSFEED_PAGELOAD_TIMEOUT_SEC", "45")))
             driver.set_script_timeout(int(os.getenv("POSFEED_SCRIPT_TIMEOUT_SEC", "45")))
         except Exception as timeout_err:
             logger.warning("WebDriver timeout 설정 실패(무시): %s", timeout_err)
-        logger.info("브라우저 실행 성공")
         return driver
-    except Exception as e:
-        match = re.search(r"Current browser version is (\d+)", str(e))
-        if match:
-            detected = int(match.group(1))
-            logger.warning("버전 불일치 → %d 으로 재시도", detected)
-            driver = uc.Chrome(options=_make_options(), version_main=detected)
-            driver.set_window_size(1920, 1080)
-            try:
-                driver.set_page_load_timeout(int(os.getenv("POSFEED_PAGELOAD_TIMEOUT_SEC", "45")))
-                driver.set_script_timeout(int(os.getenv("POSFEED_SCRIPT_TIMEOUT_SEC", "45")))
-            except Exception as timeout_err:
-                logger.warning("WebDriver timeout 설정 실패(무시): %s", timeout_err)
-            return driver
-        # DNS/네트워크 오류: 기존에 패치된 바이너리를 직접 지정하여 오프라인 재시도
-        if "No address associated with hostname" in str(e) or "URLError" in type(e).__name__:
-            _known_paths = [
-                "/tmp/undetected_chromedriver/undetected_chromedriver",
-                "/root/.local/share/undetected_chromedriver/undetected_chromedriver",
-            ]
-            for _p in _known_paths:
-                if Path(_p).exists():
-                    logger.warning("DNS 오류 → 캐시 드라이버 재사용: %s", _p)
-                    driver = uc.Chrome(options=_make_options(), version_main=chrome_version, driver_executable_path=_p)
-                    driver.set_window_size(1920, 1080)
-                    try:
-                        driver.set_page_load_timeout(int(os.getenv("POSFEED_PAGELOAD_TIMEOUT_SEC", "45")))
-                        driver.set_script_timeout(int(os.getenv("POSFEED_SCRIPT_TIMEOUT_SEC", "45")))
-                    except Exception:
-                        pass
-                    logger.info("브라우저 실행 성공 (오프라인 재시도)")
-                    return driver
-        raise
+
+    driver = launch_uc_chrome(
+        options=_make_options(),
+        account_id=POSFEED_ID,
+        chrome_bin=os.getenv("CHROME_BIN", "/usr/bin/google-chrome"),
+        log_fn=logger.info,
+        prefer_standard=os.getenv("POSFEED_PREFER_STANDARD_CHROME", "").lower() in {"1", "true", "yes"},
+        command_timeout_sec=int(os.getenv("POSFEED_DRIVER_COMMAND_TIMEOUT_SEC", "45")),
+    )
+    logger.info("브라우저 실행 성공")
+    return _finalize_driver(driver)
 
 
 def _login(driver: uc.Chrome, wait: WebDriverWait) -> None:
     """Posfeed 로그인"""
-    driver.get(LOGIN_URL)
-    time.sleep(2)
-    id_input = wait.until(EC.presence_of_element_located((By.NAME, "username")))
-    id_input.clear()
-    id_input.send_keys(POSFEED_ID)
-    pw_input = driver.find_element(By.NAME, "password")
-    pw_input.clear()
-    pw_input.send_keys(POSFEED_PW)
-    pw_input.send_keys(Keys.RETURN)
-    wait.until(lambda d: "#/login" not in d.current_url)
-    _dismiss_change_password_notice(driver)
-    time.sleep(2)
-    logger.info("Posfeed 로그인 완료 | URL: %s", driver.current_url)
+    last_exc: Exception | None = None
+    for attempt in range(1, 3):
+        id_input, pw_input = _wait_for_posfeed_login_form(driver, wait)
+        id_input.clear()
+        id_input.send_keys(POSFEED_ID)
+        pw_input.clear()
+        pw_input.send_keys(POSFEED_PW)
+        pw_input.send_keys(Keys.RETURN)
+        try:
+            wait.until(lambda d: "#/login" not in d.current_url)
+            _dismiss_change_password_notice(driver)
+            time.sleep(2)
+            logger.info("Posfeed 로그인 완료 | URL: %s", driver.current_url)
+            return
+        except TimeoutException as exc:
+            last_exc = exc
+            logger.warning(
+                "Posfeed 로그인 실패 %d/2 | current_url=%s",
+                attempt,
+                getattr(driver, "current_url", ""),
+            )
+            if attempt < 2:
+                try:
+                    driver.refresh()
+                except Exception:
+                    pass
+                time.sleep(3)
+    raise TimeoutException(
+        f"Posfeed 로그인 실패: 로그인 페이지에서 벗어나지 못했습니다. current_url={getattr(driver, 'current_url', '')!r}"
+    ) from last_exc
+
+
+def _find_first_visible(driver: uc.Chrome, locators: tuple[tuple[str, str], ...]):
+    for locator in locators:
+        for element in driver.find_elements(*locator):
+            try:
+                if element.is_displayed():
+                    return element
+            except Exception:
+                continue
+    return None
+
+
+def _wait_for_posfeed_login_form(driver: uc.Chrome, wait: WebDriverWait):
+    """SPA 로그인 폼이 렌더링될 때까지 재진입하며 대기한다."""
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            driver.get(LOGIN_URL)
+            wait.until(lambda d: d.execute_script("return document.readyState") in ("interactive", "complete"))
+            time.sleep(2)
+            return wait.until(
+                lambda d: (
+                    _find_first_visible(d, _LOGIN_ID_LOCATORS),
+                    _find_first_visible(d, _LOGIN_PW_LOCATORS),
+                )
+                if _find_first_visible(d, _LOGIN_ID_LOCATORS) and _find_first_visible(d, _LOGIN_PW_LOCATORS)
+                else False
+            )
+        except TimeoutException as exc:
+            last_exc = exc
+            logger.warning(
+                "Posfeed 로그인 폼 대기 실패 %d/3 | url=%s",
+                attempt,
+                getattr(driver, "current_url", ""),
+            )
+            if attempt < 3:
+                try:
+                    driver.refresh()
+                except Exception:
+                    pass
+                time.sleep(3)
+
+    raise TimeoutException(
+        f"Posfeed 로그인 화면을 불러오지 못했습니다. current_url={getattr(driver, 'current_url', '')!r}"
+    ) from last_exc
 
 
 def _dismiss_change_password_notice(driver: uc.Chrome) -> None:
@@ -332,31 +394,49 @@ def _scrape_one_order(driver: uc.Chrome, wait: WebDriverWait, order_code: str) -
         # SPA 라우팅/렌더가 느리면 이전 주문 화면의 table이 남아있는 상태에서 파싱될 수 있다.
         # 주문코드가 페이지 텍스트에 반영될 때까지 대기해 '이전 주문 데이터' 혼입을 방지한다.
         wait.until(lambda d: str(order_code) in (d.execute_script("return document.body && document.body.innerText") or ""))
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".el-table")))
+        wait.until(
+            lambda d: d.find_elements(By.CSS_SELECTOR, ".el-table, table[aria-label*='상품'], table.MuiTable-root")
+        )
         # 상품 정보 테이블 row가 생기거나(데이터) empty-text가 채워질 때(진짜 빈 상세)까지 추가로 대기
         def _table_ready(d):
             state = d.execute_script("""
-                function findProductTable() {
-                    const tables = Array.from(document.querySelectorAll('.el-table'));
-                    for (const t of tables) {
-                        // fixed 컬럼(좌/우) 영역은 제외하고 메인 header만 본다.
-                        const headers = Array.from(t.querySelectorAll(':scope > .el-table__header-wrapper th .cell'))
+                function tableHeaders(table) {
+                    if (table.classList && table.classList.contains('el-table')) {
+                        return Array.from(table.querySelectorAll(':scope > .el-table__header-wrapper th .cell'))
                           .map(el => (el.innerText || '').trim())
                           .filter(Boolean);
+                    }
+                    return Array.from(table.querySelectorAll('thead th, [role="columnheader"], .MuiTableCell-head'))
+                      .map(el => (el.innerText || '').trim())
+                      .filter(Boolean);
+                }
+
+                function tableRows(table) {
+                    if (table.classList && table.classList.contains('el-table')) {
+                        return Array.from(table.querySelectorAll(':scope > .el-table__body-wrapper tbody tr'));
+                    }
+                    return Array.from(table.querySelectorAll('tbody tr, [role="row"]'));
+                }
+
+                function findProductTable() {
+                    const tables = Array.from(document.querySelectorAll('.el-table, table[aria-label*="상품"], table.MuiTable-root'));
+                    for (const t of tables) {
+                        const label = (t.getAttribute('aria-label') || '').trim();
+                        const headers = tableHeaders(t);
                         const hasQty = headers.some(h => h.includes('수량'));
                         const hasName = headers.some(h => h.includes('상품') || h.includes('품목'));
                         const hasPrice = headers.some(h => h.includes('단품') || h.includes('가격') || h.includes('금액'));
-                        if (hasQty && hasName && hasPrice) return t;
+                        if ((label.includes('상품') || hasName) && hasQty && hasPrice) return t;
                     }
                     return null;
                 }
 
                 const table = findProductTable();
                 if (!table) return { rowCount: 0, emptyText: '', tableFound: false };
-                const rows = table.querySelectorAll(':scope > .el-table__body-wrapper tbody tr');
-                const emptyTextEl = table.querySelector(':scope > .el-table__body-wrapper .el-table__empty-text');
+                const rows = tableRows(table);
+                const emptyTextEl = table.querySelector(':scope > .el-table__body-wrapper .el-table__empty-text, .MuiTableBody-root .MuiTableCell-root');
                 const emptyText = emptyTextEl ? (emptyTextEl.innerText || '').trim() : '';
-                return { rowCount: rows.length, emptyText: emptyText };
+                return { rowCount: rows.length, emptyText: rows.length ? '' : emptyText };
             """) or {}
             if (state.get("rowCount", 0) or state.get("emptyText")):
                 return state
@@ -368,16 +448,31 @@ def _scrape_one_order(driver: uc.Chrome, wait: WebDriverWait, order_code: str) -
         return None
 
     table_rows = driver.execute_script("""
+        function tableHeaders(table) {
+            if (table.classList && table.classList.contains('el-table')) {
+                return Array.from(table.querySelectorAll(':scope > .el-table__header-wrapper th .cell'))
+                  .map(el => (el.innerText || '').trim());
+            }
+            return Array.from(table.querySelectorAll('thead th, [role="columnheader"], .MuiTableCell-head'))
+              .map(el => (el.innerText || '').trim());
+        }
+
+        function tableBodyRows(table) {
+            if (table.classList && table.classList.contains('el-table')) {
+                return Array.from(table.querySelectorAll(':scope > .el-table__body-wrapper tbody tr'));
+            }
+            return Array.from(table.querySelectorAll('tbody tr, [role="row"]'));
+        }
+
         function findProductTable() {
-            const tables = Array.from(document.querySelectorAll('.el-table'));
+            const tables = Array.from(document.querySelectorAll('.el-table, table[aria-label*="상품"], table.MuiTable-root'));
             for (const t of tables) {
-                const headers = Array.from(t.querySelectorAll(':scope > .el-table__header-wrapper th .cell'))
-                  .map(el => (el.innerText || '').trim())
-                  .filter(Boolean);
+                const label = (t.getAttribute('aria-label') || '').trim();
+                const headers = tableHeaders(t).filter(Boolean);
                 const hasQty = headers.some(h => h.includes('수량'));
                 const hasName = headers.some(h => h.includes('상품') || h.includes('품목'));
                 const hasPrice = headers.some(h => h.includes('단품') || h.includes('가격') || h.includes('금액'));
-                if (hasQty && hasName && hasPrice) return t;
+                if ((label.includes('상품') || hasName) && hasQty && hasPrice) return t;
             }
             return null;
         }
@@ -385,15 +480,14 @@ def _scrape_one_order(driver: uc.Chrome, wait: WebDriverWait, order_code: str) -
         const table = findProductTable();
         if (!table) return { headers: [], rows: [] };
 
-        const headers = Array.from(table.querySelectorAll(':scope > .el-table__header-wrapper th .cell'))
-          .map(el => (el.innerText || '').trim());
+        const headers = tableHeaders(table);
 
         // 중요: td .cell 과 td 를 같이 잡으면 중복으로 들어가 컬럼 인덱스가 깨진다.
         // 또한 fixed 컬럼(좌/우) body를 포함하면 부분 컬럼만 파싱돼 인덱스가 깨진다.
-        const rows = Array.from(table.querySelectorAll(':scope > .el-table__body-wrapper tbody tr')).map(row => {
+        const rows = tableBodyRows(table).map(row => {
           const tds = row.querySelectorAll(':scope > td');
           return Array.from(tds).map(td => (td.innerText || '').trim());
-        });
+        }).filter(row => row.length > 0);
 
         return { headers, rows };
     """) or []
@@ -617,16 +711,7 @@ def _parse_collect_mode(collect_mode: str) -> tuple[str, list[str]]:
     return "date_range", dates
 
 
-def _filter_target_store(df: pd.DataFrame, target_store: str | None = None) -> pd.DataFrame:
-    if not target_store or df.empty or "store" not in df.columns:
-        return df
-    before = len(df)
-    filtered = df[df["store"].fillna("").astype(str).str.strip() == target_store].copy()
-    logger.info("target_store detail 필터: %s -> %d/%d건", target_store, len(filtered), before)
-    return filtered
-
-
-def _load_source_df(collect_mode: str, target_store: str | None = None) -> pd.DataFrame:
+def _load_source_df(collect_mode: str) -> pd.DataFrame:
     """collect_mode에 따라 posfeed_sales 파티션 로드(파일명: posfeed_orders.csv)"""
     sales_root = ANALYTICS_DB / "posfeed_sales"
     mode_type, date_list = _parse_collect_mode(collect_mode)
@@ -667,9 +752,6 @@ def _load_source_df(collect_mode: str, target_store: str | None = None) -> pd.Da
         if df.empty:
             raise AirflowSkipException(f"해당 날짜 데이터 없음 | {collect_mode}")
 
-    df = _filter_target_store(df, target_store)
-    if df.empty:
-        raise AirflowSkipException(f"target_store 데이터 없음 | {target_store} | {collect_mode}")
     return df
 
 
@@ -691,19 +773,14 @@ def _load_collected_set(ym_filter: str | None) -> set[str]:
     return collected
 
 
-def extract_order_codes(
-    collect_mode: str = "yesterday",
-    force_rescrape: bool = False,
-    target_store: str | None = None,
-    **context,
-) -> str:
+def extract_order_codes(collect_mode: str = "yesterday", force_rescrape: bool = False, **context) -> str:
     """collect_mode에 따라 수집 대상 주문 코드를 매장별로 그룹화하여 XCom에 저장"""
     # dag_run.conf로도 강제 재수집 가능
     dag_run = context.get("dag_run")
     if dag_run and dag_run.conf and dag_run.conf.get("force_rescrape"):
         force_rescrape = True
 
-    df = _load_source_df(collect_mode, target_store=target_store)
+    df = _load_source_df(collect_mode)
 
     df["주문 코드"] = df["주문 코드"].dropna().astype(str)
 
@@ -850,7 +927,11 @@ def extract_order_codes(
     logger.info("수집 대상: %d개 매장 / %d건 | 모드: %s", len(stores), total_new, collect_mode)
 
     if not stores:
-        raise AirflowSkipException("수집할 신규 주문 코드 없음")
+        context["ti"].xcom_push(
+            key="order_codes",
+            value={"stores": []},
+        )
+        return f"[{collect_mode}] 신규 주문 코드 없음 | 전체 탐색 완료"
 
     context["ti"].xcom_push(
         key="order_codes",
@@ -918,7 +999,8 @@ def check_undetailed_orders(**context) -> str:
 
     total_new = sum(len(s["codes"]) for s in stores)
     if not stores:
-        raise AirflowSkipException("수집할 신규 주문 코드 없음 (extract + cross-check 통합)")
+        ti.xcom_push(key="order_codes", value={"stores": []})
+        return "cross-check 완료 | detail 미보유 주문 코드 없음 | 전체 탐색 완료"
 
     ti.xcom_push(key="order_codes", value={"stores": stores})
     return f"cross-check 완료 | detail 미보유 추가 {added_codes}건 | 총 {total_new}건 / {len(stores)}개 매장"
@@ -933,6 +1015,11 @@ def scrape_order_details(**context) -> str:
     stores: list = payload["stores"]
     total_stores = len(stores)
     total_codes = sum(len(s["codes"]) for s in stores)
+    if not stores:
+        result = "상세 누락 주문 없음 | 전체 탐색 완료 | 0건"
+        logger.info(result)
+        return result
+
     logger.info("크롤링 시작 | %d개 매장 | 총 %d건", total_stores, total_codes)
 
     driver = _launch_browser()
@@ -1167,7 +1254,7 @@ def scrape_order_details(**context) -> str:
     return result
 
 
-def scrape_missing_order_details(collect_mode: str = "yesterday", target_store: str | None = None, **context) -> str:
+def scrape_missing_order_details(collect_mode: str = "yesterday", **context) -> str:
     """scrape_order_details 이후 결과를 기준으로, extract_order_codes에서 추출된 코드 중
     미수집된 코드만 다시 수집해서 추가 저장한다."""
     payload = context["ti"].xcom_pull(task_ids="check_undetailed_orders", key="order_codes")
@@ -1178,12 +1265,14 @@ def scrape_missing_order_details(collect_mode: str = "yesterday", target_store: 
 
     extracted_stores: list = payload["stores"]
     if not extracted_stores:
-        raise AirflowSkipException("No missing codes (extract_order_codes stores is empty)")
+        result = "미수집 재수집 대상 없음 | 전체 탐색 완료 | 0건"
+        logger.info(result)
+        return result
     extracted_total = sum(len(s["codes"]) for s in extracted_stores)
     logger.info("미수집 재수집 체크 시작 | 추출 코드: %d건", extracted_total)
 
     # extract_order_codes와 동일한 ym_filter 계산 로직 유지
-    df = _load_source_df(collect_mode, target_store=target_store)
+    df = _load_source_df(collect_mode)
     mode_type, date_list = _parse_collect_mode(collect_mode)
     if mode_type == "yesterday":
         latest_date = df["등록날짜"].dropna().max()
@@ -1235,3 +1324,32 @@ def scrape_missing_order_details(collect_mode: str = "yesterday", target_store: 
 
     # 기존 scrape_order_details 로직을 그대로 재사용 (입력 stores만 missing으로 교체)
     return scrape_order_details(ti=_TiShim({"stores": missing_stores}))
+
+
+def extract_today_order_codes(**context) -> str:
+    """Today DAG의 sale_date 기준으로 주문 상세 대상 코드를 추출한다."""
+    ti = context.get("ti")
+    sale_date = ti.xcom_pull(task_ids="resolve_today", key="sale_date") if ti else None
+    if not sale_date:
+        conf = (getattr(context.get("dag_run"), "conf", None) or {})
+        sale_date = conf.get("sale_date")
+    if not sale_date:
+        sale_date = pendulum.now("Asia/Seoul").format("YYYY-MM-DD")
+
+    return extract_order_codes(collect_mode=str(sale_date), **context)
+
+
+def scrape_today_details(**context) -> str:
+    """Today DAG의 extract_order_codes 결과만 상세 크롤링한다."""
+    payload = context["ti"].xcom_pull(task_ids="extract_order_codes", key="order_codes")
+    if not payload or not payload.get("stores"):
+        raise AirflowSkipException("당일 신규 주문 코드 없음")
+
+    class _TiShim:
+        def __init__(self, shim_payload: dict):
+            self._payload = shim_payload
+
+        def xcom_pull(self, *args, **kwargs):
+            return self._payload
+
+    return scrape_order_details(ti=_TiShim(payload))

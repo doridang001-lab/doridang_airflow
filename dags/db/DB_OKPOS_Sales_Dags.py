@@ -8,7 +8,7 @@ OKPOS 매출 원본파일 자동 수집 DAG
 4. 합계 제거 + 매장명 추가 후 brand=도리당/store={매장}/ym={YYYY-MM}/{page_type}.csv 저장
 5. log.parquet 실행 이력 기록
 
-매일 07:45 KST 실행 (DB_OKPOS_SALES_TIME)
+매일 06:10 실행 (DB_OKPOS_SALES_TIME)
 인증: OKPOS ID/PW (파이프라인 상수)
 """
 
@@ -19,16 +19,18 @@ from pathlib import Path
 import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.utils.trigger_rule import TriggerRule
 
 from modules.transform.utility.notifier import enqueue_heal_task, send_telegram
 from modules.transform.utility.schedule import DB_OKPOS_SALES_TIME
+from modules.transform.utility.mail_recipients import MAIL_CMJ_PM
 from modules.transform.pipelines.db.DB_OKPOS_Sales import (
     resolve_sale_dates,
     prune_preopen_data,
     purge_okpos_daily,
-    download_today_stores,
-    download_receipt_stores,
-    download_daily_stores,
+    plan_okpos_download_batches,
+    download_okpos_batch,
+    merge_okpos_download_batches,
     report_missing_daily,
     ingest_manual_daily_xlsx,
     save_to_raw,
@@ -62,11 +64,14 @@ dag_id = Path(__file__).stem
 #   (기존 파일이 있으면 자동으로 skip, 강제 재다운로드는 conf의 force_redownload / force_redownload_daily 사용)
 # MANUAL_DATE_RANGE: tuple | None = None
 MANUAL_DATE_RANGE = None
-LOOKBACK_DAYS: int | None = 120 # None or int형
+LOOKBACK_DAYS: int | None = 7 # None or int형
+_ALERT_EMAILS = [MAIL_CMJ_PM]
 
 
 def _on_failure_callback(context):
-    """Task 실패 시 Telegram 알림 발송."""
+    """Task 실패 시 이메일/텔레그램 알림 발송."""
+    from modules.transform.utility.mailer import send_email, text_to_html
+
     ti = context.get("task_instance")
     dag_id_ = ti.dag_id
     task_id = ti.task_id
@@ -74,6 +79,7 @@ def _on_failure_callback(context):
     exception = context.get("exception", "예외 없음")
     log_url = ti.log_url
 
+    subject = f"[Airflow 실패] {dag_id_} / {task_id}"
     body = (
         f"DAG: {dag_id_}\n"
         f"Task: {task_id}\n"
@@ -81,6 +87,15 @@ def _on_failure_callback(context):
         f"에러: {exception}\n"
         f"로그: {log_url}"
     )
+    try:
+        send_email(
+            subject=subject,
+            html_content=text_to_html(body),
+            to_emails=_ALERT_EMAILS,
+        )
+        logger.info(f"실패 알림 발송 완료: {_ALERT_EMAILS}")
+    except Exception as e:
+        logger.error(f"실패 알림 발송 실패: {e}")
     send_telegram(body + "\n해결해라")
     enqueue_heal_task(context)
 
@@ -173,26 +188,74 @@ with DAG(
         python_callable=purge_okpos_daily,
     )
 
-    # Selenium task: Python-level retry plus Airflow retry.
-    t2 = PythonOperator(
-        task_id="download_today",
-        python_callable=download_today_stores,
+    t1e = PythonOperator(
+        task_id="repair_okpos_order_duplicates",
+        python_callable=_reload_and_call,
+        op_kwargs={"fn_name": "repair_okpos_order_duplicates"},
+        retries=0,
+    )
+
+    t2_plan = PythonOperator(
+        task_id="plan_download_today",
+        python_callable=plan_okpos_download_batches,
+        op_kwargs={"page_type": "today"},
+    )
+
+    t2_batch = PythonOperator.partial(
+        task_id="download_today_batch",
+        python_callable=download_okpos_batch,
+        pool="selenium_pool",
         retries=2,
         retry_delay=timedelta(minutes=3),
+    ).expand(op_kwargs=t2_plan.output)
+
+    t2 = PythonOperator(
+        task_id="download_today",
+        python_callable=merge_okpos_download_batches,
+        op_kwargs={"page_type": "today", "batch_task_id": "download_today_batch"},
+        trigger_rule=TriggerRule.NONE_FAILED,
     )
+
+    t3_plan = PythonOperator(
+        task_id="plan_download_receipt",
+        python_callable=plan_okpos_download_batches,
+        op_kwargs={"page_type": "receipt"},
+    )
+
+    t3_batch = PythonOperator.partial(
+        task_id="download_receipt_batch",
+        python_callable=download_okpos_batch,
+        pool="selenium_pool",
+        retries=2,
+        retry_delay=timedelta(minutes=3),
+    ).expand(op_kwargs=t3_plan.output)
 
     t3 = PythonOperator(
         task_id="download_receipt",
-        python_callable=download_receipt_stores,
+        python_callable=merge_okpos_download_batches,
+        op_kwargs={"page_type": "receipt", "batch_task_id": "download_receipt_batch"},
+        trigger_rule=TriggerRule.NONE_FAILED,
+    )
+
+    t3b_plan = PythonOperator(
+        task_id="plan_download_daily",
+        python_callable=plan_okpos_download_batches,
+        op_kwargs={"page_type": "daily"},
+    )
+
+    t3b_batch = PythonOperator.partial(
+        task_id="download_daily_batch",
+        python_callable=download_okpos_batch,
+        pool="selenium_pool",
         retries=2,
         retry_delay=timedelta(minutes=3),
-    )
+    ).expand(op_kwargs=t3b_plan.output)
 
     t3b = PythonOperator(
         task_id="download_daily",
-        python_callable=download_daily_stores,
-        retries=2,
-        retry_delay=timedelta(minutes=3),
+        python_callable=merge_okpos_download_batches,
+        op_kwargs={"page_type": "daily", "batch_task_id": "download_daily_batch"},
+        trigger_rule=TriggerRule.NONE_FAILED,
     )
 
     t4 = PythonOperator(
@@ -211,9 +274,18 @@ with DAG(
     t5 = PythonOperator(
         task_id="check_and_fill_missing_today",
         python_callable=check_and_fill_missing_today,
+        pool="selenium_pool",
         # today/receipt 불일치 한쪽만 있을 때 NO_DATA 마킹 및 자동 보정
         retries=2,
         retry_delay=timedelta(minutes=3),
+    )
+
+    t5b = PythonOperator(
+        task_id="reconcile_zero_daily_against_sales_detail",
+        python_callable=_reload_and_call,
+        op_kwargs={"fn_name": "reconcile_zero_daily_against_sales_detail"},
+        retries=0,
+        execution_timeout=timedelta(minutes=15),
     )
 
     t6 = PythonOperator(
@@ -245,6 +317,10 @@ with DAG(
         python_callable=_reload_and_call,
         op_kwargs={"fn_name": "reconcile_against_daily_summary"},
         retries=0,
+        execution_timeout=timedelta(minutes=15),
     )
 
-    t1 >> t1b >> t1c >> t1d >> t2 >> t3 >> t3b >> t4 >> t4b >> t5 >> t6c >> t6a >> t6b >> t6 >> t7
+    t1 >> t1b >> t1c >> t1d >> t1e >> t2_plan >> t2_batch >> t2
+    t2 >> t3_plan >> t3_batch >> t3
+    t3 >> t3b_plan >> t3b_batch >> t3b
+    t3b >> t4 >> t4b >> t5 >> t5b >> t6c >> t6a >> t6b >> t6 >> t7

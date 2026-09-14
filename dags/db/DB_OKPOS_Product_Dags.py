@@ -53,6 +53,7 @@ with DAG(
     t1 = PythonOperator(
         task_id="download_okpos_product",
         python_callable=download_okpos_product,
+        pool="selenium_pool",
     )
 
     t2 = PythonOperator(

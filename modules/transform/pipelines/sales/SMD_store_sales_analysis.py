@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from modules.transform.utility.mailer import send_email, text_to_html
+from modules.transform.utility.mail_recipients import MAIL_CMJ_PM
 
 import numpy as np
 import ollama
@@ -720,7 +721,7 @@ def _alert_no_target(rows: "pd.DataFrame", **context) -> None:
         send_email(
             subject="[도리당] 월 목표 미설정 매장 알림",
             html_content=body,
-            to_emails=["a17019@kakao.com"],
+            to_emails=MAIL_CMJ_PM,
             **context,
         )
         logger.info("월 목표 미설정 알림 이메일 발송: %d건", len(items))

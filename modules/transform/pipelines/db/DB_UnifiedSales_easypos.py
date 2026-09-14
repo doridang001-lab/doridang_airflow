@@ -8,14 +8,13 @@ unified_sales - EasyPOS 채널 전용 모듈.
 - MART_DB/unified_sales_grp/unified_sales_YYMMDD.parquet (공통 _save_unified_daily 사용)
 """
 
-import hashlib
 import logging
 import re
 from datetime import datetime
 
 import pandas as pd
 
-from modules.transform.utility.paths import ANALYTICS_DB, FIN_PRODUCT_CSV_PATH
+from modules.transform.utility.paths import ANALYTICS_DB, FIN_PRODUCT_CSV_PATH, existing_fin_product_csv_path
 from modules.transform.pipelines.db.DB_UnifiedSales_common import (
     UNIFIED_COLUMNS,
     _apply_fin_item_name,
@@ -27,6 +26,7 @@ from modules.transform.pipelines.db.DB_UnifiedSales_common import (
     _strip_and_coalesce_columns,
     _to_int_series,
 )
+from modules.transform.pipelines.db.DB_ItemIdAllocator import allocate_manual_item_ids
 
 logger = logging.getLogger(__name__)
 
@@ -47,14 +47,16 @@ def _normalize_easypos_product_name(name: str) -> str:
     s = s.strip()
     if not s or s.lower() == "nan":
         return ""
-    # EasyPOS 영수증 item_name에 붙는 트리 표시(prefix) 제거만 적용
+    # EasyPOS 영수증 item_name에 붙는 표시(prefix) 제거만 적용
     # 예: "└▶ 낙곱새 전골" -> "낙곱새 전골"
     s = re.sub(r"^(?:└\s*▶|└▶)\s*", "", s).strip()
+    # 예: "[포장]소주" -> "소주"
+    s = re.sub(r"^\[\s*포장\s*\]\s*", "", s).strip()
     return s
 
 
 def _load_easypos_product_name_map() -> dict[str, str]:
-    """fin_product_grp.csv에서 easypos 상품명→상품코드 매핑을 만든다.
+    """fin_product_grp_input.csv에서 easypos 상품명→상품코드 매핑을 만든다.
 
     EasyPOS 영수증에는 상품코드가 없어서 item_id를 상품명 기반으로 '역매핑'해야 함.
     - updated_at 컬럼이 있으면 최신 기준으로 dedupe
@@ -64,12 +66,13 @@ def _load_easypos_product_name_map() -> dict[str, str]:
     if _EASYPOS_PRODUCT_NAME_TO_CODE is not None:
         return _EASYPOS_PRODUCT_NAME_TO_CODE
 
-    if not FIN_PRODUCT_CSV_PATH.exists():
+    source_path = existing_fin_product_csv_path()
+    if not source_path.exists():
         _EASYPOS_PRODUCT_NAME_TO_CODE = {}
         return _EASYPOS_PRODUCT_NAME_TO_CODE
 
     try:
-        df = pd.read_csv(FIN_PRODUCT_CSV_PATH, dtype=str).fillna("")
+        df = pd.read_csv(source_path, dtype=str).fillna("")
     except Exception:
         _EASYPOS_PRODUCT_NAME_TO_CODE = {}
         return _EASYPOS_PRODUCT_NAME_TO_CODE
@@ -202,9 +205,8 @@ def _transform_easypos_df(raw: pd.DataFrame) -> pd.DataFrame:
     # item_seq: order_id 내 순번(1부터)
     df["item_seq"] = df.groupby("order_id").cumcount().add(1).astype(int).astype(str)
 
-    # item_id:
-    # - 1순위: fin_product_grp.csv(easypos 상품조회)에서 상품명→상품코드 역매핑
-    # - 2순위: 매핑 실패 시 item_name 정규화 + md5 hash
+    # item_id: fin_product_grp_input.csv(easypos 상품조회)에서 상품명→상품코드 역매핑
+    # 매핑 실패 시 숫자 item_id 원칙이 깨지므로 저장하지 않고 실패시킨다.
     name_to_code = _load_easypos_product_name_map()
     item_name_norm = (
         df["item_name"]
@@ -214,8 +216,15 @@ def _transform_easypos_df(raw: pd.DataFrame) -> pd.DataFrame:
         .map(_normalize_easypos_product_name)
     )
     mapped_code = item_name_norm.map(lambda s: name_to_code.get(s, "") if s else "").fillna("").astype(str).str.strip()
-    fallback_hash = item_name_norm.map(lambda s: hashlib.md5(s.encode()).hexdigest() if s else "")
-    df["item_id"] = mapped_code.where(mapped_code != "", fallback_hash)
+    missing_code = (item_name_norm != "") & (mapped_code == "")
+    if missing_code.any():
+        samples = item_name_norm[missing_code].drop_duplicates().head(20).tolist()
+        raise ValueError(f"easypos 상품코드 매핑 실패 {int(missing_code.sum())}행: {samples}")
+    df["item_id"] = mapped_code
+    df["item_id"] = allocate_manual_item_ids(
+        df[["source", "brand", "store", "item_id", "item_name", "unit_price"]],
+        persist=True,
+    )
 
     # 주문서별 대표상품(menu_name) 및 주문카운트(order_cnt)
     item_cnt = df.groupby("order_id", as_index=False).size().rename(columns={"size": "item_cnt"})
@@ -233,12 +242,12 @@ def _transform_easypos_df(raw: pd.DataFrame) -> pd.DataFrame:
     df["_pk"] = _make_unified_pk(df)
 
     df = df.reindex(columns=UNIFIED_COLUMNS, fill_value="")
-    # item_id를 fin 상품코드로 맞춘 경우 item_name도 fin 상품명으로 정합(LEFT JOIN 100% 목표)
+    # scoped item_id 기준으로 item_name 정합
     df = _apply_fin_item_name(df)
     return df
 
 
-def run_easypos(date_str: str, overwrite: bool = False) -> str:
+def run_easypos(date_str: str, overwrite: bool = False, stores: list[str] | None = None) -> str:
     """특정 일자의 easypos receipts.csv를 unified_sales로 append/overwrite."""
     try:
         raw = _load_easypos_by_date(date_str)
@@ -250,7 +259,13 @@ def run_easypos(date_str: str, overwrite: bool = False) -> str:
     if df.empty:
         return f"스킵 (데이터 없음 | {date_str})"
 
-    saved = _save_unified_daily(df, date_str, overwrite=overwrite)
+    store_scope = {str(store).strip() for store in (stores or []) if str(store).strip()}
+    if store_scope:
+        df = df[df["store"].fillna("").astype(str).str.strip().isin(store_scope)].copy()
+        if df.empty:
+            return f"스킵 (easypos 대상 매장 데이터 없음 | {date_str} | stores={sorted(store_scope)})"
+
+    saved = _save_unified_daily(df, date_str, overwrite=overwrite, replace_stores=stores)
     result = f"unified_sales(easypos) 저장 | {date_str} | {saved}행"
     logger.info(result)
     return result
@@ -315,5 +330,45 @@ def backfill_easypos() -> str:
             logger.warning("run_easypos 실패: %s | %s", date_str, e)
 
     result = f"unified_sales(easypos) backfill 완료 | {total_targets}일"
+    logger.info(result)
+    return result
+
+
+def backfill_easypos_stores(stores: list[str]) -> str:
+    """지정 매장 easypos_sales_raw 전체를 일자별로 unified_sales에 재적재."""
+    store_scope = {str(store).strip() for store in stores if str(store).strip()}
+    if not store_scope:
+        return "SKIP: easypos 매장 제한 backfill 대상 없음"
+    if EASYPOS_STORE not in store_scope:
+        return f"SKIP: easypos 매장 제한 backfill 대상 없음 | stores={sorted(store_scope)}"
+
+    paths = sorted(EASYPOS_ROOT.glob("ym=*/receipts.csv"))
+    if not paths:
+        raise FileNotFoundError(f"easypos receipts.csv 없음 | {EASYPOS_ROOT}")
+
+    date_set: set[str] = set()
+    for p in paths:
+        try:
+            tmp = pd.read_csv(p, dtype=str, usecols=["sale_date"])
+            date_set.update(tmp["sale_date"].astype(str).str.strip().dropna().unique())
+        except Exception as e:
+            logger.warning("매장 제한 sale_date 스캔 실패: %s | %s", p, e)
+
+    total_days = 0
+    total_saved = 0
+    for date_str in sorted(date_set):
+        if not date_str or date_str.lower() == "nan":
+            continue
+        try:
+            from modules.transform.pipelines.db.DB_UnifiedSales_nightly import backfill_unit
+            result = backfill_unit(run_easypos, date_str, overwrite=False, stores=sorted(store_scope))
+            logger.info(result)
+            total_days += 1
+            if "|" in result and "행" in result:
+                total_saved += int(result.rsplit("|", 1)[1].strip().split("행", 1)[0])
+        except Exception as e:
+            logger.warning("매장 제한 run_easypos 실패: %s | stores=%s | %s", date_str, sorted(store_scope), e)
+
+    result = f"unified_sales(easypos) 매장 제한 backfill 완료 | stores={sorted(store_scope)} | {total_days}일 / {total_saved}행"
     logger.info(result)
     return result

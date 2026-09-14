@@ -1,25 +1,25 @@
-﻿'''
+'''
 Baemin macro DAG — 배달의민족 계정별 자동 수집
 
 === 수집 흐름 (계정 단위, 단일 브라우저 세션) ===
   load_accounts
       ↓
-  collect_all
+  init_staging
+    ├─ collect_batch_1 → collect_batch_2
+    └─ collect_batch_3 → collect_batch_4
     ├─ 로그인
-    ├─ now 수집        (우리가게NOW 현황 지표)
+    ├─ 매장/store_id 확인
     ├─ 우가클 수집     (우리가게 클릭 현황 - 이번달 + 저번달)
-    ├─ 변경이력 수집   (매장 변경이력 - history/change/shop)
-    ├─ 주문내역 수집   (orders/history - 어제)
+    ├─ 운영시간 수집   (매장 운영시간 - manage/operation)
+    ├─ 주문내역 수집   (orders/history - 어제 배달완료)
     ├─ 광고 funnel 수집 (stat/advertisement - 어제)
     └─ 로그아웃
+      ↓
+  retry_failed (네 배치 실패 통합 최종 재시도)
 
 === 저장 경로 ===
-  now      : analytics/baemin_macro/metrics_now/
-               brand={brand}/store={store}/ym={YYYY-MM}/baemin_now.csv
   우가클    : analytics/baemin_macro/metrics_our_store_clicks/
                brand={brand}/store={store}/ym={YYYY-MM}/woori_shop_click.csv
-  변경이력  : analytics/baemin_macro/shop_change/
-               brand={brand}/store={store}/ym={YYYY-MM}/shop_change.csv
   주문내역  : analytics/baemin_macro/orders/
   광고funnel: analytics/baemin_macro/ad_funnel/
                brand={brand}/store={store}/ym={YYYY-MM}/orders_{YYYY-MM-DD}.csv
@@ -29,15 +29,15 @@ Baemin macro DAG — 배달의민족 계정별 자동 수집
   주문내역: 어제 (upsert by 주문번호)
 '''
 
+from modules.transform.utility.workload import retry_dag_id, route_trigger
+
 import html
 import logging
 import os
 import random
 import re
-import shutil
 import time
 import warnings
-import importlib
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -45,10 +45,11 @@ from typing import Any
 import pendulum
 import pandas as pd
 from airflow import DAG
+from airflow.exceptions import AirflowTaskTimeout
 from airflow.operators.python import PythonOperator
 from airflow.utils.trigger_rule import TriggerRule
 
-from modules.transform.utility.notifier import send_telegram
+from modules.transform.utility.notifier import on_failure_callback_no_telegram
 from modules.transform.pipelines.db.DB_Beamin_collect import (
     load_accounts as pipeline_load_accounts,
 )
@@ -58,21 +59,44 @@ from modules.transform.pipelines.db.beamin_stability import (
 )
 from modules.transform.pipelines.db.DB_Beamin_combined import (
     collect_now_and_woori as pipeline_collect_all,
+    collect_orders_only as pipeline_collect_orders_only,
     retry_once_failed as pipeline_retry_failed,
+)
+from modules.transform.pipelines.db.beamin_staging import (
+    cleanup_staging,
+    export_staging_to_inbox,
+    init_empty_staging,
+    init_progress,
+    load_progress,
+    local_stage_paths,
+    patch_baemin_staging_paths,
+    progress_path,
+    resolve_macro_role,
+    safe_run_id_part,
+    restore_baemin_staging_paths,
 )
 from modules.transform.pipelines.db.DB_Beamin_retry import (
     build_retry_conf,
     count_failed_items,
+    merge_failed_payloads,
     retry_needed,
 )
-from modules.transform.utility.schedule import SMD_BAEMIN_COLLECT_TIME
-from modules.transform.pipelines.db.DB_Beamin_Macro_validate import validate_toorder_orders
-from modules.transform.utility.paths import ANALYTICS_DB, COLLECT_DB, LOCAL_DB
+from modules.transform.pipelines.db.DB_Beamin_pc2_distribute import UPLOAD_INBOX_DIR
+from modules.transform.utility.schedule import (
+    SMD_BAEMIN_COLLECT_BATCH1_TIME,
+)
+from modules.transform.pipelines.db.DB_Beamin_Macro_validate import (
+    _merge_order_amounts,
+    _order_amounts,
+    validate_toorder_orders,
+)
+from modules.transform.utility.paths import ANALYTICS_DB, COLLECT_DB
 from modules.transform.utility.store_normalize import normalize as normalize_store_names, strip_brand
+from modules.transform.utility.mail_recipients import MAIL_CMJ_PM
+from modules.transform.utility.dag_defaults import COLLECT_DAGRUN_TIMEOUT
 
 logger = logging.getLogger(__name__)
 dag_id = Path(__file__).stem
-BAEMIN_SCHEDULE = os.getenv("BAEMIN_COLLECT_SCHEDULE", SMD_BAEMIN_COLLECT_TIME)
 
 warnings.filterwarnings(
     "ignore",
@@ -81,19 +105,276 @@ warnings.filterwarnings(
 )
 
 KST = pendulum.timezone("Asia/Seoul")
-_ALERT_EMAILS = ["a17019@kakao.com"]
-
-TARGET_STORES = [
-]  # exact match; empty list means all stores
+_ALERT_EMAILS = [MAIL_CMJ_PM]
+_UPLOAD_DAG_ID = "DB_Beamin_Macro_Upload_Dags"
+_BATCH_TASK_IDS = (
+    "collect_batch_1",
+    "collect_batch_2",
+    "collect_batch_3",
+    "collect_batch_4",
+)
+_LANES: tuple[tuple[str, ...], ...] = (
+    ("collect_batch_1", "collect_batch_2"),
+    ("collect_batch_3", "collect_batch_4"),
+)
+_LANE_OFFSET_RANGE: tuple[float, float] = (15.0, 20.0)
+COLLECT_LANES: int = 2
+BAEMIN_SELENIUM_POOL = "baemin_selenium_pool"
+_RETRY_FAILED_TIMEOUT_MINUTES = 120
+TARGET_STORES: list[str] = []  # empty list means all stores (전체매장 대상 → COLLECT_RANGE로 상/하위 분할)
 # None: 전체 수집, "상위": 가나다순 상위 절반, "하위": 가나다순 하위 절반(나머지)
 # ex ) COLLECT_RANGE="상위" → 가나다순 상위 절반만 수집
 COLLECT_RANGE: str | None = "상위" # 상위, 하위, None
+SCHEDULED_DEFAULT_STABILITY_PROFILE = "safe_daily"
+DEFAULT_ORDERS_ONLY = True
+_MACRO_ROLE_RAW = os.getenv("BAEMIN_MACRO_ROLE")
+_MACRO_ROLE = resolve_macro_role(_MACRO_ROLE_RAW)
 
-# ─── 주문내역 백필 제어 ────────────────────────────────────────────────────────
-# None  → 어제 1일만 수집 (기본)
-# int N → 어제부터 N일 전까지 백필 (예: 7 → 어제 포함 최근 7일)
-ORDERS_BACKFILL_DAYS: int | None = None
 MANUAL_BAEMIN_ORDERS_DIR = COLLECT_DB / "영업관리부_수집"
+
+
+def _current_run_id(context) -> str:
+    dag_run = context.get("dag_run")
+    return str(getattr(dag_run, "run_id", context.get("run_id", "manual")) if dag_run else context.get("run_id", "manual"))
+
+
+def _flag_enabled(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "none", "null"}:
+            return default
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+    return bool(value)
+
+
+def _orders_only_enabled(context) -> bool:
+    dag_run = context.get("dag_run")
+    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    params = context.get("params") or {}
+    if "orders_only" in conf:
+        return _flag_enabled(conf.get("orders_only"), default=DEFAULT_ORDERS_ONLY)
+    if "orders_only" in params:
+        return _flag_enabled(params.get("orders_only"), default=DEFAULT_ORDERS_ONLY)
+    return DEFAULT_ORDERS_ONLY
+
+
+def _main_stage_paths(context) -> tuple[Path, Path]:
+    return local_stage_paths("analytics_stage_main", _current_run_id(context))
+
+
+def _target_date_from_context(context) -> str:
+    dag_run = context.get("dag_run")
+    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    if conf.get("target_date"):
+        return conf["target_date"]
+    data_interval_end = context.get("data_interval_end")
+    if data_interval_end is not None:
+        return pendulum.instance(data_interval_end).in_timezone(KST).subtract(days=1).format("YYYY-MM-DD")
+    return pendulum.now(KST).subtract(days=1).format("YYYY-MM-DD")
+
+
+def _normalize_collect_task_ids(collect_task_ids=None) -> tuple[str, ...]:
+    if not collect_task_ids:
+        return ("collect_all",)
+    return tuple(str(task_id) for task_id in collect_task_ids)
+
+
+def _pull_batch_values(ti, collect_task_ids, key: str) -> list:
+    values: list = []
+    for task_id in _normalize_collect_task_ids(collect_task_ids):
+        value = ti.xcom_pull(task_ids=task_id, key=key)
+        if isinstance(value, list):
+            values.extend(value)
+    return values
+
+
+def _pull_batch_failures(ti, collect_task_ids) -> dict:
+    return merge_failed_payloads(
+        *(
+            ti.xcom_pull(task_ids=task_id, key="failed") or {}
+            for task_id in _normalize_collect_task_ids(collect_task_ids)
+        )
+    )
+
+
+def _loaded_account_ids(context) -> set[str]:
+    account_list = context["ti"].xcom_pull(task_ids="load_accounts", key="account_list") or []
+    return {
+        str((account or {}).get("account_id") or "").strip()
+        for account in account_list
+        if str((account or {}).get("account_id") or "").strip()
+    }
+
+
+def _account_id_from_failed_account(account: Any) -> str:
+    if not isinstance(account, dict):
+        return ""
+    return str(account.get("account_id") or "").strip()
+
+
+def _account_id_from_failed_item(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    account = item.get("account") or {}
+    if not isinstance(account, dict):
+        return ""
+    return str(account.get("account_id") or "").strip()
+
+
+def _unique_failed_account_ids(failed: dict | None) -> set[str]:
+    data = failed or {}
+    account_ids = {
+        _account_id_from_failed_account(account)
+        for account in data.get("accounts") or []
+    }
+    for key in ("stores", "orders", "ads", "stages"):
+        account_ids.update(
+            _account_id_from_failed_item(item)
+            for item in data.get(key) or []
+        )
+    account_ids.discard("")
+    return account_ids
+
+
+def _collect_scope_label(context) -> str | None:
+    dag_run = context.get("dag_run")
+    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    params = context.get("params") or {}
+    for candidate in (
+        conf.get("collect_range"),
+        params.get("collect_range"),
+        _MACRO_ROLE["range"],
+        COLLECT_RANGE,
+    ):
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _filter_failed_to_loaded_accounts(failed: dict | None, allowed_ids: set[str]) -> dict:
+    data = failed or {}
+    if not allowed_ids:
+        return {
+            "accounts": data.get("accounts") or [],
+            "stores": data.get("stores") or [],
+            "orders": data.get("orders") or [],
+            "ads": data.get("ads") or [],
+            "stages": data.get("stages") or [],
+        }
+
+    def account_allowed(account: dict | None) -> bool:
+        account_id = str((account or {}).get("account_id") or "").strip()
+        return bool(account_id and account_id in allowed_ids)
+
+    filtered = {
+        "accounts": [
+            account
+            for account in data.get("accounts") or []
+            if account_allowed(account if isinstance(account, dict) else None)
+        ],
+        "stores": [
+            item
+            for item in data.get("stores") or []
+            if isinstance(item, dict) and account_allowed(item.get("account"))
+        ],
+        "orders": [
+            item
+            for item in data.get("orders") or []
+            if isinstance(item, dict) and account_allowed(item.get("account"))
+        ],
+        "ads": [
+            item
+            for item in data.get("ads") or []
+            if isinstance(item, dict) and account_allowed(item.get("account"))
+        ],
+        "stages": [
+            item
+            for item in data.get("stages") or []
+            if isinstance(item, dict) and account_allowed(item.get("account"))
+        ],
+    }
+    dropped = count_failed_items(data) - count_failed_items(filtered)
+    if dropped:
+        logger.warning(
+            "상위 수집 범위 밖 실패 제외: dropped=%d allowed_accounts=%d",
+            dropped,
+            len(allowed_ids),
+        )
+    return filtered
+
+
+_SYNC_RETRY_DEFER_REASON_PATTERNS = (
+    "date_filter",
+    "date filtered",
+    "date_filtered_rows",
+    "날짜",
+    "validation_mismatch",
+    "suspect_no_data",
+    "extension collect timeout",
+    "httpconnectionpool",
+    "read timed out",
+    "connection refused",
+    "max retries exceeded",
+)
+
+
+def _failure_reason_texts(failed: dict | None) -> list[str]:
+    texts: list[str] = []
+    for key in ("accounts", "stores", "orders", "ads", "stages"):
+        for item in (failed or {}).get(key) or []:
+            if not isinstance(item, dict):
+                continue
+            for field in ("reason", "error", "message", "stage"):
+                value = item.get(field)
+                if value:
+                    texts.append(str(value).strip())
+            validation = item.get("validation")
+            if isinstance(validation, dict):
+                for field in ("reason", "error", "message"):
+                    value = validation.get(field)
+                    if value:
+                        texts.append(str(value).strip())
+            elif isinstance(validation, list):
+                for entry in validation:
+                    if isinstance(entry, dict):
+                        value = entry.get("reason") or entry.get("error") or entry.get("message")
+                        if value:
+                            texts.append(str(value).strip())
+            nested_values = []
+            if isinstance(item.get("store"), dict):
+                nested_values.append(item.get("store"))
+            if isinstance(item.get("stores"), list):
+                nested_values.extend(value for value in item.get("stores") if isinstance(value, dict))
+            for nested in nested_values:
+                for field in ("reason", "error", "message"):
+                    value = nested.get(field)
+                    if value:
+                        texts.append(str(value).strip())
+    return [text for text in texts if text]
+
+
+def _should_defer_sync_retry(failed: dict | None) -> bool:
+    """UI 날짜/확장 driver 계열 실패는 120분 동기 retry 대신 Retry DAG로 넘긴다."""
+    if count_failed_items(failed) == 0:
+        return False
+    if (failed or {}).get("accounts") or (failed or {}).get("stores") or (failed or {}).get("stages"):
+        return False
+    texts = _failure_reason_texts(failed)
+    if not texts:
+        return False
+    lowered = [text.lower() for text in texts]
+    return all(
+        any(pattern in text for pattern in _SYNC_RETRY_DEFER_REASON_PATTERNS)
+        for text in lowered
+    )
 
 
 def _save_validate_log(target_date: str, section: str, text: str) -> None:
@@ -113,173 +394,54 @@ def _save_validate_log(target_date: str, section: str, text: str) -> None:
         logger.warning("검증 로그 저장 실패: %s", exc)
 
 
-def _send_alert(subject: str, body: str) -> None:
-    from modules.transform.utility.mailer import send_email, text_to_html
-
-    try:
-        send_email(subject=subject, html_content=text_to_html(body), to_emails=_ALERT_EMAILS)
-        logger.info("알림 발송 완료: %s", _ALERT_EMAILS)
-    except Exception as e:
-        logger.error("알림 발송 실패: %s", e)
-
-
-def _on_failure_callback(context):
-    ti = context.get("task_instance")
-    logical_date = context.get("logical_date") or ti.execution_date
-    execution_date = logical_date.in_timezone(KST).strftime("%Y-%m-%d %H:%M")
-    body = (
-        f"DAG: {ti.dag_id}\n"
-        f"Task: {ti.task_id}\n"
-        f"실행일시(KST): {execution_date}\n"
-        f"에러: {context.get('exception', '알 수 없음')}\n"
-        f"로그: {ti.log_url}"
-    )
-    _send_alert(subject=f"[Airflow 실패] {ti.dag_id} / {ti.task_id}", body=body)
-    send_telegram(body + "\n해결해라")
-
-
 default_args = {
     "retries": 1,
     "retry_delay": timedelta(minutes=10),
     "depends_on_past": False,
     "email_on_failure": False,
     "email_on_retry": False,
-    "on_failure_callback": _on_failure_callback,
+    "on_failure_callback": on_failure_callback_no_telegram,
 }
 
 
-_MISSING = object()
-_BAEMIN_STAGE_ATTRS = (
-    (
-        "modules.transform.pipelines.db.DB_Beamin_01_now",
-        "BAEMIN_METRICS_DB",
-        ("metrics_now",),
-    ),
-    (
-        "modules.transform.pipelines.db.DB_Beamin_02_woori_shop_click",
-        "BAEMIN_OUR_STORE_CLICKS_DB",
-        ("metrics_our_store_clicks",),
-    ),
-    (
-        "modules.transform.pipelines.db.DB_Beamin_03_shop_change",
-        "BAEMIN_SHOP_CHANGE_DB",
-        ("shop_change",),
-    ),
-    (
-        "modules.transform.pipelines.db.DB_Beamin_03_shop_change",
-        "BAEMIN_SHOP_OPERATION_DB",
-        ("shop_operation",),
-    ),
-    (
-        "modules.transform.pipelines.db.DB_Beamin_04_orders",
-        "BAEMIN_ORDERS_DB",
-        ("orders",),
-    ),
-    (
-        "modules.transform.pipelines.db.DB_Beamin_05_ad_funnel",
-        "BAEMIN_AD_FUNNEL_DB",
-        ("ad_funnel",),
-    ),
-    (
-        "modules.transform.pipelines.db.DB_Beamin_Macro_validate",
-        "BAEMIN_ORDERS_DB",
-        ("orders",),
-    ),
-    (
-        "modules.transform.pipelines.db.DB_Beamin_monthly_operation",
-        "BAEMIN_MONTHLY_OPERATION_DB",
-        ("monthly_operation",),
-    ),
-    (
-        "modules.transform.pipelines.db.DB_Beamin_monthly_operation",
-        "BAEMIN_SHOP_CHANGE_DB",
-        ("shop_change",),
-    ),
-    (
-        "modules.transform.pipelines.db.DB_Beamin_monthly_operation",
-        "BAEMIN_SHOP_OPERATION_DB",
-        ("shop_operation",),
-    ),
-)
-
-
-def _reset_baemin_staging(onedrive_baemin: Path, local_baemin: Path) -> None:
-    local_root = LOCAL_DB.resolve()
-    target = local_baemin.resolve()
-    if local_baemin.exists():
-        if not target.is_relative_to(local_root):
-            raise RuntimeError(f"staging 삭제 범위 오류: {local_baemin}")
-        shutil.rmtree(local_baemin)
-
-    if onedrive_baemin.exists():
-        shutil.copytree(str(onedrive_baemin), str(local_baemin), dirs_exist_ok=True)
-        logger.info("OneDrive 원본 staging 복사 완료: %s -> %s", onedrive_baemin, local_baemin)
-    else:
-        local_baemin.mkdir(parents=True, exist_ok=True)
-        logger.info("OneDrive 원본 없음, 빈 staging 생성: %s", local_baemin)
-
-
-def _patch_baemin_staging_paths(local_analytics: Path) -> tuple[str | None, list[tuple[Any, str, Any]]]:
-    import modules.transform.utility.paths as _paths
-
-    analytics_original = os.environ.get("ANALYTICS_DB")
-    os.environ["ANALYTICS_DB"] = str(local_analytics)
-    _paths._cache.clear()
-
-    local_baemin = local_analytics / "baemin_macro"
-    originals: list[tuple[Any, str, Any]] = []
-    for module_name, attr_name, relative_parts in _BAEMIN_STAGE_ATTRS:
-        module = importlib.import_module(module_name)
-        originals.append((module, attr_name, getattr(module, attr_name, _MISSING)))
-        setattr(module, attr_name, local_baemin.joinpath(*relative_parts))
-
-    logger.info("staging 모드 전환: %s", local_analytics)
-    return analytics_original, originals
-
-
-def _restore_baemin_staging_paths(
-    analytics_original: str | None,
-    originals: list[tuple[Any, str, Any]],
-) -> None:
-    import modules.transform.utility.paths as _paths
-
-    for module, attr_name, original_value in reversed(originals):
-        if original_value is _MISSING:
-            try:
-                delattr(module, attr_name)
-            except AttributeError:
-                pass
-        else:
-            setattr(module, attr_name, original_value)
-
-    if analytics_original is None:
-        os.environ.pop("ANALYTICS_DB", None)
-    else:
-        os.environ["ANALYTICS_DB"] = analytics_original
-    _paths._cache.clear()
-    logger.info("staging 모드 해제")
-
-
-def _upload_baemin_staging(local_baemin: Path, onedrive_baemin: Path) -> None:
-    if not local_baemin.exists():
-        logger.warning("staging 경로 없음, OneDrive 업로드 생략: %s", local_baemin)
-        return
-
-    onedrive_baemin.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(str(local_baemin), str(onedrive_baemin), dirs_exist_ok=True)
-    logger.info("OneDrive 업로드 완료: %s -> %s", local_baemin, onedrive_baemin)
-
-
 def _split_accounts_by_range(accounts: list[dict], collect_range: str | None) -> list[dict]:
+    if isinstance(collect_range, str) and collect_range.strip().lower() in {"", "none", "null"}:
+        collect_range = None
     if not collect_range or not accounts:
         return accounts
 
     ordered = sorted(accounts, key=lambda a: str(a.get("store_name", "")))
+    normalized_range = str(collect_range).strip()
+
+    batch_match = re.fullmatch(r"batch:(\d+)/(\d+)", normalized_range)
+    if batch_match:
+        batch_index = int(batch_match.group(1))
+        batch_total = int(batch_match.group(2))
+        if batch_total <= 0 or batch_index < 1 or batch_index > batch_total:
+            logger.warning("알 수 없는 COLLECT_RANGE=%r", collect_range)
+            return accounts
+        groups: dict[str, list[dict]] = {}
+        for account in ordered:
+            groups.setdefault(str(account.get("account_id") or ""), []).append(account)
+        group_keys = list(groups)
+        start = len(group_keys) * (batch_index - 1) // batch_total
+        end = len(group_keys) * batch_index // batch_total
+        selected = [account for key in group_keys[start:end] for account in groups[key]]
+        logger.info(
+            "매장 분할 [%s]: 전체 %d개 -> %d개 (%s ~ %s)",
+            collect_range,
+            len(ordered),
+            len(selected),
+            selected[0]["store_name"] if selected else "-",
+            selected[-1]["store_name"] if selected else "-",
+        )
+        return selected
+
     mid = len(ordered) // 2
 
-    if collect_range == "상위":
+    if normalized_range == "상위":
         selected = ordered[:mid]
-    elif collect_range == "하위":
+    elif normalized_range == "하위":
         selected = ordered[mid:]
     else:
         logger.warning("알 수 없는 COLLECT_RANGE=%r", collect_range)
@@ -299,18 +461,64 @@ def _split_accounts_by_range(accounts: list[dict], collect_range: str | None) ->
 def load_accounts(**context) -> str:
     dag_run = context.get("dag_run")
     conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    params = context.get("params") or {}
     stores_override = conf.get("stores")
     target = stores_override if stores_override else TARGET_STORES
-    accounts = pipeline_load_accounts(target_stores=target, exact=True)
+    logger.info(
+        "계정 로드 target 확인: stores_override=%r collect_range_conf=%r collect_range_param=%r target=%r",
+        stores_override,
+        conf.get("collect_range"),
+        params.get("collect_range"),
+        target,
+    )
+    accounts = pipeline_load_accounts(target_stores=target, exact=False)
 
     if not stores_override:
-        collect_range = conf.get("collect_range", COLLECT_RANGE)
-        accounts = _split_accounts_by_range(accounts, collect_range)
+        conf_range = conf.get("collect_range")
+        param_range = params.get("collect_range")
+        role_range = _MACRO_ROLE["range"] or COLLECT_RANGE
+        for candidate in (conf_range, param_range):
+            if str(candidate or "").strip() in {"상위", "하위"}:
+                role_range = str(candidate).strip()
+                break
+
+        batch_range = None
+        if params.get("batch_orchestration") != "single_dag":
+            for candidate in (conf_range, param_range):
+                normalized = str(candidate or "").strip()
+                if re.fullmatch(r"batch:\d+/\d+", normalized):
+                    batch_range = normalized
+                    break
+
+        all_count = len(accounts)
+        accounts = _split_accounts_by_range(accounts, role_range)
+        role_count = len(accounts)
+        accounts = _split_accounts_by_range(accounts, batch_range)
+        logger.info(
+            "계정 2단계 분할: 전체 %d개 -> %s %d개 -> %s %d개",
+            all_count,
+            role_range or "전체",
+            role_count,
+            batch_range or "배치 없음",
+            len(accounts),
+        )
+
+    if _MACRO_ROLE["slug"]:
+        logger.info(
+            "배민 매크로 PC 역할: range=%s slug=%s",
+            _MACRO_ROLE["range"],
+            _MACRO_ROLE["slug"],
+        )
+    else:
+        logger.warning(
+            "BAEMIN_MACRO_ROLE 미설정 또는 미지원 값: %r (기존 전량 수집/폴더명 사용)",
+            _MACRO_ROLE_RAW,
+        )
 
     context["ti"].xcom_push(key="account_list", value=accounts)
     stores = [a["store_name"] for a in accounts]
     logger.info("계정 로드 완료: %d개 -> %s", len(accounts), stores)
-    return f"계정 {len(accounts)}개, {stores}"
+    return f"계정 {len(accounts)}개 {stores}"
 
 
 def _manual_baemin_store_key(raw_store_name: str, fallback_name: str = "") -> str:
@@ -356,34 +564,27 @@ def _collect_manual_baemin_orders(target_date: str, base_dir: Path) -> tuple[dic
         if not store_key:
             logger.warning("manual baemin store parse failed: %s / raw=%s", csv_path.name, raw_store_name)
             continue
-        required = {"주문상태", "주문번호", "주문시각", "결제금액"}
+        required = {"주문상태", "주문번호", "주문시각"}
         if not required.issubset(df.columns):
             logger.warning("manual baemin CSV missing required columns: %s", csv_path.name)
             continue
         filtered = df[
             (df["주문상태"].astype(str) == "배달완료")
             & df["주문시각"].astype(str).str.startswith(date_prefix, na=False)
-            & df["결제금액"].astype(str).str.strip().ne("")
-        ][["주문번호", "결제금액"]].copy()
-        if filtered.empty:
+        ]
+        # ToOrder와 같은 기준(총결제금액, 없으면 결제금액)으로 집약한다.
+        amounts = _order_amounts(filtered)
+        if amounts.empty:
             continue
-        store_frames.setdefault(store_key, []).append(filtered)
+        store_frames.setdefault(store_key, []).append(amounts)
         used_files.append(csv_path.name)
 
     result: dict[str, dict] = {}
     for store_key, frames in store_frames.items():
-        combined = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["주문번호"])
-        amount = int(
-            combined["결제금액"]
-            .astype(str)
-            .str.replace(",", "", regex=False)
-            .pipe(pd.to_numeric, errors="coerce")
-            .fillna(0)
-            .sum()
-        )
+        combined = _merge_order_amounts(frames)
         result[store_key] = {
-            "amount": amount,
-            "orders": int(combined["주문번호"].nunique()),
+            "amount": int(combined["amount"].sum()),
+            "orders": int(len(combined)),
         }
     return result, used_files
 
@@ -391,7 +592,7 @@ def _collect_manual_baemin_orders(target_date: str, base_dir: Path) -> tuple[dic
 def precheck_manual_baemin_orders(**context) -> str:
     dag_run = context.get("dag_run")
     conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
+    target_date = _target_date_from_context(context)
     manual_dir = Path(str(conf.get("manual_baemin_dir") or MANUAL_BAEMIN_ORDERS_DIR))
 
     if not manual_dir.exists():
@@ -449,204 +650,225 @@ def precheck_manual_baemin_orders(**context) -> str:
     return summary
 
 
-def collect_all(**context) -> str:
-    import random
-    import time
-
-    wait_sec = random.uniform(0, 60)
-    logger.info("수집 시작 전 랜덤 대기: %.0f초", wait_sec)
-    time.sleep(wait_sec)
-
+def retry_failed(
+    *,
+    collect_task_ids=None,
+    retry_all_types: bool = False,
+    **context,
+) -> str:
     dag_run = context.get("dag_run")
     conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    target_date = _target_date_from_context(context)
+    orders_only = _orders_only_enabled(context)
+    profile = resolve_stability_profile(conf.get("stability_profile") or SCHEDULED_DEFAULT_STABILITY_PROFILE)
+    logger.info("재시도 안정성 프로필: %s", profile["name"])
 
-    # 수집 날짜 목록 결정
-    # conf target_date 우선, 없으면 ORDERS_BACKFILL_DAYS 기준 (어제부터 N일), 기본은 어제 1일
-    if conf.get("target_date"):
-        dates = [conf["target_date"]]
-    elif ORDERS_BACKFILL_DAYS:
-        yesterday = pendulum.yesterday(KST)
-        dates = [yesterday.subtract(days=i).format("YYYY-MM-DD") for i in range(ORDERS_BACKFILL_DAYS)]
-        logger.info("백필 모드: %d일치 수집 %s ~ %s", len(dates), dates[-1], dates[0])
+    allowed_account_ids = _loaded_account_ids(context)
+    failed = _filter_failed_to_loaded_accounts(
+        _pull_batch_failures(context["ti"], collect_task_ids),
+        allowed_account_ids,
+    )
+    context["ti"].xcom_push(key="original_failed", value=failed)
+    residual_failed = {"accounts": [], "stores": [], "orders": [], "ads": [], "stages": []}
+    if retry_all_types:
+        immediate_failed = failed
+        deferred_counts = {"stores": 0, "ads": 0}
+    elif orders_only:
+        immediate_failed = {
+            "accounts": failed.get("accounts") or [],
+            "stages": [],
+            "stores": failed.get("stores") or [],
+            "orders": failed.get("orders") or [],
+            "ads": [],
+        }
+        deferred_counts = {
+            "stores": 0,
+            "ads": 0,
+        }
     else:
-        dates = [pendulum.yesterday(KST).format("YYYY-MM-DD")]
-
-    account_list = context["ti"].xcom_pull(task_ids="load_accounts", key="account_list")
-    if not account_list:
-        logger.warning("수집 대상 계정 없음")
-        return "수집 대상 없음"
-
-    summaries = []
-    last_result: dict = {}
-    for target_date in dates:
-        logger.info("수집 날짜: %s", target_date)
-        last_result = pipeline_collect_all(account_list, target_date=target_date)
-        summaries.append(f"{target_date}: {last_result['summary']}")
-
-    context["ti"].xcom_push(key="failed", value=last_result.get("failed", {}))
-    context["ti"].xcom_push(key="validation", value=last_result.get("validation", []))
-    context["ti"].xcom_push(key="ad_stores", value=last_result.get("ad_stores", []))
-    context["ti"].xcom_push(key="store_info_per_account", value=last_result.get("store_info_per_account", []))
-    return " | ".join(summaries)
-
-
-def retry_failed(**context) -> str:
-    dag_run = context.get("dag_run")
-    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date")
-
-    failed = context["ti"].xcom_pull(task_ids="collect_all", key="failed") or {}
-    if not any(failed.get(k) for k in ("accounts", "stores", "orders", "ads")):
-        logger.info("재시도 대상 없음")
+        immediate_failed = {
+            "accounts": failed.get("accounts") or [],
+            "stages": failed.get("stages") or [],
+            "stores": [],
+            "orders": failed.get("orders") or [],
+            "ads": [],
+        }
+        deferred_counts = {
+            "stores": len(failed.get("stores") or []),
+            "ads": len(failed.get("ads") or []),
+        }
+    if count_failed_items(immediate_failed) == 0:
+        logger.info(
+            "즉시 재시도 대상 없음: deferred stores=%d ads=%d",
+            deferred_counts["stores"],
+            deferred_counts["ads"],
+        )
+        if deferred_counts["stores"] or deferred_counts["ads"]:
+            residual_failed["stores"] = failed.get("stores") or []
+            residual_failed["ads"] = failed.get("ads") or []
+            context["ti"].xcom_push(key="residual_failed", value=residual_failed)
+            return (
+                "즉시 재시도 없음 "
+                f"(검증 단계로 이관: stores={deferred_counts['stores']} ads={deferred_counts['ads']})"
+            )
+        context["ti"].xcom_push(key="residual_failed", value=residual_failed)
         return "재시도 없음"
 
-    return pipeline_retry_failed(failed, target_date=target_date)
-
-
-def validate_orders(**context) -> str:
-    dag_run = context.get("dag_run")
-    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
-
-    validation = context["ti"].xcom_pull(task_ids="collect_all", key="validation") or []
-    if not validation:
-        logger.info("orders 검증 결과 없음")
-        return "검증 없음"
-
-    mismatches = [v for v in validation if v.get("matched") is False]
-    matched = [v for v in validation if v.get("matched") is True]
-    unknown = [v for v in validation if v.get("matched") is None]
-
-    lines = [
-        f"orders 검증: 총 {len(validation)}건 "
-        f"(일치 {len(matched)}, 불일치 {len(mismatches)}, 미확인 {len(unknown)})"
-    ]
-    for v in mismatches:
-        lines.append(
-            f"  ❌ {v.get('store', '?')} [{v.get('status', '?')}] "
-            f"수집={v.get('actual_count')}건/{v.get('actual_amount', 0):,}원 "
-            f"기대={v.get('expected_count')}건/{v.get('expected_amount', 0):,}원 "
-            f"(재시도 {v.get('retried', 0)}회)"
+    if _should_defer_sync_retry(immediate_failed):
+        residual_failed = merge_failed_payloads(residual_failed, immediate_failed)
+        if not retry_all_types and not orders_only:
+            residual_failed["stores"].extend(failed.get("stores") or [])
+            residual_failed["ads"].extend(failed.get("ads") or [])
+        context["ti"].xcom_push(key="residual_failed", value=residual_failed)
+        logger.warning(
+            "동기 retry 생략: 날짜 필터/확장 collector 계열 실패는 Retry DAG로 이월 "
+            "(immediate=%d)",
+            count_failed_items(immediate_failed),
         )
-    if missing_brand_stores:
-        lines.append(f"누락브랜드 의심 매장: {', '.join(sorted(set(missing_brand_stores)))}")
-    if missing_brand_stores:
-        lines.append(f"누락브랜드 의심 매장: {', '.join(sorted(set(missing_brand_stores)))}")
-    if missing_brand_stores:
-        lines.append(f"누락브랜드 의심 매장: {', '.join(sorted(set(missing_brand_stores)))}")
-    summary = "\n".join(lines)
-    if missing_brand_stores:
-        summary += f"\n누락브랜드 의심 매장: {', '.join(sorted(set(missing_brand_stores)))}"
-    logger.info(summary)
+        return (
+            "동기 retry 생략 "
+            f"(Retry DAG 이월: immediate={count_failed_items(immediate_failed)})"
+        )
 
-    if mismatches:
-        _send_alert(subject=f"[배민 orders 불일치] {len(mismatches)}건", body=summary)
-        send_telegram(summary)
+    local_analytics, _local_baemin = _main_stage_paths(context)
+    prog_path = progress_path(local_analytics, "retry")
+    analytics_original, patched_paths = patch_baemin_staging_paths(local_analytics)
+    try:
+        result = pipeline_retry_failed(
+            immediate_failed,
+            target_date=target_date,
+            stability_profile=profile["name"],
+            progress_file=prog_path,
+            progress_run_id=_current_run_id(context),
+            orders_only=orders_only,
+        )
+    finally:
+        restore_baemin_staging_paths(analytics_original, patched_paths)
+    if isinstance(result, dict):
+        residual_failed = result.get("residual_failed") or residual_failed
+        if not retry_all_types:
+            residual_failed["stores"].extend(failed.get("stores") or [])
+            residual_failed["ads"].extend(failed.get("ads") or [])
+        context["ti"].xcom_push(key="residual_failed", value=residual_failed)
+        return str(result.get("summary") or "재시도 완료")
+    context["ti"].xcom_push(key="residual_failed", value=residual_failed)
+    return str(result)
 
-    _save_validate_log(target_date, "orders 검증", summary)
-    return summary
+
+def export_to_upload_inbox(*, collect_task_ids=None, **context) -> str:
+    ti = context["ti"]
+    local_analytics, local_baemin = _main_stage_paths(context)
+    if not local_baemin.exists():
+        logger.warning("배민 upload export 스킵: staging 경로 없음 %s", local_baemin)
+        return "upload inbox export 스킵: staging 없음"
+
+    account_list = ti.xcom_pull(task_ids="load_accounts", key="account_list") or []
+    validation = _pull_batch_values(ti, collect_task_ids, "validation")
+    ad_stores = _pull_batch_values(ti, collect_task_ids, "ad_stores")
+    store_info_per_account = _pull_batch_values(
+        ti,
+        collect_task_ids,
+        "store_info_per_account",
+    )
+    original_failed = ti.xcom_pull(task_ids="retry_failed", key="original_failed")
+    if original_failed is None:
+        original_failed = _pull_batch_failures(ti, collect_task_ids)
+    residual_failed = ti.xcom_pull(task_ids="retry_failed", key="residual_failed")
+    failed = residual_failed if residual_failed is not None else original_failed
+    if residual_failed is None:
+        logger.warning("retry_failed residual_failed XCom 없음: 원본 실패 payload를 upload meta failed로 사용")
+    meta = {
+        "target_date": _target_date_from_context(context),
+        "orders_only": _orders_only_enabled(context),
+        "account_list": account_list,
+        "validation": validation,
+        "ad_stores": ad_stores,
+        "store_info_per_account": store_info_per_account,
+        "original_failed": original_failed,
+        "failed": failed,
+        "residual_failed": failed,
+    }
+    final_run = export_staging_to_inbox(
+        local_baemin,
+        _current_run_id(context),
+        inbox_dir=UPLOAD_INBOX_DIR,
+        meta=meta,
+        replace_existing=False,
+        folder_prefix=str(_MACRO_ROLE["slug"] or ""),
+    )
+    cleanup_staging(local_analytics)
+    ti.xcom_push(key="upload_inbox_run", value=str(final_run))
+    return f"upload inbox export 완료: {final_run}"
 
 
-def validate_ad_funnel(**context) -> str:
-    from modules.transform.pipelines.db.DB_Beamin_05_ad_funnel import _validate_and_retry_ad_funnel
+def trigger_upload_after_export(**context) -> str:
+    """수집 종료 시각과 무관하게 이번 top 폴더만 중앙 적재 큐에 넣는다."""
+    if _MACRO_ROLE["slug"] != "top":
+        logger.info(
+            "배민 upload 직접 트리거 스킵: role=%s (중앙 top 전용)",
+            _MACRO_ROLE["slug"] or _MACRO_ROLE_RAW,
+        )
+        return f"upload 직접 트리거 스킵: role={_MACRO_ROLE['slug'] or _MACRO_ROLE_RAW}"
 
+    ti = context["ti"]
+    exported = ti.xcom_pull(task_ids="export_to_upload_inbox", key="upload_inbox_run")
+    if not exported:
+        logger.warning("배민 upload 트리거 스킵: export 폴더 없음")
+        return "upload 트리거 스킵: export 폴더 없음"
+
+    folder_name = Path(str(exported)).name
+    if not folder_name.startswith("manual__"):
+        raise ValueError(f"허용되지 않은 upload 폴더명: {folder_name}")
+
+    source_run_id = _current_run_id(context)
+    upload_run_id = f"collect_export__{safe_run_id_part(source_run_id)}"
+    trigger_conf = {
+        "folder_pattern": folder_name,
+        "skip_if_empty": True,
+        "source": "main_top_collect_export",
+        "target_date": _target_date_from_context(context),
+        "orders_only": _orders_only_enabled(context),
+    }
     dag_run = context.get("dag_run")
     conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
+    from modules.transform.utility.workload import is_background
+    if is_background(conf, context["ti"].dag_id):
+        trigger_conf["workload"] = "history"
+    if conf.get("manual_baemin_dir"):
+        trigger_conf["manual_baemin_dir"] = conf["manual_baemin_dir"]
 
-    ad_stores = context["ti"].xcom_pull(task_ids="collect_all", key="ad_stores") or []
-    if not ad_stores:
-        logger.info("ad_funnel 점검 대상 없음")
-        return "점검 없음"
+    from airflow.api.common.trigger_dag import trigger_dag
+    from airflow.exceptions import DagRunAlreadyExists
 
-    result = _validate_and_retry_ad_funnel(ad_stores, target_date)
-    context["ti"].xcom_push(key="ad_funnel_result", value=result)
-    empty = result["empty_stores"]
-    still = result["still_empty"]
+    try:
+        result = route_trigger(trigger_dag, history_context=context,
+            dag_id=("DB_Beamin_Macro_Backfill_Upload_Dags" if trigger_conf.get("workload") == "history" else _UPLOAD_DAG_ID),
+            run_id=upload_run_id,
+            conf=trigger_conf,
+        )
+    except DagRunAlreadyExists:
+        logger.info("배민 upload DAG run 이미 존재: %s", upload_run_id)
+        return f"upload DAG run 이미 존재: {upload_run_id}"
 
-    lines = [
-        f"ad_funnel 빈값 점검: 총 {len(ad_stores)}매장 / 빈값 {len(empty)}건 / "
-        f"재수집 후 잔여 {len(still)}건"
-    ]
-    for s in still:
-        lines.append(f"  ❌ {s.get('store', '?')} 재수집 후에도 빈값 잔존")
-    summary = "\n".join(lines)
-    logger.info(summary)
+    if result in ("deferred", "existing", "cancelled"):
+        return f"upload DAG 요청 상태={result}: {upload_run_id}"
 
-    if still:
-        _send_alert(subject=f"[배민 ad_funnel 빈값] {len(still)}건 잔존", body=summary)
-        send_telegram(summary)
-
-    _save_validate_log(target_date, "ad_funnel 빈값 점검", summary)
-    return summary
-
-
-def validate_toorder(**context) -> str:
-    dag_run = context.get("dag_run")
-    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
-
-    account_list = context["ti"].xcom_pull(task_ids="load_accounts", key="account_list") or []
-    store_info_per_account = (
-        context["ti"].xcom_pull(task_ids="collect_all", key="store_info_per_account") or []
+    logger.info(
+        "배민 upload DAG 트리거 완료: run_id=%s folder=%s",
+        upload_run_id,
+        folder_name,
     )
-
-    result = validate_toorder_orders(
-        account_list, store_info_per_account, target_date
-    )
-
-    matched = result.get("matched", False)
-    compared = result.get("compared_count", 0)
-    retried = result.get("retried_stores", [])
-    mismatched = result.get("mismatched_stores", [])
-    store_results = result.get("store_results", {})
-    gap_stores = result.get("toorder_gap_stores", [])
-    missing_brand_stores = result.get("missing_brand_stores", [])
-    missing_brand_stores = result.get("missing_brand_stores", [])
-
-    # 요약 헤더
-    summary_lines = [
-        f"토더 교차검증 [{target_date}]: "
-        f"비교 {compared}개 매장 / "
-        f"{'✅전체일치' if matched else f'❌불일치 {len(mismatched)}개'}"
-    ]
-    # 불일치 매장 상세
-    for store, info in store_results.items():
-        if not info.get("toorder_gap"):
-            if not info["matched"]:
-                retry_mark = " (재수집후)" if store in retried else ""
-                summary_lines.append(
-                    f"  [{store}] ToOrder={info['toorder']:,} / 배민={info['baemin']:,}{retry_mark}"
-                )
-    # ToOrder 갭 매장 (계정연결 문제) 별도 표기
-    if gap_stores:
-        summary_lines.append(f"⚠️ ToOrder 갭 의심(계정연결?): {', '.join(gap_stores)}")
-        for store in gap_stores:
-            info = store_results.get(store, {})
-            summary_lines.append(
-                f"  [{store}] ToOrder=0 / 배민={info.get('baemin', 0):,}"
-            )
-    summary = "\n".join(summary_lines)
-    logger.info(summary)
-
-    # 비교 매장이 0개면 검증 불가(예: ToOrder CSV 없음) → 허위 '불일치' 알림 보내지 않음
-    if compared > 0 and (not matched or gap_stores or missing_brand_stores):
-        send_telegram(summary)
-
-    _save_validate_log(target_date, "ToOrder 교차검증", summary)
-    return summary
+    return f"upload DAG 트리거 완료: {upload_run_id}"
 
 
 _NOTIFY_TASK_ID = "notify_collection_result"
 _CORE_TASK_IDS = {
     "load_accounts",
+    "init_staging",
     "collect_all",
+    *_BATCH_TASK_IDS,
     "retry_failed",
-}
-_VALIDATION_TASK_IDS = {
-    "validate_orders",
-    "validate_ad_funnel",
-    "validate_toorder",
+    "export_to_upload_inbox",
 }
 _PROBLEM_LOG_PATTERNS = (
     "ERROR",
@@ -672,11 +894,26 @@ _EMPTY_SIGNAL_PATTERNS = (
 _BENIGN_WARNING_PATTERNS = (
     "DeprecationWarning: This process",
     "ToOrder CSV 없음",
+    "데이터 없음(정상)",
+    "우가클 데이터없음(정상)",
+    "NOW 데이터없음(정상)",
+    "로그아웃 생략",
+    "날짜 '어제' 배지 미확인, 주문 날짜 검증 단계로 계속 진행",
 )
 
 _RECOVERED_WARNING_PATTERNS = (
     "dashboard not ready",
     "지표 추출 오류",
+    "세션 문제 감지, 재생성 시도",
+    "로드 지연",
+    "이동 지연",
+    "페이지 이동 지연",
+    "페이지 로드 지연",
+    "메트릭 데이터 로드 지연",
+    "새로고침 지연",
+    "F5 재시도",
+    "계속 진행",
+    "실패(무시)",
 )
 
 
@@ -787,123 +1024,18 @@ def _extract_log_signals(task_instance, max_lines: int = 8) -> tuple[list[str], 
     return problem_lines[-max_lines:], empty_signal_count, recovered_lines[-max_lines:]
 
 
-def _build_collection_notification_legacy_v1(context) -> tuple[str, str, bool]:
+def _build_collection_notification(
+    context,
+    *,
+    collect_task_ids=None,
+) -> tuple[str, str, str, bool]:
     ti = context["ti"]
     dag_run = context.get("dag_run")
     logical_date = context.get("logical_date") or getattr(ti, "execution_date", None)
     conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
+    target_date = _target_date_from_context(context)
     run_id = getattr(dag_run, "run_id", getattr(ti, "run_id", "?"))
-    execution_time = (
-        logical_date.in_timezone(KST).strftime("%Y-%m-%d %H:%M")
-        if hasattr(logical_date, "in_timezone")
-        else str(logical_date or "?")
-    )
-
-    task_instances = []
-    if dag_run and hasattr(dag_run, "get_task_instances"):
-        task_instances = [
-            t for t in dag_run.get_task_instances()
-            if getattr(t, "task_id", None) != _NOTIFY_TASK_ID
-        ]
-    task_by_id = {t.task_id: t for t in task_instances}
-
-    failed = ti.xcom_pull(task_ids="collect_all", key="failed") or {}
-    validation = ti.xcom_pull(task_ids="collect_all", key="validation") or []
-    returns = {
-        task_id: ti.xcom_pull(task_ids=task_id, key="return_value")
-        for task_id in [
-            "load_accounts",
-            "collect_all",
-            "retry_failed",
-            "validate_orders",
-            "validate_ad_funnel",
-            "validate_toorder",
-        ]
-    }
-
-    hard_failures = [
-        t for t in task_instances
-        if getattr(t, "state", None) in {"failed", "upstream_failed"}
-        and getattr(t, "task_id", None) in (_CORE_TASK_IDS | _VALIDATION_TASK_IDS)
-    ]
-    mismatches = [v for v in validation if isinstance(v, dict) and v.get("matched") is False]
-
-    validation_text = "\n".join(
-        _safe_text(returns.get(task_id), 300)
-        for task_id in ("validate_orders", "validate_ad_funnel", "validate_toorder")
-        if returns.get(task_id)
-    )
-    validation_issue = any(word in validation_text for word in ("불일치", "잔존", "갭", "mismatch", "still_empty"))
-
-    if hard_failures:
-        status = "실패"
-    elif retry_count or mismatches or validation_issue:
-        status = "부분실패"
-    else:
-        status = "성공"
-
-    lines = [
-        f"[배민 수집 결과] {status}",
-        f"DAG: {dag_id}",
-        f"Run: {run_id}",
-        f"실행시각(KST): {execution_time}",
-        f"target_date: {target_date}",
-        "",
-        "[수집 요약]",
-    ]
-    for task_id in ("load_accounts", "collect_all", "retry_failed"):
-        task = task_by_id.get(task_id)
-        state = getattr(task, "state", "?") if task else "?"
-        duration = _task_duration_seconds(task) if task else None
-        duration_text = f", {duration}s" if duration is not None else ""
-        lines.append(f"- {task_id}: {state}{duration_text} | {_safe_text(returns.get(task_id), 220)}")
-
-    if failed:
-        lines.append(
-            "retry 대상: "
-            f"accounts={len(failed.get('accounts') or [])}, "
-            f"stores={len(failed.get('stores') or [])}, "
-            f"orders={len(failed.get('orders') or [])}, "
-            f"ads={len(failed.get('ads') or [])}"
-        )
-    if mismatches:
-        lines.append(f"orders 검증 불일치: {len(mismatches)}건")
-
-    if validation_text:
-        lines.extend(["", "[검증 요약]", validation_text[:1200]])
-
-    problem_lines: list[str] = []
-    empty_signal_count = 0
-    for task in task_instances:
-        task_problems, task_empty_count = _extract_log_signals(task)
-        empty_signal_count += task_empty_count
-        if task_problems:
-            problem_lines.append(f"- {task.task_id}:")
-            problem_lines.extend(f"  {line}" for line in task_problems)
-
-    if empty_signal_count:
-        lines.extend(["", f"[정상 빈값 신호] 우가클/빈 테이블 로그 {empty_signal_count}건"])
-    if problem_lines:
-        lines.extend(["", "[문제 로그]", *problem_lines[:24]])
-
-    if hard_failures:
-        lines.extend(["", "[실패 task 로그 URL]"])
-        for task in hard_failures:
-            lines.append(f"- {task.task_id}: {getattr(task, 'log_url', '?')}")
-
-    body = "\n".join(lines)
-    subject = f"[배민 수집 결과] {status} / {target_date}"
-    return subject, body[:6000], status != "성공"
-
-
-def _build_collection_notification(context) -> tuple[str, str, str, bool]:
-    ti = context["ti"]
-    dag_run = context.get("dag_run")
-    logical_date = context.get("logical_date") or getattr(ti, "execution_date", None)
-    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
-    run_id = getattr(dag_run, "run_id", getattr(ti, "run_id", "?"))
+    current_dag_id = getattr(ti, "dag_id", dag_id)
     execution_time = (
         logical_date.in_timezone(KST).strftime("%Y-%m-%d %H:%M")
         if hasattr(logical_date, "in_timezone")
@@ -915,51 +1047,54 @@ def _build_collection_notification(context) -> tuple[str, str, str, bool]:
         task_instances = [t for t in dag_run.get_task_instances() if getattr(t, "task_id", None) != _NOTIFY_TASK_ID]
     task_by_id = {t.task_id: t for t in task_instances}
 
-    failed = ti.xcom_pull(task_ids="collect_all", key="failed") or {}
-    validation = ti.xcom_pull(task_ids="collect_all", key="validation") or []
+    normalized_collect_task_ids = _normalize_collect_task_ids(collect_task_ids)
+    original_failed = ti.xcom_pull(task_ids="retry_failed", key="original_failed")
+    if original_failed is None:
+        original_failed = _pull_batch_failures(ti, normalized_collect_task_ids)
+    residual_failed = ti.xcom_pull(task_ids="retry_failed", key="residual_failed")
+    final_failed = residual_failed if residual_failed is not None else original_failed
+    validation = _pull_batch_values(ti, normalized_collect_task_ids, "validation")
+    summary_task_ids = (
+        "load_accounts",
+        *normalized_collect_task_ids,
+        "retry_failed",
+        "export_to_upload_inbox",
+    )
     returns = {
         task_id: ti.xcom_pull(task_ids=task_id, key="return_value")
-        for task_id in (
-            "load_accounts",
-            "collect_all",
-            "retry_failed",
-            "validate_orders",
-            "validate_ad_funnel",
-            "validate_toorder",
-        )
+        for task_id in summary_task_ids
     }
 
     hard_failures = [
         t for t in task_instances
         if getattr(t, "state", None) in {"failed", "upstream_failed"}
-        and getattr(t, "task_id", None) in (_CORE_TASK_IDS | _VALIDATION_TASK_IDS)
+        and getattr(t, "task_id", None) in _CORE_TASK_IDS
     ]
     mismatches = [v for v in validation if isinstance(v, dict) and v.get("matched") is False]
-    validation_texts = [
-        _safe_text(returns.get(task_id), 500)
-        for task_id in ("validate_orders", "validate_ad_funnel", "validate_toorder")
-        if returns.get(task_id)
+    settle_suspects = [
+        v
+        for v in validation
+        if isinstance(v, dict)
+        and (
+            v.get("settlement_suspect")
+            or (
+                v.get("settle_rate") is not None
+                and float(v.get("settle_rate") or 0) < 0.9
+            )
+        )
     ]
-    validation_issue = _has_validation_issue(validation_texts)
 
     task_rows: list[tuple[str, str, str, str]] = []
     lines = [
         "[배민 수집 결과] {status}",
-        f"DAG: {dag_id}",
+        f"DAG: {current_dag_id}",
         f"Run: {run_id}",
         f"실행시각(KST): {execution_time}",
         f"target_date: {target_date}",
         "",
         "[수집 요약]",
     ]
-    for task_id in (
-        "load_accounts",
-        "collect_all",
-        "retry_failed",
-        "validate_orders",
-        "validate_ad_funnel",
-        "validate_toorder",
-    ):
+    for task_id in summary_task_ids:
         task = task_by_id.get(task_id)
         state = getattr(task, "state", "?") if task else "?"
         duration = _task_duration_seconds(task) if task else None
@@ -968,16 +1103,40 @@ def _build_collection_notification(context) -> tuple[str, str, str, bool]:
         lines.append(f"- {task_id}: {state}, {duration_text} | {summary}")
         task_rows.append((task_id, state, duration_text, summary))
 
-    if failed:
+    original_retry_count = _count_failed_items(original_failed)
+    final_retry_count = _count_failed_items(final_failed)
+    if original_retry_count:
         lines.append(
-            "retry 대상 "
-            f"accounts={len(failed.get('accounts') or [])}, "
-            f"stores={len(failed.get('stores') or [])}, "
-            f"orders={len(failed.get('orders') or [])}, "
-            f"ads={len(failed.get('ads') or [])}"
+            "원본 수집 실패 신호 "
+            f"accounts={len(original_failed.get('accounts') or [])}, "
+            f"stores={len(original_failed.get('stores') or [])}, "
+            f"orders={len(original_failed.get('orders') or [])}, "
+            f"ads={len(original_failed.get('ads') or [])}, "
+            f"stages={len(original_failed.get('stages') or [])}"
+        )
+        lines.append(
+            "최종 잔여 실패 "
+            f"accounts={len(final_failed.get('accounts') or [])}, "
+            f"stores={len(final_failed.get('stores') or [])}, "
+            f"orders={len(final_failed.get('orders') or [])}, "
+            f"ads={len(final_failed.get('ads') or [])}, "
+            f"stages={len(final_failed.get('stages') or [])}"
         )
     if mismatches:
         lines.append(f"orders 검증 불일치 {len(mismatches)}건")
+    if settle_suspects:
+        lines.append(
+            f"정산정보 미게시(09시 이후 자동 재수집 예정) {len(settle_suspects)}건 "
+            "— 주문 합계는 정상 저장됨, 입금예정금액만 추후 채워짐"
+        )
+        for item in settle_suspects[:12]:
+            rate = item.get("settle_rate")
+            rate_text = "-" if rate is None else f"{float(rate) * 100:.1f}%"
+            lines.append(
+                f"  - {item.get('store', '?')} [{item.get('status', '?')}] "
+                f"rate={rate_text} 정산={item.get('settle_count')}/{item.get('settle_denominator')} "
+                f"재시도={item.get('retried', 0)}"
+            )
 
     problem_lines: list[str] = []
     recovered_lines: list[str] = []
@@ -992,21 +1151,24 @@ def _build_collection_notification(context) -> tuple[str, str, str, bool]:
             recovered_lines.append(f"- {task.task_id}:")
             recovered_lines.extend(f"  {line}" for line in task_recovered)
 
+    # settle_suspects(정산정보 미게시)는 배민이 정산 데이터를 09시 이후에 게시하는
+    # 정상 패턴이며 주문 합계는 이미 검증·저장됨 → 부분성공 판정에서 제외한다.
+    has_final_issue = bool(mismatches or final_retry_count)
     if hard_failures:
         status = "실패"
-    elif problem_lines or mismatches or validation_issue:
+    elif has_final_issue:
         status = "부분성공"
     else:
         status = "성공"
     lines[0] = f"[배민 수집 결과] {status}"
 
-    if validation_texts:
-        lines.extend(["", "[검증 요약]", *validation_texts])
     if empty_signal_count:
         lines.extend(["", f"[정상 빈값 신호] 우가클/빈 테이블 로그 {empty_signal_count}건"])
     if recovered_lines:
         lines.extend(["", "[복구된 경고]", *recovered_lines[:24]])
-    if problem_lines:
+    if problem_lines and status == "성공":
+        lines.extend(["", "[참고 로그: 복구/재시도 후 최종 성공]", *problem_lines[:24]])
+    elif problem_lines:
         lines.extend(["", "[문제 로그]", *problem_lines[:24]])
     if hard_failures:
         lines.extend(["", "[실패 task 로그 URL]"])
@@ -1017,9 +1179,20 @@ def _build_collection_notification(context) -> tuple[str, str, str, bool]:
     subject = f"[배민 수집 결과] {status} / {target_date}"
 
     badge_color = "#1f8b4c" if status == "성공" else "#d97706" if status == "부분성공" else "#c0392b"
+    problem_title = "참고 로그: 복구/재시도 후 최종 성공" if status == "성공" else "문제 로그"
     problem_html = "".join(f"<li>{html.escape(line)}</li>" for line in problem_lines[:24]) or "<li>없음</li>"
     recovered_html = "".join(f"<li>{html.escape(line)}</li>" for line in recovered_lines[:24]) or "<li>없음</li>"
-    validation_html = "".join(f"<li>{html.escape(text)}</li>" for text in validation_texts) or "<li>없음</li>"
+    settle_html = "".join(
+        "<li>"
+        + html.escape(
+            f"{item.get('store', '?')} [{item.get('status', '?')}] "
+            f"rate={float(item.get('settle_rate') or 0) * 100:.1f}% "
+            f"정산={item.get('settle_count')}/{item.get('settle_denominator')} "
+            f"재시도={item.get('retried', 0)}"
+        )
+        + "</li>"
+        for item in settle_suspects[:24]
+    ) or "<li>없음</li>"
     html_rows = "".join(
         f"<tr><td>{html.escape(task_id)}</td><td>{html.escape(state)}</td><td>{html.escape(duration)}</td><td>{html.escape(summary)}</td></tr>"
         for task_id, state, duration, summary in task_rows
@@ -1035,9 +1208,10 @@ def _build_collection_notification(context) -> tuple[str, str, str, bool]:
         </div>
         <div style="padding:24px;">
           <table style="width:100%;border-collapse:collapse;margin-bottom:20px;">
-            <tr><td style="padding:8px 0;font-weight:700;">DAG</td><td>{html.escape(dag_id)}</td></tr>
+            <tr><td style="padding:8px 0;font-weight:700;">DAG</td><td>{html.escape(current_dag_id)}</td></tr>
             <tr><td style="padding:8px 0;font-weight:700;">실행시각</td><td>{html.escape(execution_time)}</td></tr>
-            <tr><td style="padding:8px 0;font-weight:700;">Retry 대상</td><td>accounts={len(failed.get('accounts') or [])}, stores={len(failed.get('stores') or [])}, orders={len(failed.get('orders') or [])}, ads={len(failed.get('ads') or [])}</td></tr>
+            <tr><td style="padding:8px 0;font-weight:700;">원본 수집 실패 신호</td><td>accounts={len(original_failed.get('accounts') or [])}, stores={len(original_failed.get('stores') or [])}, orders={len(original_failed.get('orders') or [])}, ads={len(original_failed.get('ads') or [])}, stages={len(original_failed.get('stages') or [])}</td></tr>
+            <tr><td style="padding:8px 0;font-weight:700;">최종 잔여 실패</td><td>accounts={len(final_failed.get('accounts') or [])}, stores={len(final_failed.get('stores') or [])}, orders={len(final_failed.get('orders') or [])}, ads={len(final_failed.get('ads') or [])}, stages={len(final_failed.get('stages') or [])}</td></tr>
             <tr><td style="padding:8px 0;font-weight:700;">정상 빈값 신호</td><td>{empty_signal_count}건</td></tr>
           </table>
           <h3 style="margin:20px 0 8px 0;">Task 요약</h3>
@@ -1052,11 +1226,11 @@ def _build_collection_notification(context) -> tuple[str, str, str, bool]:
             </thead>
             <tbody>{html_rows}</tbody>
           </table>
-          <h3 style="margin:20px 0 8px 0;">검증 요약</h3>
-          <ul>{validation_html}</ul>
           <h3 style="margin:20px 0 8px 0;">복구된 경고</h3>
           <ul>{recovered_html}</ul>
-          <h3 style="margin:20px 0 8px 0;">문제 로그</h3>
+          <h3 style="margin:20px 0 8px 0;">정산정보 미게시(09시 이후 자동 재수집 예정)</h3>
+          <ul>{settle_html}</ul>
+          <h3 style="margin:20px 0 8px 0;">{html.escape(problem_title)}</h3>
           <ul>{problem_html}</ul>
         </div>
       </div>
@@ -1066,13 +1240,12 @@ def _build_collection_notification(context) -> tuple[str, str, str, bool]:
     return subject, body, html_body, status != "성공"
 
 
-def notify_collection_result(**context) -> str:
-    subject, body, html_body, should_email = _build_collection_notification(context)
+def notify_collection_result(*, collect_task_ids=None, **context) -> str:
+    subject, body, html_body, should_email = _build_collection_notification(
+        context,
+        collect_task_ids=collect_task_ids,
+    )
     logger.info(body)
-    try:
-        send_telegram(body)
-    except Exception as exc:
-        logger.warning("Telegram 결과 알림 실패(무시): %s", exc)
     if should_email:
         try:
             _send_alert(subject=subject, body=body, html_content=html_body)
@@ -1081,93 +1254,204 @@ def notify_collection_result(**context) -> str:
     return subject
 
 
-def collect_all(**context) -> str:
+def init_staging(**context) -> str:
     dag_run = context.get("dag_run")
     conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    profile = resolve_stability_profile(conf.get("stability_profile"))
+    _local_analytics, local_baemin = _main_stage_paths(context)
+    if conf.get("force_restart") or not local_baemin.exists():
+        init_empty_staging(local_baemin)
+        return f"staging 초기화: {local_baemin}"
+    local_baemin.mkdir(parents=True, exist_ok=True)
+    logger.info("배민 staging 누적 유지(태스크 재시도): %s", local_baemin)
+    return f"staging 유지: {local_baemin}"
+
+
+def collect_batch(
+    *,
+    batch_range: str | None = None,
+    lane_offset: bool = False,
+    **context,
+) -> str:
+    dag_run = context.get("dag_run")
+    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
+    profile = resolve_stability_profile(conf.get("stability_profile") or SCHEDULED_DEFAULT_STABILITY_PROFILE)
+    logger.info(
+        "수집 안정성 프로필: name=%s driver_restart_every_stores=%s max_session_recovery_per_account=%s",
+        profile["name"],
+        profile.get("driver_restart_every_stores"),
+        profile.get("max_session_recovery_per_account"),
+    )
+    if lane_offset:
+        offset_range = conf.get("lane_offset_range") or _LANE_OFFSET_RANGE
+        offset_sec = random.uniform(*offset_range)
+        logger.info("레인 B 시작 오프셋 %.0f초", offset_sec)
+        time.sleep(offset_sec)
     wait_sec = random.uniform(*profile["initial_stagger_range"])
     logger.info("수집 시작 전 계정 지터 대기 %.0f초", wait_sec)
     time.sleep(wait_sec)
 
-    target_date = conf.get("target_date")
+    target_date = _target_date_from_context(context)
+    context["ti"].xcom_push(key="target_date", value=target_date)
     account_list = context["ti"].xcom_pull(task_ids="load_accounts", key="account_list")
     if not account_list:
         logger.warning("수집 대상 계정 없음")
         return "수집 대상 없음"
 
-    onedrive_baemin = ANALYTICS_DB / "baemin_macro"
-    local_analytics = LOCAL_DB / "analytics_stage"
-    local_baemin = local_analytics / "baemin_macro"
-    _reset_baemin_staging(onedrive_baemin, local_baemin)
-    analytics_original, patched_paths = _patch_baemin_staging_paths(local_analytics)
-
-    try:
-        # 백필 날짜 목록 계산 (ORDERS_BACKFILL_DAYS 설정 & conf 미지정 시)
-        backfill_dates: list[str] = []
-        if target_date is None and ORDERS_BACKFILL_DAYS is not None:
-            yesterday = pendulum.yesterday(KST)
-            backfill_dates = [
-                yesterday.subtract(days=i).format("YYYY-MM-DD")
-                for i in range(ORDERS_BACKFILL_DAYS)
-            ]
-            logger.info(
-                "주문 백필 모드: %d일치 (%s ~ %s)",
-                len(backfill_dates),
-                backfill_dates[-1],
-                backfill_dates[0],
-            )
-
-        result = pipeline_collect_all(
-            account_list,
-            target_date=target_date,
-            stability_profile=profile["name"],
+    requested_batch = str(conf.get("collect_range") or "").strip()
+    if not re.fullmatch(r"batch:\d+/\d+", requested_batch):
+        requested_batch = ""
+    if batch_range:
+        first_batch = "batch:1/4"
+        selected_batch = requested_batch or first_batch
+        partial_run = bool(conf.get("stores")) or not _batch_chain_enabled(
+            conf.get("run_all_batches", True)
         )
-        context["ti"].xcom_push(key="failed", value=result.get("failed", {}))
-        context["ti"].xcom_push(key="validation", value=result.get("validation", []))
-        context["ti"].xcom_push(key="ad_stores", value=result.get("ad_stores", []))
-        store_info_per_account = result.get("store_info_per_account", [])
-        context["ti"].xcom_push(key="store_info_per_account", value=store_info_per_account)
-        metrics = result.get("metrics")
-        if metrics and dag_run:
-            write_runtime_metrics(run_id=dag_run.run_id, stage="collect_all", payload=metrics)
-
-        # 백필: 추가 날짜들에 대해 orders만 재수집
-        backfill_summary = ""
-        if backfill_dates and store_info_per_account:
-            from modules.transform.pipelines.db.DB_Beamin_04_orders import (
-                collect_orders_for_account as _orders_fn,
+        if (requested_batch and batch_range != requested_batch) or (
+            partial_run and not requested_batch and batch_range != first_batch
+        ):
+            logger.info(
+                "배치 수집 스킵: task=%s batch=%s requested=%s stores=%s run_all_batches=%r",
+                context["ti"].task_id,
+                batch_range,
+                selected_batch,
+                bool(conf.get("stores")),
+                conf.get("run_all_batches", True),
             )
-            pw_map = {a["account_id"]: a["password"] for a in account_list}
-            lines = []
-            for bdate in backfill_dates:
-                ok, fail = 0, 0
-                for item in store_info_per_account:
-                    acc_id = item["account_id"]
-                    stores = item.get("stores", [])
-                    pw = pw_map.get(acc_id, "")
-                    if not pw or not stores:
-                        continue
-                    try:
-                        res = _orders_fn(acc_id, pw, stores, target_date=bdate)
-                        if res.get("failed"):
-                            fail += len(res["failed"])
-                        else:
-                            ok += 1
-                    except Exception as exc:
-                        logger.warning("백필 orders 실패 [%s / %s]: %s", acc_id, bdate, exc)
-                        fail += 1
-                lines.append(f"{bdate}: 성공 {ok} / 실패 {fail}")
-            backfill_summary = " | ".join(lines)
-            logger.info("백필 완료: %s", backfill_summary)
+            for key in ("failed", "validation", "ad_stores", "store_info_per_account"):
+                context["ti"].xcom_push(
+                    key=key,
+                    value={"accounts": [], "stores": [], "orders": [], "ads": [], "stages": []}
+                    if key == "failed"
+                    else [],
+                )
+            return f"배치 스킵: {batch_range}"
+        if not conf.get("stores"):
+            account_list = _split_accounts_by_range(account_list, batch_range)
+        logger.info(
+            "단일 DAG 배치 수집 대상: task=%s range=%s accounts=%d",
+            context["ti"].task_id,
+            batch_range,
+            len(account_list),
+        )
 
-        summary = result["summary"]
-        if backfill_summary:
-            summary += f"\n[백필] {backfill_summary}"
+    local_analytics, local_baemin = _main_stage_paths(context)
+    run_id = _current_run_id(context)
+    progress_key = batch_range.replace(":", "_").replace("/", "_") if batch_range else None
+    prog_path = progress_path(local_analytics, progress_key)
+    orders_only = _orders_only_enabled(context)
+    resume_progress = None
+    if not orders_only and not conf.get("force_restart"):
+        resume_progress = load_progress(
+            prog_path,
+            run_id=run_id,
+            target_date=target_date,
+        )
 
-        _upload_baemin_staging(local_baemin, onedrive_baemin)
-        return summary
+    if resume_progress is not None:
+        logger.info("배민 수집 이어받기: staging 유지 %s", local_baemin)
+    else:
+        local_baemin.mkdir(parents=True, exist_ok=True)
+        logger.info("배민 배치 staging 누적 유지: %s", local_baemin)
+        if not orders_only:
+            init_progress(
+                prog_path,
+                run_id=run_id,
+                target_date=target_date,
+                total_accounts=len(account_list),
+            )
+
+    def _push_interrupted_state() -> None:
+        progress = None
+        if not orders_only:
+            progress = load_progress(
+                prog_path,
+                run_id=run_id,
+                target_date=target_date,
+            )
+        done_ids = {str(value) for value in (progress or {}).get("done_accounts") or []}
+        remaining_accounts = [
+            account
+            for account in account_list
+            if str(account.get("account_id") or "") not in done_ids
+        ]
+        carry = (progress or {}).get("carry") or {}
+        carry_failed = carry.get("failed") or {}
+        failed_accounts = list(carry_failed.get("accounts") or [])
+        failed_ids = {str(account.get("account_id") or "") for account in failed_accounts}
+        failed_accounts.extend(
+            account
+            for account in remaining_accounts
+            if str(account.get("account_id") or "") not in failed_ids
+        )
+        failed = {
+            "accounts": failed_accounts,
+            "stores": list(carry_failed.get("stores") or []),
+            "orders": list(carry_failed.get("orders") or []),
+            "ads": list(carry_failed.get("ads") or []),
+            "stages": list(carry_failed.get("stages") or []),
+        }
+        context["ti"].xcom_push(key="failed", value=failed)
+        context["ti"].xcom_push(key="validation", value=list(carry.get("validation") or []))
+        context["ti"].xcom_push(key="ad_stores", value=list(carry.get("ad_stores") or []))
+        context["ti"].xcom_push(
+            key="store_info_per_account",
+            value=list(carry.get("store_info_per_account") or []),
+        )
+
+    analytics_original, patched_paths = patch_baemin_staging_paths(local_analytics)
+    try:
+        if orders_only:
+            result = pipeline_collect_orders_only(
+                account_list,
+                target_date=target_date,
+                stability_profile=profile["name"],
+            )
+        else:
+            result = pipeline_collect_all(
+                account_list,
+                target_date=target_date,
+                stability_profile=profile["name"],
+                woori_only=bool(conf.get("woori_only")),
+                progress_file=prog_path,
+                progress_run_id=run_id,
+            )
+    except AirflowTaskTimeout:
+        _push_interrupted_state()
+        logger.exception(
+            "%s 타임아웃 - 미완료 계정만 재시도 대상으로 XCom 저장",
+            context["ti"].task_id,
+        )
+        raise
+    except Exception:
+        _push_interrupted_state()
+        logger.exception(
+            "%s 실패 - 미완료 계정만 재시도 대상으로 XCom 저장",
+            context["ti"].task_id,
+        )
+        raise
     finally:
-        _restore_baemin_staging_paths(analytics_original, patched_paths)
+        restore_baemin_staging_paths(analytics_original, patched_paths)
+
+    context["ti"].xcom_push(key="failed", value=result.get("failed", {}))
+    context["ti"].xcom_push(key="validation", value=result.get("validation", []))
+    context["ti"].xcom_push(key="ad_stores", value=result.get("ad_stores", []))
+    store_info_per_account = result.get("store_info_per_account", [])
+    context["ti"].xcom_push(key="store_info_per_account", value=store_info_per_account)
+    metrics = result.get("metrics")
+    if metrics and dag_run:
+        write_runtime_metrics(
+            run_id=dag_run.run_id,
+            stage=context["ti"].task_id,
+            payload=metrics,
+        )
+    return result["summary"]
+
+
+def collect_all(**context) -> str:
+    """legacy B2/B3/B4와 기존 수동 실행 호환용 단일 배치 수집."""
+    _local_analytics, local_baemin = _main_stage_paths(context)
+    init_empty_staging(local_baemin)
+    return collect_batch(**context)
 
 
 def _send_alert(subject: str, body: str, html_content: str | None = None) -> None:
@@ -1185,6 +1469,8 @@ def _send_alert(subject: str, body: str, html_content: str | None = None) -> Non
 
 
 def validate_orders(**context) -> str:
+    target_date = _target_date_from_context(context)
+
     validation = context["ti"].xcom_pull(task_ids="collect_all", key="validation") or []
     if not validation:
         logger.info("orders 검증 결과 없음")
@@ -1208,16 +1494,15 @@ def validate_orders(**context) -> str:
     summary = "\n".join(lines)
     logger.info(summary)
     if mismatches:
-        send_telegram(summary)
+        _send_alert(subject=f"[배민 orders 불일치] {len(mismatches)}건", body=summary)
+    _save_validate_log(target_date, "orders 검증", summary)
     return summary
 
 
 def validate_ad_funnel(**context) -> str:
     from modules.transform.pipelines.db.DB_Beamin_05_ad_funnel import _validate_and_retry_ad_funnel
 
-    dag_run = context.get("dag_run")
-    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
+    target_date = _target_date_from_context(context)
 
     ad_stores = context["ti"].xcom_pull(task_ids="collect_all", key="ad_stores") or []
     if not ad_stores:
@@ -1241,20 +1526,30 @@ def validate_ad_funnel(**context) -> str:
     summary = "\n".join(lines)
     logger.info(summary)
     if still:
-        send_telegram(summary)
+        _send_alert(subject=f"[배민 ad_funnel 빈값] {len(still)}건 잔존", body=summary)
+    _save_validate_log(target_date, "ad_funnel 빈값 점검", summary)
     return summary
 
 
 def validate_toorder(**context) -> str:
-    dag_run = context.get("dag_run")
-    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
+    target_date = _target_date_from_context(context)
 
     account_list = context["ti"].xcom_pull(task_ids="load_accounts", key="account_list") or []
     store_info_per_account = context["ti"].xcom_pull(task_ids="collect_all", key="store_info_per_account") or []
     manual_precheck = context["ti"].xcom_pull(task_ids="precheck_manual_baemin_orders", key="manual_precheck_summary") or {}
 
     result = validate_toorder_orders(account_list, store_info_per_account, target_date)
+    expected_accounts = len(account_list)
+    observed_accounts = len(store_info_per_account)
+    blind = compared_blind = False
+    if expected_accounts and observed_accounts == 0:
+        blind = compared_blind = True
+    elif expected_accounts and observed_accounts < expected_accounts:
+        blind = True
+    if blind:
+        result["blind"] = True
+        result["expected_accounts"] = expected_accounts
+        result["observed_accounts"] = observed_accounts
     context["ti"].xcom_push(key="toorder_result", value=result)
 
     matched = result.get("matched", False)
@@ -1264,6 +1559,7 @@ def validate_toorder(**context) -> str:
     store_results = result.get("store_results", {})
     gap_stores = result.get("toorder_gap_stores", [])
     missing_brand_stores = result.get("missing_brand_stores", [])
+    source_mismatch_stores = result.get("source_mismatch_stores", [])
 
     lines = [
         f"토더 교차검증[{target_date}]: 비교 {compared}개 매장 / "
@@ -1272,7 +1568,11 @@ def validate_toorder(**context) -> str:
     for store, info in store_results.items():
         if not info.get("toorder_gap") and not info.get("matched"):
             retry_mark = " (재수집후)" if store in retried else ""
-            lines.append(f"  - {store} ToOrder={info['toorder']:,} / 배민={info['baemin']:,}{retry_mark}")
+            source_mark = " (원천차이/재수집제외)" if store in source_mismatch_stores else ""
+            lines.append(
+                f"  - {store} ToOrder={info['toorder']:,} / 배민={info['baemin']:,}"
+                f"{retry_mark}{source_mark}"
+            )
             if info.get("brand_issue"):
                 lines.append(
                     f"    brand_issue={info.get('brand_issue')} "
@@ -1285,6 +1585,17 @@ def validate_toorder(**context) -> str:
         lines.append(f"ToOrder 값 미수집(계정연결?): {', '.join(gap_stores)}")
     if missing_brand_stores:
         lines.append(f"누락브랜드 의심 매장: {', '.join(sorted(set(missing_brand_stores)))}")
+    if source_mismatch_stores:
+        lines.append(f"원천 금액 차이(자동재수집 제외): {', '.join(sorted(set(source_mismatch_stores)))}")
+    if blind:
+        lines.append(f"검증 사각지대: 계정 {expected_accounts}개 중 수집 매장정보 {observed_accounts}개")
+        logger.warning(
+            "ToOrder 검증 사각지대 감지: expected_accounts=%d observed_accounts=%d compared=%d zero=%s",
+            expected_accounts,
+            observed_accounts,
+            compared,
+            compared_blind,
+        )
     if manual_precheck.get("used"):
         lines.append(
             f"수동사전검증: files={len(manual_precheck.get('files', []))} "
@@ -1293,8 +1604,7 @@ def validate_toorder(**context) -> str:
         )
     summary = "\n".join(lines)
     logger.info(summary)
-    if compared > 0 and (not matched or gap_stores or missing_brand_stores):
-        send_telegram(summary)
+    _save_validate_log(target_date, "ToOrder 교차검증", summary)
     return summary
 
 
@@ -1306,13 +1616,41 @@ def trigger_retry_if_needed(**context) -> str:
     ti = context["ti"]
     dag_run = context.get("dag_run")
     conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
+    target_date = _target_date_from_context(context)
 
-    failed = ti.xcom_pull(task_ids="collect_all", key="failed") or {}
+    allowed_account_ids = _loaded_account_ids(context)
+    residual_failed = ti.xcom_pull(task_ids="retry_failed", key="residual_failed")
+    failed = residual_failed if residual_failed is not None else (ti.xcom_pull(task_ids="collect_all", key="failed") or {})
+    failed = _filter_failed_to_loaded_accounts(failed, allowed_account_ids)
+    if _orders_only_enabled(context):
+        failed = {
+            "accounts": failed.get("accounts") or [],
+            "stores": failed.get("stores") or [],
+            "orders": failed.get("orders") or [],
+            "ads": [],
+            "stages": [],
+        }
     failed_count = count_failed_items(failed)
     if failed_count == 0:
         logger.info("Retry DAG 트리거 스킵: 원본 실패 없음")
         return "Retry DAG 트리거 스킵: 원본 실패 없음"
+
+    failed_account_ids = _unique_failed_account_ids(failed)
+    loaded_account_count = len(allowed_account_ids)
+    failed_account_count = len(failed_account_ids)
+    retry_account_ratio = (
+        failed_account_count / loaded_account_count
+        if loaded_account_count
+        else 0.0
+    )
+    if loaded_account_count and failed_account_count:
+        logger.warning(
+            "Retry 대상 계정 비율: failed_accounts=%d/%d ratio=%.1f%% failed_items=%d",
+            failed_account_count,
+            loaded_account_count,
+            retry_account_ratio * 100,
+            failed_count,
+        )
 
     toorder_result = ti.xcom_pull(task_ids="validate_toorder", key="toorder_result")
     ad_funnel_result = ti.xcom_pull(task_ids="validate_ad_funnel", key="ad_funnel_result")
@@ -1321,13 +1659,18 @@ def trigger_retry_if_needed(**context) -> str:
         return "Retry DAG 트리거 스킵: 추가 재시도 불필요"
 
     source_run_id = getattr(dag_run, "run_id", context.get("run_id", "manual"))
+    scope_label = _collect_scope_label(context)
     retry_conf = build_retry_conf(
         failed=failed,
         target_date=target_date,
-        source_dag_id=dag_id,
+        source_dag_id=ti.dag_id,
         source_run_id=source_run_id,
         attempt=1,
-        max_attempts=int(conf.get("max_attempts", 10)),
+        max_attempts=int(conf.get("max_attempts", 3)),
+        stability_profile=conf.get("stability_profile") or SCHEDULED_DEFAULT_STABILITY_PROFILE,
+        allowed_account_ids=sorted(allowed_account_ids),
+        collect_range=scope_label,
+        orders_only=_orders_only_enabled(context),
     )
     run_id = (
         f"retry__{target_date.replace('-', '')}__attempt_1__"
@@ -1338,8 +1681,8 @@ def trigger_retry_if_needed(**context) -> str:
     from airflow.exceptions import DagRunAlreadyExists
 
     try:
-        trigger_dag(
-            dag_id="DB_Beamin_Macro_Dags_Retry",
+        result = route_trigger(trigger_dag, history_context=context,
+            dag_id=retry_dag_id(conf, context["ti"].dag_id),
             run_id=run_id,
             conf=retry_conf,
         )
@@ -1347,250 +1690,123 @@ def trigger_retry_if_needed(**context) -> str:
         logger.info("Retry DAG run 이미 존재: %s", run_id)
         return f"Retry DAG run 이미 존재: {run_id}"
 
+    if result in ("deferred", "existing", "cancelled"):
+        return f"Retry DAG 요청 상태={result}: {run_id}"
+
     logger.info(
-        "Retry DAG 트리거 완료: run_id=%s failed_count=%d accounts=%d stores=%d orders=%d ads=%d",
+        "Retry DAG 트리거 완료: run_id=%s range=%s allowed_accounts=%d failed_count=%d accounts=%d stores=%d orders=%d ads=%d stages=%d",
         run_id,
+        retry_conf.get("collect_range") or "-",
+        len(retry_conf.get("allowed_account_ids") or []),
         failed_count,
         len(retry_conf.get("failed_account_ids") or []),
         len(retry_conf.get("failed_stores") or []),
         len(retry_conf.get("failed_orders") or []),
         len(retry_conf.get("failed_ads") or []),
+        len(retry_conf.get("failed_stages") or []),
     )
     return f"Retry DAG 트리거 완료: {run_id}"
 
 
-def _build_collection_notification_legacy_v4(context) -> tuple[str, str, str, bool]:
-    ti = context["ti"]
-    dag_run = context.get("dag_run")
-    logical_date = context.get("logical_date") or getattr(ti, "execution_date", None)
-    conf = (getattr(dag_run, "conf", None) or {}) if dag_run else {}
-    target_date = conf.get("target_date") or pendulum.yesterday(KST).format("YYYY-MM-DD")
-    run_id = getattr(dag_run, "run_id", getattr(ti, "run_id", "?"))
-    execution_time = (
-        logical_date.in_timezone(KST).strftime("%Y-%m-%d %H:%M")
-        if hasattr(logical_date, "in_timezone")
-        else str(logical_date or "?")
-    )
+def _batch_chain_enabled(value: Any) -> bool:
+    if value is False:
+        return False
+    if isinstance(value, str) and value.strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    return True
 
-    task_instances = []
-    if dag_run and hasattr(dag_run, "get_task_instances"):
-        task_instances = [t for t in dag_run.get_task_instances() if getattr(t, "task_id", None) != _NOTIFY_TASK_ID]
-    task_by_id = {t.task_id: t for t in task_instances}
 
-    failed = ti.xcom_pull(task_ids="collect_all", key="failed") or {}
-    validation = ti.xcom_pull(task_ids="collect_all", key="validation") or []
-    returns = {
-        task_id: ti.xcom_pull(task_ids=task_id, key="return_value")
-        for task_id in [
-            "load_accounts",
-            "collect_all",
-            "retry_failed",
-            "validate_orders",
-            "validate_ad_funnel",
-            "validate_toorder",
-        ]
-    }
-
-    hard_failures = [
-        t for t in task_instances
-        if getattr(t, "state", None) in {"failed", "upstream_failed"}
-        and getattr(t, "task_id", None) in (_CORE_TASK_IDS | _VALIDATION_TASK_IDS)
-    ]
-    retry_count = _count_failed_items(failed)
-    mismatches = [v for v in validation if isinstance(v, dict) and v.get("matched") is False]
-    validation_texts = [
-        _safe_text(returns.get(task_id), 500)
-        for task_id in ("validate_orders", "validate_ad_funnel", "validate_toorder")
-        if returns.get(task_id)
-    ]
-    validation_issue = _has_validation_issue(validation_texts)
-
-    if hard_failures:
-        status = "실패"
-    elif retry_count or mismatches or validation_issue:
-        status = "부분성공"
-    else:
-        status = "성공"
-
-    lines = [
-        f"[배민 수집 결과] {status}",
-        f"DAG: {dag_id}",
-        f"Run: {run_id}",
-        f"실행시각(KST): {execution_time}",
-        f"target_date: {target_date}",
-        "",
-        "[수집 요약]",
-    ]
-
-    task_rows: list[tuple[str, str, str, str]] = []
-    for task_id in ("load_accounts", "collect_all", "retry_failed", "validate_orders", "validate_ad_funnel", "validate_toorder"):
-        task = task_by_id.get(task_id)
-        state = getattr(task, "state", "?") if task else "?"
-        duration = _task_duration_seconds(task) if task else None
-        duration_text = f"{duration}s" if duration is not None else "-"
-        summary = _safe_text(returns.get(task_id), 240)
-        lines.append(f"- {task_id}: {state}, {duration_text} | {summary}")
-        task_rows.append((task_id, state, duration_text, summary))
-
-    if failed:
-        lines.append(
-            "retry 대상 "
-            f"accounts={len(failed.get('accounts') or [])}, "
-            f"stores={len(failed.get('stores') or [])}, "
-            f"orders={len(failed.get('orders') or [])}, "
-            f"ads={len(failed.get('ads') or [])}"
+def _build_single_dag_parallel_lanes() -> DAG:
+    parallel_enabled = COLLECT_LANES == 2
+    with DAG(
+        dag_id=dag_id,
+        schedule=SMD_BAEMIN_COLLECT_BATCH1_TIME,
+        start_date=pendulum.datetime(2024, 1, 1, tz="Asia/Seoul"),
+        catchup=False,
+        dagrun_timeout=COLLECT_DAGRUN_TIMEOUT,
+        concurrency=2 if parallel_enabled else 1,
+        max_active_runs=1,
+        max_active_tasks=2 if parallel_enabled else 1,
+        default_args=default_args,
+        params={
+            "collect_range": None,
+            "batch_orchestration": "single_dag",
+            "orders_only": DEFAULT_ORDERS_ONLY,
+        },
+        is_paused_upon_creation=False,
+        tags=["db", "baemin", "crawl"],
+    ) as built_dag:
+        load_task = PythonOperator(
+            task_id="load_accounts",
+            python_callable=load_accounts,
         )
-    if mismatches:
-        lines.append(f"orders 검증 불일치 {len(mismatches)}건")
+        init_staging_task = PythonOperator(
+            task_id="init_staging",
+            python_callable=init_staging,
+            execution_timeout=timedelta(minutes=5),
+        )
+        batch_tasks = [
+            PythonOperator(
+                task_id=task_id,
+                python_callable=collect_batch,
+                op_kwargs={
+                    "batch_range": f"batch:{index}/4",
+                    "lane_offset": parallel_enabled and task_id == "collect_batch_3",
+                },
+                pool=BAEMIN_SELENIUM_POOL,
+                trigger_rule=(
+                    TriggerRule.ALL_SUCCESS
+                    if task_id in {lane[0] for lane in _LANES}
+                    else TriggerRule.ALL_DONE
+                ),
+                execution_timeout=timedelta(minutes=300),
+            )
+            for index, task_id in enumerate(_BATCH_TASK_IDS, start=1)
+        ]
+        retry_task = PythonOperator(
+            task_id="retry_failed",
+            python_callable=retry_failed,
+            op_kwargs={
+                "collect_task_ids": list(_BATCH_TASK_IDS),
+                "retry_all_types": False,
+            },
+            pool=BAEMIN_SELENIUM_POOL,
+            trigger_rule=TriggerRule.ALL_DONE,
+            retries=0,
+            execution_timeout=timedelta(minutes=_RETRY_FAILED_TIMEOUT_MINUTES),
+        )
+        export_task = PythonOperator(
+            task_id="export_to_upload_inbox",
+            python_callable=export_to_upload_inbox,
+            op_kwargs={"collect_task_ids": list(_BATCH_TASK_IDS)},
+            trigger_rule=TriggerRule.ALL_DONE,
+            execution_timeout=timedelta(minutes=30),
+        )
+        upload_task = PythonOperator(
+            task_id="trigger_upload_after_export",
+            python_callable=trigger_upload_after_export,
+            trigger_rule=TriggerRule.ALL_DONE,
+            execution_timeout=timedelta(minutes=5),
+        )
+        notify_task = PythonOperator(
+            task_id=_NOTIFY_TASK_ID,
+            python_callable=notify_collection_result,
+            op_kwargs={"collect_task_ids": list(_BATCH_TASK_IDS)},
+            trigger_rule=TriggerRule.ALL_DONE,
+        )
 
-    problem_lines: list[str] = []
-    empty_signal_count = 0
-    for task in task_instances:
-        task_problems, task_empty_count = _extract_log_signals(task)
-        empty_signal_count += task_empty_count
-        if task_problems:
-            problem_lines.append(f"- {task.task_id}:")
-            problem_lines.extend(f"  {line}" for line in task_problems)
+        load_task >> init_staging_task
+        if parallel_enabled:
+            init_staging_task >> batch_tasks[0] >> batch_tasks[1]
+            init_staging_task >> batch_tasks[2] >> batch_tasks[3]
+            [batch_tasks[1], batch_tasks[3]] >> retry_task
+        else:
+            init_staging_task >> batch_tasks[0]
+            batch_tasks[0] >> batch_tasks[1] >> batch_tasks[2] >> batch_tasks[3]
+            batch_tasks[3] >> retry_task
+        retry_task >> export_task >> upload_task >> notify_task
 
-    if validation_texts:
-        lines.extend(["", "[검증 요약]", *validation_texts])
-    if empty_signal_count:
-        lines.extend(["", f"[정상 빈값 신호] 우가클/빈 테이블 로그 {empty_signal_count}건"])
-    if problem_lines:
-        lines.extend(["", "[문제 로그]", *problem_lines[:24]])
-    if hard_failures:
-        lines.extend(["", "[실패 task 로그 URL]"])
-        for task in hard_failures:
-            lines.append(f"- {task.task_id}: {getattr(task, 'log_url', '?')}")
-
-    body = "\n".join(lines)[:6000]
-    subject = f"[배민 수집 결과] {status} / {target_date}"
-
-    badge_color = "#1f8b4c" if status == "성공" else "#d97706" if status == "부분성공" else "#c0392b"
-    problem_html = "".join(f"<li>{html.escape(line)}</li>" for line in problem_lines[:24]) or "<li>없음</li>"
-    validation_html = "".join(f"<li>{html.escape(text)}</li>" for text in validation_texts) or "<li>없음</li>"
-    html_rows = "".join(
-        f"<tr><td>{html.escape(task_id)}</td><td>{html.escape(state)}</td><td>{html.escape(duration)}</td><td>{html.escape(summary)}</td></tr>"
-        for task_id, state, duration, summary in task_rows
-    )
-    html_body = f"""
-    <html>
-    <head><meta charset="UTF-8"></head>
-    <body style="font-family:'Malgun Gothic',Arial,sans-serif;background:#f4f6f8;padding:24px;color:#1f2937;">
-      <div style="max-width:960px;margin:0 auto;background:#ffffff;border:1px solid #e5e7eb;border-radius:16px;overflow:hidden;">
-        <div style="background:{badge_color};color:#fff;padding:20px 24px;">
-          <h2 style="margin:0 0 6px 0;">배민 수집 결과: {html.escape(status)}</h2>
-          <div style="font-size:14px;opacity:0.95;">{html.escape(target_date)} · {html.escape(run_id)}</div>
-        </div>
-        <div style="padding:24px;">
-          <table style="width:100%;border-collapse:collapse;margin-bottom:20px;">
-            <tr><td style="padding:8px 0;font-weight:700;">DAG</td><td>{html.escape(dag_id)}</td></tr>
-            <tr><td style="padding:8px 0;font-weight:700;">실행시각</td><td>{html.escape(execution_time)}</td></tr>
-            <tr><td style="padding:8px 0;font-weight:700;">Retry 대상</td><td>accounts={len(failed.get('accounts') or [])}, stores={len(failed.get('stores') or [])}, orders={len(failed.get('orders') or [])}, ads={len(failed.get('ads') or [])}</td></tr>
-            <tr><td style="padding:8px 0;font-weight:700;">정상 빈값 신호</td><td>{empty_signal_count}건</td></tr>
-          </table>
-          <h3 style="margin:20px 0 8px 0;">Task 요약</h3>
-          <table style="width:100%;border-collapse:collapse;font-size:14px;">
-            <thead>
-              <tr style="background:#111827;color:#fff;">
-                <th style="padding:10px;text-align:left;">Task</th>
-                <th style="padding:10px;text-align:left;">상태</th>
-                <th style="padding:10px;text-align:left;">소요</th>
-                <th style="padding:10px;text-align:left;">요약</th>
-              </tr>
-            </thead>
-            <tbody>{html_rows}</tbody>
-          </table>
-          <h3 style="margin:20px 0 8px 0;">검증 요약</h3>
-          <ul>{validation_html}</ul>
-          <h3 style="margin:20px 0 8px 0;">문제 로그</h3>
-          <ul>{problem_html}</ul>
-        </div>
-      </div>
-    </body>
-    </html>
-    """
-    return subject, body, html_body, status != "성공"
+    return built_dag
 
 
-def notify_collection_result_legacy_v4(**context) -> str:
-    subject, body, html_body, should_email = _build_collection_notification(context)
-    logger.info(body)
-    try:
-        send_telegram(body)
-    except Exception as exc:
-        logger.warning("Telegram 결과 알림 실패(무시): %s", exc)
-    if should_email:
-        try:
-            _send_alert(subject=subject, body=body, html_content=html_body)
-        except Exception as exc:
-            logger.warning("Email 결과 알림 실패(무시): %s", exc)
-    return subject
-
-
-with DAG(
-    dag_id=dag_id,
-    schedule=BAEMIN_SCHEDULE,
-    start_date=pendulum.datetime(2024, 1, 1, tz="Asia/Seoul"),
-    catchup=False,
-    max_active_runs=1,
-    default_args=default_args,
-    tags=["db", "baemin", "crawl"],
-) as dag:
-
-    t0 = PythonOperator(
-        task_id="precheck_manual_baemin_orders",
-        python_callable=precheck_manual_baemin_orders,
-        execution_timeout=timedelta(minutes=15),
-    )
-
-    t1 = PythonOperator(
-        task_id="load_accounts",
-        python_callable=load_accounts,
-    )
-
-    t2 = PythonOperator(
-        task_id="collect_all",
-        python_callable=collect_all,
-        execution_timeout=timedelta(minutes=300),
-    )
-
-    t3 = PythonOperator(
-        task_id="retry_failed",
-        python_callable=retry_failed,
-        trigger_rule="all_done",
-        execution_timeout=timedelta(minutes=120),
-    )
-
-    t4 = PythonOperator(
-        task_id="validate_orders",
-        python_callable=validate_orders,
-        trigger_rule="all_done",
-    )
-
-    t5 = PythonOperator(
-        task_id="validate_ad_funnel",
-        python_callable=validate_ad_funnel,
-        trigger_rule="all_done",
-    )
-
-    t6 = PythonOperator(
-        task_id="validate_toorder",
-        python_callable=validate_toorder,
-        trigger_rule="all_done",
-        execution_timeout=timedelta(minutes=30),
-    )
-
-    t7 = PythonOperator(
-        task_id=_NOTIFY_TASK_ID,
-        python_callable=notify_collection_result,
-        trigger_rule=TriggerRule.ALL_DONE,
-    )
-
-    t8 = PythonOperator(
-        task_id="trigger_retry_if_needed",
-        python_callable=trigger_retry_if_needed,
-        trigger_rule=TriggerRule.ALL_DONE,
-    )
-
-    t0 >> t1 >> t2 >> t3 >> [t4, t5, t6] >> t7 >> t8
+dag = _build_single_dag_parallel_lanes()

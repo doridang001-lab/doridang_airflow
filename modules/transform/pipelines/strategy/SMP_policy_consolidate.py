@@ -7,6 +7,7 @@
 
 import json
 import logging
+import os
 import time
 import pendulum
 import pandas as pd
@@ -29,6 +30,7 @@ from modules.transform.utility.paths import (
     POLICY_CONSOLIDATED_CSV,
 )
 from modules.transform.utility.mailer import send_email
+from modules.transform.utility.mail_recipients import MAIL_CMJ_PM, MAIL_OH_NAYOUNG, MAIL_POLICY_REVIEWER
 
 # Flow 자동화
 FLOW_POLICY_URL = "https://flow.team/l/QdNBw"
@@ -234,7 +236,7 @@ def send_policy_alert(**context) -> str:
     result = send_email(
         subject=subject,
         html_content=html,
-        to_emails=["a17019@kakao.com", "puding83@kakao.com", "bulu1017@kakao.com"]
+        to_emails=[MAIL_CMJ_PM, MAIL_POLICY_REVIEWER, MAIL_OH_NAYOUNG]
         ,
     )
     logger.info(f"정책 알림 이메일 발송 완료: {new_count}건")
@@ -345,7 +347,7 @@ def _build_alert_html(policies: list, new_platforms: set, today: str) -> str:
           <td style="background:#f8f9fa; padding:16px 32px; border-top:1px solid #eee; margin-top:8px;">
             <p style="margin:0; color:#999; font-size:11px; line-height:1.6;">
               이 메일은 도리당 자동화 시스템에서 발송되었습니다.<br>
-              문의: 조민준 PM a17019@doridang.com
+              문의: 조민준 PM {MAIL_CMJ_PM}
             </p>
           </td>
         </tr>
@@ -411,6 +413,7 @@ def post_to_flow(**context) -> str:
     신규/변경 정책이 없으면 게시를 스킵한다.
     """
     from selenium.webdriver.common.by import By
+    from selenium.common.exceptions import TimeoutException
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
     from modules.transform.pipelines.sales.SMD_sales_visit_log_01_crawling import (
@@ -443,6 +446,7 @@ def post_to_flow(**context) -> str:
 
     driver = launch_browser()
     driver.set_window_size(1920, 1080)
+    driver.set_page_load_timeout(int(os.getenv("FLOW_PAGE_LOAD_TIMEOUT", "90")))
     try:
         if not do_login(driver):
             raise RuntimeError("Flow 로그인 실패")
@@ -450,7 +454,11 @@ def post_to_flow(**context) -> str:
         wait = WebDriverWait(driver, 20)
 
         # ① 프로젝트 직접 URL 이동
-        driver.get(FLOW_POLICY_URL)
+        try:
+            driver.get(FLOW_POLICY_URL)
+        except TimeoutException:
+            logger.warning("Flow 프로젝트 페이지 로드 타임아웃 → window.stop() 후 DOM 대기 계속")
+            driver.execute_script("window.stop();")
         time.sleep(5)
 
         # ② 콘텐츠 로딩 대기

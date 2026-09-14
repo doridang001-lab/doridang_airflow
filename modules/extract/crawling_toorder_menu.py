@@ -12,20 +12,24 @@ import logging
 import os
 import random
 import re
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import undetected_chromedriver as uc
+from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options as SeleniumChromeOptions
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from modules.transform.utility.selenium_uc import configure_uc_data_path, launch_uc_chrome
+from modules.transform.utility.selenium_uc import _apply_failfast_client, launch_uc_chrome
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +45,24 @@ OPTION_ANALYSIS_URL = "https://ceo.toorder.co.kr/dashboard/product-analysis/opti
 MENU_ANALYSIS_KIND = "menu"
 OPTION_ANALYSIS_KIND = "option"
 LOGIN_FAIL_URL_PATTERNS = ["/login", "/auth"]
+ANALYSIS_NAV_LABELS = {
+    MENU_ANALYSIS_URL: "메뉴별 판매량",
+    OPTION_ANALYSIS_URL: "옵션 메뉴 판매량",
+}
+LOGIN_NAVIGATION_RETRY_ERRORS = (
+    "Connection aborted",
+    "RemoteDisconnected",
+    "Connection refused",
+    "NewConnectionError",
+    "MaxRetryError",
+    "HTTPConnectionPool",
+    "Read timed out",
+    "timeout",
+    "tab crashed",
+    "chrome not reachable",
+    "disconnected",
+    "no such window",
+)
 
 DATAGRID_ROW_HEIGHT = 52   # MUI DataGrid 행 높이 (px)
 SCROLL_STEP = 260          # 5행 단위 스크롤
@@ -49,6 +71,19 @@ SCROLL_STEP = 260          # 5행 단위 스크롤
 # ============================================================
 # 내부 유틸리티 (crawling_toorder_sales_report.py 패턴 재사용)
 # ============================================================
+
+def _is_retriable_navigation_error(message: str) -> bool:
+    normalized = message.lower()
+    return any(marker.lower() in normalized for marker in LOGIN_NAVIGATION_RETRY_ERRORS)
+
+
+def _navigate_without_page_load_wait(driver, url: str) -> None:
+    """page-load 대기 없이 URL 이동을 시작한다."""
+    try:
+        driver.execute_cdp_cmd("Page.navigate", {"url": url})
+    except Exception:
+        driver.get(url)
+
 
 def _react_set_value(driver, element, value: str) -> None:
     """React 컨트롤드 인풋에 native setter로 값을 주입한다."""
@@ -99,12 +134,28 @@ def _fill_react_input(driver, element, value: str, account_id: str, field_name: 
 
 def _launch_browser(account_id: str, download_dir: Path) -> uc.Chrome:
     """undetected_chromedriver 브라우저 인스턴스를 생성한다."""
-    options = uc.ChromeOptions()
+    runtime_root = Path(os.getenv("TOORDER_CHROME_RUNTIME_ROOT", "/tmp/toorder_chrome_runtime")) / account_id
+    runtime_root.mkdir(parents=True, exist_ok=True)
+
+    options = SeleniumChromeOptions() if os.getenv("AIRFLOW_HOME") is not None else uc.ChromeOptions()
+    options.page_load_strategy = "none"
     if HEADLESS_MODE:
         options.add_argument("--headless=new")
+    profile_dir = runtime_root / f"profile_{os.getpid()}_{int(time.time())}"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    options.add_argument(f"--user-data-dir={profile_dir}")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    options.add_argument("--renderer-process-limit=2")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-features=site-per-process")
+    options.add_argument("--disk-cache-size=1")
+    options.add_argument("--media-cache-size=1")
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
     options.add_argument("--window-size=1920,1080")
     prefs = {
         "download.default_directory": str(download_dir.absolute()),
@@ -115,13 +166,35 @@ def _launch_browser(account_id: str, download_dir: Path) -> uc.Chrome:
     }
     options.add_experimental_option("prefs", prefs)
 
-    driver = launch_uc_chrome(
-        options=options,
-        account_id=account_id,
-        chrome_bin=os.getenv("CHROME_BIN", "/usr/bin/google-chrome"),
-        log_fn=lambda msg: logger.info("[%s] %s", account_id, msg),
-        prefer_standard=os.getenv("AIRFLOW_HOME") is not None,
-    )
+    chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/google-chrome")
+    if Path(chrome_bin).exists():
+        options.binary_location = chrome_bin
+
+    if os.getenv("AIRFLOW_HOME") is not None:
+        chromedriver_bin = os.getenv("CHROMEDRIVER_PATH", "/usr/local/bin/chromedriver")
+        logger.info(
+            "[%s] 표준 chromedriver 직접 실행: driver=%s chrome=%s",
+            account_id,
+            chromedriver_bin,
+            chrome_bin,
+        )
+        driver = webdriver.Chrome(
+            service=Service(executable_path=chromedriver_bin),
+            options=options,
+        )
+        _apply_failfast_client(
+            driver,
+            timeout_sec=30,
+            log_fn=lambda msg: logger.info("[%s] %s", account_id, msg),
+        )
+    else:
+        driver = launch_uc_chrome(
+            options=options,
+            account_id=account_id,
+            chrome_bin=chrome_bin,
+            log_fn=lambda msg: logger.info("[%s] %s", account_id, msg),
+            command_timeout_sec=30,
+        )
     try:
         driver.execute_cdp_cmd(
             "Page.setDownloadBehavior",
@@ -134,33 +207,57 @@ def _launch_browser(account_id: str, download_dir: Path) -> uc.Chrome:
     except Exception as exc:
         logger.warning("[%s] download behavior configure failed: %s", account_id, exc)
     driver.set_window_size(1920, 1080)
+    driver.set_page_load_timeout(45)
+    driver.set_script_timeout(20)
+    setattr(driver, "_toorder_profile_dir", str(profile_dir))
     logger.info("[%s] 브라우저 실행 완료 (headless=%s)", account_id, HEADLESS_MODE)
     return driver
+
+
+def _quit_driver(driver, account_id: str) -> None:
+    profile_dir = Path(str(getattr(driver, "_toorder_profile_dir", "") or ""))
+    try:
+        driver.quit()
+        logger.info("[%s] 브라우저 종료", account_id)
+    except Exception:
+        pass
+    if profile_dir:
+        try:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+        except Exception as exc:
+            logger.warning("[%s] Chrome profile cleanup failed: %s | %s", account_id, profile_dir, exc)
 
 
 def _do_login(driver, account_id: str, password: str) -> bool:
     """투오더 CEO 사이트에 로그인한다."""
     logger.info("[%s] 로그인 시도", account_id)
 
-    retry_errors = ("Connection aborted", "RemoteDisconnected", "Connection refused", "NewConnectionError", "MaxRetryError")
     for attempt in range(1, 4):
         try:
-            driver.get(LOGIN_URL)
-            end_time = time.time() + 15
-            while time.time() < end_time:
-                if driver.execute_script(
-                    "return document.querySelector('input[name=\"id\"]') !== null;"
-                ):
-                    break
-                time.sleep(0.5)
-            else:
+            _navigate_without_page_load_wait(driver, LOGIN_URL)
+            try:
+                WebDriverWait(driver, 20).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "input[name='id']"))
+                )
+            except TimeoutException:
                 logger.error("[%s] React 앱 로드 타임아웃", account_id)
                 return False
             time.sleep(1.0)
             break
         except Exception as exc:
             err_str = str(exc)
-            if attempt < 3 and any(err in err_str for err in retry_errors):
+            if isinstance(exc, TimeoutException):
+                try:
+                    driver.execute_script("window.stop();")
+                    if driver.find_elements(By.CSS_SELECTOR, "input[name='id']"):
+                        logger.warning(
+                            "[%s] 페이지 로드 timeout 후 로그인 폼 감지, 계속 진행",
+                            account_id,
+                        )
+                        break
+                except Exception:
+                    pass
+            if attempt < 3 and _is_retriable_navigation_error(err_str):
                 logger.warning(
                     "[%s] 페이지 이동 실패 (재시도 %d/3): %s",
                     account_id,
@@ -242,7 +339,9 @@ NETWORK_ERRORS = (
 
 _BROWSER_DEAD_MARKERS = (
     "Connection refused", "NewConnectionError", "MaxRetryError",
-    "RemoteDisconnected", "Connection aborted",
+    "RemoteDisconnected", "Connection aborted", "HTTPConnectionPool",
+    "Read timed out", "tab crashed", "chrome not reachable",
+    "disconnected", "no such window",
 )
 
 
@@ -270,23 +369,78 @@ def _recover_browser(
 ) -> Optional[Any]:
     """브라우저 재시작 후 분석 페이지+날짜 복구. 성공 시 새 driver, 실패 시 None."""
     if driver:
+        _quit_driver(driver, account_id)
+
+    max_attempts = int(os.getenv("TOORDER_BROWSER_RECOVERY_RETRIES", "3"))
+    for attempt in range(1, max_attempts + 1):
+        new_driver = None
         try:
-            driver.quit()
-        except Exception:
-            pass
-    new_driver = _launch_browser(account_id, download_dir)
-    if not _do_login(new_driver, account_id, password):
-        logger.error("[%s] 브라우저 재시작 후 로그인 실패", account_id)
-        return None
-    if not _navigate_to_analysis_page(new_driver, account_id, page_url):
-        logger.error("[%s] 브라우저 재시작 후 페이지 이동 실패", account_id)
-        return None
-    if not _set_date_range(new_driver, account_id, start_date, end_date):
-        logger.error("[%s] 브라우저 재시작 후 날짜 설정 실패", account_id)
-        return None
-    _wait_for_export_btn(new_driver, account_id)
-    logger.info("[%s] 브라우저 재시작 완료", account_id)
-    return new_driver
+            logger.info("[%s] 브라우저 재시작 시도 (%d/%d)", account_id, attempt, max_attempts)
+            new_driver = _launch_browser(account_id, download_dir)
+            if not _do_login(new_driver, account_id, password):
+                raise RuntimeError("로그인 실패")
+            if not _navigate_to_analysis_page(new_driver, account_id, page_url):
+                raise RuntimeError("분석 페이지 이동 실패")
+            if not _set_date_range(new_driver, account_id, start_date, end_date):
+                raise RuntimeError("날짜 설정 실패")
+            _wait_for_export_btn(new_driver, account_id)
+            logger.info("[%s] 브라우저 재시작 완료", account_id)
+            return new_driver
+        except Exception as exc:
+            logger.warning(
+                "[%s] 브라우저 재시작 실패 (%d/%d): %s",
+                account_id,
+                attempt,
+                max_attempts,
+                exc,
+            )
+            if new_driver:
+                _quit_driver(new_driver, account_id)
+            if attempt < max_attempts:
+                time.sleep(5)
+
+    logger.error("[%s] 브라우저 재시작 최종 실패", account_id)
+    return None
+
+
+def _click_visible_text(driver, label: str) -> bool:
+    element = driver.execute_script(
+        """
+        const label = arguments[0];
+        const nodes = Array.from(document.querySelectorAll('button, a, div, span, p'));
+        return nodes.find((el) => {
+            const text = (el.innerText || el.textContent || '').trim();
+            return text === label && el.offsetParent !== null;
+        }) || null;
+        """,
+        label,
+    )
+    if not element:
+        return False
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();",
+        element,
+    )
+    return True
+
+
+def _navigate_by_sidebar(driver, account_id: str, url: str) -> bool:
+    label = ANALYSIS_NAV_LABELS.get(url)
+    if not label:
+        return False
+    try:
+        if not _click_visible_text(driver, "메뉴 분석"):
+            logger.info("[%s] 사이드바 상위 메뉴 미탐지: 메뉴 분석", account_id)
+            return False
+        WebDriverWait(driver, 10).until(lambda d: _click_visible_text(d, label))
+        url_fragment = url.rsplit("/", 1)[-1]
+        WebDriverWait(driver, 30).until(lambda d: url_fragment in d.current_url)
+        WebDriverWait(driver, 45).until(lambda d: len(_find_date_inputs(d)) >= 2)
+        logger.info("[%s] 사이드바 이동 완료: %s", account_id, label)
+        return True
+    except Exception as exc:
+        logger.warning("[%s] 사이드바 이동 실패, 직접 이동으로 전환: %s", account_id, exc)
+        return False
 
 
 def _navigate_to_analysis_page(
@@ -297,9 +451,11 @@ def _navigate_to_analysis_page(
     for attempt in range(1, retries + 1):
         logger.info("[%s] 페이지 이동 (시도 %d/%d): %s", account_id, attempt, retries, url_fragment)
         try:
-            driver.get(url)
+            if _navigate_by_sidebar(driver, account_id, url):
+                return True
+            _navigate_without_page_load_wait(driver, url)
             WebDriverWait(driver, 20).until(lambda d: url_fragment in d.current_url)
-            time.sleep(3.0)
+            WebDriverWait(driver, 45).until(lambda d: len(_find_date_inputs(d)) >= 2)
             return True
         except Exception as exc:
             err_str = str(exc)
@@ -316,6 +472,34 @@ def _navigate_to_analysis_page(
     return False
 
 
+DATE_INPUT_SELECTORS = (
+    ".MuiMultiInputDateRangeField-root input",
+    "input.MuiInputBase-input.MuiOutlinedInput-input.MuiInputBase-inputAdornedStart",
+    "input.MuiInputBase-input",
+    "input[placeholder*='YY']",
+    "input[placeholder*='날짜']",
+    "input[type='text']",
+)
+
+
+def _find_date_inputs(driver) -> List[Any]:
+    seen: set[str] = set()
+    inputs: List[Any] = []
+    for selector in DATE_INPUT_SELECTORS:
+        for element in driver.find_elements(By.CSS_SELECTOR, selector):
+            try:
+                key = element.id
+                if key in seen:
+                    continue
+                seen.add(key)
+                if not element.is_displayed():
+                    continue
+                inputs.append(element)
+            except Exception:
+                continue
+    return inputs
+
+
 def _set_date_range(driver, account_id: str, start_date: str, end_date: str) -> bool:
     """날짜 범위 입력 필드에 시작일과 종료일을 각각 설정한다."""
     logger.info("[%s] 날짜 설정: %s ~ %s", account_id, start_date, end_date)
@@ -323,14 +507,13 @@ def _set_date_range(driver, account_id: str, start_date: str, end_date: str) -> 
         start_fmt = datetime.strptime(start_date, "%Y-%m-%d").strftime("%y-%m-%d")
         end_fmt = datetime.strptime(end_date, "%Y-%m-%d").strftime("%y-%m-%d")
 
-        date_inputs = driver.find_elements(
-            By.CSS_SELECTOR,
-            "input.MuiInputBase-input.MuiOutlinedInput-input.MuiInputBase-inputAdornedStart",
-        )
-        if len(date_inputs) < 2:
-            date_inputs = driver.find_elements(
-                By.CSS_SELECTOR, ".MuiMultiInputDateRangeField-root input"
-            )
+        date_inputs: List[Any] = []
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            date_inputs = _find_date_inputs(driver)
+            if len(date_inputs) >= 2:
+                break
+            time.sleep(1.0)
         if len(date_inputs) < 2:
             logger.error("[%s] 날짜 입력 필드 부족 (%d개)", account_id, len(date_inputs))
             return False
@@ -1098,13 +1281,10 @@ def run_toorder_menu_crawl(
     driver = None
 
     try:
-        _MAX_BROWSER_RETRIES = 2
+        _MAX_BROWSER_RETRIES = 4
         for _br_attempt in range(1, _MAX_BROWSER_RETRIES + 1):
             if driver:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
+                _quit_driver(driver, toorder_id)
                 driver = None
             driver = _launch_browser(toorder_id, download_dir)
             if _do_login(driver, toorder_id, toorder_pw):
@@ -1231,11 +1411,7 @@ def run_toorder_menu_crawl(
 
     finally:
         if driver:
-            try:
-                driver.quit()
-                logger.info("[%s] 브라우저 종료", toorder_id)
-            except Exception:
-                pass
+            _quit_driver(driver, toorder_id)
 
     return result
 
@@ -1314,10 +1490,7 @@ def download_first_menu_detail_for_debug(
         return result
     finally:
         if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+            _quit_driver(driver, toorder_id)
 
 
 def run_toorder_menu_crawl(
@@ -1354,13 +1527,10 @@ def run_toorder_menu_crawl(
     driver = None
 
     try:
-        max_browser_retries = 2
+        max_browser_retries = 4
         for browser_attempt in range(1, max_browser_retries + 1):
             if driver:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
+                _quit_driver(driver, toorder_id)
                 driver = None
 
             driver = _launch_browser(toorder_id, download_dir)
@@ -1390,7 +1560,38 @@ def run_toorder_menu_crawl(
             result["error"] = "DataGrid 로딩 실패"
             return result
 
-        menu_names = _collect_all_menu_names(driver, toorder_id)
+        menu_names = []
+        max_collect_retries = int(os.getenv("TOORDER_BROWSER_RECOVERY_RETRIES", "3"))
+        for collect_attempt in range(1, max_collect_retries + 1):
+            try:
+                menu_names = _collect_all_menu_names(driver, toorder_id)
+                break
+            except Exception as exc:
+                if not _is_browser_dead(exc):
+                    raise
+                logger.warning(
+                    "[%s] 메뉴 목록 수집 중 브라우저 오류, 재시작 (%d/%d): %s",
+                    toorder_id,
+                    collect_attempt,
+                    max_collect_retries,
+                    exc,
+                )
+                driver = _recover_browser(
+                    driver,
+                    toorder_id,
+                    toorder_pw,
+                    download_dir,
+                    page_url,
+                    start_date,
+                    end_date,
+                )
+                if driver is None:
+                    result["error"] = "브라우저 재시작 실패"
+                    return result
+        else:
+            result["error"] = "메뉴 목록 수집 실패"
+            return result
+
         if not menu_names:
             logger.warning("[%s] 메뉴 목록 없음, 상세 수집 생략", toorder_id)
             return result
@@ -1562,10 +1763,6 @@ def run_toorder_menu_crawl(
 
     finally:
         if driver:
-            try:
-                driver.quit()
-                logger.info("[%s] 브라우저 종료", toorder_id)
-            except Exception:
-                pass
+            _quit_driver(driver, toorder_id)
 
     return result

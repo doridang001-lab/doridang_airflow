@@ -9,6 +9,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pendulum
 
 from modules.transform.utility.paths import (
     ANALYTICS_DB,
@@ -17,14 +18,19 @@ from modules.transform.utility.paths import (
     COUPANG_ORDERS_DB,
     MART_DB,
 )
+from modules.transform.pipelines.db.DB_UnifiedSales_common import (
+    DELIVERY_PLATFORM_FAMILIES,
+    filter_manual_delivery_sources_for_test_stores,
+    iter_unified_sales_files,
+)
 from modules.transform.utility.store_normalize import normalize_for_join
 
 logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
 
 PLATFORM_GROUPS = {
-    "배달의민족": {"배달의민족", "배민1", "배민 포장", "배민 사장"},
-    "쿠팡이츠": {"쿠팡이츠", "쿠팡 포장"},
+    "배달의민족": set(DELIVERY_PLATFORM_FAMILIES["배민수동"]),
+    "쿠팡이츠": set(DELIVERY_PLATFORM_FAMILIES["쿠팡수동"]),
 }
 PLATFORM_TO_GROUP = {
     platform: group
@@ -32,6 +38,7 @@ PLATFORM_TO_GROUP = {
     for platform in platforms
 }
 GAP_THRESHOLD = 2.0
+TOORDER_PATH = ANALYTICS_DB / "toorder_daily_store_platform" / "toorder_store_platform_daily.parquet"
 
 
 @dataclass(frozen=True)
@@ -70,6 +77,41 @@ def _empty_long() -> pd.DataFrame:
     return pd.DataFrame(columns=["date", "store", "platform_group", "amt"])
 
 
+def _expected_toorder_max_date() -> str:
+    return pendulum.now("Asia/Seoul").subtract(days=1).format("YYYY-MM-DD")
+
+
+def _toorder_max_date(path: Path = TOORDER_PATH) -> str | None:
+    if not path.exists():
+        return None
+    df = pd.read_parquet(path, columns=["date"])
+    if df.empty or "date" not in df.columns:
+        return None
+    parsed = pd.to_datetime(df["date"], errors="coerce").dropna()
+    if parsed.empty:
+        return None
+    return parsed.max().strftime("%Y-%m-%d")
+
+
+def validate_toorder_freshness(
+    path: Path = TOORDER_PATH,
+    *,
+    expected_date: str | None = None,
+) -> str:
+    expected = expected_date or _expected_toorder_max_date()
+    max_date = _toorder_max_date(path)
+    if max_date is None:
+        raise RuntimeError(f"ToOrder 원천 parquet 없음 또는 날짜 없음: expected>={expected}, path={path}")
+    if max_date < expected:
+        raise RuntimeError(
+            "ToOrder 원천 최신일 지연: "
+            f"max_date={max_date}, expected>={expected}, path={path}. "
+            "DB_Toorder_store_platform_daily_Dags를 먼저 복구 실행하세요."
+        )
+    logger.info("ToOrder 원천 최신성 확인: max_date=%s expected>=%s", max_date, expected)
+    return max_date
+
+
 def _read_parquet_parts(files: list[Path], columns: list[str]) -> pd.DataFrame:
     parts = []
     for path in files:
@@ -83,7 +125,7 @@ def _read_parquet_parts(files: list[Path], columns: list[str]) -> pd.DataFrame:
 
 
 def load_toorder() -> pd.DataFrame:
-    path = ANALYTICS_DB / "toorder_daily_store_platform" / "toorder_store_platform_daily.parquet"
+    path = TOORDER_PATH
     if not path.exists():
         logger.warning("toorder parquet 없음: %s", path)
         return _empty_long()
@@ -93,13 +135,14 @@ def load_toorder() -> pd.DataFrame:
 
 def load_unified() -> pd.DataFrame:
     root = MART_DB / "unified_sales_grp"
-    files = sorted(root.glob("unified_sales_*.parquet")) if root.exists() else []
+    files = iter_unified_sales_files()
     if not files:
         logger.warning("unified_sales parquet 없음: %s", root)
         return _empty_long()
-    df = _read_parquet_parts(files, ["sale_date", "store", "platform", "total_price"])
+    df = _read_parquet_parts(files, ["sale_date", "store", "platform", "source", "total_price"])
     if df.empty:
         return _empty_long()
+    df = filter_manual_delivery_sources_for_test_stores(df)
     return _normalize_grouped(df, "sale_date", "store", "platform", "total_price")
 
 
@@ -162,9 +205,7 @@ def load_baemin_macro() -> pd.DataFrame:
         df["총결제금액"].astype(str).str.replace(",", "", regex=False).str.strip(),
         errors="coerce",
     ).fillna(0)
-    grouped = df.groupby("주문번호", as_index=False).agg(
-        주문시각=("주문시각", "max"),
-        store=("store", "max"),
+    grouped = df.groupby(["store", "주문번호", "주문시각"], as_index=False).agg(
         총결제금액=("총결제금액", "max"),
     )
     grouped["date"] = _baemin_order_date(grouped["주문시각"])
@@ -218,9 +259,7 @@ def load_coupang_macro() -> pd.DataFrame:
         df["매출액"].astype(str).str.replace(",", "", regex=False).str.strip(),
         errors="coerce",
     ).fillna(0)
-    grouped = df.groupby("order_id", as_index=False).agg(
-        order_date=("order_date", "max"),
-        store=("store", "max"),
+    grouped = df.groupby(["store", "order_id", "order_date"], as_index=False).agg(
         매출액=("매출액", "max"),
     )
     grouped["date"] = _coupang_order_date(grouped["order_date"])
@@ -337,6 +376,8 @@ def _empty_output() -> pd.DataFrame:
 
 
 def build_collection_compare() -> str:
+    validate_toorder_freshness()
+
     frames = []
     for spec in SOURCES:
         try:

@@ -1,0 +1,39 @@
+{"question": "팀원 별 프로젝트 진행상황", "expect_tool": "get_team_status", "expect_args": {}, "note": "추천질문 버튼"}
+{"question": "각 팀원 프로젝트 진행상황을 요약해서 알려줘", "expect_tool": "get_team_status", "expect_args": {}}
+{"question": "각 팀원 프로젝트 진행상황을 작성자 기준으로 요약해서 알려줘", "expect_tool": "get_team_status", "expect_args": {"basis": "author"}}
+{"question": "안녕", "expect_tool": "__light_chat__", "expect_args": {}}
+{"question": "황유경 실장의 진행상황을 알려줘", "expect_tool": "get_worker_status", "expect_args": {"worker": "황유경"}}
+{"question": "황유경 실장의 프로젝트 진행상황을 알려줘", "expect_tool": "get_worker_status", "expect_args": {"worker": "황유경"}}
+{"question": "황유경", "expect_tool": "get_worker_status", "expect_args": {"worker": "황유경"}}
+{"question": "황유경실장", "expect_tool": "get_worker_status", "expect_args": {"worker": "황유경"}}
+{"question": "황유경은 얼마나다했어?", "expect_tool": "get_worker_status", "expect_args": {"worker": "황유경"}}
+{"question": "황유경 실장 진행중인 마케팅 프로젝트 날짜별로 정리해서 보여줘", "expect_tool": "get_worker_status", "expect_args": {"worker": "황유경"}}
+{"question": "황유경 실장 프로젝트 진행상황을 작성자 기준으로 알려줘", "expect_tool": "get_worker_status", "expect_args": {"worker": "황유경", "basis": "author"}}
+{"question": "황유경 실장 프로젝트 진행상황 피드백 및 결과 알려줘", "expect_tool": "get_worker_status", "expect_args": {"worker": "황유경"}, "note": "'피드백'이 사람 질문보다 먼저 risk 룰에 걸린다"}
+{"question": "황유경 실장 프로젝트 진행상황 피드백 및 결과알려줘", "expect_tool": "get_worker_status", "expect_args": {"worker": "황유경"}}
+{"question": "황유경 실장 프로젝트 진행상황을 작성자 기준으로 피드백 및 결과 알려줘", "expect_tool": "get_worker_status", "expect_args": {"worker": "황유경", "basis": "author"}}
+{"question": "조민준 PM프로젝트 진행상황 정리해서 알려줘", "expect_tool": "get_worker_status", "expect_args": {"worker": "조민준"}}
+{"question": "조민준 PM 프로젝트 진행상황 피드백해줘", "expect_tool": "get_worker_status", "expect_args": {"worker": "조민준"}}
+{"question": "차보령 대리는?", "expect_tool": "get_worker_status", "expect_args": {"worker": "차보령"}}
+{"question": "직영점 성장전략 진행상황 알려줘", "expect_tool": "get_project_status", "expect_args": {"project_id": "2926716"}}
+{"question": "브랜드 전략기획부] 직영점 성장전략(온라인 유입) 게시물 요약해줘", "expect_tool": "get_project_status", "expect_args": {"project_id": "2926716"}}
+{"question": "[브랜드 전략기획부] 회사 현황판 구축 진행상황 승인검증", "expect_tool": "get_project_status", "expect_args": {"project_id": "2926713"}}
+{"question": "브랜드 바이럴 진행상황 알려줘", "expect_tool": "get_project_status", "expect_args": {"project_id": "2926717"}}
+{"question": "마케팅 실적을 찾아줘", "expect_tool": "get_topic_status", "expect_args": {"keyword": "마케팅 실적"}}
+{"question": "마케팅 실적 찾아서 결론 알려줘", "expect_tool": "get_topic_status", "expect_args": {"keyword": "마케팅 실적"}}
+{"question": "마케팅 실적 찾아서 결론과 리스크 알려줘", "expect_tool": "get_topic_status", "expect_args": {"keyword": "마케팅 실적"}, "note": "'리스크'가 topic보다 먼저 risk 룰에 걸린다"}
+{"question": "이번에 리더가 확인해야 할 위험 업무만 알려줘", "expect_tool": "get_risk_status", "expect_args": {}}
+{"question": "상태 피드백건 확인용", "expect_tool": "get_risk_status", "expect_args": {"priority_only": true}, "note": "추천질문 버튼"}
+{"question": "브랜드 바이럴 프로젝트에서 현재 막힌 업무를 정리해줘", "expect_tool": "get_risk_status", "expect_args": {"project_id": "2926717"}}
+{"question": "직영점 성장전략에서 기한 지난 업무와 다음 액션 알려줘", "expect_tool": "filter_posts", "expect_args": {"due": "overdue", "project_id": "2926716"}}
+{"question": "기한 없음을 다찾아서 알려줘", "expect_tool": "filter_posts", "expect_args": {"due": "none"}}
+{"question": "진행중만 찾아줘", "expect_tool": "filter_posts", "expect_args": {"status": "진행"}}
+{"question": "지연된거 찾아줘", "expect_tool": "filter_posts", "expect_args": {"due": "overdue"}, "note": "계획서에 명시된 대표 실패 케이스"}
+{"question": "보류된 업무 알려줘", "expect_tool": "filter_posts", "expect_args": {"status": "보류"}}
+{"question": "몇시야?", "expect_tool": null, "expect_args": {}, "note": "범위 밖. 룰이 잡으면 안 되고 LLM이 안내해야 한다"}
+{"question": "날짜도 포함해", "expect_tool": null, "expect_args": {}, "requires_context": true, "note": "직전 답변을 다시 정리하는 후속 질문. 기대 tool이 하나로 정해지지 않아 채점 제외", "history": [{"role": "user", "text": "황유경 실장의 진행상황을 알려줘"}, {"role": "assistant", "text": "## 황유경 담당자 기준 진행상황\n- 전체 게시글: 110건\n- 상태: 완료 52, 진행 35, 대기 9\n- 기한 경과: 3건"}]}
+{"question": "조민준 1건이 뭐야?", "expect_tool": "get_worker_status", "expect_args": {"worker": "조민준"}, "requires_context": false, "note": "직전 답변의 조민준을 이어받아야 한다", "history": [{"role": "user", "text": "팀원 별 프로젝트 진행상황"}, {"role": "assistant", "text": "- 조민준: 53건 / 진행중 2건\n- 황유경: 110건 / 진행중 46건\n- 차보령: 95건 / 진행중 72건"}]}
+{"question": "그 중에 기한 지난 건만 다시 보여줘", "history": [{"role": "user", "text": "황유경 실장의 진행상황을 알려줘"}, {"role": "assistant", "text": "## 황유경 담당자 기준 진행상황\n- 전체 게시글: 110건\n- 상태: 완료 52, 진행 35, 대기 9\n- 기한 경과: 3건"}], "expect_tool": "filter_posts", "expect_args": {"worker": "황유경", "due": "overdue"}, "note": "맥락에서 사람을 이어받아야 한다. 룰은 전체 19건을 답했다"}
+{"question": "차보령은?", "history": [{"role": "user", "text": "팀원 별 프로젝트 진행상황"}, {"role": "assistant", "text": "- 조민준: 53건 / 진행중 2건\n- 황유경: 110건 / 진행중 46건\n- 차보령: 95건 / 진행중 72건"}], "expect_tool": "get_worker_status", "expect_args": {"worker": "차보령"}}
+{"question": "회의록 보여줘", "expect_tool": "filter_posts", "expect_args": {"status": "회의록"}, "note": "기록은 직접 물을 때만 조회한다"}
+{"question": "조민준 담당자 기준 진행상황", "expect_tool": "get_worker_status", "expect_args": {"worker": "조민준"}, "note": "사용자가 실제로 물어 결함을 발견한 질문"}
