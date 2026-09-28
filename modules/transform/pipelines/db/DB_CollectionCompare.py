@@ -428,3 +428,116 @@ def build_collection_compare() -> str:
         f"수집비교 {len(wide)}행 -> {COLLECTION_COMPARE_PATH} "
         f"(차이 {diff_count}, 누락 {missing_count})"
     )
+
+
+# ── 쿠팡 누락수집 목록 ──────────────────────────────────────────────
+# 기준은 통합(없으면 토더). 토더가 틀릴 때가 있으므로 통합=쿠팡이면 토더와 달라도 정상이다.
+RECOLLECT_LOOKBACK_DAYS = 30
+RECOLLECT_MIN_GAP_AMT = 1000
+RECOLLECT_MIN_GAP_RATE = 1.0
+RECOLLECT_MERGE_GAP_DAYS = 0  # 연속 날짜만 합침 (09-13, 09-15는 따로 조회)
+RECOLLECT_MAX_RANGE_DAYS = 31
+RECOLLECT_LATEST_NAME = "coupang_recollect_latest.txt"
+
+
+def _coupang_recollect_rows(df: pd.DataFrame, today: str) -> pd.DataFrame:
+    """쿠팡 재수집 대상 (date, store, reason) 행을 반환한다."""
+    cols = ["date", "store", "reason"]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    start = (pd.Timestamp(today) - pd.Timedelta(days=RECOLLECT_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    cp = df[
+        (df["platform_group"] == "쿠팡이츠")
+        & (df["date"].astype(str) >= start)
+        & (df["date"].astype(str) < today)
+    ].copy()
+    if cp.empty:
+        return pd.DataFrame(columns=cols)
+
+    use_unified = cp["present_unified"].astype(bool) & (cp["amt_unified"] > 0)
+    ref_amt = cp["amt_unified"].where(use_unified, cp["amt_toorder"])
+    ref_ok = use_unified | (cp["present_toorder"].astype(bool) & (cp["amt_toorder"] > 0))
+    ref_label = pd.Series("통합", index=cp.index).where(use_unified, "토더")
+
+    coupang_present = cp["present_coupang_macro"].astype(bool)
+    coupang_amt = cp["amt_coupang_macro"]
+    gap = ref_amt - coupang_amt
+    gap_rate = (gap / ref_amt.where(ref_amt > 0)).fillna(0) * 100
+    under = (gap > RECOLLECT_MIN_GAP_AMT) & (gap_rate >= RECOLLECT_MIN_GAP_RATE)
+    missing = ~coupang_present
+
+    target = ref_ok & (missing | (coupang_present & under))
+    out = cp[target].copy()
+    if out.empty:
+        return pd.DataFrame(columns=cols)
+    out["reason"] = [
+        "누락" if miss else f"과소 {label} {ref:,} > 쿠팡 {amt:,}"
+        for miss, label, ref, amt in zip(
+            missing[target], ref_label[target], ref_amt[target].astype(int), coupang_amt[target].astype(int)
+        )
+    ]
+    return out[cols].sort_values(["store", "date"]).reset_index(drop=True)
+
+
+def _merge_date_ranges(dates: list[str]) -> list[tuple[str, str]]:
+    """날짜 목록을 연속 구간으로 묶는다(연속된 날짜만 합치고 빈 날이 있으면 나눔)."""
+    days = sorted({pd.Timestamp(d) for d in dates})
+    ranges: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    for day in days:
+        if ranges:
+            start, end = ranges[-1]
+            gap_days = (day - end).days - 1
+            span_days = (day - start).days + 1
+            if gap_days <= RECOLLECT_MERGE_GAP_DAYS and span_days <= RECOLLECT_MAX_RANGE_DAYS:
+                ranges[-1] = (start, day)
+                continue
+        ranges.append((day, day))
+    return [(s.strftime("%Y-%m-%d"), e.strftime("%Y-%m-%d")) for s, e in ranges]
+
+
+def _format_recollect_lines(rows: pd.DataFrame, generated_at: str) -> list[str]:
+    body = []
+    for store, grp in rows.groupby("store", sort=True):
+        reasons = dict(zip(grp["date"].astype(str), grp["reason"]))
+        for start, end in _merge_date_ranges(list(reasons)):
+            in_range = [r for d, r in reasons.items() if start <= d <= end]
+            n_missing = sum(r == "누락" for r in in_range)
+            n_under = len(in_range) - n_missing
+            memo = ",".join(
+                part for part in (
+                    f"누락 {n_missing}일" if n_missing else "",
+                    f"과소 {n_under}일" if n_under else "",
+                ) if part
+            )
+            body.append((start, end, store, memo))
+    body.sort(key=lambda x: (x[0], x[1], x[2]))
+    header = (
+        f"# 쿠팡 누락수집 generated={generated_at} "
+        f"ranges={len(body)} stores={rows['store'].nunique() if not rows.empty else 0}"
+    )
+    return [header] + [f"{s}~{e}\t{store}\t{memo}" for s, e, store, memo in body]
+
+
+def export_coupang_recollect_list(
+    compare_path: Path = COLLECTION_COMPARE_PATH,
+    out_dir: Path | None = None,
+    today: str | None = None,
+) -> str:
+    """수집비교 마트에서 쿠팡 재수집 목록 txt를 만든다(확장 '쿠팡 누락수집' 입력용)."""
+    now = datetime.now(KST)
+    today = today or now.strftime("%Y-%m-%d")
+    out_dir = out_dir or compare_path.parent
+    df = pd.read_parquet(compare_path) if compare_path.exists() else _empty_output()
+    rows = _coupang_recollect_rows(df, today)
+    lines = _format_recollect_lines(rows, now.strftime("%Y-%m-%d %H:%M"))
+    text = "\n".join(lines) + "\n"
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    latest = out_dir / RECOLLECT_LATEST_NAME
+    dated = out_dir / f"coupang_recollect_{today.replace('-', '')}.txt"
+    for path in (latest, dated):
+        path.write_text(text, encoding="utf-8", newline="\n")
+    n_ranges = len(lines) - 1
+    n_stores = rows["store"].nunique() if not rows.empty else 0
+    logger.info("쿠팡 누락수집 목록: %d구간 / %d매장 -> %s", n_ranges, n_stores, latest)
+    return f"쿠팡 누락수집 목록 {n_ranges}구간 / {n_stores}매장 -> {latest}"

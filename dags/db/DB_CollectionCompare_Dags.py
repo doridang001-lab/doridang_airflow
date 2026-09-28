@@ -7,7 +7,10 @@ import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-from modules.transform.pipelines.db.DB_CollectionCompare import build_collection_compare
+from modules.transform.pipelines.db.DB_CollectionCompare import (
+    build_collection_compare,
+    export_coupang_recollect_list,
+)
 from modules.transform.pipelines.db.DB_BaeminManual_load import (
     load_manual_baemin_files,
     cleanup_manual_baemin_files,
@@ -65,6 +68,11 @@ with DAG(
         python_callable=build_collection_compare,
     )
 
+    export_recollect = PythonOperator(
+        task_id="export_coupang_recollect_list",
+        python_callable=export_coupang_recollect_list,
+    )
+
     ingest_baemin >> cleanup_baemin
     move_coupang >> load_coupang
-    [cleanup_baemin, load_coupang] >> build_compare
+    [cleanup_baemin, load_coupang] >> build_compare >> export_recollect
