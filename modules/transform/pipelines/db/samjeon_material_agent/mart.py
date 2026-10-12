@@ -27,7 +27,8 @@ FOOD_MAIN = "도리당 송파삼전점"
 FOOD_MEAL = "도리당 송파삼전점(부식)"
 DAM_STORE = "도리당 송파삼전점"
 CATEGORIES = {"원재료", "포장재", "기타"}
-RULE_VERSION = "samjeon-mart-v1"
+RULE_VERSION = "samjeon-mart-v2"
+DEFAULT_GUIDE = Path(__file__).with_name("agent_guide.md")
 DEFAULT_OUTPUT = MART_DB / "CEO_DB" / "samjeon_agent_DB"
 DEFAULT_WORK = LOCAL_DB / "temp" / "samjeon_material_mart"
 DEFAULT_CLASSIFICATION = LOCAL_DB / "samjeon_material_agent" / "classification.json"
@@ -132,6 +133,7 @@ def plan_build(
     work_root: str | Path | None = None,
     classification_path: str | Path | None = None,
     coverage_path: str | Path | None = None,
+    guide_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """기준일과 읽을 파일을 확정한다. 디렉터리·파일은 만들지 않는다."""
     target = date.fromisoformat(as_of_date) if as_of_date else pendulum.now("Asia/Seoul").date() - timedelta(days=1)
@@ -143,6 +145,8 @@ def plan_build(
     dam_dir = Path(dam_root) if dam_root else ANALYTICS_DB / "Logistics_Dam"
     class_path = Path(classification_path) if classification_path else DEFAULT_CLASSIFICATION
     close_path = Path(coverage_path) if coverage_path else DEFAULT_COVERAGE
+    guide = Path(guide_path) if guide_path else DEFAULT_GUIDE
+    guide_hash = _digest(guide)
     days = [(start + timedelta(days=i)).isoformat() for i in range(57)]
     sales = [_file_entry(sales_dir / f"unified_sales_{day[2:].replace('-', '')}.parquet", "sales", day) for day in days]
     food = [_file_entry(food_dir / f"food_guide_orders_{month}.parquet", "food_guide", month) for month in _month_names(start, target)]
@@ -150,7 +154,8 @@ def plan_build(
     inputs = sales + food + dam
     config = {"classification": _digest(class_path) if class_path.is_file() else "",
               "coverage": _digest(close_path) if close_path.is_file() else ""}
-    signature = hashlib.sha256(_json_bytes({"date": str(target), "files": inputs, "config": config, "rule": RULE_VERSION})).hexdigest()[:16]
+    signature = hashlib.sha256(_json_bytes({"date": str(target), "files": inputs, "config": config,
+                                            "guide_sha256": guide_hash, "rule": RULE_VERSION})).hexdigest()[:16]
     snapshot_id = f"{target}-{signature}"
     work = Path(work_root) if work_root else DEFAULT_WORK
     return {
@@ -158,6 +163,7 @@ def plan_build(
         "sales_files": sales, "food_files": food, "dam_files": dam,
         "config_hashes": config, "classification_path": str(class_path),
         "coverage_path": str(close_path), "snapshot_id": snapshot_id,
+        "guide_path": str(guide), "guide_sha256": guide_hash,
         "stage_dir": str(work / snapshot_id),
         "output_root": str(Path(output_root) if output_root else DEFAULT_OUTPUT),
     }
@@ -396,6 +402,8 @@ def _agent_context(plan: dict[str, Any], tables: dict[str, pd.DataFrame], classi
 
     def period(start: str, finish: str) -> dict[str, Any]:
         total_sales = _sum(sales, start=start, end=finish, date_col="sale_date")
+        hall_sales = _sum(sales.loc[sales["source"].eq("okpos")],
+                          start=start, end=finish, date_col="sale_date")
         amounts = {
             category: _sum(purchase, start=start, end=finish, date_col="purchase_date", categories={category})
             for category in ("원재료", "포장재", "현장 직원식대", "기타", "미분류")
@@ -412,7 +420,8 @@ def _agent_context(plan: dict[str, Any], tables: dict[str, pd.DataFrame], classi
             gap = str(((ratio - Decimal("0.37")) * 100).quantize(Decimal("0.1")))
             excess = str(Decimal(purchase_amount) - Decimal(total_sales) * Decimal("0.37"))
         return {
-            "observed_sales_won": total_sales, "observed_purchase_won": purchase_amount,
+            "observed_sales_won": total_sales, "hall_sales_won": hall_sales,
+            "observed_purchase_won": purchase_amount,
             "ingredient_won": amounts["원재료"], "packaging_won": amounts["포장재"],
             "staff_meal_won": amounts["현장 직원식대"], "other_won": amounts["기타"],
             "unclassified_won": amounts["미분류"], "complete": complete,
@@ -479,6 +488,7 @@ def _agent_context(plan: dict[str, Any], tables: dict[str, pd.DataFrame], classi
     return {
         "as_of_date": today, "window_start": plan["start_date"],
         "snapshot_id": plan["snapshot_id"], "rule_version": RULE_VERSION,
+        "guide": {"file": "agent_guide.md", "sha256": plan["guide_sha256"]},
         "classification_version": classification_version,
         "status": overall,
         "daily": daily, "month_to_date": mtd,
@@ -570,7 +580,7 @@ def stage_purchases(plan: dict[str, Any]) -> dict[str, Any]:
 
 OUTPUT_TABLES = ("purchase_lines", "sales_daily", "purchase_daily", "item_daily", "quality_daily")
 OUTPUT_NAMES = tuple(f"{name}.parquet" for name in OUTPUT_TABLES) + (
-    "review_candidates.csv", "agent_context.json", "manifest.json")
+    "review_candidates.csv", "agent_context.json", "agent_guide.md", "manifest.json")
 
 
 def _check_source_versions(plan: dict[str, Any]) -> None:
@@ -581,6 +591,8 @@ def _check_source_versions(plan: dict[str, Any]) -> None:
             raise RuntimeError(f"원천 판본 변경으로 게시 중단: {path}")
     for name, path_key in (("classification", "classification_path"), ("coverage", "coverage_path")):
         _read_config(plan[path_key], plan["config_hashes"][name])
+    if _digest(Path(plan["guide_path"])) != plan["guide_sha256"]:
+        raise RuntimeError("계획 이후 LLM 가이드 판본 변경")
 
 
 def stage_aggregate(plan: dict[str, Any]) -> dict[str, Any]:
@@ -588,9 +600,13 @@ def stage_aggregate(plan: dict[str, Any]) -> dict[str, Any]:
     sales = pd.read_parquet(stage / "sales_daily.parquet")
     purchases = pd.read_parquet(stage / "purchase_lines_raw.parquet")
     tables, context = _aggregate_tables(plan, sales, purchases)
+    _check_source_versions(plan)
     for name in OUTPUT_TABLES:
         tables[name].to_parquet(stage / f"{name}.parquet", index=False)
     tables["review_candidates"].to_csv(stage / "review_candidates.csv", index=False, encoding="utf-8-sig")
+    shutil.copy2(plan["guide_path"], stage / "agent_guide.md")
+    if _digest(stage / "agent_guide.md") != plan["guide_sha256"]:
+        raise RuntimeError("LLM 가이드 복사 검증 실패")
     (stage / "agent_context.json").write_bytes(_json_bytes(context))
     files = {name: _digest(stage / name) for name in OUTPUT_NAMES if name != "manifest.json"}
     manifest = {
@@ -598,6 +614,7 @@ def stage_aggregate(plan: dict[str, Any]) -> dict[str, Any]:
         "window_start": plan["start_date"], "rule_version": RULE_VERSION,
         "sources": plan["sales_files"] + plan["food_files"] + plan["dam_files"],
         "config_hashes": plan["config_hashes"], "files": files,
+        "guide_sha256": plan["guide_sha256"],
         "rows": {name: len(tables[name]) for name in OUTPUT_TABLES},
         "status": context["status"],
     }
@@ -614,6 +631,9 @@ def validate_snapshot(plan: dict[str, Any]) -> dict[str, Any]:
     for name, expected in manifest["files"].items():
         if _digest(stage / name) != expected:
             raise ValueError(f"스냅샷 파일 해시 불일치: {name}")
+    context = json.loads((stage / "agent_context.json").read_text(encoding="utf-8"))
+    if context.get("guide") != {"file": "agent_guide.md", "sha256": manifest["files"]["agent_guide.md"]}:
+        raise ValueError("에이전트 문맥과 가이드 판본 불일치")
     lines = pd.read_parquet(stage / "purchase_lines.parquet")
     purchase_daily = pd.read_parquet(stage / "purchase_daily.parquet")
     item_daily = pd.read_parquet(stage / "item_daily.parquet")
@@ -630,6 +650,14 @@ def validate_snapshot(plan: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("부식 계정 분류 오류")
     if not sales_daily.empty and sales_daily["sale_date"].gt(plan["as_of_date"]).any():
         raise ValueError("기준일 이후 매출이 포함됐습니다")
+    target = plan["as_of_date"]
+    month_start = date.fromisoformat(target).replace(day=1).isoformat()
+    for label, start in (("daily", target), ("month_to_date", month_start)):
+        selected = sales_daily.loc[sales_daily["sale_date"].between(start, target)]
+        expected_total = int(selected["amount_won"].sum())
+        expected_hall = int(selected.loc[selected["source"].eq("okpos"), "amount_won"].sum())
+        if context[label]["observed_sales_won"] != expected_total or context[label]["hall_sales_won"] != expected_hall:
+            raise ValueError(f"{label} 매출 소계 대사 실패")
     if int(lines["amount_won"].sum()) != int(purchase_daily["amount_won"].sum()) or int(lines["amount_won"].sum()) != int(item_daily["amount_won"].sum()):
         raise ValueError("구매 합계 대사 실패")
     return {"snapshot_id": plan["snapshot_id"], "status": manifest["status"],

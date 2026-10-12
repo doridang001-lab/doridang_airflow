@@ -1,6 +1,7 @@
 """송파삼전점 mart의 분류, 대사, 게시 경계를 검증한다."""
 
 import json
+import shutil
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -22,6 +23,7 @@ def _fixture(tmp_path: Path):
     pd.DataFrame([
         {"sale_date": "2026-10-11", "store": STORE, "source": "okpos", "total_price": 100000, "_pk": "1"},
         {"sale_date": "2026-10-11", "store": STORE, "source": "okpos", "total_price": -10000, "_pk": "2"},
+        {"sale_date": "2026-10-11", "store": STORE, "source": "posfeed", "total_price": 20000, "_pk": "4"},
         {"sale_date": "2026-10-11", "store": "다른점", "source": "okpos", "total_price": 999999, "_pk": "3"},
     ]).to_parquet(sales / "unified_sales_261011.parquet")
     pd.DataFrame([
@@ -54,13 +56,20 @@ def test_staff_meal_and_reconciliation(tmp_path):
     lines = pd.read_parquet(stage / "purchase_lines.parquet")
     assert dict(zip(lines["account"], lines["category"])) == {
         FOOD_MAIN: "원재료", FOOD_MEAL: "현장 직원식대"}
-    assert context["daily"]["observed_sales_won"] == 90000
+    assert context["daily"]["observed_sales_won"] == 110000
+    assert context["daily"]["hall_sales_won"] == 90000
+    assert context["month_to_date"]["hall_sales_won"] == 90000
     assert context["daily"]["observed_purchase_won"] == 30000
     assert context["daily"]["staff_meal_won"] == 5000
     assert context["daily"]["purchase_rate_pct"] is None
     assert context["forecast"]["status"] == "보류"
+    manifest = json.loads((stage / "manifest.json").read_text(encoding="utf-8"))
+    assert (stage / "agent_guide.md").is_file()
+    assert context["guide"] == {"file": "agent_guide.md",
+                                "sha256": manifest["files"]["agent_guide.md"]}
     assert publish_snapshot(plan)["latest_updated"] in {True, False}
     assert publish_snapshot(plan)["purchase_rows"] == 2
+    assert (Path(plan["output_root"]) / "snapshots" / plan["snapshot_id"] / "agent_guide.md").is_file()
 
 
 def test_source_change_blocks_publication(tmp_path):
@@ -104,3 +113,23 @@ def test_month_end_forecast_only_with_closed_samples():
     assert result["projected_purchase_rate_pct"] == "37.0"
     quality.loc[(quality["date"] == "2026-10-10") & quality["source"].eq("food_guide"), "status"] = "잠정"
     assert _forecast({"as_of_date": "2026-10-11"}, sales, purchases, quality, False)["status"] == "보류"
+
+
+def test_guide_revision_changes_snapshot_and_blocks_stale_publish(tmp_path):
+    original, _ = _fixture(tmp_path)
+    guide = tmp_path / "agent_guide.md"
+    shutil.copy2(original["guide_path"], guide)
+    paths = {"sales_root": Path(original["sales_files"][-1]["path"]).parent,
+             "food_root": Path(original["food_files"][-1]["path"]).parent,
+             "dam_root": tmp_path / "dam", "guide_path": guide,
+             "work_root": tmp_path / "work", "output_root": tmp_path / "output"}
+    first = plan_build("2026-10-11", **paths)
+    stage_sales(first)
+    stage_purchases(first)
+    stage_aggregate(first)
+    guide.write_text(guide.read_text(encoding="utf-8") + "\n판본 검증용 변경\n", encoding="utf-8")
+    second = plan_build("2026-10-11", **paths)
+    assert first["snapshot_id"] != second["snapshot_id"]
+    with pytest.raises(RuntimeError, match="가이드 판본 변경"):
+        publish_snapshot(first)
+    assert not (Path(first["output_root"]) / "latest.json").exists()
