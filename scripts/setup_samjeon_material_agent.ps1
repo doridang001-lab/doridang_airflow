@@ -1,14 +1,40 @@
 ﻿param(
-    [string]$Config,
-    [switch]$CheckOnly
+    [string]$Config = 'C:\Local_DB\samjeon_material_agent\service.json',
+    [switch]$CheckOnly,
+    [switch]$InstallPrerequisites
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
-if (-not $Config) {
-    $Config = Join-Path $repoRoot 'config\samjeon_material_agent.example.json'
+if ($CheckOnly -and $InstallPrerequisites) { throw '-CheckOnly와 -InstallPrerequisites를 함께 사용할 수 없습니다.' }
+if ($InstallPrerequisites) {
+    foreach ($package in @(@('git','Git.Git'), @('py','Python.Python.3.12'), @('npm','OpenJS.NodeJS.LTS'))) {
+        $needed = -not (Get-Command $package[0] -ErrorAction SilentlyContinue)
+        if ($package[0] -eq 'py' -and -not $needed) {
+            & py -3.12 -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)'
+            $needed = $LASTEXITCODE -ne 0
+        }
+        if ($needed) {
+            & winget install --id $package[1] --exact --source winget --accept-package-agreements --accept-source-agreements
+            if ($LASTEXITCODE -ne 0) { throw "설치 실패: $($package[1])" }
+        }
+    }
+    $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
+    $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if (-not $npm) { throw 'Node.js 설치 후 새 PowerShell에서 다시 실행하세요.' }
+    & $npm.Source install --global '@openai/codex@0.158.0'
+    if ($LASTEXITCODE -ne 0) { throw 'Codex CLI 설치 실패' }
 }
-$configPath = (Resolve-Path -LiteralPath $Config).Path
+$configPath = [IO.Path]::GetFullPath($Config)
+if ($configPath -match '(?i)onedrive') { throw '운영 설정은 OneDrive 밖 로컬 폴더에 두세요.' }
+if (-not (Test-Path -LiteralPath $configPath)) {
+    if ($CheckOnly) { throw '운영 설정이 없습니다. 설치 스크립트를 -CheckOnly 없이 실행하세요.' }
+    $settings = Get-Content -LiteralPath (Join-Path $repoRoot 'config\samjeon_material_agent.example.json') -Encoding utf8 -Raw | ConvertFrom-Json
+    $settings.state_root = Join-Path (Split-Path -Parent $configPath) 'state'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $configPath) -Force | Out-Null
+    [IO.File]::WriteAllText($configPath, ($settings | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false)))
+    Write-Output "비활성 운영 설정 생성: $configPath"
+}
 $python = Join-Path $repoRoot '.venv\Scripts\python.exe'
 
 if (-not (Test-Path -LiteralPath $python)) {
@@ -39,6 +65,7 @@ try {
     }
     & $python -B -X utf8 -m modules.transform.pipelines.db.samjeon_material_service doctor --config $configPath
     if ($LASTEXITCODE -ne 0) { throw '삼전점 서비스 점검에 실패했습니다.' }
+    Write-Output '진단의 ready와 blocked_reasons를 확인하세요. Codex 로그인, 봇 토큰·허용 ID, v3 데이터 경로를 등록한 뒤 --require-ready로 재검증합니다.'
 } finally {
     Pop-Location
 }

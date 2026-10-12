@@ -128,6 +128,28 @@ class Store:
         with self.db:
             self.db.execute('UPDATE analyses SET focus=? WHERE id=? AND chat=?', (product_key, aid, chat))
 
+    def turns(self, chat, analysis, now):
+        scope = {k: analysis.get(k) for k in ('snapshot_id', 'date_from', 'date_to', 'focus')}
+        rows = self.get(f'turns-v1-{chat}', [])
+        return [r for r in rows if r['scope'] == scope and
+                (now - datetime.fromisoformat(r['created'])).total_seconds() < 86400][-10:]
+
+    def remember_turn(self, chat, analysis, question, answer, now):
+        rows = self.turns(chat, analysis, now)
+        rows.append({'scope': {k: analysis.get(k) for k in ('snapshot_id', 'date_from', 'date_to', 'focus')},
+                     'question': question[:1000], 'answer': answer[:1500], 'created': now.isoformat()})
+        self.put(f'turns-v1-{chat}', rows[-10:])
+
+    def save_answer(self, chat, analysis, notes, text):
+        from .grounded import scope_signature
+        self.put(f'answer-v1-{chat}-{analysis["id"]}',
+                 {'signature': scope_signature(analysis, notes), 'text': text})
+
+    def grounded_answer(self, chat, analysis, notes):
+        from .grounded import scope_signature
+        record = self.get(f'answer-v1-{chat}-{analysis["id"]}', {})
+        return record.get('text') if record.get('signature') == scope_signature(analysis, notes) else None
+
     def enqueue(self, key, chat, payload):
         with self.db:
             self.db.execute('INSERT OR IGNORE INTO outbox(key,chat,payload,created) VALUES(?,?,?,?)',

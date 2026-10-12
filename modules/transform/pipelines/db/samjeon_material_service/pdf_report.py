@@ -8,10 +8,10 @@ from xml.sax.saxutils import escape
 from .config import local_path
 from .presentation import render_query, briefing
 
-REPORT_VERSION = 'conversation-v1'
+REPORT_VERSION = 'conversation-v2'
 
 
-def create_pdf(settings, repository, analysis, notes):
+def create_pdf(settings, repository, analysis, notes, grounded=None):
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -33,7 +33,7 @@ def create_pdf(settings, repository, analysis, notes):
             'total': sum(r['result']['total'] for r in purchase_evidence),
             'rows': [row for r in purchase_evidence for row in r['result']['rows']]}}
     identity = {'snapshot': analysis['snapshot_id'], 'from': analysis['date_from'], 'to': analysis['date_to'],
-                'notes': notes, 'focus': analysis.get('focus'), 'version': REPORT_VERSION,
+                'notes': notes, 'grounded': grounded, 'focus': analysis.get('focus'), 'version': REPORT_VERSION,
                 'template': hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name('presentation.py').read_bytes()).hexdigest()}
     key = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:24]
     folder = local_path(settings.state_root) / 'reports' / analysis['date_to']
@@ -56,6 +56,8 @@ def create_pdf(settings, repository, analysis, notes):
              p(f"조회 기간 {analysis['date_from']} ~ {analysis['date_to']}"),
              p(f"분석 판본 {analysis['snapshot_id']} / 자료 상태 {context['status']}"),
              p('확인할 사항', 'Heading2'), p(briefing(context))]
+    if grounded:
+        story.extend([p('대화에서 확인한 분석', 'Heading2'), p(grounded)])
     for kind, title in (('summary', '매출·매입과 목표'), ('compare', '구매 변화와 증가 품목'),
                         ('staff_meal', '현장 직원식대'), ('forecast', '조건부 월말 전망')):
         story.extend([p(title, 'Heading2'), p(render_query(results[kind]))])

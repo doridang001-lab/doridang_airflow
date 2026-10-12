@@ -15,6 +15,7 @@ from .codex_adapter import CodexAdapter
 from .conversation import parse, HELP
 from .presentation import briefing, alert_items, buttons, chunks, render_query
 from .pdf_report import create_pdf
+from .grounded import validate_plan, make_facts, render_answer
 
 KST = ZoneInfo('Asia/Seoul')
 log = logging.getLogger(__name__)
@@ -37,6 +38,8 @@ class Service:
         self.settings, self.store, self.transport = settings, store, transport
         self.repo = repository or Repository(settings)
         self.model = model or CodexAdapter(settings)
+        if isinstance(self.repo, Repository):
+            self.repo.last_good = self.store.get('last_valid_snapshot')
         self.clock = clock
         self.cancellations = {}
         self.delivery_lock = asyncio.Lock()
@@ -48,7 +51,114 @@ class Service:
     def write_health(self):
         from modules.transform.pipelines.db.samjeon_material_agent.contracts import atomic_json
         atomic_json(self.store.root / 'health.json', {'checked_at': self.clock().isoformat(),
-                    'last_snapshot': self.store.get('last_snapshot'), **self.store.health()})
+                    'last_snapshot': self.store.get('last_snapshot'),
+                    'ai': self.store.get('ai_status'), 'data_notice': getattr(self.repo, 'fallback_reason', None),
+                    **self.store.health()})
+
+    async def current(self):
+        result = await asyncio.to_thread(self.repo.current)
+        if not getattr(self.repo, 'fallback_reason', None):
+            self.store.put('last_valid_snapshot', str(result[0]))
+        return result
+
+    def data_notice(self, context):
+        notice = getattr(self.repo, 'fallback_reason', None)
+        yesterday = str(self.clock().date() - timedelta(days=1))
+        if context['as_of_date'] < yesterday:
+            notice = (notice + ' ' if notice else '') + '최신 일자 자료가 아직 준비되지 않았습니다.'
+        return f"\n\n자료 안내: {notice} 기준일 {context['as_of_date']}." if notice else ''
+
+    async def pdf(self, uid, chat, analysis, cancelled):
+        notes = self.store.notes(chat, analysis['id'])
+        saved = self.store.grounded_answer(chat, analysis, notes)
+        document = await asyncio.to_thread(create_pdf, self.settings, self.repo, analysis, notes, saved)
+        if not cancelled.is_set():
+            await self.send(f'update-{uid}', chat,
+                f"{analysis['date_from']} ~ {analysis['date_to']} 상세 근거입니다. 대화와 같은 분석 판본입니다.",
+                document=document, cancelled=cancelled)
+
+    async def analyze_text(self, uid, user, chat, text, path, context, analysis, cancelled):
+        history = self.store.turns(chat, analysis, self.clock())
+        plan = await asyncio.to_thread(self.model.plan, text, {
+            'snapshot_date': context['as_of_date'], 'date_from': analysis['date_from'],
+            'date_to': analysis['date_to'], 'selected_product': analysis.get('focus'),
+            'history': [{'question': r['question'], 'answer': r['answer']} for r in history]}, cancelled)
+        self.store.put('ai_status', {'checked_at': self.clock().isoformat(),
+                       'stage': 'plan', 'error': getattr(self.model, 'last_error', None)})
+        if cancelled.is_set() or self.store.cancelled(uid):
+            return True
+        if plan is None:
+            return False
+        plan = validate_plan(plan)
+        if plan['action'] == 'clarify':
+            # 질문은 질문으로만 표시하며 계산 결과로 취급하지 않는다.
+            await self.send(f'update-{uid}', chat, '확인 질문: ' + plan['clarification'], cancelled=cancelled)
+            return True
+        if plan['action'] == 'pdf':
+            await self.pdf(uid, chat, analysis, cancelled)
+            return True
+        if plan['action'] == 'note':
+            self.store.note(chat, analysis['id'], user, text)
+            await self.send(f'update-{uid}', chat, '이 분석에 설명을 기록했습니다. 다음 분석에 참고하며 원천 검수 승인으로 처리하지 않습니다.', cancelled=cancelled)
+            return True
+        queries = plan['queries']
+        periods = {(q['date_from'] or analysis['date_from'], q['date_to'] or analysis['date_to']) for q in queries}
+        names = {q['product_name'] for q in queries if q['product_name']}
+        if len(periods) != 1 or len(names) > 1:
+            await self.send(f'update-{uid}', chat, '한 번에 확인할 기간과 품목을 하나씩 알려주세요.', cancelled=cancelled)
+            return True
+        start, end = next(iter(periods))
+        if (start, end) != (analysis['date_from'], analysis['date_to']):
+            analysis = self.analysis(chat, path, context, str(uid), start, end)
+        focus = analysis.get('focus') if all(q['intent'] in ('compare', 'evidence') for q in queries) else None
+        if names:
+            name = next(iter(names))
+            choices = await asyncio.to_thread(self.repo.search_items, path, name)
+            if cancelled.is_set():
+                return True
+            if not choices:
+                await self.send(f'update-{uid}', chat, '해당 품목을 자료에서 찾지 못했습니다. 구매내역의 품목명을 알려주세요.', cancelled=cancelled)
+                return True
+            if len(choices) > 1:
+                self.store.put('choices-' + analysis['id'], choices)
+                markup = {'inline_keyboard': [[{'text': f"{r['item_name']} {r['spec']}"[:55],
+                    'callback_data': f"{analysis['id']}:pick{i}"}] for i, r in enumerate(choices)]}
+                await self.send(f'update-{uid}', chat, '같은 이름으로 여러 품목이 있습니다. 어떤 품목을 확인할까요?', markup, cancelled=cancelled)
+                return True
+            focus = choices[0]['product_key']
+            if any(q['intent'] not in ('compare', 'evidence') for q in queries):
+                await self.send(f'update-{uid}', chat, '개별 품목은 구매 비교와 근거를 확인할 수 있습니다. 전체 매입률과 구분해 질문해 주세요.', cancelled=cancelled)
+                return True
+        if focus != analysis.get('focus'):
+            analysis = self.analysis(chat, path, context, str(uid) + (focus or 'all'), start, end)
+            self.store.focus(analysis['id'], chat, focus)
+            analysis = self.store.analysis(analysis['id'], chat)
+        results = []
+        for query in queries:
+            result = await asyncio.to_thread(self.repo.query, path, query['intent'], start, end,
+                **({'product_key': focus} if focus else {}))
+            if cancelled.is_set() or self.store.cancelled(uid):
+                return True
+            results.append(result)
+        facts = make_facts(results)
+        notes = self.store.notes(chat, analysis['id'])
+        model_notes = notes[-10:]
+        answer = await asyncio.to_thread(self.model.explain, text, {
+            'facts': facts, 'notes': [{'id': f'N{i + 1}', 'text': n['text']} for i, n in enumerate(model_notes)]}, cancelled)
+        if cancelled.is_set() or self.store.cancelled(uid):
+            return True
+        error = getattr(self.model, 'last_error', None)
+        try:
+            rendered = render_answer(answer, facts, model_notes)
+        except (ValueError, TypeError):
+            error = error or 'invalid_answer'
+            rendered = 'AI 설명을 완료하지 못해 확인된 조회 결과를 안내합니다.\n\n' + '\n\n'.join(f['text'] for f in facts)
+        rendered += self.data_notice(context)
+        self.store.put('ai_status', {'checked_at': self.clock().isoformat(), 'stage': 'answer', 'error': error})
+        self.store.save_answer(chat, analysis, notes, rendered)
+        self.store.remember_turn(chat, analysis, text, rendered, self.clock())
+        await self.send(f'update-{uid}', chat, rendered, buttons(analysis['id']), cancelled=cancelled)
+        return True
 
     async def ingest(self, updates):
         fresh = [u for u in updates if not self.store.db.execute('SELECT 1 FROM updates WHERE id=?', (u['update_id'],)).fetchone()]
@@ -155,13 +265,17 @@ class Service:
                 path = Path(analysis['snapshot'])
                 context = await asyncio.to_thread(self.repo.context, path, analysis['snapshot_id'])
             else:
-                path, context = await asyncio.to_thread(self.repo.current)
+                path, context = await self.current()
                 if cancelled.is_set() or self.store.cancelled(uid):
                     return
                 analysis = self.analysis(chat, path, context, str(uid))
             if not callback:
+                if (not text.startswith('/') and self.settings.ai_enabled and self.settings.ai_verified
+                        and hasattr(self.model, 'plan')):
+                    if await self.analyze_text(uid, user, chat, text, path, context, analysis, cancelled):
+                        return
                 request = parse(text, analysis['date_to'])
-            if request is None:
+            if request is None and not (self.settings.ai_enabled and hasattr(self.model, 'plan')):
                 request = await asyncio.to_thread(self.model.interpret, text,
                     {'date_from': analysis['date_from'], 'date_to': analysis['date_to'],
                      'snapshot_date': context['as_of_date']}, cancelled)
@@ -176,11 +290,7 @@ class Service:
             elif request['action'] == 'help':
                 answer = HELP
             elif request['action'] == 'pdf':
-                document = await asyncio.to_thread(create_pdf, self.settings, self.repo, analysis, self.store.notes(chat, aid))
-                if not cancelled.is_set():
-                    await self.send(f'update-{uid}', chat,
-                                    f"{analysis['date_from']} ~ {analysis['date_to']} 상세 근거입니다. 대화와 같은 분석 판본입니다.",
-                                    document=document, cancelled=cancelled)
+                await self.pdf(uid, chat, analysis, cancelled)
                 return
             elif request['action'] == 'explain':
                 # 대화 기간이 바뀐 뒤에도 해당 기간의 조회를 사용한다.
@@ -228,6 +338,9 @@ class Service:
             if notes and request and request['action'] in ('explain', 'query'):
                 answer += '\n\n대표님 설명: ' + notes[-1]['text'] + '\n(사용자가 알려준 설명입니다.)'
             if not cancelled.is_set() and not self.store.cancelled(uid):
+                answer += self.data_notice(context)
+                if not callback and not text.startswith('/') and self.settings.ai_enabled and getattr(self.model, 'last_error', None):
+                    answer = 'AI 연결을 사용할 수 없어 기본 조회로 안내합니다.\n\n' + answer
                 self.store.remember(chat, aid, self.clock() + timedelta(hours=24))
                 await self.send(f'update-{uid}', chat, answer, buttons(aid), cancelled=cancelled)
         except (ValueError, FileNotFoundError, KeyError) as exc:
@@ -260,8 +373,8 @@ class Service:
         yesterday = str(now.date() - timedelta(days=1))
         morning = '09:30' <= hhmm <= '12:00'
         try:
-            path, context = await asyncio.to_thread(self.repo.current)
-            fresh = context['as_of_date'] == yesterday
+            path, context = await self.current()
+            fresh = context['as_of_date'] == yesterday and not getattr(self.repo, 'fallback_reason', None)
         except (OSError, ValueError, KeyError):
             path, context, fresh = None, None, False
         daily_key = f'daily-{chat}-{today}'

@@ -1,0 +1,14 @@
+/config/samjeon-development.paths
+/.claude/scripts/gitpush.sh
+/scripts/AGENTS.md
+/scripts/CLAUDE.md
+/modules/CLAUDE.md
+/modules/transform/AGENTS.md
+/modules/transform/CLAUDE.md
+/modules/transform/pipelines/db/AGENTS.md
+/dags/db/DB_Samjeon_Material_Agent_Dags.py
+/dags/db/DB_Samjeon_Material_Mart_Dags.py
+/tests/test_samjeon_*.py
+/harness/samjeon_material_mart.md
+/prd_codex/*PRD_261006.md
+/prd_codex/update_log.md

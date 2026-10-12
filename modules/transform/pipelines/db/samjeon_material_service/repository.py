@@ -9,8 +9,27 @@ from modules.transform.pipelines.db.samjeon_material_agent.query import load_sna
 class Repository:
     def __init__(self, settings):
         self.settings = settings
+        self.last_good = None
+        self.fallback_reason = None
 
     def current(self):
+        self.fallback_reason = None
+        try:
+            result = self._current()
+            self.last_good = str(result[0])
+            return result
+        except (OSError, ValueError, KeyError, TypeError):
+            if not self.last_good or self.settings.snapshot:
+                raise
+            root = Path(self.settings.snapshot_root).resolve() / 'snapshots'
+            candidate = Path(self.last_good).resolve()
+            if not candidate.is_relative_to(root):
+                raise ValueError('이전 정상 자료 경로가 게시 루트 밖입니다') from None
+            _, context, _ = load_snapshot(candidate)
+            self.fallback_reason = '최신 자료 동기화를 기다리는 중입니다. 이전에 검증한 자료를 표시합니다.'
+            return candidate, context
+
+    def _current(self):
         if self.settings.snapshot:
             path = Path(self.settings.snapshot).resolve()
         else:
@@ -55,6 +74,13 @@ class Repository:
         if match and match[1] not in ('그것', '그게', '매입', '매출', '직원식대', '구매', '품목'):
             return [r for r in names if match[1] in r['item_name']][:10]
         return []
+
+    def search_items(self, path, name):
+        _, _, tables = load_snapshot(Path(path))
+        rows = tables['item_daily'][['product_key', 'item_name', 'spec', 'source']].drop_duplicates()
+        exact = rows.loc[rows['item_name'].eq(name)]
+        selected = exact if not exact.empty else rows.loc[rows['item_name'].str.contains(name, regex=False, na=False)]
+        return selected.head(10).to_dict('records')
 
     def compare_item(self, path, product_key, start, end):
         from modules.transform.pipelines.db.samjeon_material_agent.analytics import period_result, compare_periods
