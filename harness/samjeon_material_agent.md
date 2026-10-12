@@ -2,11 +2,31 @@
 
 ## 실행 위치와 책임
 
-- 개발: `C:\airflow_samjeon_agent`, 브랜치 `feat/samjeon-material-agent-1006`.
-- Windows 서비스가 Telegram·Codex·SQLite·PDF를 소유한다. 대표님은 Telegram 개인 대화에 접속한다.
+- 코드 수정·검증·gitpush는 개발 PC에서만 한다. 대표님 노트북은 GitHub `main`을 받아 실행하며 코드를 수정하지 않는다.
+- 대표님 Windows 노트북의 작업 스케줄러가 Telegram·선택적 Codex·SQLite·PDF 서비스를 실행한다. 대표님은 같은 노트북 또는 휴대폰의 Telegram 개인 대화에 접속한다.
 - 계산은 `samjeon_material_agent`, 대화·알림은 별도 `samjeon_material_service` 패키지다. 서비스 수정은 마트 계산 해시에 포함되지 않는다.
-- `DB_Samjeon_Material_Agent_Dags`는 확인 요청 파일만 큐에 쓰며 SQLite나 Telegram에 접근하지 않는다.
+- `DB_Samjeon_Material_Agent_Dags`의 로컬 큐는 다른 PC의 서비스에 자동 전달되지 않는다. 노트북 서비스는 게시 스냅샷의 `latest.json`을 자체 감시한다.
 - 새 DAG는 일시중지, `SAMJEON_MATERIAL_AGENT_ENABLED=false`, 서비스 `enabled=false`, `auto_send=false`, AI 비활성이 기본이다.
+
+## 새 노트북 준비
+
+1. Windows에서 Git, Python 3.12, Telegram Desktop을 설치한다. WSL은 이 서비스의 실행 조건이 아니다. ChatGPT Business Standard 로그인은 설치 작업에 사용할 수 있으나 Telegram 봇의 Codex CLI 인증을 자동으로 대신하지 않는다.
+2. GitHub의 `main`을 `C:\airflow_samjeon_agent`에 복제한다. 이후 코드 갱신은 변경 파일이 없는지 확인하고 `git pull --ff-only origin main`만 사용한다. 노트북에서 코드 수정·커밋·push를 하지 않는다.
+3. 저장소 루트에서 `scripts/setup_samjeon_material_agent.ps1`을 실행한다. 이 스크립트는 Python 3.12 전용 `.venv`와 최소 의존성을 준비하고 `doctor`를 실행한다. 설정·토큰·스냅샷이 없는 첫 결과는 미준비로 표시되는 것이 정상이다.
+4. 실제 서비스 설정은 저장소 밖의 `C:\Local_DB\samjeon_material_agent\service.json`에 둔다. `state_root`는 같은 로컬 폴더 아래로, `snapshot_root`는 `latest.json`과 `snapshots/`가 있는 승인된 v3 게시 루트로 지정한다. 원본 자료와 게시본은 서비스가 읽기 전용으로 사용한다.
+5. 전용 Telegram 봇 토큰은 노트북의 서비스 실행 계정 환경변수 `SAMJEON_TELEGRAM_BOT_TOKEN`에 보관한다. 대표님 Telegram 계정의 숫자 사용자·개인 대화 ID만 허용 목록에 넣는다. 토큰과 실제 ID는 Git에 저장하지 않는다.
+6. 설정의 `enabled=true`, `auto_send=false`로 대화·PDF를 먼저 시험한다. `doctor`에서 v3 판본과 준비 상태를 확인한 후 `auto_send=true`와 작업 스케줄러 `-Enable`을 적용한다. 노트북은 로그인 상태·전원·네트워크를 유지하고 절전을 해제해야 응답한다.
+
+```powershell
+winget install --id Git.Git --exact --source winget
+winget install --id Python.Python.3.12 --exact --source winget
+winget install --id Telegram.TelegramDesktop --exact --source winget
+git clone --branch main https://github.com/doridang001-lab/doridang_airflow.git C:\airflow_samjeon_agent
+cd C:\airflow_samjeon_agent
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup_samjeon_material_agent.ps1
+```
+
+현재 OneDrive의 `latest.json`은 v3가 아니다. v3 분류·마감 검수와 게시 승인이 끝나기 전에는 실자료 자동 알림을 켜지 않는다. OneDrive의 파일·동기화 설정 변경은 승인 후 진행한다.
 
 ## 준비와 명령
 
