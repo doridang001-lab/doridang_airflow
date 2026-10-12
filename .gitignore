@@ -98,6 +98,10 @@ pnpm-debug.log*
 !phases/
 !phases/**/*.json
 config/*.json
+!config/samjeon_material_agent.example.json
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 
 # Downloaded/temporary files
 download/

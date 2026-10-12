@@ -4038,3 +4038,10 @@
 - 변경: 16:22 메타DB 덤프 → compose stop → Docker 종료·`wsl --shutdown` → 현재 vhdx(disk 25.7GB, main 0.1GB)를 `E:\DockerData\wsl`로 복사 → **`CustomWslDistroDir` = `E:\DockerData\wsl`** 설정(4.55에서 `DataFolder`는 Hyper-V vm-data용이라 무시됨, 실측) → `wsl --unregister docker-desktop` 후 Docker 재시작 → distro BasePath·파일 잠금이 E:로 이동한 것 확인 → 컨테이너 자동 기동. 다운타임 약 6분, 놓친 스케줄 없음.
 - 검증: 9개 컨테이너 healthy, 웹 /health 200, dag_run 27,227·variable 118·unpaused 74·import error 0, doridangdb 7테이블. 옛 166GB 사본 2벌 삭제 → E: 여유 23.7GB → 348.5GB.
 - 남은 위험: `C:\Users\민준\AppData\Local\Docker\wsl\disk\docker_data.vhdx`(25.7GB, 미사용)는 롤백용으로 하루 두고 삭제 예정. Docker Desktop을 GUI에서 "Disk image location"으로 다시 바꾸면 이 설정과 충돌할 수 있음.
+
+### 2026-10-12 삼전점 텔레그램 대화형 관리 에이전트
+- 대상: C:\airflow_samjeon_agent / feat/samjeon-material-agent-1006; 마트 v3·별도 서비스·보고 DAG·실행 스크립트·PRD v1.3.
+- 변경: 의심 항목 선제 안내, 후속 질문·품목 선택·사용자 설명, 동일 판본 PDF, SQLite·취소·재시작·중복 발송 방지, Codex 조회 계약을 구현.
+- 검증: 81개 테스트·하네스 100 DAG 분류·격리 컨테이너 두 DAG import 통과; 실제 v3 대화 시연·4쪽 PDF 검수, 원천·스냅샷 121파일 해시 불변.
+- 게시: 새 기능 브랜치에서 검토한 파일만 gitpush·main 대상 PR 생성. 기존 마트 PR #21의 구현을 포함하는 v3 판본임을 명시.
+- 남은 위험: 실제 봇·대표님 ID·Codex 무인 실행과 추가 사용 통제 미검증. OneDrive 게시·자동 발송·작업스케줄러·운영 배포는 비활성.

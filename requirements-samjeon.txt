@@ -1,0 +1,7 @@
+# Windows Python 3.12에서 검증한 서비스·마트 최소 의존성
+pandas==2.1.4
+numpy==1.26.4
+pyarrow==22.0.0
+pendulum==3.1.0
+tzdata==2025.3
+reportlab==5.0.1

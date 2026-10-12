@@ -1,26 +1,32 @@
 # modules/__init__.py
 
 # ========== 설정 ==========
-from modules.common.config import DB_CONFIG, get_db_url, nb_get_db_url, CHANNELS, STORES
 
 # ========== 스케줄 ==========
-from modules.transform.utility.schedule import (
-    SMD_ORDERS_TIME, SMD_VISIT_LOG,
-    SMP_TOORDER_VOC_TIME, SMP_FDAM_CS_TIME,
-)
 
 # ========== 이메일 ==========
-from modules.transform.utility.mailer import send_email, text_to_html
 
 # ========== transform ==========
-from modules.transform.aggregate import agg_df
-from modules.transform.key_generator import add_surrogate_key
-from modules.transform.utility.io import read_csv_glob, load_data, preprocess_df
 
 
 # ========== Lazy imports (circular import 방지) ==========
 def __getattr__(name):
     """modules 패키지 레벨 lazy import"""
+    # 읽기 전용 CLI import가 메일 설정·저장 경로를 초기화하지 않도록 한다.
+    groups = {
+        'modules.common.config': {'DB_CONFIG', 'get_db_url', 'nb_get_db_url', 'CHANNELS', 'STORES'},
+        'modules.transform.utility.schedule': {'SMD_ORDERS_TIME', 'SMD_VISIT_LOG', 'SMP_TOORDER_VOC_TIME', 'SMP_FDAM_CS_TIME'},
+        'modules.transform.utility.mailer': {'send_email', 'text_to_html'},
+        'modules.transform.aggregate': {'agg_df'},
+        'modules.transform.key_generator': {'add_surrogate_key'},
+        'modules.transform.utility.io': {'read_csv_glob', 'load_data', 'preprocess_df'},
+    }
+    for module, names in groups.items():
+        if name in names:
+            from importlib import import_module
+            value = getattr(import_module(module), name)
+            globals()[name] = value
+            return value
 
     # DB
     _DB = {'read_table', 'db_read_table', 'nb_read_table'}

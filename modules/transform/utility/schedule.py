@@ -41,6 +41,8 @@ SMP_SNS_SNAPSHOT_TIME       = "0 4 * * *"   # 매일 04:00 (SNS 팔로워/친구
 
 DB_COUPANG_MACRO_TIME = "30,50 * * * *"  # 매시 30분, 50분 실행 (KST)
 DB_UNIFIED_SALES_NIGHTLY_TIME = "0 22 * * *"  # 전체기간 계산 전용
+DB_SAMJEON_MATERIAL_MART_TIME = "15,45 9-11 * * *"
+DB_SAMJEON_MATERIAL_AGENT_TIME = "0,30 9-12 * * *"
 DB_UNIFIED_SALES_TIME        = "40 7 * * *"  # 매일 07:40 실행 (08:10 전 완료 목표)
 DB_UNIFIED_SALES_GUARD_TIME  = "15 8 * * *"  # 매일 08:15 실행 (07:40 미생성 감시/보정)
 DB_ORDER_CROSS_ANALYSIS_TIME = "10,40 8-23 * * *"  # 입력 변경 감지, 최근 3일 우선 + 과거 최대 10일

@@ -1,0 +1,19 @@
+{
+  "state_root": "../.tmp/samjeon-service",
+  "snapshot_root": "",
+  "snapshot": "",
+  "enabled": false,
+  "auto_send": false,
+  "allowed_users": [],
+  "allowed_chats": [],
+  "recipient": null,
+  "token_env": "SAMJEON_TELEGRAM_BOT_TOKEN",
+  "ai_enabled": false,
+  "ai_verified": false,
+  "codex_executable": "codex",
+  "model": "gpt-6-astra",
+  "font_path": "C:/Windows/Fonts/malgun.ttf",
+  "notification_start": "09:30",
+  "notification_end": "21:00",
+  "poll_seconds": 60
+}
