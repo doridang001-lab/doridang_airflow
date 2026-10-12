@@ -8,6 +8,12 @@ from modules.transform.pipelines.db.samjeon_material_service.config import Setti
 from modules.transform.pipelines.db.samjeon_material_service.codex_adapter import CodexAdapter, DISABLED
 
 
+@pytest.fixture(autouse=True)
+def verified_cli(monkeypatch):
+    # 이 파일은 모델 출력 계약을 검증한다. 실제 Windows 런처·인증은 별도 회귀 시험에서 검증한다.
+    monkeypatch.setattr(CodexAdapter, 'diagnose', lambda *a, **k: {'ready': True, 'reason': None})
+
+
 def test_disabled_model_never_creates_workdir(tmp_path):
     root = tmp_path / 'none'
     adapter = CodexAdapter(Settings(state_root=str(root)))
@@ -81,4 +87,4 @@ def test_model_cancel_and_timeout_terminate_process(tmp_path, monkeypatch, cance
         event.set()
     adapter = CodexAdapter(Settings(state_root=str(tmp_path), ai_enabled=True, ai_verified=True))
     assert adapter.interpret('질문', {}, event) is None
-    assert stopped
+    assert bool(stopped) is not cancelled

@@ -1,0 +1,17 @@
+/AGENTS.md
+/.gitignore
+/.gitattributes
+/requirements-samjeon.txt
+/config/samjeon_material_agent.example.json
+/config/samjeon-runtime.paths
+/harness/samjeon_material_agent.md
+/modules/__init__.py
+/modules/transform/__init__.py
+/modules/transform/pipelines/__init__.py
+/modules/transform/pipelines/db/samjeon_material_agent/
+/modules/transform/pipelines/db/samjeon_material_service/
+/scripts/setup_samjeon_material_agent.ps1
+/scripts/start_samjeon_material_agent.ps1
+/scripts/register_samjeon_material_agent_task.ps1
+/scripts/update_samjeon_material_agent.ps1
+/scripts/set_samjeon_sparse.ps1
