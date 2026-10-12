@@ -4038,3 +4038,21 @@
 - 변경: 16:22 메타DB 덤프 → compose stop → Docker 종료·`wsl --shutdown` → 현재 vhdx(disk 25.7GB, main 0.1GB)를 `E:\DockerData\wsl`로 복사 → **`CustomWslDistroDir` = `E:\DockerData\wsl`** 설정(4.55에서 `DataFolder`는 Hyper-V vm-data용이라 무시됨, 실측) → `wsl --unregister docker-desktop` 후 Docker 재시작 → distro BasePath·파일 잠금이 E:로 이동한 것 확인 → 컨테이너 자동 기동. 다운타임 약 6분, 놓친 스케줄 없음.
 - 검증: 9개 컨테이너 healthy, 웹 /health 200, dag_run 27,227·variable 118·unpaused 74·import error 0, doridangdb 7테이블. 옛 166GB 사본 2벌 삭제 → E: 여유 23.7GB → 348.5GB.
 - 남은 위험: `C:\Users\민준\AppData\Local\Docker\wsl\disk\docker_data.vhdx`(25.7GB, 미사용)는 롤백용으로 하루 두고 삭제 예정. Docker Desktop을 GUI에서 "Disk image location"으로 다시 바꾸면 이 설정과 충돌할 수 있음.
+
+### 2026-10-12 송파삼전점 원재료 에이전트 mart DAG 구현
+- 대상: `DB_Samjeon_Material_Mart_Dags`, 변환 모듈, 스케줄·하네스 문서.
+- 변경: 57일 매출·푸드가이드·물류담 재집계, 부식 계정 직원식대 분리, 근거·품질·분류 검수·에이전트 문맥, 해시 검증 후 버전 스냅샷 게시 설계.
+- 검증: 단위 테스트 3건, 실제 원천 읽기 전용 집계 14,495 매출 행·648 구매 행 대사, 하네스 validate 통과.
+- 남은 위험: 분류·마감 설정 미입력 구간은 잠정이며 구매율·예측을 보류한다. DAG는 최초 일시중지이고 OneDrive 게시 실행은 승인 후 수행한다.
+
+### 2026-10-12 송파삼전점 홀 소계·LLM 해석 가이드 추가
+- 대상: 원재료 mart 변환, `agent_guide.md`, 하네스 문서와 테스트.
+- 변경: `okpos` 순매출을 일별·월 누적 홀 소계로 제공하고, 가이드를 스냅샷 판본·manifest·agent_context에 연결.
+- 검증: 합성 테스트 5건과 실제 원천 읽기 전용 집계 14,495 매출 행·648 구매 행 대사 통과.
+- 남은 위험: 다른 매출 원천의 채널은 확정하지 않았고 OneDrive 게시 실행은 승인 후 수행한다.
+
+### 2026-10-12 mart 게시 게이트와 실행 이력 확인
+- 대상: 송파삼전점 mart DAG 게시 태스크와 운영 문서.
+- 확인: v1 DAG 정기·수동 실행 2건 성공, OneDrive에 v1 스냅샷 1개와 latest.json 생성. v2는 게시되지 않음.
+- 변경: DAG 일시중지 확인 및 `SAMJEON_MATERIAL_MART_PUBLISH_ENABLED=true`일 때만 게시하도록 기본 차단.
+- 남은 위험: 기존 v1 OneDrive 산출물은 승인 없이 수정·삭제하지 않았으며 별도 운영 판단이 필요하다.
