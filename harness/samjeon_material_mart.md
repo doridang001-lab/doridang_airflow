@@ -5,6 +5,7 @@
 - DAG: `dags/db/DB_Samjeon_Material_Mart_Dags.py`
 - 변환: `modules/transform/pipelines/db/samjeon_material_agent/mart.py`
 - 신규 DAG는 일시중지 상태로 등록한다. 일정은 한국시간 09:15~11:45에 30분 간격이다.
+- `publish` 태스크는 Airflow Variable `SAMJEON_MATERIAL_MART_PUBLISH_ENABLED=true`일 때만 OneDrive에 쓴다. 기본값은 `false`이며 미설정 시 게시를 건너뛴다. 승인 전에는 DAG 일시중지도 유지한다.
 - 기본 기준일은 한국시간 전일이다. 수동 실행은 `{"sale_date":"YYYY-MM-DD"}`로 지정한다.
 - 매 실행마다 기준일까지 57일을 재계산한다. XCom에는 파일 경로와 해시가 담긴 작은 계획만 보낸다.
 
@@ -27,6 +28,7 @@
 - 완전한 날짜만 구매율·7일 비교에 사용한다. 월말 전망은 완료된 동일 요일의 최근 8주 매출·매입 표본이 잔여일마다 4개 이상일 때만 낸다.
 - 검증 후 버전 폴더를 게시하고, 기준일이 전일이면 `latest.json`을 마지막에 교체한다. 과거 날짜 수동 실행은 최신 포인터를 바꾸지 않는다.
 - OneDrive 게시를 실제 실행하려면 저장소의 OneDrive 변경 승인 규칙을 지킨다.
+- 2026-10-12에 v1 DAG가 정기·수동 실행돼 v1 스냅샷 1개를 OneDrive에 게시한 사실을 확인했다. DAG를 일시중지했으며 기존 산출물은 별도 승인 없이 수정·삭제하지 않는다.
 
 ## 로컬 검증
 

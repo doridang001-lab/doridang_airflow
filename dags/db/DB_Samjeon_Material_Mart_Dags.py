@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pendulum
 from airflow import DAG
+from airflow.exceptions import AirflowSkipException
+from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 
 from modules.transform.pipelines.db.samjeon_material_agent.mart import (
@@ -22,6 +24,10 @@ def _plan(**context):
 
 def _run(step, **context):
     plan = context["ti"].xcom_pull(task_ids="resolve_inputs")
+    if step == "publish" and str(Variable.get(
+        "SAMJEON_MATERIAL_MART_PUBLISH_ENABLED", default_var="false"
+    )).strip().lower() != "true":
+        raise AirflowSkipException("OneDrive 게시 승인이 없어 스냅샷 게시를 건너뜁니다")
     functions = {
         "sales": stage_sales, "purchases": stage_purchases,
         "aggregate": stage_aggregate, "validate": validate_snapshot,
