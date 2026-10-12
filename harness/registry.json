@@ -9,6 +9,7 @@
     {"id": "private", "patterns": ["dags/private/*.py"], "guidance": ["dags/CLAUDE.md"], "harness_docs": []}
   ],
   "overrides": [
+    {"dag": "dags/db/DB_Samjeon_Material_Mart_Dags.py", "harness_docs": ["samjeon_material_mart"]},
     {"dag": "dags/db/DB_OrderCrossAnalysis_Dags.py", "harness_docs": ["order_cross_analysis"]},
     {"dag": "dags/db/DB_Beamin_Macro_Backfill_Dags.py", "harness_docs": ["baemin_macro"]},
     {"dag": "dags/db/DB_Beamin_Macro_Backfill_Retry_Dags.py", "harness_docs": ["baemin_macro"]},
