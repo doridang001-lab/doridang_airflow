@@ -64,6 +64,31 @@ def test_valid_model_query(tmp_path, monkeypatch):
     assert adapter.interpret('직원 먹는 비용', {}, threading.Event())['query']['intent'] == 'staff_meal'
 
 
+@pytest.mark.parametrize('event_type', ['command_execution', 'file_change', 'mcp_tool_call', 'web_search', 'unknown_tool'])
+def test_chat_rejects_tool_events_and_keeps_sandbox(tmp_path, monkeypatch, event_type):
+    from modules.transform.pipelines.db.samjeon_material_service import codex_adapter as mod
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, args, **kwargs):
+            assert args[args.index('--sandbox') + 1] == 'read-only'
+            assert all(feature in args for feature in DISABLED)
+            assert 'OPENAI_API_KEY' not in kwargs['env'] and 'SAMJEON_TELEGRAM_BOT_TOKEN' not in kwargs['env']
+            self.stdin = (Path(kwargs['cwd']) / 'input').open('wb')
+            Path(args[args.index('--output-last-message') + 1]).write_text(json.dumps(
+                {'kind': 'reply', 'text': '안녕하세요.'}), encoding='utf-8')
+            kwargs['stdout'].write((json.dumps({'item': {'type': event_type}}) + '\n').encode())
+            kwargs['stdout'].flush()
+
+        def poll(self):
+            return 0
+    monkeypatch.setattr(mod.shutil, 'which', lambda _: 'fake')
+    monkeypatch.setattr(mod.subprocess, 'Popen', FakeProcess)
+    adapter = CodexAdapter(Settings(state_root=str(tmp_path), ai_enabled=True, ai_verified=True))
+    assert adapter.chat('안녕', {'history': []}, threading.Event()) is None
+    assert adapter.last_error == 'unexpected_tool'
+
+
 @pytest.mark.parametrize('cancelled,timeout', [(True, False), (False, True)])
 def test_model_cancel_and_timeout_terminate_process(tmp_path, monkeypatch, cancelled, timeout):
     from modules.transform.pipelines.db.samjeon_material_service import codex_adapter as mod

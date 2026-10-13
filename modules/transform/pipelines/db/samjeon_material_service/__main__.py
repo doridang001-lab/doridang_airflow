@@ -83,6 +83,17 @@ def doctor(settings):
         if result.get('as_of_date') != str(datetime.now(ZoneInfo('Asia/Seoul')).date() - timedelta(days=1)):
             blocked.append('전일 자료가 최신 게시본이어야 합니다')
     result.update(ready=not blocked, blocked_reasons=blocked)
+    conversation_blocked = [label for key, label in (
+        ('token_present', '봇 토큰 없음'), ('users_registered', '사용자 미등록'),
+        ('chat_registered', '대화 미등록'), ('pdf_available', '런타임 의존성 없음')) if not result[key]]
+    if not cli['ready']:
+        conversation_blocked.append('Codex 연결 준비 필요')
+    if settings.auto_send:
+        conversation_blocked.append('대화 전용 배포는 auto_send=false가 필요합니다')
+    result.update(conversation_deployable=not conversation_blocked,
+                  conversation_blocked_reasons=conversation_blocked,
+                  conversation_ready=not conversation_blocked and settings.enabled and settings.ai_enabled and settings.ai_verified,
+                  data_ready='snapshot_id' in result)
     return result
 
 
@@ -94,6 +105,8 @@ def main(argv=None):
         cmd.add_argument('--config', type=Path)
         cmd.add_argument('--dry-run', action='store_true')
         cmd.add_argument('--require-ready', action='store_true')
+        if name == 'doctor':
+            cmd.add_argument('--require-conversation-deployable', action='store_true')
         if name == 'report':
             cmd.add_argument('--snapshot', type=Path, required=True)
     args = parser.parse_args(argv)
@@ -120,13 +133,22 @@ def main(argv=None):
             verified = True
         except (ValueError, TypeError):
             verified = False
-        return {'ready': verified, 'codex': probe, 'plan_valid': bool(plan), 'answer_valid': verified,
+        first = adapter.chat('안녕. 오늘 대화의 기억 단어는 해바라기야. 기억해 줘.', {'history': []},
+                             threading.Event()) if probe['ready'] else None
+        second = adapter.chat('아까 내가 알려준 기억 단어가 뭐였지?', {'history': [{
+            'question': '안녕. 오늘 대화의 기억 단어는 해바라기야. 기억해 줘.',
+            'answer': first['text']}]}, threading.Event()) if first and first['kind'] == 'reply' else None
+        chat_verified = bool(first and second and second['kind'] == 'reply' and '해바라기' in second['text'])
+        ready = verified and chat_verified
+        return {'ready': ready, 'codex': probe, 'plan_valid': bool(plan), 'answer_valid': verified,
+                'conversation_valid': bool(first and first['kind'] == 'reply'), 'followup_valid': chat_verified,
                 'error': adapter.last_error, 'settings_changed': False,
                 'additional_spend_controls_verified': False,
-                '_exit_code': 2 if args.require_ready and not verified else 0}
+                '_exit_code': 2 if args.require_ready and not ready else 0}
     if args.command == 'doctor' or (args.command == 'service' and args.dry_run):
         result = doctor(settings)
-        result['_exit_code'] = 2 if args.require_ready and not result['ready'] else 0
+        failed = (args.require_ready and not result['ready']) or (getattr(args, 'require_conversation_deployable', False) and not result['conversation_deployable'])
+        result['_exit_code'] = 2 if failed else 0
         return result
     if args.command == 'report':
         from dataclasses import replace

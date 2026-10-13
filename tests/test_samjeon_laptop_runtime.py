@@ -75,11 +75,12 @@ def test_snapshot_sync_fallback_and_return_to_latest(tmp_path):
     repo = Repository(Settings(snapshot_root=str(published)))
     assert repo.current()[0] == target
     latest.write_text('{', encoding='utf-8')
-    assert repo.current()[0] == target
-    assert repo.fallback_reason
+    with pytest.raises(ValueError):
+        repo.current()
     restarted = Repository(repo.settings)
     restarted.last_good = repo.last_good
-    assert restarted.current()[0] == target
+    with pytest.raises(ValueError):
+        restarted.current()
     latest.write_text(json.dumps(pointer), encoding='utf-8')
     assert repo.current()[0] == target and repo.fallback_reason is None
     (target / 'agent_context.json').write_text('{}', encoding='utf-8')
@@ -132,7 +133,8 @@ def test_powershell_syntax_and_battery_settings():
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows 배포 통합 시험')
-def test_update_and_rollback_keep_state_and_control_task(tmp_path):
+@pytest.mark.parametrize('conversation_only', [False, True])
+def test_update_and_rollback_keep_state_and_control_task(tmp_path, conversation_only):
     """실제 Git·venv·PowerShell로 갱신/실패/복구. 작업 스케줄러 API만 가짜로 교체한다."""
     source, clone = tmp_path / 'origin', tmp_path / 'laptop'
     source.mkdir()
@@ -148,7 +150,7 @@ def test_update_and_rollback_keep_state_and_control_task(tmp_path):
     package.mkdir(parents=True)
     (package / '__init__.py').write_text('', encoding='ascii')
     (package / 'config.py').write_text('import json\nfrom types import SimpleNamespace\nclass Settings:\n @staticmethod\n def load(p):\n  return SimpleNamespace(**json.load(open(p)))\n', encoding='ascii')
-    (package / '__main__.py').write_text('from contextlib import nullcontext\nfrom pathlib import Path\ndef instance_lock(root): return nullcontext()\nif __name__ == "__main__":\n print("diagnostic")\n raise SystemExit(2 if Path("version.txt").read_text() == "bad" else 0)\n', encoding='ascii')
+    (package / '__main__.py').write_text('import sys\nfrom contextlib import nullcontext\nfrom pathlib import Path\ndef instance_lock(root): return nullcontext()\nif __name__ == "__main__":\n print("diagnostic",sys.argv)\n raise SystemExit(2 if Path("version.txt").read_text() == "bad" else 0)\n', encoding='ascii')
     (source / 'version.txt').write_text('old', encoding='ascii')
     def git(*args, cwd=source):
         return subprocess.run(['git', *args], cwd=cwd, check=True, capture_output=True, encoding='utf-8').stdout.strip()
@@ -166,25 +168,31 @@ def test_update_and_rollback_keep_state_and_control_task(tmp_path):
     config.write_text(json.dumps({'state_root': str(state)}), encoding='ascii')
     log = tmp_path / 'scheduler.txt'
     wrapper = tmp_path / 'run.ps1'
-    wrapper.write_text('param([string]$Script,[string]$Config,[switch]$Rollback)\n'
+    wrapper.write_text('param([string]$Script,[string]$Config,[switch]$Rollback,[switch]$ConversationOnly,[string]$BootstrapPreviousCommit="")\n'
         'function Get-ScheduledTask { [pscustomobject]@{State="Ready"} }\n'
         'function Disable-ScheduledTask { param($TaskName); Add-Content $env:SAMJEON_TEST_LOG disable }\n'
         'function Stop-ScheduledTask { param($TaskName); Add-Content $env:SAMJEON_TEST_LOG stop }\n'
         'function Enable-ScheduledTask { param($TaskName); Add-Content $env:SAMJEON_TEST_LOG enable }\n'
         'function Start-ScheduledTask { param($TaskName); Add-Content $env:SAMJEON_TEST_LOG start }\n'
-        '& $Script -Config $Config -Rollback:$Rollback\n', encoding='ascii')
+        '& $Script -Config $Config -Rollback:$Rollback -ConversationOnly:$ConversationOnly -BootstrapPreviousCommit $BootstrapPreviousCommit\n', encoding='ascii')
     env = dict(os.environ, SAMJEON_TEST_LOG=str(log))
-    def deploy(rollback=False):
+    def deploy(rollback=False, bootstrap=None):
         return subprocess.run(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(wrapper),
             '-Script', str(clone / 'scripts/update_samjeon_material_agent.ps1'), '-Config', str(config),
-            *(['-Rollback'] if rollback else [])], cwd=clone, env=env, capture_output=True, encoding='utf-8', errors='replace')
+            *(['-Rollback'] if rollback else []), *(['-ConversationOnly'] if conversation_only else []),
+            *(['-BootstrapPreviousCommit', bootstrap] if bootstrap else [])], cwd=clone, env=env, capture_output=True, encoding='utf-8', errors='replace')
     (source / 'version.txt').write_text('new', encoding='ascii')
     commit('new')
-    result = deploy()
+    previous = git('rev-parse', 'HEAD', cwd=clone)
+    if conversation_only:
+        git('pull', '--ff-only', 'origin', 'main', cwd=clone)
+    result = deploy(bootstrap=previous if conversation_only else None)
     assert result.returncode == 0, result.stdout + result.stderr
     assert (clone / 'version.txt').read_text() == 'new'
     assert json.loads((state / 'deployment.json').read_text(encoding='utf-8-sig'))['status'] == 'updated'
-    assert log.read_text().splitlines() == ['disable', 'stop', 'enable', 'start']
+    assert json.loads((state / 'deployment.json').read_text(encoding='utf-8-sig'))['previous_commit'] == previous
+    assert log.read_text().splitlines() == (['disable', 'stop'] if conversation_only else ['disable', 'stop', 'enable', 'start'])
+    assert ('--require-conversation-deployable' if conversation_only else '--require-ready') in result.stdout
     (source / 'version.txt').write_text('bad', encoding='ascii')
     commit('bad')
     result = deploy()
@@ -195,3 +203,51 @@ def test_update_and_rollback_keep_state_and_control_task(tmp_path):
     assert (clone / 'version.txt').read_text() == 'new'
     assert (state / 'state.sqlite3').read_bytes() == b'preserve-outbox-and-conversation'
     assert git('status', '--porcelain', cwd=clone) == ''
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows 시작 스크립트 회귀 시험')
+def test_start_default_python_reaches_disabled_guard_without_writing(tmp_path):
+    config = tmp_path / 'service.json'
+    config.write_text(json.dumps({'state_root': str(tmp_path / 'state')}), encoding='utf-8')
+    result = subprocess.run(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+        str(ROOT / 'scripts/start_samjeon_material_agent.ps1'), '-Config', str(config)],
+        cwd=tmp_path, capture_output=True, encoding='utf-8', errors='replace', timeout=30)
+    assert result.returncode != 0
+    assert 'settings.ready()' in result.stderr
+    assert 'Join-Path' not in result.stderr
+    assert not (tmp_path / 'state').exists()
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows 작업 스케줄러 실행 계약')
+def test_scheduler_action_starts_default_python_in_isolated_runtime(tmp_path):
+    import venv
+    root = tmp_path / 'runtime with spaces'
+    scripts = root / 'scripts'
+    scripts.mkdir(parents=True)
+    for name in ('start_samjeon_material_agent.ps1', 'register_samjeon_material_agent_task.ps1'):
+        shutil.copy2(ROOT / 'scripts' / name, scripts / name)
+    venv.EnvBuilder(with_pip=False).create(root / '.venv')
+    package = root / 'modules/transform/pipelines/db/samjeon_material_service'
+    package.mkdir(parents=True)
+    (package / '__main__.py').write_text('import sys,json\nprint(json.dumps(sys.argv[1:]))\n', encoding='ascii')
+    config = tmp_path / 'service.json'
+    config.write_text('{}', encoding='ascii')
+    action = tmp_path / 'action.json'
+    wrapper = tmp_path / 'scheduler.ps1'
+    wrapper.write_text('param($Script,$Config,$Output)\n'
+        'function New-ScheduledTaskAction { param($Execute,$Argument,$WorkingDirectory); [pscustomobject]@{Execute=$Execute;Argument=$Argument;WorkingDirectory=$WorkingDirectory} }\n'
+        'function New-ScheduledTaskTrigger { param([switch]$AtLogOn,$User); @{} }\n'
+        'function New-ScheduledTaskPrincipal { param($UserId,$LogonType,$RunLevel); @{} }\n'
+        'function New-ScheduledTaskSettingsSet { param($MultipleInstances,$RestartCount,$RestartInterval,$ExecutionTimeLimit,[switch]$StartWhenAvailable,[switch]$AllowStartIfOnBatteries,[switch]$DontStopIfGoingOnBatteries); [pscustomobject]@{Enabled=$false} }\n'
+        'function New-ScheduledTask { param($Action,$Trigger,$Principal,$Settings); [pscustomobject]@{Action=$Action;Settings=$Settings} }\n'
+        'function Register-ScheduledTask { param($TaskName,$InputObject,[switch]$Force); $InputObject.Action | ConvertTo-Json | Set-Content -LiteralPath $Output -Encoding utf8 }\n'
+        '& $Script -Config $Config\n', encoding='ascii')
+    result = subprocess.run(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(wrapper),
+        '-Script', str(scripts / 'register_samjeon_material_agent_task.ps1'), '-Config', str(config), '-Output', str(action)],
+        capture_output=True, encoding='utf-8', errors='replace', timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    command = json.loads(action.read_text(encoding='utf-8-sig'))
+    started = subprocess.run(command['Execute'] + ' ' + command['Argument'], cwd=command['WorkingDirectory'],
+        capture_output=True, encoding='utf-8', errors='replace', timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+    assert started.returncode == 0, started.stdout + started.stderr
+    assert json.loads(started.stdout) == ['service', '--config', str(config)]

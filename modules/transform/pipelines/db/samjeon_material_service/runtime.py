@@ -9,10 +9,10 @@ from pathlib import Path
 import threading
 
 from .storage import Store
-from .repository import Repository
+from .repository import Repository, SnapshotUnavailable
 from .telegram import Telegram, DeliveryError
-from .codex_adapter import CodexAdapter
-from .conversation import parse, HELP
+from .codex_adapter import CodexAdapter, redact, validate_chat
+from .conversation import parse, route, period, help_text, DATA_UNAVAILABLE, AI_UNAVAILABLE, CLARIFY
 from .presentation import briefing, alert_items, buttons, chunks, render_query
 from .pdf_report import create_pdf
 from .grounded import validate_plan, make_facts, render_answer
@@ -56,7 +56,10 @@ class Service:
                     **self.store.health()})
 
     async def current(self):
-        result = await asyncio.to_thread(self.repo.current)
+        try:
+            result = await asyncio.to_thread(self.repo.current)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise SnapshotUnavailable('게시본 검증 실패') from exc
         if not getattr(self.repo, 'fallback_reason', None):
             self.store.put('last_valid_snapshot', str(result[0]))
         return result
@@ -77,10 +80,11 @@ class Service:
                 f"{analysis['date_from']} ~ {analysis['date_to']} 상세 근거입니다. 대화와 같은 분석 판본입니다.",
                 document=document, cancelled=cancelled)
 
-    async def analyze_text(self, uid, user, chat, text, path, context, analysis, cancelled):
+    async def analyze_text(self, uid, user, chat, text, path, context, analysis, cancelled, request_date=None, resolved=None):
         history = self.store.turns(chat, analysis, self.clock())
         plan = await asyncio.to_thread(self.model.plan, text, {
-            'snapshot_date': context['as_of_date'], 'date_from': analysis['date_from'],
+            'snapshot_date': context['as_of_date'], 'request_date': request_date,
+            'resolved_period': list(resolved) if resolved else None, 'date_from': analysis['date_from'],
             'date_to': analysis['date_to'], 'selected_product': analysis.get('focus'),
             'history': [{'question': r['question'], 'answer': r['answer']} for r in history]}, cancelled)
         self.store.put('ai_status', {'checked_at': self.clock().isoformat(),
@@ -102,6 +106,8 @@ class Service:
             await self.send(f'update-{uid}', chat, '이 분석에 설명을 기록했습니다. 다음 분석에 참고하며 원천 검수 승인으로 처리하지 않습니다.', cancelled=cancelled)
             return True
         queries = plan['queries']
+        if resolved:
+            queries = [{**q, 'date_from': resolved[0], 'date_to': resolved[1]} for q in queries]
         periods = {(q['date_from'] or analysis['date_from'], q['date_to'] or analysis['date_to']) for q in queries}
         names = {q['product_name'] for q in queries if q['product_name']}
         if len(periods) != 1 or len(names) > 1:
@@ -156,11 +162,48 @@ class Service:
         rendered += self.data_notice(context)
         self.store.put('ai_status', {'checked_at': self.clock().isoformat(), 'stage': 'answer', 'error': error})
         self.store.save_answer(chat, analysis, notes, rendered)
-        self.store.remember_turn(chat, analysis, text, rendered, self.clock())
-        await self.send(f'update-{uid}', chat, rendered, buttons(analysis['id']), cancelled=cancelled)
+        delivered = await self.send(f'update-{uid}', chat, rendered, buttons(analysis['id']), cancelled=cancelled)
+        if delivered and not cancelled.is_set():
+            self.store.remember_turn(chat, analysis, text, rendered, self.clock())
         return True
 
+    async def chat(self, uid, chat, text, cancelled):
+        answer = None
+        if self.settings.ai_enabled and self.settings.ai_verified and hasattr(self.model, 'chat'):
+            try:
+                history = self.store.chat_turns(chat, self.clock())
+                answer = await asyncio.to_thread(self.model.chat, redact(text, self.settings.token),
+                    redact({'history': [{'question': r['question'], 'answer': r['answer']} for r in history]},
+                           self.settings.token), cancelled)
+                answer = validate_chat(answer) if answer else None
+            except Exception:
+                answer = None
+        if cancelled.is_set() or self.store.cancelled(uid):
+            return True
+        self.store.put('ai_status', {'checked_at': self.clock().isoformat(), 'stage': 'chat',
+                                    'error': None if answer else 'chat_unavailable'})
+        if answer and answer['kind'] == 'data_request':
+            return False
+        rendered = AI_UNAVAILABLE if not answer else CLARIFY if answer['kind'] == 'clarify' else redact(answer['text'], self.settings.token)
+        delivered = await self.send(f'update-{uid}', chat, rendered, cancelled=cancelled)
+        if delivered and answer and answer['kind'] == 'reply' and not cancelled.is_set():
+            self.store.remember_chat(chat, redact(text, self.settings.token), rendered, self.clock())
+            self.store.remember_topic(chat, 'chat', self.clock())
+        return True
+
+    async def help(self):
+        try:
+            await self.current()
+            data_ready = True
+        except SnapshotUnavailable:
+            data_ready = False
+        ai_ready = self.settings.ai_enabled and self.settings.ai_verified
+        if ai_ready and hasattr(self.model, 'diagnose'):
+            ai_ready = (await asyncio.to_thread(self.model.diagnose))['ready']
+        return help_text(ai_ready, data_ready)
+
     async def ingest(self, updates):
+        updates = redact(updates, self.settings.token)
         fresh = [u for u in updates if not self.store.db.execute('SELECT 1 FROM updates WHERE id=?', (u['update_id'],)).fetchone()]
         self.store.receive(updates)
         for update in fresh:
@@ -182,6 +225,7 @@ class Service:
                 await self.send(f"cancel-{update['update_id']}", chat, '진행 중인 요청을 취소했습니다. 이미 전달된 메시지는 대화에 남습니다.')
 
     async def send(self, key, chat, text=None, markup=None, document=None, cancelled=None):
+        text = redact(text, self.settings.token)
         if document is not None:
             self.store.enqueue(key + ':0000', chat, {'method': 'sendDocument', 'document': str(document),
                                                      'caption': text or '같은 분석 판본의 상세 자료입니다.'})
@@ -236,13 +280,27 @@ class Service:
         cancelled = self.cancellations.setdefault(uid, threading.Event())
         self.store.update_status(uid, 'processing')
         try:
-            text = message.get('text', '').strip()
+            text = redact(message.get('text', '').strip(), self.settings.token)
             if len(text) > 4000:
                 raise ValueError('질문을 4,000자 이내로 나눠 보내주세요')
-            if text.split('@')[0] in ('/help', '/start'):
-                await self.send(f'update-{uid}', chat, HELP, cancelled=cancelled)
-                return
             analysis = self.store.context(chat, self.clock())
+            previous_analysis = analysis
+            topic = self.store.topic(chat, self.clock())
+            if not callback:
+                kind = route(text, topic.get('topic') or ('data' if analysis else None))
+                if kind == 'help':
+                    await self.send(f'update-{uid}', chat, await self.help(), cancelled=cancelled)
+                    return
+                if kind == 'clarify':
+                    await self.send(f'update-{uid}', chat, CLARIFY, cancelled=cancelled)
+                    return
+                if kind == 'chat' and await self.chat(uid, chat, text, cancelled):
+                    return
+            self.store.remember_topic(chat, 'data', self.clock())
+            # Telegram의 원래 수신 시각을 사용하여 대기 중 자정을 넘겨도 의미가 변하지 않는다.
+            received = datetime.fromtimestamp(message['date'], KST) if isinstance(message.get('date'), (int, float)) else self.clock()
+            request_date = str(received.astimezone(KST).date())
+            resolved = period(text, request_date) if not callback else None
             if callback:
                 token, separator, action = callback.get('data', '').partition(':')
                 analysis = self.store.analysis(token, chat)
@@ -259,22 +317,45 @@ class Service:
                                'meal': {'action': 'query', 'query': {'intent': 'staff_meal'}}, 'pdf': {'action': 'pdf'}}[action]
             else:
                 request = None
-                if any(word in text for word in ('지금', '최신', '현재')):
+                if resolved or topic.get('topic') == 'chat' or any(word in text for word in ('지금', '최신', '현재')):
                     analysis = None
+            current_path, current_context = await self.current()
+            if (not callback and topic.get('outcome') == 'unavailable'
+                    and text.rstrip('?! .') in ('왜', '왜요', '왜 그래', '왜 그래요', '다시 설명해줘')):
+                await self.send(f'update-{uid}', chat,
+                    '앞선 질문에서는 요청하신 자료의 준비·검증이 끝나지 않아 답하지 못했습니다. 확인할 항목을 다시 말씀해 주세요.',
+                    cancelled=cancelled)
+                self.store.remember_topic(chat, 'data', self.clock(), 'unavailable')
+                return
             if analysis:
                 path = Path(analysis['snapshot'])
-                context = await asyncio.to_thread(self.repo.context, path, analysis['snapshot_id'])
+                try:
+                    context = await asyncio.to_thread(self.repo.context, path, analysis['snapshot_id'])
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    raise SnapshotUnavailable('대화 판본 검증 실패') from exc
             else:
-                path, context = await self.current()
+                path, context = current_path, current_context
                 if cancelled.is_set() or self.store.cancelled(uid):
                     return
-                analysis = self.analysis(chat, path, context, str(uid))
+                if resolved and resolved[1] > context['as_of_date']:
+                    self.store.remember_topic(chat, 'data', self.clock(), 'unavailable')
+                    await self.send(f'update-{uid}', chat, f'{resolved[0]} ~ {resolved[1]} 자료가 아직 준비되지 않았습니다. 준비되면 다시 질문해 주세요.', cancelled=cancelled)
+                    return
+                analysis = self.analysis(chat, path, context, str(uid), *(resolved or (None, None)))
+                if resolved and previous_analysis and previous_analysis.get('focus') and topic.get('topic') == 'data' and any(w in text for w in ('그럼', '그 품목', '그제는')):
+                    self.store.focus(analysis['id'], chat, previous_analysis['focus'])
+                    analysis = self.store.analysis(analysis['id'], chat)
             if not callback:
+                request = parse(text, analysis['date_to'], today=request_date)
+                if request is None and resolved:
+                    request = {'action': 'query', 'query': {'intent': 'compare' if analysis.get('focus') else 'summary', 'date_from': resolved[0], 'date_to': resolved[1]}}
+                    if analysis.get('focus'):
+                        request['query']['product_key'] = analysis['focus']
+                simple_summary = request and request['action'] == 'query' and request['query']['intent'] == 'summary' and not any(w in text for w in ('왜', '원인', '분석'))
                 if (not text.startswith('/') and self.settings.ai_enabled and self.settings.ai_verified
-                        and hasattr(self.model, 'plan')):
-                    if await self.analyze_text(uid, user, chat, text, path, context, analysis, cancelled):
+                        and hasattr(self.model, 'plan') and not simple_summary):
+                    if await self.analyze_text(uid, user, chat, text, path, context, analysis, cancelled, request_date, resolved):
                         return
-                request = parse(text, analysis['date_to'])
             if request is None and not (self.settings.ai_enabled and hasattr(self.model, 'plan')):
                 request = await asyncio.to_thread(self.model.interpret, text,
                     {'date_from': analysis['date_from'], 'date_to': analysis['date_to'],
@@ -288,7 +369,7 @@ class Service:
                 self.store.note(chat, aid, user, text)
                 answer = '알려주신 설명을 이 분석에 기록했습니다. 이어서 설명드릴 때 함께 표시하겠습니다. 원천 금액과 품목·마감 검수 상태는 그대로 유지합니다.'
             elif request['action'] == 'help':
-                answer = HELP
+                answer = await self.help()
             elif request['action'] == 'pdf':
                 await self.pdf(uid, chat, analysis, cancelled)
                 return
@@ -298,7 +379,7 @@ class Service:
                     result = await asyncio.to_thread(self.repo.query, path, 'compare', analysis['date_from'],
                                                      analysis['date_to'], product_key=analysis['focus'])
                     answer = render_query(result)
-                elif analysis['date_to'] != context['as_of_date']:
+                elif (analysis['date_to'] != context['as_of_date'] or analysis['date_from'] != analysis['date_to'][:7] + '-01'):
                     result = await asyncio.to_thread(self.repo.query, path, 'anomalies', analysis['date_from'], analysis['date_to'])
                     answer = render_query(result)
                 else:
@@ -342,13 +423,19 @@ class Service:
                 if not callback and not text.startswith('/') and self.settings.ai_enabled and getattr(self.model, 'last_error', None):
                     answer = 'AI 연결을 사용할 수 없어 기본 조회로 안내합니다.\n\n' + answer
                 self.store.remember(chat, aid, self.clock() + timedelta(hours=24))
-                await self.send(f'update-{uid}', chat, answer, buttons(aid), cancelled=cancelled)
+                delivered = await self.send(f'update-{uid}', chat, answer, buttons(aid), cancelled=cancelled)
+                if delivered and not callback and request and request['action'] in ('query', 'explain') and not cancelled.is_set():
+                    self.store.remember_turn(chat, analysis, text, answer, self.clock())
+        except SnapshotUnavailable:
+            self.store.update_status(uid, 'failed', 'snapshot_unavailable')
+            self.store.remember_topic(chat, 'data', self.clock(), 'unavailable')
+            if not cancelled.is_set():
+                await self.send(f'error-{uid}', chat, DATA_UNAVAILABLE, cancelled=cancelled)
         except (ValueError, FileNotFoundError, KeyError) as exc:
             self.store.update_status(uid, 'failed', type(exc).__name__)
             if not cancelled.is_set():
                 # 파일 경로·원천 상세·비밀값이 예외에 포함될 수 있어 그대로 보내지 않는다.
-                msg = '자료·조회 조건을 확인하지 못했습니다. 날짜를 YYYY-MM-DD 형식으로 확인해 주세요. '
-                msg += '스냅샷이 없거나 판본·해시 검증에 실패하면 운영자 확인이 필요합니다.'
+                msg = '요청 내용을 확인하지 못했습니다. 확인할 항목이나 기간을 조금 더 구체적으로 말씀해 주세요.'
                 await self.send(f'error-{uid}', chat, msg)
         except Exception as exc:
             self.store.update_status(uid, 'failed', type(exc).__name__)

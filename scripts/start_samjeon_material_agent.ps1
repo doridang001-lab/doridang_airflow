@@ -1,9 +1,10 @@
 param(
     [Parameter(Mandatory=$true)][string]$Config,
-    [string]$Python = (Join-Path $PSScriptRoot '..\.venv\Scripts\python.exe')
+    [string]$Python = ''
 )
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+if (-not $Python) { $Python = Join-Path $repoRoot '.venv\Scripts\python.exe' }
 $configPath = (Resolve-Path -LiteralPath $Config).Path
 if (-not (Test-Path -LiteralPath $Python)) { throw '전용 Python 환경을 먼저 준비하세요.' }
 Set-Location -LiteralPath $repoRoot
