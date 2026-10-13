@@ -140,6 +140,24 @@ class Store:
                      'question': question[:1000], 'answer': answer[:1500], 'created': now.isoformat()})
         self.put(f'turns-v1-{chat}', rows[-10:])
 
+    def chat_turns(self, chat, now):
+        return [r for r in self.get(f'chat-turns-v1-{chat}', [])
+                if 0 <= (now - datetime.fromisoformat(r['created'])).total_seconds() < 86400][-10:]
+
+    def remember_chat(self, chat, question, answer, now):
+        rows = self.chat_turns(chat, now)
+        rows.append({'question': question[:4000], 'answer': answer[:2000], 'created': now.isoformat()})
+        self.put(f'chat-turns-v1-{chat}', rows[-10:])
+
+    def topic(self, chat, now):
+        value = self.get(f'topic-v1-{chat}', {})
+        if value and 0 <= (now - datetime.fromisoformat(value['created'])).total_seconds() < 86400:
+            return value
+        return {}
+
+    def remember_topic(self, chat, topic, now, outcome=None):
+        self.put(f'topic-v1-{chat}', {'topic': topic, 'outcome': outcome, 'created': now.isoformat()})
+
     def save_answer(self, chat, analysis, notes, text):
         from .grounded import scope_signature
         self.put(f'answer-v1-{chat}-{analysis["id"]}',

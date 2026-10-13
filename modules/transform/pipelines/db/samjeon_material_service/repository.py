@@ -4,6 +4,26 @@ import re
 from datetime import date, timedelta
 from pathlib import Path
 from modules.transform.pipelines.db.samjeon_material_agent.query import load_snapshot, query_snapshot
+from .conversation import validate_query
+
+
+class SnapshotUnavailable(ValueError):
+    """게시본 검증 실패. 사용자 날짜 오류와 분리한다."""
+
+
+def checked_snapshot(path):
+    try:
+        return load_snapshot(path)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise SnapshotUnavailable('스냅샷 검증 실패') from exc
+
+
+def checked_query(path, **kwargs):
+    validate_query(kwargs)
+    try:
+        return query_snapshot(Path(path), **kwargs)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise SnapshotUnavailable('스냅샷 조회 실패') from exc
 
 
 class Repository:
@@ -18,16 +38,8 @@ class Repository:
             result = self._current()
             self.last_good = str(result[0])
             return result
-        except (OSError, ValueError, KeyError, TypeError):
-            if not self.last_good or self.settings.snapshot:
-                raise
-            root = Path(self.settings.snapshot_root).resolve() / 'snapshots'
-            candidate = Path(self.last_good).resolve()
-            if not candidate.is_relative_to(root):
-                raise ValueError('이전 정상 자료 경로가 게시 루트 밖입니다') from None
-            _, context, _ = load_snapshot(candidate)
-            self.fallback_reason = '최신 자료 동기화를 기다리는 중입니다. 이전에 검증한 자료를 표시합니다.'
-            return candidate, context
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise SnapshotUnavailable('게시본 검증 실패') from exc
 
     def _current(self):
         if self.settings.snapshot:
@@ -43,25 +55,28 @@ class Repository:
             if not manifest.is_relative_to(root / 'snapshots') or manifest.name != 'manifest.json':
                 raise ValueError('최신 포인터의 경로가 허용 범위 밖입니다')
             path = manifest.parent
-        manifest, context, _ = load_snapshot(path)
+        manifest, context, _ = checked_snapshot(path)
         if not self.settings.snapshot and (manifest['snapshot_id'] != pointer['snapshot_id'] or
                                           manifest['as_of_date'] != pointer['as_of_date']):
             raise ValueError('최신 포인터와 스냅샷 판본 불일치')
         return path, context
 
     def context(self, path, expected=None):
-        _, context, _ = load_snapshot(Path(path))
-        if expected and context['snapshot_id'] != expected:
-            raise ValueError('대화의 스냅샷 판본이 변경됐습니다')
-        return context
+        try:
+            _, context, _ = checked_snapshot(Path(path))
+            if expected and context['snapshot_id'] != expected:
+                raise ValueError('대화의 스냅샷 판본이 변경됐습니다')
+            return context
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise SnapshotUnavailable('대화 판본 검증 실패') from exc
 
     def query(self, path, intent, start=None, end=None, **filters):
         if intent == 'compare' and filters.get('product_key'):
             return self.compare_item(path, filters['product_key'], start, end)
-        return query_snapshot(Path(path), intent=intent, date_from=start, date_to=end, **filters)
+        return checked_query(path, intent=intent, date_from=start, date_to=end, **filters)
 
     def items(self, path, question):
-        _, _, tables = load_snapshot(Path(path))
+        _, _, tables = checked_snapshot(Path(path))
         frame = tables['item_daily']
         if frame.empty:
             return []
@@ -76,7 +91,7 @@ class Repository:
         return []
 
     def search_items(self, path, name):
-        _, _, tables = load_snapshot(Path(path))
+        _, _, tables = checked_snapshot(Path(path))
         rows = tables['item_daily'][['product_key', 'item_name', 'spec', 'source']].drop_duplicates()
         exact = rows.loc[rows['item_name'].eq(name)]
         selected = exact if not exact.empty else rows.loc[rows['item_name'].str.contains(name, regex=False, na=False)]
@@ -84,10 +99,10 @@ class Repository:
 
     def compare_item(self, path, product_key, start, end):
         from modules.transform.pipelines.db.samjeon_material_agent.analytics import period_result, compare_periods
-        check = query_snapshot(Path(path), intent='compare', date_from=start, date_to=end)
+        check = checked_query(path, intent='compare', date_from=start, date_to=end)
         if check['status'] == '범위 밖':
             return check
-        _, context, tables = load_snapshot(Path(path))
+        _, context, tables = checked_snapshot(Path(path))
         selected = tables['item_daily'].loc[tables['item_daily']['product_key'].eq(product_key)]
         if selected.empty:
             raise ValueError('해당 품목의 구매 근거가 없습니다')
@@ -107,7 +122,7 @@ class Repository:
 
     def period_context(self, path, expected, start, end):
         from modules.transform.pipelines.db.samjeon_material_agent.analytics import build_context
-        manifest, context, tables = load_snapshot(Path(path))
+        manifest, context, tables = checked_snapshot(Path(path))
         if context['snapshot_id'] != expected:
             raise ValueError('대화의 스냅샷 판본이 변경됐습니다')
         check = self.query(path, 'anomalies', start, end)

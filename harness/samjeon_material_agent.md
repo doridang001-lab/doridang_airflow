@@ -15,7 +15,7 @@
 3. 저장소 루트에서 `scripts/setup_samjeon_material_agent.ps1`을 실행한다. 이 스크립트는 Python 3.12 전용 `.venv`와 최소 의존성을 준비하고 `doctor`를 실행한다. 설정·토큰·스냅샷이 없는 첫 결과는 미준비로 표시되는 것이 정상이다.
 4. 실제 서비스 설정은 저장소 밖의 `C:\Local_DB\samjeon_material_agent\service.json`에 둔다. `state_root`는 같은 로컬 폴더 아래로, `snapshot_root`는 `latest.json`과 `snapshots/`가 있는 승인된 v3 게시 루트로 지정한다. 원본 자료와 게시본은 서비스가 읽기 전용으로 사용한다.
 5. 전용 Telegram 봇 토큰은 노트북의 서비스 실행 계정 환경변수 `SAMJEON_TELEGRAM_BOT_TOKEN`에 보관한다. 대표님 Telegram 계정의 숫자 사용자·개인 대화 ID만 허용 목록에 넣는다. 토큰과 실제 ID는 Git에 저장하지 않는다.
-6. 설정의 `enabled=true`, `auto_send=false`로 대화·PDF를 먼저 시험한다. `doctor`에서 v3 판본과 준비 상태를 확인한 후 `auto_send=true`와 작업 스케줄러 `-Enable`을 적용한다. 노트북은 로그인 상태·전원·네트워크를 유지하고 절전을 해제해야 응답한다.
+6. 추가 사용 정책 확인과 실계정 대화 검증 후 `enabled=true`, `ai_enabled=true`, `ai_verified=true`, `auto_send=false`로 대화를 시험한다. PDF·자료 조회는 v3 검증 후 시험한다. 전체 `doctor --require-ready` 통과 후에만 작업 스케줄러를 등록한다. `auto_send=true`는 대표님의 별도 요청이 있을 때만 적용한다. 노트북은 로그인 상태·전원·네트워크를 유지하고 절전을 해제해야 응답한다.
 
 ```powershell
 winget install --id Git.Git --exact --source winget
@@ -45,7 +45,7 @@ python -m venv .venv
 - 개발 `state_root`는 작업 폴더 `.tmp/samjeon-service`다. 운영에서는 `C:\Local_DB\samjeon_material_agent`를 지정한다.
 - `snapshot`은 검증할 로컬 불변 v3 폴더다. 운영은 `snapshot`을 비우고 `snapshot_root`에 승인된 v3 게시 루트를 지정한다.
 - `SAMJEON_TELEGRAM_BOT_TOKEN`은 서비스 계정 환경변수로 설정한다. 기존 운영 봇의 polling을 공유하지 않는다.
-- `doctor`는 외부 연결 없이 설정·스냅샷·글꼴·의존성을 확인한다. `token_present`나 `ai_configured`는 실인증 성공을 뜻하지 않는다.
+- `doctor`는 모델·Telegram 호출 없이 설정·스냅샷·글꼴·의존성과 CLI 로그인 상태를 확인한다. `token_present`나 `ai_configured`는 실대화 검증 성공을 뜻하지 않는다.
 - dry-run은 `-B`와 함께 실행한다. 디렉터리·SQLite·모델 작업·발송이 발생하지 않아야 한다.
 
 ## 대화와 판단
@@ -72,7 +72,7 @@ python -m venv .venv
 
 ## Codex 운영 조건
 
-- 모델은 `gpt-6-astra`, 지원 CLI는 `0.158.0`이다. 일반 질문은 조회 계획과 근거 설명으로 최대 2회, 호출당 최대 90초다. 명령·버튼·자동 알림은 정형 조회를 기본으로 한다.
+- 모델은 `gpt-6-astra`, 지원 CLI는 `0.158.0`이다. 자유 대화는 최대 1회, 자료 분석은 조회 계획과 근거 설명으로 최대 2회, 호출당 최대 90초다. 단순 매출 질문·명령·버튼·자동 알림은 정형 조회를 사용한다.
 - 사용자 설정·규칙 상속을 끄고 별도 작업 폴더, 읽기 전용 sandbox, 도구·플러그인·브라우저 비활성 옵션을 적용한다. API 키는 자식 환경에 전달하지 않는다.
 - 첫 출력 계약은 허용 조회 종류·기간·품목의 최대 세 개 조회 또는 확인 질문이다. Python 계산 후 두 번째 계약으로 사실 ID·근거 있는 가설·추가 질문을 받는다. 수치는 검증된 결과에서 삽입하며 임의 수치·근거·셸 요청은 거부한다. 미확정 자료의 원인 판단은 보류한다.
 - `ai_verified`는 운영 계정의 인증·무인 실행·도구 차단·추가 사용 통제를 실검증한 뒤 설정한다. CLI 설치 확인이나 자동 테스트만으로 true로 바꾸지 않는다.
@@ -90,7 +90,7 @@ python -m venv .venv
 ## 검증
 
 ```powershell
-.\.venv\Scripts\python.exe -B -X utf8 -m pytest tests/test_samjeon_material_mart.py tests/test_samjeon_material_mart_v3.py tests/test_samjeon_material_service.py tests/test_samjeon_material_codex.py tests/test_samjeon_material_pdf.py tests/test_samjeon_material_agent_dag.py tests/test_samjeon_grounded.py tests/test_samjeon_laptop_runtime.py -q -p no:cacheprovider
+.\.venv\Scripts\python.exe -B -X utf8 -m pytest tests/test_samjeon_material_mart.py tests/test_samjeon_material_mart_v3.py tests/test_samjeon_material_service.py tests/test_samjeon_material_codex.py tests/test_samjeon_material_pdf.py tests/test_samjeon_material_agent_dag.py tests/test_samjeon_grounded.py tests/test_samjeon_laptop_runtime.py tests/test_samjeon_conversation.py -q -p no:cacheprovider
 python scripts/harness_cli.py validate --target .
 ```
 
@@ -113,15 +113,19 @@ $config = 'C:\Local_DB\samjeon_material_agent\service.json'
 ```
 
 - `doctor`는 로컬 CLI·인증 방식·설정·게시 파일·글꼴을 점검하며 모델·Telegram을 호출하지 않는다. `--require-ready`는 미준비일 때 종료코드 2를 반환한다.
-- `verify-ai`는 가상 자료로 실제 모델을 최대 두 번 호출해 계획과 설명을 검증한다. 실제 사용량이 발생하며 설정의 `ai_verified`는 자동 변경하지 않는다. `--dry-run`은 모델을 호출하지 않는다.
+- `verify-ai`는 가상 자료 계획·설명과 자유 대화 두 턴을 최대 네 번 실호출한다. 후속 질문의 기억 단어도 확인한다. 추가 사용 정책 확인 후에만 실행하며 `ai_verified`는 자동 변경하지 않는다. `--dry-run`은 모델을 호출하지 않는다.
 - API 키 인증은 차단한다. Business의 추가 크레딧·자동 충전·워크스페이스 사용 정책은 운영 전 관리 화면에서 확인한다. 실연결 성공은 추가 비용 차단 검증을 뜻하지 않는다.
 - 지원 CLI 버전이 달라지면 진단이 실패한다. 개발 PC에서 인자·권한·출력 계약을 재검증하고 지원 버전을 게시한 후 갱신한다.
 
 ## 동기화 지연과 분석 이력
 
-승인된 OneDrive 게시 폴더는 노트북에서 실제 파일을 읽을 수 있도록 준비한다. OneDrive 동기화 설정 변경도 승인 후 진행한다. 최신 포인터·파일이 동기화 중이면 마지막 정상 스냅샷을 다시 검증해 기준일과 지연 상태를 표시한다. 이전 파일까지 손상되면 조회를 중단한다. 다음 60초 점검에서 정상 게시본으로 복귀한다.
+승인된 OneDrive 게시 폴더는 노트북에서 실제 파일을 읽을 수 있도록 준비한다. OneDrive 동기화 설정 변경도 승인 후 진행한다. 최신 포인터·매니페스트·파일 해시 검증이 실패하면 이전 정상 자료가 있어도 수치·PDF 조회를 중단하고 자료 준비 안내를 보낸다. 정상 v3가 도착하면 다음 조회부터 이용할 수 있다. 기존 분석과 버튼은 최신 게시 상태 확인에 더해 원래 판본을 검증해 사용한다.
 
 최근 10개 대화 턴을 동일 스냅샷·기간·품목에서 24시간 유지한다. 버전 있는 `meta` JSON으로 저장해 SQLite v1 구조를 유지한다. 사용자 설명·범위가 바뀌면 이전 AI 설명을 재사용하지 않는다. PDF는 같은 판본의 계산 결과와 저장된 분석 설명을 포함한다.
+
+일반 대화는 별도 `chat-turns-v1-*` 키로 개인 대화별 최근 10턴·24시간을 유지하며 분석 이력을 전달하지 않는다. 취소·실패·전송 결과 불명 답변은 전달된 대화로 기억하지 않는다. 명령과 업무 키워드, 마지막 대화 주제로 먼저 분기하고 모호한 질문은 되묻는다. `어제`는 Telegram 메시지 수신일의 한국 날짜 기준이며 스냅샷 날짜를 대신 사용하지 않는다. `지난주`는 월~일, `최근 7일`은 어제까지, `이번 달`은 월초~어제(월초 당일이면 당일)다.
+
+`/start`·`/help`는 현재 대화·자료 준비 상태만 안내한다. v3가 없을 때 수치 질문에는 정확히 `현재 검증된 삼전점 자료가 준비되지 않아 매출·원재료 수치를 답할 수 없습니다. 준비되면 다시 질문해 주세요.`라고 답한다.
 
 `state/logs/service.log`와 `state/health.json`에서 AI 실패 단계·자료 동기화 지연·발송 상태를 확인한다. 토큰과 원본 CLI 오류 전문은 저장하지 않는다. 노트북 실계정·전용 봇·승인된 v3 연결 후 연속 3일 운영 확인을 수행한다.
 
@@ -134,6 +138,37 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\update_samjeon
 ```
 
 깨끗한 `main`에서 작업 중지·잠금 확인 → fast-forward pull → 부분 설치 목록 재적용 → 의존성 설치 → 준비 진단 → 기존 활성 작업 재시작 순서로 실행한다. 직접 실행한 서비스도 먼저 종료한다. 실패하면 자동 시작을 끄고 이전 커밋을 로컬 `deployment.json`에 보존한다. 복구는 `reset --keep`으로 코드만 되돌리고 설정·대화·발송 이력을 유지한다.
+
+### v3 준비 전 대화 전용 갱신
+
+`doctor`의 `conversation_deployable`은 토큰·허용 목록·의존성·지원 CLI/ChatGPT 로그인 및 `auto_send=false`를 검사한다. `enabled`·`ai_enabled`·`ai_verified`가 꺼져 있어도 코드 배포는 가능하다. 이 세 설정까지 켜져야 `conversation_ready=true`이며, `data_ready`는 검증된 v3 존재 여부다. 기존 `ready`와 `--require-ready`는 전체 운영 준비 조건을 유지한다.
+
+```powershell
+.\scripts\update_samjeon_material_agent.ps1 -ConversationOnly
+.\.venv\Scripts\python.exe -B -X utf8 -m modules.transform.pipelines.db.samjeon_material_service doctor --config 'C:\Local_DB\samjeon_material_agent\service.json' --require-conversation-deployable
+```
+
+대화 전용 갱신은 기존 자동 실행 작업을 중지·비활성화하고 재시작하지 않는다. 새 작업도 등록하지 않는다. 전체 준비 전에는 비활성 작업 등록도 차단한다. 복구는 기록된 배포 모드를 따르며, 복구한 구버전이 새 점검 옵션을 지원하지 않으면 코드 복구 후 서비스 중지를 유지한다.
+
+**구버전에서 최초 전환:** 구버전 스크립트에는 `-ConversationOnly`가 없으므로 서비스를 중지하고 기존 자동 실행 작업도 비활성화한 뒤 아래 순서로 실행한다. 토큰·실제 ID·설정 파일 내용을 명령 출력에 넣지 않는다.
+
+```powershell
+Set-Location -LiteralPath 'C:\airflow_samjeon_agent'
+if ((git branch --show-current) -ne 'main') { throw 'main 체크아웃이 필요합니다.' }
+if (@(git status --porcelain).Count) { throw '로컬 변경을 먼저 확인하세요.' }
+$previousCommit = git rev-parse HEAD
+if ($LASTEXITCODE -ne 0) { throw '이전 커밋 확인 실패' }
+$config = 'C:\Local_DB\samjeon_material_agent\service.json'
+$stateRoot = & .\.venv\Scripts\python.exe -B -X utf8 -c 'import sys; from modules.transform.pipelines.db.samjeon_material_service.config import Settings; print(Settings.load(sys.argv[1]).state_root)' $config
+if ($LASTEXITCODE -ne 0) { throw '설정 확인 실패' }
+& .\.venv\Scripts\python.exe -B -X utf8 -c 'import sys; from pathlib import Path; from modules.transform.pipelines.db.samjeon_material_service.__main__ import instance_lock; lock=instance_lock(Path(sys.argv[1])); lock.__enter__(); lock.__exit__(None,None,None)' $stateRoot
+if ($LASTEXITCODE -ne 0) { throw '서비스를 먼저 중지하세요.' }
+git pull --ff-only origin main
+if ($LASTEXITCODE -ne 0) { throw '갱신 실패' }
+.\scripts\update_samjeon_material_agent.ps1 -Config $config -ConversationOnly -BootstrapPreviousCommit $previousCommit
+```
+
+최초 전환에서도 원래 커밋을 배포 기록에 보존한다. 설정·SQLite는 덮어쓰지 않는다. 추가 크레딧·자동 충전 정책 확인 → `verify-ai --require-ready` → 세 활성화 설정 수동 변경 → 시작 스크립트 실행 → Telegram 실제 화면에서 인사·후속 질문·매출 미준비 안내 확인 순서로 진행한다. 승인된 v3 동기화와 `doctor --require-ready`, 근거·후속 질문·PDF 검증 후에만 로그인 자동 실행을 등록한다. `auto_send=false`를 유지한다.
 
 개발 PC의 worktree는 변경을 게시한 뒤 다음 명령으로 정리한다. 에이전트 코드·관련 테스트·운영 문서만 표시하고 다른 worktree의 범위는 유지한다. 저장소에서 다른 프로젝트의 파일을 삭제하지 않는다.
 

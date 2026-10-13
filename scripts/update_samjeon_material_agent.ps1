@@ -1,6 +1,8 @@
 ﻿param(
     [string]$Config = 'C:\Local_DB\samjeon_material_agent\service.json',
-    [switch]$Rollback
+    [switch]$Rollback,
+    [switch]$ConversationOnly,
+    [string]$BootstrapPreviousCommit = ''
 )
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
@@ -25,14 +27,25 @@ try {
     if ($statePath -eq $repoRoot -or $statePath.StartsWith($repoRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw '업데이트 상태 경로는 저장소 밖으로 지정하세요.' }
     $receipt = Join-Path $statePath 'deployment.json'
     $previous = (Git-Checked -Arguments @('rev-parse','HEAD')) -join ''
+    if ($BootstrapPreviousCommit) {
+        if ($Rollback -or -not $ConversationOnly -or $BootstrapPreviousCommit -notmatch '^[0-9a-f]{40}$') {
+            throw '최초 전환의 이전 커밋은 대화 전용 갱신에만 지정할 수 있습니다.'
+        }
+        Git-Checked -Arguments @('merge-base','--is-ancestor',$BootstrapPreviousCommit,'HEAD') | Out-Null
+        $previous = $BootstrapPreviousCommit
+    }
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     $restart = $false
+    $mode = if ($ConversationOnly) { 'conversation' } else { 'full' }
     if ($Rollback) {
         if (-not (Test-Path -LiteralPath $receipt)) { throw '복구할 배포 기록이 없습니다.' }
         $record = Get-Content -LiteralPath $receipt -Encoding utf8 -Raw | ConvertFrom-Json
         $target = $record.previous_commit
         if ($target -notmatch '^[0-9a-f]{40}$') { throw '이전 커밋 기록 오류' }
         $restart = [bool]$record.restart
+        if ($record.PSObject.Properties.Name -contains 'mode') { $mode = $record.mode }
+        if ($ConversationOnly) { $mode = 'conversation' }
+        if ($mode -notin @('conversation','full')) { throw '배포 모드 기록 오류' }
         # 상태 기록의 해시가 실제 커밋이며 대상이 로컬에 존재하는지 확인한다.
         Git-Checked -Arguments @('cat-file','-e',($target + '^{commit}')) | Out-Null
     } else {
@@ -41,7 +54,7 @@ try {
         $target = (Git-Checked -Arguments @('rev-parse','origin/main')) -join ''
         $restart = $task -and $task.State -ne 'Disabled'
         New-Item -ItemType Directory -Path $statePath -Force | Out-Null
-        @{previous_commit=$previous; target_commit=$target; restart=[bool]$restart; status='prepared'} |
+        @{previous_commit=$previous; target_commit=$target; restart=[bool]$restart; mode=$mode; status='prepared'} |
             ConvertTo-Json | Set-Content -LiteralPath $receipt -Encoding utf8
     }
     if ($task) {
@@ -62,16 +75,20 @@ try {
         if ($LASTEXITCODE -ne 0) { throw '부분 설치 갱신 실패' }
         & $python -m pip install -r (Join-Path $repoRoot 'requirements-samjeon.txt')
         if ($LASTEXITCODE -ne 0) { throw '의존성 갱신 실패' }
-        & $python -B -X utf8 -m modules.transform.pipelines.db.samjeon_material_service doctor --config $resolvedConfig --require-ready
-        if ($LASTEXITCODE -ne 0) { throw '실행 준비 점검 실패' }
-        if ($task -and $restart) {
+        $gate = if ($mode -eq 'conversation') { '--require-conversation-deployable' } else { '--require-ready' }
+        & $python -B -X utf8 -m modules.transform.pipelines.db.samjeon_material_service doctor --config $resolvedConfig $gate
+        $ready = $LASTEXITCODE -eq 0
+        if (-not $ready -and -not $Rollback) { throw '실행 준비 점검 실패' }
+        if ($task -and $restart -and $mode -eq 'full' -and $ready) {
             Enable-ScheduledTask -TaskName $taskName | Out-Null
             Start-ScheduledTask -TaskName $taskName
         }
         $record = Get-Content -LiteralPath $receipt -Encoding utf8 -Raw | ConvertFrom-Json
         $record.status = if ($Rollback) { 'rolled_back' } else { 'updated' }
         $record | ConvertTo-Json | Set-Content -LiteralPath $receipt -Encoding utf8
-        Write-Output '코드·의존성·진단 완료. 설정과 대화·발송 이력을 유지했습니다.'
+        if (-not $ready) { Write-Warning '코드는 복구했습니다. 준비 점검을 통과하지 못해 서비스는 중지 상태입니다.' }
+        if ($mode -eq 'conversation') { Write-Output '대화 전용 코드 갱신 완료. 서비스·자동 실행은 활성화하지 않았습니다.' }
+        Write-Output '설정과 대화·발송 이력을 유지했습니다.'
     } catch {
         Write-Error "배포 중단. 서비스는 비활성 상태입니다. 이전 커밋: $previous. 복구: .\scripts\update_samjeon_material_agent.ps1 -Config '$resolvedConfig' -Rollback. 원인: $_"
     }
