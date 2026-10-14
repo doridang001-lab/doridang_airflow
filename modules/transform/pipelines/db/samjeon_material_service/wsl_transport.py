@@ -15,7 +15,7 @@ ERRORS = frozenset(('wsl_missing', 'wsl_distribution_missing', 'wsl_unavailable'
     'unsupported_cli', 'chatgpt_login_required', 'cli_probe_timeout', 'cli_launch_failed',
     'ai_disabled_or_cli_missing', 'cancelled', 'context_too_large', 'model_timeout',
     'model_output_too_large', 'usage_limit', 'authentication_failed', 'model_failed',
-    'unexpected_tool', 'cli_launch_or_output_failed'))
+    'unexpected_tool', 'unexpected_event', 'cli_launch_or_output_failed'))
 
 
 def safe_error(value):

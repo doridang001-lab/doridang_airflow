@@ -22,6 +22,7 @@ if args == ['login', 'status']:
     print('Logged in using ' + ('API key' if mode == 'api' else 'ChatGPT')); sys.exit(0)
 assert not any(k in os.environ for k in ('OPENAI_API_KEY', 'SAMJEON_TELEGRAM_BOT_TOKEN', 'WSLENV'))
 assert 'model_reasoning_effort="medium"' in args
+assert 'suppress_unstable_features_warning=true' in args
 assert args[args.index('--sandbox') + 1] == 'read-only'
 if mode == 'hang':
     child = subprocess.Popen(['/usr/bin/python3', '-c', 'import time; time.sleep(300)'])
@@ -30,7 +31,23 @@ if mode == 'hang':
 prompt = sys.stdin.read()
 assert '한글' in prompt
 pathlib.Path(args[args.index('--output-last-message') + 1]).write_text(json.dumps({'kind':'reply','text':'한글 답변입니다.'}))
-print(json.dumps({'item': {'type': 'command_execution' if mode == 'tool' else 'agent_message'}}))
+notice = {'type':'item.completed','item':{'id':'item_0','type':'error','message':
+    'Code Mode is unavailable because code-mode host is disabled. Code mode will fail closed; '
+    'enable `features.code_mode_host` and install `codex-code-mode-host`.'}}
+if mode != 'late_notice':
+    print(json.dumps(notice))
+print(json.dumps({'type':'turn.started'}))
+if mode == 'late_notice':
+    print(json.dumps(notice))
+elif mode == 'error':
+    print(json.dumps({'type':'error','message':'server failed'}))
+elif mode == 'failed':
+    print(json.dumps({'type':'turn.failed','error':{'message':'quota exceeded'}}))
+elif mode == 'unknown':
+    print(json.dumps({'type':'new_event'}))
+print(json.dumps({'type':'item.completed','item': {'id':'item_1','type': 'command_execution' if mode == 'tool' else 'agent_message'}}))
+if mode != 'incomplete':
+    print(json.dumps({'type':'turn.completed','usage':{'input_tokens':1,'output_tokens':1}}))
 '''
 
 
@@ -93,6 +110,15 @@ class RunnerTest(unittest.TestCase):
         result = self.result()
         self.assertEqual(result['error'], 'unexpected_tool')
         self.assertEqual(result['event_type'], 'command_execution')
+
+    def test_other_errors_and_unknown_events_rejected(self):
+        for mode, expected in [('error', 'model_failed'), ('failed', 'usage_limit'),
+                               ('unknown', 'unexpected_event'), ('late_notice', 'model_failed'),
+                               ('incomplete', 'model_failed')]:
+            with self.subTest(mode=mode):
+                (self.root / 'mode').write_text(mode)
+                self.start()
+                self.assertEqual(self.result()['error'], expected)
 
     def test_parent_eof_kills_descendants_and_unblocks_stdin(self):
         (self.root / 'mode').write_text('hang')

@@ -70,7 +70,17 @@ $config = 'C:\Local_DB\samjeon_material_agent\service.json'
 
 `doctor`는 모델과 Telegram을 호출하지 않는다. WSL 존재·배포판·사용자/Python·경로 변환·Linux CLI·지원 버전·ChatGPT 로그인을 검사한다. 결과의 `codex.backend`는 `wsl`, `reasoning_effort`는 `medium`이어야 한다. Linux에 실제 모델 접근 권한이 있는지는 실검증으로 확인한다.
 
-`unexpected_tool`은 여전히 허용되지 않은 이벤트를 차단한다. 알려진 이벤트 종류만 `event_type`으로 기록하고 그 외 값은 `unknown`으로 바꾼다. 실패 당시 실제 이벤트를 확보하지 못했으므로 허용 목록을 임의로 확대하지 않는다. `verify-ai`는 단계별 `checks`를 보존하여 뒤 단계가 성공해도 앞 단계 오류가 사라지지 않는다. 일반 대화의 안전한 오류는 `state/health.json`에 반영한다.
+CLI 호출에는 `-c suppress_unstable_features_warning=true`를 명시한다. CLI 0.158.0의 Code Mode 비활성 시작 알림은 첫 `turn.started` 이전의 정확한 `item.completed`/`error` 형식과 전체 문구가 일치할 때만 허용한다. 시스템 설정 파일의 알림 억제에 의존하지 않는다. 도구 비활성 옵션은 유지한다.
+
+최상위 `error`, `turn.failed`, 다른 오류 항목은 `model_failed` 또는 인증·사용량 오류로 반환한다. 실제 도구 실행은 `unexpected_tool`, 미확인 이벤트는 `unexpected_event`로 차단한다. 종료 코드 0·정상 턴 완료·유효한 최종 JSON을 모두 요구하므로 답변 파일이 있어도 실패를 성공으로 바꾸지 않는다. 알려진 이벤트 종류만 `event_type`으로 기록하고 그 외 값은 `unknown`으로 바꾼다. `verify-ai`의 단계별 `checks`는 유지하며 원본 CLI 오류 전문은 저장하지 않는다.
+
+### 2026-10-14 운영 노트북 인계 반영
+
+운영자가 Ubuntu 26.04.1 LTS, 사용자 `samjeon`, Python 3.14.4, Node.js 24.21.0, `/opt/samjeon-node/bin/codex` 0.158.0과 ChatGPT 구독 로그인을 확인했다. WSL 전환과 `doctor --require-conversation-deployable`도 통과했다. 추가 크레딧·자동 충전 모두 비활성이라고 확인했으며 계정별 사용량 변화는 운영자가 확인한다.
+
+허용된 개인 대화의 질문 수신과 정형 연결 시험 답변 발송은 확인됐다. 이는 AI 자동 문답 성공이나 사용자 화면 수신 확인을 의미하지 않는다. 시작 알림 때문에 `verify-ai`가 실패하여 세 활성화 설정과 `auto_send`는 모두 false인 상태로 인계됐다.
+
+이 노트북은 환경 설치와 `configure-wsl`을 반복하지 않는다. 새 변경이 main에 병합되면 노트북의 `gitpull-agent` 대화 전용 절차(저장소의 `update_samjeon_material_agent.ps1 -ConversationOnly`)로 갱신하고 아래 실검증·활성화·수신 확인을 이어간다. 기존 설정·SQLite·인증·배포 이력과 OneDrive 자료는 보존한다.
 
 ## 실검증과 활성화
 
