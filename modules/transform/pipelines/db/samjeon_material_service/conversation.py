@@ -1,5 +1,6 @@
 """명령·짧은 후속 질문을 처리한다. 미지원 질문은 추측해 실행하지 않는다."""
 import re
+import calendar
 from datetime import date, timedelta
 
 INTENTS = {'summary', 'compare', 'anomalies', 'forecast', 'staff_meal', 'evidence', 'status'}
@@ -15,9 +16,13 @@ def route(text, topic=None):
     if command in ('/start', '/help'):
         return 'help'
     if command.startswith('/'):
-        return 'data' if command[1:] in INTENTS | {'report'} else 'clarify'
+        return 'data' if command[1:] in INTENTS | {'report', 'items'} else 'clarify'
     if re.match(r'^(안녕|반가워|고마워|고맙|감사|좋은 아침|다른 얘기|다른 이야기)', text):
         return 'chat'
+    if re.search(r'\d+\s*월', text):
+        return 'data' if topic == 'data' or any(w in text for w in ('분석', '실적', '매출', '구매', '매입', '확정', '전체')) else 'clarify'
+    if re.search(r'이상\s*탐지|고급\s*분석', text):
+        return 'data'
     if any(w in text for w in ('삼전', '매출', '매입', '원재료', '구매', '품목', '직원식대', '원가',
                               '식대', '부식', '증빙', 'pdf', 'PDF', '보고서', '선매입', '미리 샀',
                               '의심', '원인 분석', '원인을 분석', '월말', '증가액')):
@@ -33,12 +38,36 @@ def route(text, topic=None):
     return 'chat' if text else 'clarify'
 
 
+def month_period(text, today):
+    matches = list(re.finditer(r'(?<!\d)(?:(\d+)\s*년\s*)?(\d+)\s*월', text))
+    if not matches:
+        if '전체' in text and ('이번 달' in text or '이번달' in text):
+            day = date.fromisoformat(str(today))
+            return str(day.replace(day=1)), str(day.replace(day=calendar.monthrange(day.year, day.month)[1]))
+        return None
+    if len(matches) != 1 or re.search(r'\d{4}-\d{2}-\d{2}|오늘|어제|그제|지난\s*주|최근\s*7일|이번\s*달', text):
+        raise ValueError('기간을 하나만 알려주세요')
+    match = matches[0]
+    if (match[1] and len(match[1]) != 4) or len(match[2]) > 2:
+        raise ValueError('연월 형식 오류')
+    if re.match(r'\s*\d+\s*일', text[match.end():]):
+        raise ValueError('특정 날짜는 YYYY-MM-DD로 알려주세요')
+    year = int(match[1] or date.fromisoformat(str(today)).year)
+    month = int(match[2])
+    return str(date(year, month, 1)), str(date(year, month, calendar.monthrange(year, month)[1]))
+
+
 def period(text, today):
     """상대 날짜는 스냅샷 기준일이 아닌 요청 수신일(KST) 기준으로 한 번 확정한다."""
+    monthly = month_period(text, today)
+    if monthly:
+        return monthly
     dates = re.findall(r'\d{4}-\d{2}-\d{2}', text)
     if len(dates) > 2:
         raise ValueError('조회 기간을 시작일·종료일 두 날짜로 알려주세요')
     if dates:
+        if re.search(r'오늘|어제|그제|지난\s*주|최근\s*7일|이번\s*달', text):
+            raise ValueError('조회 기간 충돌')
         checked = validate_query({'intent': 'summary', 'date_from': dates[0], 'date_to': dates[-1]})
         return checked['date_from'], checked['date_to']
     today = date.fromisoformat(str(today))
@@ -75,7 +104,7 @@ HELP = ('삼전점 자료를 함께 확인하겠습니다.\n'
 def validate_query(raw):
     if not isinstance(raw, dict) or set(raw) - {'intent', 'date_from', 'date_to', 'evidence_id', 'product_key', 'source', 'offset', 'limit'}:
         raise ValueError('허용되지 않은 조회 요청')
-    if raw.get('intent') not in INTENTS:
+    if raw.get('intent') not in INTENTS | {'items'}:
         raise ValueError('조회 종류 오류')
     out = dict(raw)
     for k in ('date_from', 'date_to'):

@@ -5,17 +5,26 @@ from datetime import date, timedelta
 from pathlib import Path
 from modules.transform.pipelines.db.samjeon_material_agent.query import load_snapshot, query_snapshot
 from .conversation import validate_query
-
-
-class SnapshotUnavailable(ValueError):
-    """게시본 검증 실패. 사용자 날짜 오류와 분리한다."""
+from .data_contract import SnapshotUnavailable
+from . import legacy
 
 
 def checked_snapshot(path):
     try:
-        return load_snapshot(path)
+        manifest = json.loads((Path(path) / 'manifest.json').read_text(encoding='utf-8'))
+        if not isinstance(manifest, dict):
+            raise ValueError('게시 형식 오류')
+        if manifest.get('schema_version') == 3:
+            manifest, context, tables = load_snapshot(path)
+            context = {**context, 'format': 'v3', 'window_start': manifest['window_start']}
+            return manifest, context, tables
+        if 'schema_version' not in manifest and manifest.get('rule_version') == 'samjeon-mart-v1':
+            return legacy.load(path, manifest)
+        raise SnapshotUnavailable(code='unsupported_format')
+    except SnapshotUnavailable:
+        raise
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise SnapshotUnavailable('스냅샷 검증 실패') from exc
+        raise SnapshotUnavailable(code='snapshot_invalid') from exc
 
 
 def checked_query(path, **kwargs):
@@ -23,7 +32,7 @@ def checked_query(path, **kwargs):
     try:
         return query_snapshot(Path(path), **kwargs)
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise SnapshotUnavailable('스냅샷 조회 실패') from exc
+        raise SnapshotUnavailable(code='snapshot_invalid') from exc
 
 
 class Repository:
@@ -38,24 +47,33 @@ class Repository:
             result = self._current()
             self.last_good = str(result[0])
             return result
+        except SnapshotUnavailable:
+            raise
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise SnapshotUnavailable('게시본 검증 실패') from exc
+            raise SnapshotUnavailable(code='snapshot_invalid') from exc
 
     def _current(self):
         if self.settings.snapshot:
             path = Path(self.settings.snapshot).resolve()
+            if not path.is_dir():
+                raise SnapshotUnavailable(code='snapshot_missing')
         else:
             if not self.settings.snapshot_root:
-                raise ValueError('v3 스냅샷 경로가 등록되지 않았습니다')
+                raise SnapshotUnavailable(code='snapshot_missing')
             root = Path(self.settings.snapshot_root).resolve()
+            if not (root / 'latest.json').is_file():
+                raise SnapshotUnavailable(code='snapshot_missing')
             pointer = json.loads((root / 'latest.json').read_text(encoding='utf-8'))
-            if pointer.get('schema_version') != 3:
-                raise ValueError('최신 게시본이 v3가 아닙니다. v3 게시가 필요합니다')
+            if not isinstance(pointer, dict) or not isinstance(pointer.get('manifest'), str):
+                raise ValueError('포인터 형식 오류')
             manifest = (root / pointer['manifest']).resolve()
             if not manifest.is_relative_to(root / 'snapshots') or manifest.name != 'manifest.json':
                 raise ValueError('최신 포인터의 경로가 허용 범위 밖입니다')
             path = manifest.parent
         manifest, context, _ = checked_snapshot(path)
+        if not self.settings.snapshot and (('schema_version' in pointer) != ('schema_version' in manifest)
+                                          or pointer.get('schema_version') != manifest.get('schema_version')):
+            raise SnapshotUnavailable(code='snapshot_invalid')
         if not self.settings.snapshot and (manifest['snapshot_id'] != pointer['snapshot_id'] or
                                           manifest['as_of_date'] != pointer['as_of_date']):
             raise ValueError('최신 포인터와 스냅샷 판본 불일치')
@@ -67,10 +85,20 @@ class Repository:
             if expected and context['snapshot_id'] != expected:
                 raise ValueError('대화의 스냅샷 판본이 변경됐습니다')
             return context
+        except SnapshotUnavailable:
+            raise
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise SnapshotUnavailable('대화 판본 검증 실패') from exc
+            raise SnapshotUnavailable(code='snapshot_invalid') from exc
 
     def query(self, path, intent, start=None, end=None, **filters):
+        # product_keys는 검증된 서버 측 근거 화면에만 사용하는 제한된 필터다.
+        ordinary = {k: v for k, v in filters.items() if k != 'product_keys'}
+        validate_query(dict(intent=intent, date_from=start, date_to=end, **ordinary))
+        loaded = checked_snapshot(Path(path))
+        if loaded[1].get('format') == legacy.FORMAT:
+            return legacy.query(loaded, intent, start, end, **filters)
+        if 'product_keys' in filters or intent == 'items':
+            raise ValueError('해당 자료 형식에서 지원하지 않는 조회입니다')
         if intent == 'compare' and filters.get('product_key'):
             return self.compare_item(path, filters['product_key'], start, end)
         return checked_query(path, intent=intent, date_from=start, date_to=end, **filters)
@@ -98,6 +126,9 @@ class Repository:
         return selected.head(10).to_dict('records')
 
     def compare_item(self, path, product_key, start, end):
+        loaded = checked_snapshot(Path(path))
+        if loaded[1].get('format') == legacy.FORMAT:
+            return legacy.query(loaded, 'compare', start, end, product_key=product_key)
         from modules.transform.pipelines.db.samjeon_material_agent.analytics import period_result, compare_periods
         check = checked_query(path, intent='compare', date_from=start, date_to=end)
         if check['status'] == '범위 밖':
@@ -125,6 +156,8 @@ class Repository:
         manifest, context, tables = checked_snapshot(Path(path))
         if context['snapshot_id'] != expected:
             raise ValueError('대화의 스냅샷 판본이 변경됐습니다')
+        if context.get('format') == legacy.FORMAT:
+            return legacy.query((manifest, context, tables), 'summary', start, end)
         check = self.query(path, 'anomalies', start, end)
         if check['status'] == '범위 밖':
             raise ValueError('상세 분석에 필요한 과거 자료가 부족합니다')

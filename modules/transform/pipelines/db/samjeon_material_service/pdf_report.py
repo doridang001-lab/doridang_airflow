@@ -12,6 +12,8 @@ REPORT_VERSION = 'conversation-v2'
 
 
 def create_pdf(settings, repository, analysis, notes, grounded=None):
+    if repository.context(analysis['snapshot'], analysis['snapshot_id']).get('format') == 'legacy_v1':
+        raise ValueError('기존 잠정 자료는 PDF를 지원하지 않습니다')
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle

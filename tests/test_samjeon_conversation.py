@@ -264,7 +264,9 @@ def test_real_v3_failure_blocks_numbers_and_pdf_after_prior_success(service, tmp
     else:
         (target / 'agent_context.json').write_text('{}', encoding='utf-8')
     asyncio.run(conversation(service, update(2, '어제 매출은?'), update(3, '/report')))
-    assert messages(service)[-2:] == [DATA_UNAVAILABLE, DATA_UNAVAILABLE]
+    from modules.transform.pipelines.db.samjeon_material_service.repository import SnapshotUnavailable
+    expected = str(SnapshotUnavailable(code='snapshot_missing' if failure == 'missing' else 'snapshot_invalid'))
+    assert messages(service)[-2:] == [expected, expected]
     assert not any(method == 'sendDocument' for method, _ in service.transport.calls)
 
 
