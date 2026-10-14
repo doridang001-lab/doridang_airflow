@@ -117,7 +117,7 @@ def test_real_wsl_with_fake_cli():
 
 
 @pytest.mark.skipif(not os.environ.get('SAMJEON_TEST_WSL_DISTRIBUTION'), reason='명시한 WSL에서만 가짜 CLI 통합 시험')
-@pytest.mark.parametrize('mode', ['ok', 'hang'])
+@pytest.mark.parametrize('mode', ['ok', 'hang', 'error', 'failed', 'unknown', 'tool', 'late_notice', 'incomplete'])
 def test_windows_to_wsl_roundtrip(tmp_path, mode):
     distribution = os.environ['SAMJEON_TEST_WSL_DISTRIBUTION']
     source = Path(__file__).with_name('samjeon_wsl_probe.py').resolve()
@@ -137,10 +137,13 @@ def test_windows_to_wsl_roundtrip(tmp_path, mode):
             timer = threading.Timer(2, cancelled.set)
             timer.start()
         answer = adapter.chat('한글 질문', {}, cancelled)
-        if mode == 'hang':
-            assert answer is None and adapter.last_error == 'cancelled'
-        else:
+        if mode == 'ok':
             assert answer['text'] == '한글 답변입니다.'
+        else:
+            expected = {'hang': 'cancelled', 'error': 'model_failed', 'failed': 'usage_limit',
+                        'unknown': 'unexpected_event', 'tool': 'unexpected_tool',
+                        'late_notice': 'model_failed', 'incomplete': 'model_failed'}
+            assert answer is None and adapter.last_error == expected[mode]
         assert not (tmp_path / 'never-written').exists()
     finally:
         if timer:
@@ -227,3 +230,22 @@ def test_background_start_is_hidden_without_launching_service(tmp_path):
     launch = json.loads(result_file.read_text(encoding='utf-8-sig'))
     assert launch['window'] == 'Hidden' and launch['file'] == 'powershell.exe'
     assert '-Background' not in launch['args'] and str(config) in launch['args']
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows 실제 자식 프로세스 이벤트 계약')
+@pytest.mark.parametrize('mode,expected', [('ok', None), ('error', 'model_failed'),
+    ('failed', 'usage_limit'), ('unknown', 'unexpected_event'), ('tool', 'unexpected_tool'),
+    ('late_notice', 'model_failed'), ('incomplete', 'model_failed')])
+def test_windows_native_startup_events(tmp_path, mode, expected):
+    from samjeon_wsl_probe import FAKE
+    fake = tmp_path / 'fake.py'
+    fake.write_text(FAKE, encoding='utf-8')
+    (tmp_path / 'mode').write_text(mode, encoding='ascii')
+    launcher = tmp_path / 'codex.cmd'
+    launcher.write_text('@echo off\n"' + sys.executable + '" -B -X utf8 "' + str(fake) + '" %*\n', encoding='utf-8')
+    adapter = CodexAdapter(Settings(codex_executable=str(launcher), state_root=str(tmp_path / 'state'),
+                                     ai_enabled=True, ai_verified=True))
+    assert adapter.diagnose()['ready']
+    answer = adapter.chat('한글 질문', {}, threading.Event())
+    assert adapter.last_error == expected
+    assert (answer is not None) is (expected is None)

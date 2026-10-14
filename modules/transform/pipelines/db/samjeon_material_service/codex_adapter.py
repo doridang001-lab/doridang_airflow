@@ -14,6 +14,73 @@ from .conversation import validate_query
 from .grounded import PLAN_SCHEMA, ANSWER_SCHEMA, validate_plan
 
 SUPPORTED_VERSION = '0.158.0'
+# CLI 0.158.0에서 도구를 의도적으로 끈 경우의 시작 알림. 부분 일치는 금지한다.
+CODE_MODE_DISABLED_NOTICE = (
+    'Code Mode is unavailable because code-mode host is disabled. '
+    'Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`.')
+TOOL_ITEMS = frozenset(('command_execution', 'file_change', 'mcp_tool_call', 'web_search',
+                        'tool_call', 'function_call'))
+
+
+def model_error(message):
+    """원문을 보존하지 않고 오류 메시지만 안전한 분류로 바꾼다."""
+    text = message.lower() if isinstance(message, str) else ''
+    if any(s in text for s in ('usage limit', 'rate limit', 'quota', '429')):
+        return 'usage_limit'
+    if any(s in text for s in ('unauthorized', '401', 'login', 'authentication')):
+        return 'authentication_failed'
+    return 'model_failed'
+
+
+def inspect_events(event_text, version):
+    """한 번의 정상 턴 완료를 요구한다. 반환값은 오류 분류와 안전한 항목 종류다."""
+    started = completed = thread_seen = False
+    for line in event_text.splitlines():
+        event = json.loads(line)
+        if not isinstance(event, dict):
+            raise ValueError('이벤트 형식 오류')
+        kind = event.get('type')
+        if kind == 'error':
+            return model_error(event.get('message')), 'error'
+        if kind == 'turn.failed':
+            error = event.get('error')
+            return model_error(error.get('message') if isinstance(error, dict) else None), 'error'
+        if kind == 'thread.started':
+            if thread_seen or started or completed:
+                return 'unexpected_event', 'unknown'
+            thread_seen = True
+        elif kind == 'turn.started':
+            if started or completed:
+                return 'unexpected_event', 'unknown'
+            started = True
+        elif kind == 'turn.completed':
+            if not started or completed:
+                return 'unexpected_event', 'unknown'
+            completed = True
+        elif kind in ('item.started', 'item.updated', 'item.completed'):
+            item = event.get('item')
+            if not isinstance(item, dict):
+                raise ValueError('이벤트 항목 오류')
+            item_type = item.get('type')
+            if item_type == 'error':
+                notice = (version == SUPPORTED_VERSION and not started and not completed
+                    and kind == 'item.completed' and set(event) == {'type', 'item'}
+                    and set(item) == {'id', 'type', 'message'} and isinstance(item['id'], str)
+                    and item['message'] == CODE_MODE_DISABLED_NOTICE)
+                if notice:
+                    continue
+                return model_error(item.get('message')), 'error'
+            if isinstance(item_type, str) and item_type in TOOL_ITEMS:
+                return 'unexpected_tool', item_type
+            if item_type not in ('agent_message', 'reasoning', 'plan'):
+                return 'unexpected_event', 'unknown'
+            if not started or completed:
+                return 'unexpected_event', 'unknown'
+        else:
+            return 'unexpected_event', 'unknown'
+    return (None, None) if started and completed else ('model_failed', None)
+
+
 CHAT_SCHEMA = {'type': 'object', 'properties': {
     'kind': {'type': 'string', 'enum': ['reply', 'data_request', 'clarify']},
     'text': {'type': 'string', 'maxLength': 2000}},
@@ -206,6 +273,7 @@ class CodexAdapter:
                     '-c', 'model_reasoning_effort="medium"',
                     '--output-last-message', str(output), '--cd', str(work),
                     '-c', 'web_search="disabled"', '-c', 'project_doc_max_bytes=0',
+                    '-c', 'suppress_unstable_features_warning=true',
                     '--enable', 'skip_host_skill_discovery']
             for feature in DISABLED:
                 args.extend(['--disable', feature])
@@ -247,27 +315,19 @@ class CodexAdapter:
                         stop_tree(process)
                         writer.join(timeout=2)
                 event_text = (work / 'events.jsonl').read_text(encoding='utf-8')
-                diagnostic = ((work / 'stderr.txt').read_text(encoding='utf-8', errors='replace')[-16000:] + event_text[-16000:]).lower()
-                if process.returncode or cancelled.is_set() or not output.exists() or output.stat().st_size > 16384:
-                    self.last_error = ('usage_limit' if any(s in diagnostic for s in ('usage limit', 'rate limit', 'quota', '429'))
-                                       else 'authentication_failed' if any(s in diagnostic for s in ('unauthorized', '401', 'login'))
-                                       else 'model_failed')
+                if cancelled.is_set():
+                    self.last_error = 'cancelled'
+                    return None
+                self.last_error, self.last_event_type = inspect_events(event_text, probe.get('version'))
+                if self.last_error:
+                    if process.returncode and self.last_error == 'model_failed' and self.last_event_type is None:
+                        self.last_error = model_error((work / 'stderr.txt').read_text(encoding='utf-8', errors='replace')[-16000:])
                     self._probe = None
                     return None
-                for line in event_text.splitlines():
-                    event = json.loads(line)
-                    if not isinstance(event, dict):
-                        raise ValueError('이벤트 형식 오류')
-                    item = event.get('item', {})
-                    if not isinstance(item, dict):
-                        raise ValueError('이벤트 항목 오류')
-                    if item.get('type') and item['type'] not in ('agent_message', 'reasoning', 'plan'):
-                        self.last_error = 'unexpected_tool'
-                        # 원본 이벤트/내용을 저장하지 않는다. 알려진 종류만 보고한다.
-                        self.last_event_type = item['type'] if item['type'] in (
-                            'command_execution', 'file_change', 'mcp_tool_call', 'web_search',
-                            'todo_list', 'error', 'tool_call', 'function_call') else 'unknown'
-                        return None
+                if process.returncode or not output.exists() or output.stat().st_size > 16384:
+                    self.last_error = model_error((work / 'stderr.txt').read_text(encoding='utf-8', errors='replace')[-16000:])
+                    self._probe = None
+                    return None
                 raw = json.loads(output.read_text(encoding='utf-8'))
                 return raw
             except (OSError, ValueError, subprocess.SubprocessError):
