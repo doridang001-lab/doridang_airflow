@@ -295,7 +295,9 @@ def test_verify_ai_requires_two_turn_memory_without_changing_settings(tmp_path, 
     from modules.transform.pipelines.db.samjeon_material_service.__main__ import main
     seen = []
     monkeypatch.setattr(CodexAdapter, 'diagnose', lambda *a, **kw: {'ready': True})
-    monkeypatch.setattr(CodexAdapter, 'plan', lambda *a: {'action': 'query'})
+    monkeypatch.setattr(CodexAdapter, 'plan', lambda *a: {'action': 'query', 'queries': [
+        {'intent': 'summary', 'date_from': '2026-10-01', 'date_to': '2026-10-11',
+         'product_name': None}], 'clarification': None})
     monkeypatch.setattr(CodexAdapter, 'explain', lambda *a: {'fact_ids': ['F1'], 'hypotheses': [], 'questions': []})
     def chat(self, question, context, cancelled):
         seen.append(context)

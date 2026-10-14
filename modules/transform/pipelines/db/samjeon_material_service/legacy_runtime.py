@@ -2,6 +2,7 @@
 import asyncio
 import re
 
+from .codex_adapter import safe_diagnostic
 from .conversation import parse, month_period
 from .grounded import make_facts, render_answer, validate_plan
 from .legacy import FORMAT, QUERIES, UNSUPPORTED
@@ -14,7 +15,8 @@ async def model_call(service, stage, *args):
         error = getattr(service.model, 'last_error', None)
     except Exception:
         result, error = None, 'model_failed'
-    service.store.put('ai_status', {'checked_at': service.clock().isoformat(), 'stage': stage, 'error': error})
+    service.store.put('ai_status', {'checked_at': service.clock().isoformat(),
+                                    **safe_diagnostic(service.model, stage, error)})
     return result
 
 
@@ -42,6 +44,33 @@ def monthly_notice(scope):
     return ''
 
 
+def easy_answer(result):
+    """직전 조회값을 새로 계산한 뒤 짧은 관측 문장으로 표시한다."""
+    value = result['result']
+    header = f"{result['date_from']}~{result['date_to']} 잠정 자료입니다. 자료 기준일은 {result['as_of_date']}입니다."
+    won = lambda amount: f'{int(amount):,}원'
+    intent = result['intent']
+    if intent in ('summary', 'status'):
+        sales = (f"매출 관측액은 {won(value['sales_won'])}입니다."
+                 if value['sales_rows'] else '매출 거래는 관측되지 않았습니다. 실제 0원으로 확정한 뜻은 아닙니다.')
+        purchase = (f"구매 관측액은 {won(value['purchase_won'])}입니다."
+                    if value['purchase_rows'] else '구매 거래는 관측되지 않았습니다. 실제 0원으로 확정한 뜻은 아닙니다.')
+        return (f'{header}\n쉽게 말씀드리면 {sales} {purchase} 구매액에는 직원식대가 포함됩니다.'
+                '\n미분류 구매의 용도와 손실 원인은 아직 단정할 수 없습니다.')
+    if intent == 'items':
+        items = value.get('items', [])[:3]
+        if items:
+            ranked = ', '.join(f"{item['item_name']} {won(item['amount_won'])}" for item in items)
+            return f'{header}\n구매 관측액이 큰 품목은 {ranked} 순입니다. 수량 순위는 아닙니다.'
+    if intent == 'evidence':
+        rows = value.get('rows', [])[:3]
+        if rows:
+            shown = ', '.join(f"{row['item_name']} {won(row['amount_won'])} (근거 {row['evidence_id']})"
+                              for row in rows)
+            return f'{header}\n앞서 본 구매 기록 중 {shown}을 확인할 수 있습니다.'
+    return render_query(result)
+
+
 async def handle(service, uid, user, chat, text, path, context, previous, callback, cancelled, request_date, resolved):
     store, repo = service.store, service.repo
     old_scope = store.get('legacy-view-v1-' + previous['id'], {}) if previous else {}
@@ -64,6 +93,7 @@ async def handle(service, uid, user, chat, text, path, context, previous, callba
     filters = {}
     action = callback.get('data', '').partition(':')[2] if callback else None
     intent, note = None, False
+    easy = not callback and ('쉽게' in text or '간단히' in text)
     if callback:
         if action == 'pdf':
             await service.send(f'update-{uid}', chat, UNSUPPORTED, cancelled=cancelled)
@@ -103,20 +133,27 @@ async def handle(service, uid, user, chat, text, path, context, previous, callba
                 intent = 'items'
             elif intent is None and (resolved or any(w in text for w in ('분석', '실적', '왜', '설명'))):
                 intent = 'summary'
+        if easy and not resolved:
+            session = store.memory.session(service._session_id)
+            last = session.get('last_query') if session else None
+            if last and last.get('format') == FORMAT:
+                intent = last['intent']
+                filters = dict(last.get('filters', {}))
     analysis = service.analysis(chat, path, context, str(uid), start, end)
     aid = analysis['id']
     store.put('legacy-view-v1-' + aid, scope)
     if note:
-        store.note(chat, aid, user, text)
         store.put('legacy-view-v1-' + aid, {**old_scope, **scope})
-        await service.send(f'update-{uid}', chat, '이 기간의 설명을 기록했습니다. 원천 분류·마감 승인으로 처리하지 않습니다.', markup(aid), cancelled=cancelled)
+        delivered = await service.send(f'update-{uid}', chat, '이 기간의 설명을 기록했습니다. 원천 분류·마감 승인으로 처리하지 않습니다.', markup(aid), cancelled=cancelled)
+        if delivered and not cancelled.is_set():
+            store.note(chat, aid, user, text)
         return
     if intent is None and service.settings.ai_enabled and service.settings.ai_verified and hasattr(service.model, 'plan'):
         plan = await model_call(service, 'plan', text, {
             'format': FORMAT, 'supported_queries': list(QUERIES), 'snapshot_date': context['as_of_date'],
             'available_date_from': context['window_start'], 'available_date_to': context['as_of_date'],
             'request_date': request_date, 'resolved_period': [start, end], 'date_from': start, 'date_to': end,
-            'history': [{'question': r['question'], 'answer': r['answer']} for r in store.turns(chat, analysis, service.clock())]}, cancelled)
+            **service.model_context()}, cancelled)
         if cancelled.is_set() or store.cancelled(uid):
             return
         try:
@@ -156,7 +193,9 @@ async def handle(service, uid, user, chat, text, path, context, previous, callba
             store.put('legacy-view-v1-' + aid, scope)
             buttons = {'inline_keyboard': [[{'text': f"{r['item_name']} {r['spec']} {r['source']}"[:55],
                          'callback_data': f'{aid}:pick{i}'}] for i, r in enumerate(choices)]}
-            await service.send(f'update-{uid}', chat, '같은 이름의 여러 품목이 있습니다. 품목·규격·원천을 선택해 주세요.', buttons, cancelled=cancelled)
+            delivered = await service.send(f'update-{uid}', chat, '같은 이름의 여러 품목이 있습니다. 품목·규격·원천을 선택해 주세요.', buttons, cancelled=cancelled)
+            if delivered and not cancelled.is_set() and not callback:
+                store.memory.set_analysis(service._session_id, aid)
             return
         if choices:
             filters['product_key'] = choices[0]['product_key']
@@ -184,13 +223,14 @@ async def handle(service, uid, user, chat, text, path, context, previous, callba
         scope['page'] = {'previous': max(0, value['offset'] - 20) if value['offset'] else None,
                          'next': value['next_offset']}
     facts = make_facts([result])
-    rendered = render_query(result)
-    if (not callback and not text.startswith('/') and any(w in text for w in ('분석', '왜', '설명'))
+    rendered = easy_answer(result) if easy else render_query(result)
+    if (not easy and not callback and not text.startswith('/') and any(w in text for w in ('분석', '왜', '설명'))
             and service.settings.ai_enabled and service.settings.ai_verified and hasattr(service.model, 'explain')):
         notes = store.notes(chat, aid)[-10:]
         answer = await model_call(service, 'explain', text, {'format': FORMAT,
             'supported_queries': list(QUERIES), 'facts': facts,
-            'notes': [{'id': f'N{i + 1}', 'text': n['text']} for i, n in enumerate(notes)]}, cancelled)
+            'notes': [{'id': f'N{i + 1}', 'text': n['text']} for i, n in enumerate(notes)],
+            **service.model_context()}, cancelled)
         error = getattr(service.model, 'last_error', None)
         try:
             if not isinstance(answer, dict) or answer.get('hypotheses') or any(
@@ -201,7 +241,8 @@ async def handle(service, uid, user, chat, text, path, context, previous, callba
         except (ValueError, TypeError):
             error = error or 'invalid_answer'
             rendered = 'AI 설명을 완료하지 못해 계산된 관측 결과를 안내합니다.\n\n' + rendered
-        store.put('ai_status', {'checked_at': service.clock().isoformat(), 'stage': 'answer', 'error': error})
+        store.put('ai_status', {'checked_at': service.clock().isoformat(),
+                                **safe_diagnostic(service.model, 'answer', error)})
     if cancelled.is_set() or store.cancelled(uid):
         return
     rendered = monthly_notice(scope) + rendered
@@ -213,4 +254,12 @@ async def handle(service, uid, user, chat, text, path, context, previous, callba
     delivered = await service.send(f'update-{uid}', chat, rendered, markup(aid, scope.get('page')), cancelled=cancelled)
     if delivered and not cancelled.is_set():
         store.remember_turn(chat, analysis, text, rendered, service.clock())
+        if callback:
+            owner = store.memory.analysis_owner(previous['id']) if previous else None
+            if owner and owner['id'] == service._session_id:
+                store.memory.set_analysis(service._session_id, aid)
+        else:
+            store.memory.record(uid, user, chat, text, rendered, service._received_at,
+                                analysis, 'data', context['as_of_date'],
+                                {'format': FORMAT, 'intent': intent, 'filters': filters})
         store.remember_topic(chat, 'data', service.clock())

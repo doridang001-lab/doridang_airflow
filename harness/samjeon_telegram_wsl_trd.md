@@ -5,7 +5,7 @@
 - 개발 PC의 `C:\airflow_samjeon_agent`에서 수정·테스트하고 PR로 배포한다. 운영 노트북에서는 병합된 `main`만 받는다.
 - 운영 노트북의 Windows 서비스가 기존 Telegram 봇을 polling한다. 같은 노트북의 WSL에 로그인한 Linux Codex를 요청마다 숨김 실행하고 답변을 기존 개인 대화에 반환한다.
 - 모델은 `gpt-6-astra`, 추론 옵션은 `model_reasoning_effort="medium"`, 검증 대상 CLI는 `0.158.0`이다. `middle`이라는 옵션은 사용하지 않는다.
-- 서비스가 백그라운드로 상주하고 모델 프로세스는 요청마다 종료한다. 최근 10턴·24시간 문맥은 기존 Windows SQLite에서 전달한다. 터미널 화면이나 대화 세션 ID를 공유하지 않는다.
+- 서비스가 백그라운드로 상주하고 모델 프로세스는 요청마다 종료한다. 72시간 논리 세션과 이전 요약·최근 10문답은 Windows SQLite에서 관리해 요청마다 전달한다. 터미널 화면이나 Codex 대화 세션 ID를 공유하지 않는다.
 - 원격 개발 PC 중계, 새 봇, API 키 인증과 유료 API 자동 전환을 추가하지 않는다. WSL 실패 시 Windows Codex로 자동 전환하지 않는다.
 
 ## 실행 환경 준비
@@ -101,6 +101,8 @@ CLI 호출에는 `-c suppress_unstable_features_warning=true`를 명시한다. C
 승인된 v3 동기화와 전체 `doctor --require-ready`, 매출·근거·후속 질문·PDF 판본 검증 전에는 로그인 자동 실행 작업을 등록하지 않는다. 노트북 종료·절전·로그아웃 중에는 응답할 수 없다.
 
 ## 개발 검증과 복구
+
+2026-10-14 후속 개발에서는 verify-ai에 한국시간 요청일과 확정 조회 기간을 넣고 계획·가상 사실 설명·일반 대화를 독립 검증한다. 정상 확인 질문은 clarify, 선행 대화가 없어 실행하지 않은 기억 시험은 not_run으로 표시한다. WSL과 Windows의 모델 오류는 안전한 분류와 확인된 HTTP 상태만 전달하고, 연결·서버 일시 오류만 호스트에서 한 번 재시도한다. 세션 승계 요약은 재시도하지 않는다.
 
 기존 삼전점 전체 테스트와 `tests/test_samjeon_wsl.py`를 실행한다. 실제 WSL 통합 테스트는 `SAMJEON_TEST_WSL_DISTRIBUTION`에 개발용 배포판을 명시하면 실행되며, 임시 가짜 CLI만 사용한다. 실모델·API·Telegram 호출은 없다.
 

@@ -242,7 +242,7 @@ def test_windows_native_startup_events(tmp_path, mode, expected):
     fake.write_text(FAKE, encoding='utf-8')
     (tmp_path / 'mode').write_text(mode, encoding='ascii')
     launcher = tmp_path / 'codex.cmd'
-    launcher.write_text('@echo off\n"' + sys.executable + '" -B -X utf8 "' + str(fake) + '" %*\n', encoding='utf-8')
+    launcher.write_text('@echo off\nchcp 65001 >nul\n"' + sys.executable + '" -B -X utf8 "' + str(fake) + '" %*\n', encoding='utf-8')
     adapter = CodexAdapter(Settings(codex_executable=str(launcher), state_root=str(tmp_path / 'state'),
                                      ai_enabled=True, ai_verified=True))
     assert adapter.diagnose()['ready']
