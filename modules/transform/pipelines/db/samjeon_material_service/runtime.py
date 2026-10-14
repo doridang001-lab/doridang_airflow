@@ -50,16 +50,30 @@ class Service:
 
     def write_health(self):
         from modules.transform.pipelines.db.samjeon_material_agent.contracts import atomic_json
+        from .data_contract import readiness
+        data = getattr(self, 'data_readiness', readiness())
+        conversation_ready = bool(self.settings.enabled and self.settings.ai_enabled and self.settings.ai_verified
+                                  and self.settings.token and self.settings.allowed_users and self.settings.allowed_chats
+                                  and not self.settings.auto_send)
+        if isinstance(self.model, CodexAdapter):
+            conversation_ready = conversation_ready and bool((self.model._probe or {}).get('ready'))
         atomic_json(self.store.root / 'health.json', {'checked_at': self.clock().isoformat(),
                     'last_snapshot': self.store.get('last_snapshot'),
                     'ai': self.store.get('ai_status'), 'data_notice': getattr(self.repo, 'fallback_reason', None),
-                    **self.store.health()})
+                    **self.store.health(), **data, 'conversation_ready': conversation_ready,
+                    'full_data_ready': data['data_ready']})
 
     async def current(self):
         try:
             result = await asyncio.to_thread(self.repo.current)
+        except SnapshotUnavailable as exc:
+            from .data_contract import readiness
+            self.data_readiness = {**readiness(), 'data_error': exc.code}
+            raise
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise SnapshotUnavailable('게시본 검증 실패') from exc
+        from .data_contract import readiness
+        self.data_readiness = readiness(result[1])
         if not getattr(self.repo, 'fallback_reason', None):
             self.store.put('last_valid_snapshot', str(result[0]))
         return result
@@ -72,6 +86,11 @@ class Service:
         return f"\n\n자료 안내: {notice} 기준일 {context['as_of_date']}." if notice else ''
 
     async def pdf(self, uid, chat, analysis, cancelled):
+        context = await asyncio.to_thread(self.repo.context, analysis['snapshot'], analysis['snapshot_id'])
+        if context.get('format') == 'legacy_v1':
+            from .legacy import UNSUPPORTED
+            await self.send(f'update-{uid}', chat, UNSUPPORTED, cancelled=cancelled)
+            return
         notes = self.store.notes(chat, analysis['id'])
         saved = self.store.grounded_answer(chat, analysis, notes)
         document = await asyncio.to_thread(create_pdf, self.settings, self.repo, analysis, notes, saved)
@@ -195,15 +214,24 @@ class Service:
         return True
 
     async def help(self):
+        context = None
+        error = None
         try:
-            await self.current()
+            _, context = await self.current()
             data_ready = True
-        except SnapshotUnavailable:
+        except SnapshotUnavailable as exc:
             data_ready = False
+            error = str(exc)
         ai_ready = self.settings.ai_enabled and self.settings.ai_verified
         if ai_ready and hasattr(self.model, 'diagnose'):
             ai_ready = (await asyncio.to_thread(self.model.diagnose))['ready']
-        return help_text(ai_ready, data_ready)
+        if context and context.get('format') == 'legacy_v1':
+            return ('대표님, 삼전점 비서입니다.\n일반 대화: ' + ('준비됐습니다.' if ai_ready else '연결 준비 중입니다.')
+                    + f"\n기존 잠정 자료 조회: 가능 / {context['window_start']}~{context['as_of_date']}"
+                    + '\nv3 전체 운영 준비: 미완료. 월 전체 확정 실적을 뜻하지 않습니다.'
+                    + '\n/summary 요약 · /items 구매액 순위 · /compare 기간 비교 · /staff_meal 직원식대'
+                    + '\n/evidence 구매 근거 · /status 상태 · /help 도움말 · /cancel 취소\nPDF·예측·고급 이상 탐지는 지원하지 않습니다.')
+        return help_text(ai_ready, data_ready) + ('\n' + error if error and error != DATA_UNAVAILABLE else '')
 
     async def ingest(self, updates):
         updates = redact(updates, self.settings.token)
@@ -291,7 +319,7 @@ class Service:
             topic = self.store.topic(chat, self.clock())
             if not callback:
                 kind = route(text, topic.get('topic') or ('data' if analysis else None))
-                if kind == 'help':
+                if kind == 'help' or text.partition(' ')[0].split('@')[0] == '/status':
                     await self.send(f'update-{uid}', chat, await self.help(), cancelled=cancelled)
                     return
                 if kind == 'clarify':
@@ -303,11 +331,16 @@ class Service:
             # Telegram의 원래 수신 시각을 사용하여 대기 중 자정을 넘겨도 의미가 변하지 않는다.
             received = datetime.fromtimestamp(message['date'], KST) if isinstance(message.get('date'), (int, float)) else self.clock()
             request_date = str(received.astimezone(KST).date())
-            resolved = period(text, request_date) if not callback else None
+            try:
+                resolved = period(text, request_date) if not callback else None
+            except ValueError:
+                await self.send(f'update-{uid}', chat, '조회할 월 또는 기간을 하나만 정확히 알려주세요. 예: 2026년 10월 또는 2026-10-01 2026-10-11.', cancelled=cancelled)
+                return
             if callback:
                 token, separator, action = callback.get('data', '').partition(':')
                 analysis = self.store.analysis(token, chat)
-                if not separator or not analysis or (action not in ('why', 'items', 'meal', 'pdf') and not action.startswith('pick')):
+                import re
+                if not separator or not analysis or (action not in ('why', 'items', 'meal', 'pdf', 'evidence') and not re.fullmatch(r'(?:pick|e)\d+', action)):
                     raise ValueError('이 대화에서 확인할 수 없는 버튼입니다. 새로 질문해 주세요')
                 if action.startswith('pick'):
                     choices = self.store.get('choices-' + token, [])
@@ -315,9 +348,11 @@ class Service:
                     if not 0 <= index < len(choices):
                         raise ValueError('품목 선택 범위 오류')
                     request = {'action': 'query', 'query': {'intent': 'compare', 'product_key': choices[index]['product_key']}}
-                else:
+                elif action in ('why', 'items', 'meal', 'pdf'):
                     request = {'why': {'action': 'explain'}, 'items': {'action': 'query', 'query': {'intent': 'compare'}},
                                'meal': {'action': 'query', 'query': {'intent': 'staff_meal'}}, 'pdf': {'action': 'pdf'}}[action]
+                else:
+                    request = None
             else:
                 request = None
                 if resolved or topic.get('topic') == 'chat' or any(word in text for word in ('지금', '최신', '현재')):
@@ -334,10 +369,22 @@ class Service:
                 path = Path(analysis['snapshot'])
                 try:
                     context = await asyncio.to_thread(self.repo.context, path, analysis['snapshot_id'])
+                except SnapshotUnavailable:
+                    raise
                 except (OSError, ValueError, KeyError, TypeError) as exc:
-                    raise SnapshotUnavailable('대화 판본 검증 실패') from exc
+                    raise SnapshotUnavailable(code='snapshot_invalid') from exc
             else:
                 path, context = current_path, current_context
+            if context.get('format') == 'legacy_v1':
+                from .legacy_runtime import handle
+                legacy_previous = analysis
+                if not analysis and previous_analysis and resolved and '그 품목' in text:
+                    legacy_previous = previous_analysis
+                await handle(self, uid, user, chat, text, path, context, legacy_previous, callback, cancelled, request_date, resolved)
+                return
+            if callback and (action == 'evidence' or re.fullmatch(r'e\d+', action)):
+                raise ValueError('해당 자료 형식의 버튼이 아닙니다')
+            if not analysis:
                 if cancelled.is_set() or self.store.cancelled(uid):
                     return
                 if resolved and resolved[1] > context['as_of_date']:
@@ -429,11 +476,11 @@ class Service:
                 delivered = await self.send(f'update-{uid}', chat, answer, buttons(aid), cancelled=cancelled)
                 if delivered and not callback and request and request['action'] in ('query', 'explain') and not cancelled.is_set():
                     self.store.remember_turn(chat, analysis, text, answer, self.clock())
-        except SnapshotUnavailable:
-            self.store.update_status(uid, 'failed', 'snapshot_unavailable')
+        except SnapshotUnavailable as exc:
+            self.store.update_status(uid, 'failed', exc.code)
             self.store.remember_topic(chat, 'data', self.clock(), 'unavailable')
             if not cancelled.is_set():
-                await self.send(f'error-{uid}', chat, DATA_UNAVAILABLE, cancelled=cancelled)
+                await self.send(f'error-{uid}', chat, str(exc), cancelled=cancelled)
         except (ValueError, FileNotFoundError, KeyError) as exc:
             self.store.update_status(uid, 'failed', type(exc).__name__)
             if not cancelled.is_set():
@@ -454,6 +501,10 @@ class Service:
 
     async def monitor_once(self):
         if not self.settings.auto_send:
+            try:
+                await self.current()
+            except SnapshotUnavailable:
+                pass
             return
         now = self.clock()
         today, hhmm = str(now.date()), now.strftime('%H:%M')
@@ -464,6 +515,8 @@ class Service:
         morning = '09:30' <= hhmm <= '12:00'
         try:
             path, context = await self.current()
+            if context.get('format') == 'legacy_v1':
+                return
             fresh = context['as_of_date'] == yesterday and not getattr(self.repo, 'fallback_reason', None)
         except (OSError, ValueError, KeyError):
             path, context, fresh = None, None, False
@@ -509,6 +562,13 @@ class Service:
             path.replace(completed / path.name)
 
     async def run(self):
+        if hasattr(self.model, 'diagnose'):
+            await asyncio.to_thread(self.model.diagnose)
+        try:
+            await self.current()
+        except SnapshotUnavailable:
+            pass
+        self.write_health()
         async def poll():
             while True:
                 try:

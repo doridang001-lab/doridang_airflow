@@ -7,6 +7,7 @@
 /config/samjeon-runtime.paths
 /harness/samjeon_material_agent.md
 /harness/samjeon_telegram_wsl_trd.md
+/harness/samjeon_legacy_v1.md
 /modules/__init__.py
 /modules/transform/__init__.py
 /modules/transform/pipelines/__init__.py

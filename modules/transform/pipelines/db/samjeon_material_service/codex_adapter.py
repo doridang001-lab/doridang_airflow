@@ -198,17 +198,21 @@ class CodexAdapter:
             return None
 
     def plan(self, question, context, cancelled):
-        raw = self._invoke(PLAN_SCHEMA,
+        from .grounded import plan_schema
+        supported = context.get('supported_queries') if context.get('format') == 'legacy_v1' else None
+        raw = self._invoke(plan_schema(supported),
             '조회 계획을 만드세요. 상대 날짜 기준은 request_date(KST)입니다. snapshot_date는 자료의 기준일입니다. '
             'resolved_period가 있으면 그 기간을 반드시 사용하고, 없으면 최근 대화의 기간과 품목을 이어받으세요. '
             '원인 질문은 summary, compare, anomalies 중 필요한 조회를 최대 세 개 선택하세요. '
             '한 질문의 조회 기간과 대상 품목은 같아야 합니다. 개별 품목은 compare 또는 evidence로 조회하세요. '
             '기간 생략은 null, 품목 생략은 null입니다. 품목명은 사용자가 말한 이름만 사용하세요. '
             '불명확하거나 자료 범위를 벗어난 요청은 clarify로 되물으세요. '
-            'note는 사용자가 원인을 설명한 명확한 진술일 때만, pdf는 보고서 요청에만 사용하세요.',
+            'note는 사용자가 원인을 설명한 명확한 진술일 때만, pdf는 보고서 요청에만 사용하세요. '
+            'supported_queries가 있으면 그 조회만 선택하세요. legacy_v1은 잠정 관측값이며 PDF·예측·고급 이상 탐지가 없습니다. '
+            'items는 구매 관측액 순위, compare는 기간 간 구매 관측액 비교입니다.',
             question, context, cancelled)
         try:
-            return validate_plan(raw) if raw else None
+            return validate_plan(raw, supported) if raw else None
         except (ValueError, TypeError):
             self.last_error = 'invalid_plan'
             return None

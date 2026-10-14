@@ -2,6 +2,7 @@
 import hashlib
 import json
 import re
+import copy
 
 from .conversation import INTENTS, validate_query
 from .presentation import render_query
@@ -30,11 +31,21 @@ ANSWER_SCHEMA = object_schema({
 })
 
 
-def validate_plan(raw):
+def plan_schema(supported=None):
+    schema = copy.deepcopy(PLAN_SCHEMA)
+    if supported is not None:
+        schema['properties']['queries']['items']['properties']['intent']['enum'] = list(supported)
+        schema['properties']['action']['enum'] = ['query', 'clarify', 'note']
+    return schema
+
+
+def validate_plan(raw, supported=None):
     if not isinstance(raw, dict) or set(raw) != {'action', 'queries', 'clarification'}:
         raise ValueError('분석 계획 형식 오류')
     if raw['action'] not in ('query', 'clarify', 'note', 'pdf') or not isinstance(raw['queries'], list):
         raise ValueError('분석 작업 오류')
+    if supported is not None and raw['action'] == 'pdf':
+        raise ValueError('지원하지 않는 작업')
     if len(raw['queries']) > 3 or (raw['action'] == 'query') != bool(raw['queries']):
         raise ValueError('조회 개수 오류')
     if raw['clarification'] is not None and (not isinstance(raw['clarification'], str) or len(raw['clarification']) > 400):
@@ -47,7 +58,9 @@ def validate_plan(raw):
         name = query['product_name']
         if name is not None and (not isinstance(name, str) or not name.strip() or len(name) > 100):
             raise ValueError('품목명 오류')
-        if name and query['intent'] not in ('compare', 'evidence'):
+        if supported is not None and query['intent'] not in supported:
+            raise ValueError('지원하지 않는 조회')
+        if name and query['intent'] not in ('compare', 'evidence', 'items'):
             raise ValueError('개별 품목은 비교 또는 근거 조회를 사용하세요')
         validate_query({k: v for k, v in query.items() if k != 'product_name'})
     return raw

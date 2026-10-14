@@ -10,6 +10,7 @@ import os
 from .config import Settings, local_path
 from .repository import Repository
 from .presentation import briefing
+from .data_contract import readiness, SnapshotUnavailable
 
 
 @contextmanager
@@ -54,6 +55,7 @@ def doctor(settings):
               'ai_live_verified': settings.ai_verified, 'pdf_available': find_spec('reportlab') is not None,
               'font_available': Path(settings.font_path).is_file(), 'files_written': False,
               'state_db_exists': (local_path(settings.state_root) / 'state.sqlite3').is_file()}
+    result.update(readiness())
     health = local_path(settings.state_root) / 'health.json'
     if health.is_file():
         try:
@@ -62,17 +64,19 @@ def doctor(settings):
             result['service_health'] = {'status': '진단 파일 확인 필요'}
     try:
         _, context = Repository(settings).current()
+        result.update(readiness(context))
         result.update(snapshot_id=context['snapshot_id'], as_of_date=context['as_of_date'],
-                      data_status=context['status'], data_complete=context['month_to_date']['complete'])
+                      data_status=context['status'], data_complete=context.get('month_to_date', {}).get('complete', False))
     except (OSError, ValueError, KeyError) as exc:
-        result.update(data_complete=False, data_status='v3 스냅샷 확인 필요', data_error=type(exc).__name__)
+        result.update(data_complete=False, data_status='게시 자료 확인 필요',
+                      data_error=exc.code if isinstance(exc, SnapshotUnavailable) else 'snapshot_invalid')
     blocked = []
     for key, label in (('enabled', '서비스 비활성'), ('token_present', '봇 토큰 없음'),
                        ('users_registered', '사용자 미등록'), ('chat_registered', '대화 미등록'),
                        ('pdf_available', 'PDF 의존성 없음'), ('font_available', '한글 글꼴 없음')):
         if not result[key]:
             blocked.append(label)
-    if 'snapshot_id' not in result:
+    if not result['data_ready']:
         blocked.append('유효한 v3 게시본 없음')
     if settings.ai_enabled and (not settings.ai_verified or not cli['ready']):
         blocked.append('Codex 실연결 검증 필요' if not settings.ai_verified else 'Codex: ' + str(cli['reason']))
@@ -93,8 +97,7 @@ def doctor(settings):
         conversation_blocked.append('대화 전용 배포는 auto_send=false가 필요합니다')
     result.update(conversation_deployable=not conversation_blocked,
                   conversation_blocked_reasons=conversation_blocked,
-                  conversation_ready=not conversation_blocked and settings.enabled and settings.ai_enabled and settings.ai_verified,
-                  data_ready='snapshot_id' in result)
+                  conversation_ready=not conversation_blocked and settings.enabled and settings.ai_enabled and settings.ai_verified)
     return result
 
 
@@ -114,6 +117,7 @@ def main(argv=None):
         cmd.add_argument('--require-ready', action='store_true')
         if name == 'doctor':
             cmd.add_argument('--require-conversation-deployable', action='store_true')
+            cmd.add_argument('--require-data-query-ready', action='store_true')
         if name == 'report':
             cmd.add_argument('--snapshot', type=Path, required=True)
     args = parser.parse_args(argv)
@@ -165,11 +169,17 @@ def main(argv=None):
     if args.command == 'doctor' or (args.command == 'service' and args.dry_run):
         result = doctor(settings)
         failed = (args.require_ready and not result['ready']) or (getattr(args, 'require_conversation_deployable', False) and not result['conversation_deployable'])
+        failed = failed or (getattr(args, 'require_data_query_ready', False) and
+                            not (result['conversation_ready'] and result['data_query_ready']))
         result['_exit_code'] = 2 if failed else 0
         return result
     if args.command == 'report':
         from dataclasses import replace
-        _, context = Repository(replace(settings, snapshot=str(args.snapshot))).current()
+        repository = Repository(replace(settings, snapshot=str(args.snapshot)))
+        path, context = repository.current()
+        if context.get('format') == 'legacy_v1':
+            from .presentation import render_query
+            return {'text': render_query(repository.query(path, 'summary')), 'snapshot_id': context['snapshot_id'], 'files_written': False}
         return {'text': briefing(context), 'snapshot_id': context['snapshot_id'], 'files_written': False}
     if args.config is None:
         parser.error('service에는 --config가 필요합니다')

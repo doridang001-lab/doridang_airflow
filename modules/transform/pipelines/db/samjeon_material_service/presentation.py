@@ -79,6 +79,9 @@ def summary(period):
 
 
 def render_query(result):
+    if result.get('format') == 'legacy_v1':
+        from .legacy import render
+        return render(result)
     if result.get('status') == '범위 밖':
         return f"이 스냅샷에는 필요한 기간이 없습니다. {result['required_date_from']} ~ {result['required_date_to']} 재계산이 필요합니다."
     value, intent = result['result'], result['intent']

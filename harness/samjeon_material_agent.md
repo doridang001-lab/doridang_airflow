@@ -1,5 +1,11 @@
 # 송파삼전점 대화형 관리 에이전트
 
+## 기존 잠정 자료 조회
+
+검증된 `samjeon-mart-v1` 조회는 [기존 자료 조회 계약과 배포 절차](samjeon_legacy_v1.md)를 따른다. 매출·구매 관측액, 품목 순위, 기간 비교, 직원식대와 구매 근거를 지원하며 PDF·고급 이상 탐지·예측은 v3 전용이다. 아래 알림·PDF·마감·전체 준비 설명은 v3에 적용한다.
+
+`doctor --require-data-query-ready`는 기본 대화와 자료 조회 준비를 함께 검사한다. v1에서는 `data_query_ready=true`, `data_ready=false`, `ready=false`다. `/items`는 구매액 순위이고 `/compare`는 기간 비교다. 오류 안내는 게시본 없음·형식 미지원·파일 검증 실패·기간 부족으로 구분한다. 자료 형식이 v1이라는 이유만으로 포괄적인 자료 미준비 안내를 보내지 않는다.
+
 ## WSL 백그라운드 연결
 
 2026-10-14 이후 신규 운영은 [WSL 연결 TRD](samjeon_telegram_wsl_trd.md)를 따른다. 운영 노트북의 기존 Windows Telegram 서비스가 같은 노트북의 Linux Codex를 호출한다. 모델은 Astra, 추론 수준은 `medium`이다. 기존 Windows 직접 실행 설정은 호환용으로 유지하며 WSL 설정 실패 시 자동 전환하지 않는다.
@@ -21,9 +27,9 @@ WSL 준비가 완료된 노트북의 시작 알림 오분류 수정은 [TRD의 �
 1. Windows에서 Git과 Python 3.12를 설치한다. Telegram Desktop은 휴대폰 이용 시 선택 사항이다. WSL backend는 같은 운영 계정의 WSL 배포판과 Linux Codex 로그인이 필요하다. Windows 앱·CLI 로그인은 WSL 인증을 대신하지 않는다.
 2. 개선 코드가 GitHub `main`에 반영된 후 아래 부분 복제를 사용한다. 노트북은 실행 파일만, 현재 PC는 개발 프로필의 관련 테스트·문서까지 받는다. 갱신은 아래 업데이트 스크립트로 수행한다.
 3. 저장소 루트에서 `scripts/setup_samjeon_material_agent.ps1`을 실행한다. 이 스크립트는 Python 3.12 전용 `.venv`와 최소 의존성을 준비하고 `doctor`를 실행한다. 설정·토큰·스냅샷이 없는 첫 결과는 미준비로 표시되는 것이 정상이다.
-4. 실제 서비스 설정은 저장소 밖의 `C:\Local_DB\samjeon_material_agent\service.json`에 둔다. `state_root`는 같은 로컬 폴더 아래로, `snapshot_root`는 `latest.json`과 `snapshots/`가 있는 승인된 v3 게시 루트로 지정한다. 원본 자료와 게시본은 서비스가 읽기 전용으로 사용한다.
+4. 실제 서비스 설정은 저장소 밖의 `C:\Local_DB\samjeon_material_agent\service.json`에 둔다. `state_root`는 같은 로컬 폴더 아래로, `snapshot_root`는 `latest.json`과 `snapshots/`가 있는 게시 루트로 지정한다. 기존 v1과 승인된 v3를 형식별로 검증하며 원본 자료와 게시본은 읽기 전용으로 사용한다.
 5. 전용 Telegram 봇 토큰은 노트북의 서비스 실행 계정 환경변수 `SAMJEON_TELEGRAM_BOT_TOKEN`에 보관한다. 대표님 Telegram 계정의 숫자 사용자·개인 대화 ID만 허용 목록에 넣는다. 토큰과 실제 ID는 Git에 저장하지 않는다.
-6. 추가 사용 정책 확인과 실계정 대화 검증 후 `enabled=true`, `ai_enabled=true`, `ai_verified=true`, `auto_send=false`로 대화를 시험한다. PDF·자료 조회는 v3 검증 후 시험한다. 전체 `doctor --require-ready` 통과 후에만 작업 스케줄러를 등록한다. `auto_send=true`는 대표님의 별도 요청이 있을 때만 적용한다. 노트북은 로그인 상태·전원·네트워크를 유지하고 절전을 해제해야 응답한다.
+6. 추가 사용 정책 확인과 실계정 대화 검증 후 `enabled=true`, `ai_enabled=true`, `ai_verified=true`, `auto_send=false`로 대화를 시험한다. 기존 잠정 자료는 전용 조회 검증 후 사용하고 PDF는 v3 검증 후 시험한다. 전체 `doctor --require-ready` 통과 후에만 작업 스케줄러를 등록한다. `auto_send=true`는 대표님의 별도 요청이 있을 때만 적용한다. 노트북은 로그인 상태·전원·네트워크를 유지하고 절전을 해제해야 응답한다.
 
 ```powershell
 winget install --id Git.Git --exact --source winget
@@ -133,7 +139,7 @@ $config = 'C:\Local_DB\samjeon_material_agent\service.json'
 
 일반 대화는 별도 `chat-turns-v1-*` 키로 개인 대화별 최근 10턴·24시간을 유지하며 분석 이력을 전달하지 않는다. 취소·실패·전송 결과 불명 답변은 전달된 대화로 기억하지 않는다. 명령과 업무 키워드, 마지막 대화 주제로 먼저 분기하고 모호한 질문은 되묻는다. `어제`는 Telegram 메시지 수신일의 한국 날짜 기준이며 스냅샷 날짜를 대신 사용하지 않는다. `지난주`는 월~일, `최근 7일`은 어제까지, `이번 달`은 월초~어제(월초 당일이면 당일)다.
 
-`/start`·`/help`는 현재 대화·자료 준비 상태만 안내한다. v3가 없을 때 수치 질문에는 정확히 `현재 검증된 삼전점 자료가 준비되지 않아 매출·원재료 수치를 답할 수 없습니다. 준비되면 다시 질문해 주세요.`라고 답한다.
+`/start`·`/help`·`/status`는 일반 대화·자료 조회·전체 준비를 구분한다. v1은 전용 계약으로 잠정 관측값을 답한다. 게시본 없음·미지원 형식·검증 실패는 안전한 오류별 문구를 사용하고, 요청 기간이 없으면 보유 범위를 안내한다.
 
 `state/logs/service.log`와 `state/health.json`에서 AI 실패 단계·자료 동기화 지연·발송 상태를 확인한다. 토큰과 원본 CLI 오류 전문은 저장하지 않는다. 노트북 실계정·전용 봇·승인된 v3 연결 후 연속 3일 운영 확인을 수행한다.
 

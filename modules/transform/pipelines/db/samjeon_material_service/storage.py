@@ -128,15 +128,22 @@ class Store:
         with self.db:
             self.db.execute('UPDATE analyses SET focus=? WHERE id=? AND chat=?', (product_key, aid, chat))
 
-    def turns(self, chat, analysis, now):
+    def turn_scope(self, analysis):
         scope = {k: analysis.get(k) for k in ('snapshot_id', 'date_from', 'date_to', 'focus')}
+        legacy = self.get('legacy-view-v1-' + analysis['id'], {})
+        if legacy:
+            scope.update(format=legacy['format'], requested_period=legacy['requested_period'])
+        return scope
+
+    def turns(self, chat, analysis, now):
+        scope = self.turn_scope(analysis)
         rows = self.get(f'turns-v1-{chat}', [])
         return [r for r in rows if r['scope'] == scope and
                 (now - datetime.fromisoformat(r['created'])).total_seconds() < 86400][-10:]
 
     def remember_turn(self, chat, analysis, question, answer, now):
         rows = self.turns(chat, analysis, now)
-        rows.append({'scope': {k: analysis.get(k) for k in ('snapshot_id', 'date_from', 'date_to', 'focus')},
+        rows.append({'scope': self.turn_scope(analysis),
                      'question': question[:1000], 'answer': answer[:1500], 'created': now.isoformat()})
         self.put(f'turns-v1-{chat}', rows[-10:])
 
