@@ -48,8 +48,9 @@ def handle(request, cancelled):
     with tempfile.TemporaryDirectory(prefix='samjeon-codex-') as work:
         adapter = CodexAdapter(replace(settings, state_root=work))
         answer = adapter._invoke(request['schema'], request['instruction'], request['question'],
-                                 request['context'], cancelled)
-        return {'answer': answer, 'error': adapter.last_error, 'event_type': adapter.last_event_type}
+                                 request['context'], cancelled, allow_retry=False)
+        return {'answer': answer, 'error': adapter.last_error, 'event_type': adapter.last_event_type,
+                'http_status': adapter.last_http_status}
 
 
 def main():

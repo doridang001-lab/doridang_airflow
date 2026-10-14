@@ -15,7 +15,8 @@ ERRORS = frozenset(('wsl_missing', 'wsl_distribution_missing', 'wsl_unavailable'
     'unsupported_cli', 'chatgpt_login_required', 'cli_probe_timeout', 'cli_launch_failed',
     'ai_disabled_or_cli_missing', 'cancelled', 'context_too_large', 'model_timeout',
     'model_output_too_large', 'usage_limit', 'authentication_failed', 'model_failed',
-    'unexpected_tool', 'unexpected_event', 'cli_launch_or_output_failed'))
+    'unexpected_tool', 'unexpected_event', 'cli_launch_or_output_failed',
+    'connection_temporary', 'server_temporary'))
 
 
 def safe_error(value):
@@ -136,6 +137,8 @@ class WslTransport:
                               'todo_list', 'error', 'tool_call', 'function_call', 'unknown')
             if response.get('event_type') not in allowed_events:
                 response['event_type'] = None
+            if response.get('http_status') not in (400, 401, 403, 408, 429, 500, 502, 503, 504):
+                response['http_status'] = None
             return response
         except (OSError, ValueError, UnicodeError, subprocess.SubprocessError):
             return {'error': 'wsl_runner_failed'}

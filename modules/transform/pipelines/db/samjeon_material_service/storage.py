@@ -45,6 +45,8 @@ class Store:
         with self.db:
             self.db.execute("UPDATE outbox SET state='uncertain', error='재시작 중 전송 결과 확인 필요' WHERE state='sending'")
             self.db.execute("UPDATE updates SET status='interrupted', error='서비스 재시작' WHERE status='processing'")
+        from .memory import Memory
+        self.memory = Memory(self)
 
     def close(self):
         self.db.close()
@@ -57,13 +59,14 @@ class Store:
         with self.db:
             self.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', (key, json.dumps(value, ensure_ascii=False)))
 
-    def receive(self, updates):
+    def receive(self, updates, received_at=None):
         with self.db:
             offset = self.get('offset', 0)
             for u in updates:
                 uid = u['update_id']
                 self.db.execute('INSERT OR IGNORE INTO updates(id,payload,created) VALUES(?,?,?)',
-                                (uid, json.dumps(u, ensure_ascii=False), stamp()))
+                                (uid, json.dumps(u, ensure_ascii=False),
+                                 received_at.isoformat() if received_at else stamp()))
                 offset = max(offset, uid + 1)
             self.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('offset', json.dumps(offset)))
 
