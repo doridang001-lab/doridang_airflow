@@ -18,7 +18,8 @@ def instance_lock(root):
     root.mkdir(parents=True, exist_ok=True)
     with (root / 'service.lock').open('a+b') as handle:
         handle.seek(0)
-        if not handle.read(1):
+        # Windows는 다른 프로세스가 잠근 바이트의 읽기도 거부한다.
+        if os.fstat(handle.fileno()).st_size == 0:
             handle.write(b'1')
             handle.flush()
         handle.seek(0)
@@ -100,6 +101,12 @@ def doctor(settings):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest='command', required=True)
+    wsl = subs.add_parser('configure-wsl')
+    wsl.add_argument('--config', type=Path, required=True)
+    wsl.add_argument('--distribution', required=True)
+    wsl.add_argument('--user', required=True)
+    wsl.add_argument('--codex-executable', required=True)
+    wsl.add_argument('--dry-run', action='store_true')
     for name in ('doctor', 'service', 'report', 'verify-ai'):
         cmd = subs.add_parser(name)
         cmd.add_argument('--config', type=Path)
@@ -110,6 +117,9 @@ def main(argv=None):
         if name == 'report':
             cmd.add_argument('--snapshot', type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.command == 'configure-wsl':
+        from .wsl_config import configure
+        return configure(args.config, args.distribution, args.user, args.codex_executable, args.dry_run)
     settings = Settings.load(args.config) if args.config else Settings()
     settings.validate()
     if args.command == 'verify-ai':
@@ -123,26 +133,33 @@ def main(argv=None):
         plan = adapter.plan('이번 달 매출 요약을 보여줘',
                             {'snapshot_date': '2026-10-11', 'date_from': '2026-10-01', 'date_to': '2026-10-11', 'history': []},
                             threading.Event()) if probe['ready'] else None
+        checks = {'plan': {'error': adapter.last_error, 'event_type': adapter.last_event_type}}
         from .grounded import render_answer
         facts = [{'id': 'F1', 'text': '연결 시험용 가상 자료: 매출 100원, 매입 30원.', 'status': '정상',
                   'data': {'synthetic': True, 'sales_won': 100, 'purchase_won': 30}}]
         answer = adapter.explain('이 시험 자료에서 확인할 점을 알려줘', {'facts': facts, 'notes': []},
-                                 threading.Event()) if plan and plan['action'] == 'query' else None
+                                  threading.Event()) if plan and plan['action'] == 'query' else None
+        checks['answer'] = {'error': adapter.last_error if plan else 'not_run',
+                            'event_type': adapter.last_event_type if plan else None}
         try:
             render_answer(answer, facts, [])
             verified = True
         except (ValueError, TypeError):
             verified = False
         first = adapter.chat('안녕. 오늘 대화의 기억 단어는 해바라기야. 기억해 줘.', {'history': []},
-                             threading.Event()) if probe['ready'] else None
+                              threading.Event()) if probe['ready'] else None
+        checks['conversation'] = {'error': adapter.last_error, 'event_type': adapter.last_event_type}
         second = adapter.chat('아까 내가 알려준 기억 단어가 뭐였지?', {'history': [{
             'question': '안녕. 오늘 대화의 기억 단어는 해바라기야. 기억해 줘.',
-            'answer': first['text']}]}, threading.Event()) if first and first['kind'] == 'reply' else None
+             'answer': first['text']}]}, threading.Event()) if first and first['kind'] == 'reply' else None
+        checks['followup'] = {'error': adapter.last_error if first else 'not_run',
+                              'event_type': adapter.last_event_type if first else None}
         chat_verified = bool(first and second and second['kind'] == 'reply' and '해바라기' in second['text'])
         ready = verified and chat_verified
         return {'ready': ready, 'codex': probe, 'plan_valid': bool(plan), 'answer_valid': verified,
                 'conversation_valid': bool(first and first['kind'] == 'reply'), 'followup_valid': chat_verified,
-                'error': adapter.last_error, 'settings_changed': False,
+                'error': next((v['error'] for v in checks.values() if v['error'] and v['error'] != 'not_run'), None),
+                'checks': checks, 'settings_changed': False,
                 'additional_spend_controls_verified': False,
                 '_exit_code': 2 if args.require_ready and not ready else 0}
     if args.command == 'doctor' or (args.command == 'service' and args.dry_run):

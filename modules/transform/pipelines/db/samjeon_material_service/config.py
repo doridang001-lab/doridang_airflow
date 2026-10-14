@@ -28,6 +28,11 @@ class Settings:
     ai_enabled: bool = False
     ai_verified: bool = False
     codex_executable: str = 'codex'
+    codex_backend: str = 'windows'
+    wsl_distribution: str = ''
+    wsl_user: str = ''
+    wsl_codex_executable: str = ''
+    model_reasoning_effort: str = 'medium'
     model: str = 'gpt-6-astra'
     font_path: str = 'C:/Windows/Fonts/malgun.ttf'
     notification_start: str = '09:30'
@@ -67,6 +72,16 @@ class Settings:
             raise ValueError('자동 안내 수신자를 등록하세요')
         if self.model != 'gpt-6-astra':
             raise ValueError('이 서비스의 승인 모델은 gpt-6-astra입니다')
+        if self.codex_backend not in ('windows', 'wsl') or self.model_reasoning_effort != 'medium':
+            raise ValueError('Codex 실행 방식 또는 추론 수준 오류')
+        if self.codex_backend == 'wsl':
+            for value in (self.wsl_distribution, self.wsl_user):
+                if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}', value):
+                    raise ValueError('WSL 배포판과 사용자를 명시하세요')
+            value = self.wsl_codex_executable
+            if (not isinstance(value, str) or not value.startswith('/') or value.startswith('/mnt/')
+                    or any(c in value for c in ('\x00', '\n', '\r', '\\')) or '..' in value.split('/')):
+                raise ValueError('WSL 안에 설치한 Linux Codex 절대경로가 필요합니다')
         if not re.fullmatch(r'[A-Z][A-Z0-9_]+', self.token_env):
             raise ValueError('토큰 환경변수 이름 오류')
         for t in (self.notification_start, self.notification_end):

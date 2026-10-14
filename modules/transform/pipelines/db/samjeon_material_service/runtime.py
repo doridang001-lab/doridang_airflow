@@ -181,7 +181,10 @@ class Service:
         if cancelled.is_set() or self.store.cancelled(uid):
             return True
         self.store.put('ai_status', {'checked_at': self.clock().isoformat(), 'stage': 'chat',
-                                    'error': None if answer else 'chat_unavailable'})
+                                    'error': None if answer else (self.model.last_error or 'chat_unavailable')
+                                        if isinstance(self.model, CodexAdapter) else 'chat_unavailable',
+                                    'event_type': getattr(self.model, 'last_event_type', None)
+                                        if isinstance(self.model, CodexAdapter) else None})
         if answer and answer['kind'] == 'data_request':
             return False
         rendered = AI_UNAVAILABLE if not answer else CLARIFY if answer['kind'] == 'clarify' else redact(answer['text'], self.settings.token)

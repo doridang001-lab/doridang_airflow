@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 
 from .config import local_path
@@ -53,13 +54,17 @@ SCHEMA = {'type': 'object', 'properties': {
 
 
 def stop_tree(process):
-    if process.poll() is None:
-        if os.name == 'nt':
-            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True,
-                           creationflags=subprocess.CREATE_NO_WINDOW, timeout=10)
-        else:
-            import signal
+    if os.name != 'nt':
+        import signal
+        try:
             os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=10)
+        return
+    if process.poll() is None:
+        subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW, timeout=10)
         process.wait(timeout=10)
 
 
@@ -67,6 +72,7 @@ class CodexAdapter:
     def __init__(self, settings):
         self.settings = settings
         self.last_error = None
+        self.last_event_type = None
         self._probe = None
         self._probe_at = 0
 
@@ -79,6 +85,11 @@ class CodexAdapter:
     def diagnose(self, refresh=False):
         if not refresh and self._probe and time.monotonic() - self._probe_at < 300:
             return dict(self._probe)
+        if self.settings.codex_backend == 'wsl':
+            from .wsl_transport import WslTransport
+            result = WslTransport(self.settings).diagnose()
+            self._probe, self._probe_at = result, time.monotonic()
+            return dict(result)
         executable = shutil.which(self.settings.codex_executable)
         result = {'ready': False, 'reason': 'cli_missing', 'version': None, 'auth': 'unknown'}
         if executable:
@@ -106,7 +117,8 @@ class CodexAdapter:
         return dict(result)
 
     def available(self):
-        return bool(self.settings.ai_enabled and self.settings.ai_verified and shutil.which(self.settings.codex_executable))
+        executable = 'wsl.exe' if self.settings.codex_backend == 'wsl' else self.settings.codex_executable
+        return bool(self.settings.ai_enabled and self.settings.ai_verified and shutil.which(executable))
 
     def interpret(self, question, context, cancelled):
         raw = self._invoke(SCHEMA, '허용 조회 종류와 ISO 기간만 반환하세요.', question, context, cancelled)
@@ -162,6 +174,7 @@ class CodexAdapter:
 
     def _invoke(self, output_schema, instruction, question, context, cancelled):
         self.last_error = None
+        self.last_event_type = None
         if not self.available():
             self.last_error = 'ai_disabled_or_cli_missing'
             return None
@@ -172,6 +185,13 @@ class CodexAdapter:
         if cancelled.is_set():
             self.last_error = 'cancelled'
             return None
+        if self.settings.codex_backend == 'wsl':
+            from .wsl_transport import WslTransport
+            result = WslTransport(self.settings).invoke(output_schema, instruction,
+                redact(question, self.settings.token), redact(context, self.settings.token), cancelled)
+            self.last_error = result.get('error')
+            self.last_event_type = result.get('event_type')
+            return result.get('answer')
         root = local_path(self.settings.state_root) / 'model-work'
         root.mkdir(parents=True, exist_ok=True)
         # 한 질문에 한 번만 호출한다. 추가 설명은 검증된 로컬 문장으로 구성한다.
@@ -183,6 +203,7 @@ class CodexAdapter:
                     '--ignore-user-config', '--ignore-rules', '--ephemeral', '--strict-config',
                     '--skip-git-repo-check', '--sandbox', 'read-only', '--json',
                     '--model', self.settings.model, '--output-schema', str(schema),
+                    '-c', 'model_reasoning_effort="medium"',
                     '--output-last-message', str(output), '--cd', str(work),
                     '-c', 'web_search="disabled"', '-c', 'project_doc_max_bytes=0',
                     '--enable', 'skip_host_skill_discovery']
@@ -202,8 +223,18 @@ class CodexAdapter:
                                                cwd=work, env=env, start_new_session=os.name != 'nt',
                                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
                     try:
-                        process.stdin.write(prompt.encode('utf-8'))
-                        process.stdin.close()
+                        def feed():
+                            try:
+                                process.stdin.write(prompt.encode('utf-8'))
+                            except OSError:
+                                pass
+                            finally:
+                                try:
+                                    process.stdin.close()
+                                except OSError:
+                                    pass
+                        writer = threading.Thread(target=feed, daemon=True)
+                        writer.start()
                         started = time.monotonic()
                         while process.poll() is None:
                             oversized = (work / 'events.jsonl').stat().st_size > 2_000_000 or (work / 'stderr.txt').stat().st_size > 2_000_000
@@ -214,6 +245,7 @@ class CodexAdapter:
                             time.sleep(.1)
                     finally:
                         stop_tree(process)
+                        writer.join(timeout=2)
                 event_text = (work / 'events.jsonl').read_text(encoding='utf-8')
                 diagnostic = ((work / 'stderr.txt').read_text(encoding='utf-8', errors='replace')[-16000:] + event_text[-16000:]).lower()
                 if process.returncode or cancelled.is_set() or not output.exists() or output.stat().st_size > 16384:
@@ -231,6 +263,10 @@ class CodexAdapter:
                         raise ValueError('이벤트 항목 오류')
                     if item.get('type') and item['type'] not in ('agent_message', 'reasoning', 'plan'):
                         self.last_error = 'unexpected_tool'
+                        # 원본 이벤트/내용을 저장하지 않는다. 알려진 종류만 보고한다.
+                        self.last_event_type = item['type'] if item['type'] in (
+                            'command_execution', 'file_change', 'mcp_tool_call', 'web_search',
+                            'todo_list', 'error', 'tool_call', 'function_call') else 'unknown'
                         return None
                 raw = json.loads(output.read_text(encoding='utf-8'))
                 return raw
