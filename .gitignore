@@ -99,6 +99,7 @@ pnpm-debug.log*
 !phases/**/*.json
 config/*.json
 !config/samjeon_material_agent.example.json
+!config/samjeon_material_agent.wsl.example.json
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm

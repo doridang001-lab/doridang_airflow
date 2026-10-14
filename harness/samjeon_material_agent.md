@@ -1,5 +1,11 @@
 # 송파삼전점 대화형 관리 에이전트
 
+## WSL 백그라운드 연결
+
+2026-10-14 이후 신규 운영은 [WSL 연결 TRD](samjeon_telegram_wsl_trd.md)를 따른다. 운영 노트북의 기존 Windows Telegram 서비스가 같은 노트북의 Linux Codex를 호출한다. 모델은 Astra, 추론 수준은 `medium`이다. 기존 Windows 직접 실행 설정은 호환용으로 유지하며 WSL 설정 실패 시 자동 전환하지 않는다.
+
+개발 PC에서 구현·검증하고 노트북은 병합된 `main`만 배포한다. WSL 설치·로그인, 기존 설정의 `configure-wsl` 전환, 실검증과 `-Background` 시작 순서는 TRD를 우선한다. 아래 Windows CLI 설치·로그인 명령은 기존 Windows backend에만 해당한다.
+
 ## 실행 위치와 책임
 
 - 코드 수정·검증·gitpush는 개발 PC에서만 한다. 대표님 노트북은 GitHub `main`을 받아 실행하며 코드를 수정하지 않는다.
@@ -10,7 +16,7 @@
 
 ## 새 노트북 준비
 
-1. Windows에서 Git, Python 3.12, Telegram Desktop을 설치한다. WSL은 이 서비스의 실행 조건이 아니다. ChatGPT Business Standard 로그인은 설치 작업에 사용할 수 있으나 Telegram 봇의 Codex CLI 인증을 자동으로 대신하지 않는다.
+1. Windows에서 Git과 Python 3.12를 설치한다. Telegram Desktop은 휴대폰 이용 시 선택 사항이다. WSL backend는 같은 운영 계정의 WSL 배포판과 Linux Codex 로그인이 필요하다. Windows 앱·CLI 로그인은 WSL 인증을 대신하지 않는다.
 2. 개선 코드가 GitHub `main`에 반영된 후 아래 부분 복제를 사용한다. 노트북은 실행 파일만, 현재 PC는 개발 프로필의 관련 테스트·문서까지 받는다. 갱신은 아래 업데이트 스크립트로 수행한다.
 3. 저장소 루트에서 `scripts/setup_samjeon_material_agent.ps1`을 실행한다. 이 스크립트는 Python 3.12 전용 `.venv`와 최소 의존성을 준비하고 `doctor`를 실행한다. 설정·토큰·스냅샷이 없는 첫 결과는 미준비로 표시되는 것이 정상이다.
 4. 실제 서비스 설정은 저장소 밖의 `C:\Local_DB\samjeon_material_agent\service.json`에 둔다. `state_root`는 같은 로컬 폴더 아래로, `snapshot_root`는 `latest.json`과 `snapshots/`가 있는 승인된 v3 게시 루트로 지정한다. 원본 자료와 게시본은 서비스가 읽기 전용으로 사용한다.
