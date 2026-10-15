@@ -7,6 +7,7 @@ from .conversation import parse, month_period
 from .grounded import make_facts, render_answer, validate_plan
 from .legacy import FORMAT, QUERIES, UNSUPPORTED
 from .presentation import render_query
+from .data_contract import planning_context
 
 
 async def model_call(service, stage, *args):
@@ -150,8 +151,7 @@ async def handle(service, uid, user, chat, text, path, context, previous, callba
         return
     if intent is None and service.settings.ai_enabled and service.settings.ai_verified and hasattr(service.model, 'plan'):
         plan = await model_call(service, 'plan', text, {
-            'format': FORMAT, 'supported_queries': list(QUERIES), 'snapshot_date': context['as_of_date'],
-            'available_date_from': context['window_start'], 'available_date_to': context['as_of_date'],
+            **planning_context(context), 'snapshot_date': context['as_of_date'],
             'request_date': request_date, 'resolved_period': [start, end], 'date_from': start, 'date_to': end,
             **service.model_context()}, cancelled)
         if cancelled.is_set() or store.cancelled(uid):

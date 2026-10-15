@@ -1,6 +1,7 @@
 """검증된 숫자와 명시적 확인 질문으로 대화 문장을 만든다."""
 import hashlib
 import json
+import re
 from datetime import date
 
 
@@ -133,18 +134,74 @@ def render_query(result):
     raise ValueError('지원하지 않는 결과')
 
 
+def telegram_plain(text):
+    """Markdown 렌더링을 쓰지 않는 Telegram 답변을 일반 텍스트로 정리한다."""
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    text = re.sub(r'^[ \t]*```[^\n]*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\[([^\]\n]+)\]\((https?://[^\s)]+)\)', r'\1 (\2)', text)
+    text = re.sub(r'^ {0,3}#{1,6}[ \t]+', '# ', text, flags=re.MULTILINE)
+    text = re.sub(r'^ {0,3}>\s?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^[ \t]*[-*+][ \t]+', '- ', text, flags=re.MULTILINE)
+    text = re.sub(r'(?<!\*)\*\*(\S(?:.*?\S)?)\*\*(?!\*)', r'\1', text)
+    text = re.sub(r'(?<!_)__(\S(?:.*?\S)?)__(?!_)', r'\1', text)
+    text = re.sub(r'(?<!\w)\*(\S(?:.*?\S)?)\*(?!\w)', r'\1', text)
+    text = re.sub(r'(?<!\w)_(\S(?:.*?\S)?)_(?!\w)', r'\1', text)
+    text = re.sub(r'~~(\S(?:.*?\S)?)~~', r'\1', text)
+    text = re.sub(r'(?<!`)`([^`\n]+)`(?!`)', r'\1', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def telegram_answer(text):
+    """모바일용 결론·제목·불릿을 읽기 좋게 정렬한다. 사실 문장은 버리지 않는다."""
+    lines = telegram_plain(text).split('\n')
+    result, in_section = [], False
+    for line in lines:
+        line = line.strip()
+        if not line:
+            if result and result[-1] and not result[-1].startswith('# '):
+                result.append('')
+            continue
+        if line.startswith('# '):
+            if result and result[-1]:
+                result.append('')
+            result.append(line)
+            in_section = True
+        elif in_section and not line.startswith('- '):
+            result.append('- ' + line)
+        else:
+            result.append(line)
+    return '\n'.join(result).strip()
+
+
 def chunks(text, limit=3500):
-    # Telegram의 UTF-16 길이 제한 안에서 한글·이모지를 보존한다.
-    part, size = '', 0
-    for char in text:
-        units = len(char.encode('utf-16-le')) // 2
-        if size + units > limit:
-            yield part
-            part, size = '', 0
-        part += char
-        size += units
-    if part:
-        yield part
+    # UTF-16 길이 안에서 문단, 줄, 문장 순으로 나눈다.
+    if limit < 2:
+        raise ValueError('메시지 길이 제한이 너무 작습니다')
+    remaining = text
+    while remaining:
+        units = 0
+        end = 0
+        for char in remaining:
+            width = len(char.encode('utf-16-le')) // 2
+            if units + width > limit:
+                break
+            units += width
+            end += 1
+        if end == len(remaining):
+            yield remaining
+            return
+        window = remaining[:end]
+        floor = max(1, end // 3)
+        breaks = [window.rfind('\n\n'), window.rfind('\n'),
+                  max((m.end() for m in re.finditer(r'[.!?。！？] +', window)), default=-1)]
+        cut = next((at + 2 for at in breaks[:1] if at >= floor), None)
+        if cut is None:
+            cut = next((at + 1 for at in breaks[1:2] if at >= floor), None)
+        if cut is None:
+            cut = next((at for at in breaks[2:] if at >= floor), end)
+        yield remaining[:cut]
+        remaining = remaining[cut:]
 
 
 def buttons(aid):

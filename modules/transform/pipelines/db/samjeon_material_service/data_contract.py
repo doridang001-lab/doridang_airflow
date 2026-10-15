@@ -2,6 +2,22 @@
 from .conversation import DATA_UNAVAILABLE
 
 
+def available_metrics(tables):
+    """검증된 게시본에 관측 행이 있는 지표만 전달한다. 기간 완결성을 뜻하지 않는다."""
+    return [metric for metric, table in (('sales_won', 'sales_daily'),
+                                        ('purchase_won', 'purchase_daily'))
+            if table in tables and not tables[table].empty]
+
+
+def planning_context(context):
+    state = readiness(context)
+    return {'format': state['data_format'],
+            'supported_queries': state['supported_queries'],
+            'available_metrics': context.get('available_metrics', []),
+            'available_date_from': state['available_date_from'],
+            'available_date_to': state['available_date_to']}
+
+
 class SnapshotUnavailable(ValueError):
     MESSAGES = {
         'snapshot_unavailable': DATA_UNAVAILABLE,

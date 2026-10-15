@@ -5,7 +5,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from modules.transform.pipelines.db.samjeon_material_agent.query import load_snapshot, query_snapshot
 from .conversation import validate_query
-from .data_contract import SnapshotUnavailable
+from .data_contract import SnapshotUnavailable, available_metrics
 from . import legacy
 
 
@@ -16,7 +16,8 @@ def checked_snapshot(path):
             raise ValueError('게시 형식 오류')
         if manifest.get('schema_version') == 3:
             manifest, context, tables = load_snapshot(path)
-            context = {**context, 'format': 'v3', 'window_start': manifest['window_start']}
+            context = {**context, 'format': 'v3', 'window_start': manifest['window_start'],
+                       'available_metrics': available_metrics(tables)}
             return manifest, context, tables
         if 'schema_version' not in manifest and manifest.get('rule_version') == 'samjeon-mart-v1':
             return legacy.load(path, manifest)

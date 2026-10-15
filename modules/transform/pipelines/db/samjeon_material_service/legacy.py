@@ -111,7 +111,9 @@ def load(directory, manifest):
         raise ValueError('일별 키 중복')
     # 기존 v1 context의 계산값·예측·물리 경로는 서비스로 전달하지 않는다.
     safe = {k: manifest[k] for k in ('snapshot_id', 'as_of_date', 'window_start', 'rule_version')}
-    safe.update(format=FORMAT, status='잠정', supported_queries=list(QUERIES))
+    from .data_contract import available_metrics
+    safe.update(format=FORMAT, status='잠정', supported_queries=list(QUERIES),
+                available_metrics=available_metrics(tables))
     return manifest, safe, tables
 
 

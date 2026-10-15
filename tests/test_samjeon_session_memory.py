@@ -48,7 +48,8 @@ def test_transition_uses_fallback_when_single_summary_call_fails(service):
     new = service.store.memory.active(11, 22)
     assert new['id'] != old['id'] and new['previous'] == old['id']
     assert new['summary_attempted'] and '안녕' in new['summary']
-    assert len(calls) == 1 and len(messages(service)) == 2
+    assert len(calls) == 1 and len(messages(service)) == 3
+    assert '새 대화 세션' in messages(service)[1]
     asyncio.run(conversation(service, update(3, '안녕')))
     assert len(calls) == 1 and service.store.memory.active(11, 22)['id'] == new['id']
 
