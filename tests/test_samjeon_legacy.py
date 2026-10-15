@@ -105,6 +105,7 @@ def callback(uid, data, chat=22):
 def test_legacy_totals_and_capabilities(service):
     path, context = service.repo.current()
     assert context['format'] == 'legacy_v1' and 'forecast' not in context
+    assert context['available_metrics'] == ['sales_won', 'purchase_won']
     result = service.repo.query(path, 'summary', '2026-10-01', '2026-10-11')
     assert result['result']['sales_won'] == 10000
     assert result['result']['purchase_won'] == 8850
@@ -115,6 +116,15 @@ def test_legacy_totals_and_capabilities(service):
     assert len(service.repo.items(path, '양파는 얼마야')) == 2
     assert service.repo.query(path, 'forecast')['status'] == '미지원'
     assert 'C:/private' not in render(result)
+
+
+def test_empty_sales_is_not_advertised_as_available(service):
+    path, _ = service.repo.current()
+    sales_path = path / 'sales_daily.parquet'
+    pd.read_parquet(sales_path).iloc[:0].to_parquet(sales_path, index=False)
+    rehash(path)
+    context = service.repo.context(path)
+    assert context['available_metrics'] == ['purchase_won']
 
 
 def test_month_followup_evidence_and_outside_day(service):

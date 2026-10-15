@@ -6,6 +6,7 @@ import json
 import logging
 from pathlib import Path
 import os
+import sys
 
 from .config import Settings, local_path
 from .repository import Repository
@@ -49,6 +50,9 @@ def doctor(settings):
     adapter = CodexAdapter(settings)
     cli = adapter.diagnose()
     result = {'enabled': settings.enabled, 'auto_send': settings.auto_send,
+              'daily_briefing_enabled': settings.daily_briefing_enabled,
+              'daily_briefing_time': settings.daily_briefing_time,
+              'conversation_engine': settings.conversation_engine,
               'token_present': bool(settings.token), 'users_registered': bool(settings.allowed_users),
               'chat_registered': bool(settings.allowed_chats), 'ai_configured': adapter.available(),
               'codex': cli,
@@ -174,12 +178,18 @@ def main(argv=None):
             return result
 
         from .grounded import render_answer, validate_plan
+        from .legacy import QUERIES
         plan = check('plan', (lambda: adapter.plan('이번 달 매출 요약을 보여줘', {
+            'synthetic': True, 'format': 'legacy_v1', 'supported_queries': list(QUERIES),
+            'available_metrics': ['sales_won', 'purchase_won'],
+            'available_date_from': '2026-10-01', 'available_date_to': '2026-10-11',
             'snapshot_date': '2026-10-11', 'request_date': '2026-10-12',
             'resolved_period': ['2026-10-01', '2026-10-11'],
             'date_from': '2026-10-01', 'date_to': '2026-10-11', 'history': []},
             threading.Event())) if probe['ready'] else None,
-            lambda value: bool(value and validate_plan(value) and value['action'] == 'query'),
+            lambda value: bool(value and validate_plan(value, QUERIES) and value['action'] == 'query'
+                and value['queries'] == [{'intent': 'summary', 'date_from': '2026-10-01',
+                                         'date_to': '2026-10-11', 'product_name': None}]),
             'invalid_plan')
         facts = [{'id': 'F1', 'text': '연결 시험용 가상 자료: 매출 100원, 매입 30원.', 'status': '정상',
                   'data': {'synthetic': True, 'sales_won': 100, 'purchase_won': 30}}]
@@ -251,8 +261,12 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    if sys.stderr is not None:
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    else:
+        logging.getLogger().setLevel(logging.INFO)
     result = main()
     code = result.pop('_exit_code', 0)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if sys.stdout is not None:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
     raise SystemExit(code)

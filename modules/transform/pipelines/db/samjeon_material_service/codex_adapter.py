@@ -256,6 +256,12 @@ class CodexAdapter:
     def plan(self, question, context, cancelled):
         from .grounded import plan_schema
         supported = context.get('supported_queries') if context.get('format') == 'legacy_v1' else None
+        format_instruction = (
+            'legacy_v1은 잠정 관측값이며 PDF·예측·고급 이상 탐지가 없습니다. '
+            'items는 구매 관측액 순위, compare는 기간 간 구매 관측액 비교입니다. '
+            'summary는 사용 가능한 매출과 구매 관측액을 함께 조회합니다. '
+            if context.get('format') == 'legacy_v1' else
+            'v3 조회의 완결성·품질은 조회 결과로 판단하세요. ')
         raw = self._invoke(plan_schema(supported),
             '조회 계획을 만드세요. 상대 날짜 기준은 request_date(KST)입니다. snapshot_date는 자료의 기준일입니다. '
             'resolved_period가 있으면 그 기간을 반드시 사용하고, 없으면 최근 대화의 기간과 품목을 이어받으세요. '
@@ -264,8 +270,12 @@ class CodexAdapter:
             '기간 생략은 null, 품목 생략은 null입니다. 품목명은 사용자가 말한 이름만 사용하세요. '
             '불명확하거나 자료 범위를 벗어난 요청은 clarify로 되물으세요. '
             'note는 사용자가 원인을 설명한 명확한 진술일 때만, pdf는 보고서 요청에만 사용하세요. '
-            'supported_queries가 있으면 그 조회만 선택하세요. legacy_v1은 잠정 관측값이며 PDF·예측·고급 이상 탐지가 없습니다. '
-            'items는 구매 관측액 순위, compare는 기간 간 구매 관측액 비교입니다.',
+            'supported_queries가 있으면 그 조회만 선택하세요. '
+            'available_metrics는 게시본에 관측 행이 있는 지표입니다. sales_won은 매출, purchase_won은 구매액입니다. '
+            '매출 요약 요청은 sales_won이 있으면 summary로 조회할 수 있습니다. '
+            '요청 지표가 없으면 다른 지표로 바꾸지 말고 clarify로 안내하세요. '
+            '지표 존재는 요청 기간의 완결성이나 확정 실적을 뜻하지 않습니다. '
+            + format_instruction,
             question, context, cancelled)
         try:
             return validate_plan(raw, supported) if raw else None

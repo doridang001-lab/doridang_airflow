@@ -224,7 +224,8 @@ def test_scheduler_action_starts_default_python_in_isolated_runtime(tmp_path):
     root = tmp_path / 'runtime with spaces'
     scripts = root / 'scripts'
     scripts.mkdir(parents=True)
-    for name in ('start_samjeon_material_agent.ps1', 'register_samjeon_material_agent_task.ps1'):
+    for name in ('start_samjeon_material_agent.ps1', 'register_samjeon_material_agent_task.ps1',
+                 'watch_samjeon_material_agent.py'):
         shutil.copy2(ROOT / 'scripts' / name, scripts / name)
     venv.EnvBuilder(with_pip=False).create(root / '.venv')
     package = root / 'modules/transform/pipelines/db/samjeon_material_service'
@@ -236,18 +237,21 @@ def test_scheduler_action_starts_default_python_in_isolated_runtime(tmp_path):
     wrapper = tmp_path / 'scheduler.ps1'
     wrapper.write_text('param($Script,$Config,$Output)\n'
         'function New-ScheduledTaskAction { param($Execute,$Argument,$WorkingDirectory); [pscustomobject]@{Execute=$Execute;Argument=$Argument;WorkingDirectory=$WorkingDirectory} }\n'
-        'function New-ScheduledTaskTrigger { param([switch]$AtLogOn,$User); @{} }\n'
+        'function New-ScheduledTaskTrigger { param([switch]$AtLogOn,[switch]$Once,$At,$User,$RepetitionInterval,$RepetitionDuration); @{} }\n'
         'function New-ScheduledTaskPrincipal { param($UserId,$LogonType,$RunLevel); @{} }\n'
         'function New-ScheduledTaskSettingsSet { param($MultipleInstances,$RestartCount,$RestartInterval,$ExecutionTimeLimit,[switch]$StartWhenAvailable,[switch]$AllowStartIfOnBatteries,[switch]$DontStopIfGoingOnBatteries); [pscustomobject]@{Enabled=$false} }\n'
         'function New-ScheduledTask { param($Action,$Trigger,$Principal,$Settings); [pscustomobject]@{Action=$Action;Settings=$Settings} }\n'
-        'function Register-ScheduledTask { param($TaskName,$InputObject,[switch]$Force); $InputObject.Action | ConvertTo-Json | Set-Content -LiteralPath $Output -Encoding utf8 }\n'
+        'function Register-ScheduledTask { param($TaskName,$InputObject,[switch]$Force); if ($TaskName -eq "DoridangSamjeonMaterialAgent") { $InputObject.Action | ConvertTo-Json | Set-Content -LiteralPath $Output -Encoding utf8 } }\n'
         '& $Script -Config $Config\n', encoding='ascii')
     result = subprocess.run(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(wrapper),
         '-Script', str(scripts / 'register_samjeon_material_agent_task.ps1'), '-Config', str(config), '-Output', str(action)],
         capture_output=True, encoding='utf-8', errors='replace', timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     command = json.loads(action.read_text(encoding='utf-8-sig'))
-    started = subprocess.run(command['Execute'] + ' ' + command['Argument'], cwd=command['WorkingDirectory'],
+    assert command['Execute'].lower().endswith('pythonw.exe')
+    assert 'start_samjeon_material_agent.ps1' not in command['Argument']
+    started = subprocess.run('"' + command['Execute'][:-11] + 'python.exe" ' + command['Argument'],
+        cwd=command['WorkingDirectory'],
         capture_output=True, encoding='utf-8', errors='replace', timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
     assert started.returncode == 0, started.stdout + started.stderr
     assert json.loads(started.stdout) == ['service', '--config', str(config)]

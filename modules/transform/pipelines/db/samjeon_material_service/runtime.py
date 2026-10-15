@@ -13,6 +13,7 @@ from .repository import Repository, SnapshotUnavailable
 from .telegram import Telegram, DeliveryError
 from .codex_adapter import CodexAdapter, redact, validate_chat, safe_diagnostic
 from .memory import utc
+from .data_contract import planning_context
 from .conversation import parse, route, period, help_text, DATA_UNAVAILABLE, AI_UNAVAILABLE, CLARIFY
 from .presentation import briefing, alert_items, buttons, chunks, render_query
 from .pdf_report import create_pdf
@@ -39,6 +40,10 @@ class Service:
         self.settings, self.store, self.transport = settings, store, transport
         self.repo = repository or Repository(settings)
         self.model = model or CodexAdapter(settings)
+        self.agent = None
+        if settings.conversation_engine == 'appserver':
+            from .appserver import AppServer
+            self.agent = AppServer(settings)
         if isinstance(self.repo, Repository):
             self.repo.last_good = self.store.get('last_valid_snapshot')
         self.clock = clock
@@ -47,6 +52,8 @@ class Service:
         self._session_id = None
         self._received_at = None
         self._user = None
+        self._telegram_poll_at = None
+        self._telegram_poll_error = None
 
     def model_context(self):
         return self.store.memory.model_context(self._session_id)
@@ -122,9 +129,17 @@ class Service:
         conversation_ready = bool(self.settings.enabled and self.settings.ai_enabled and self.settings.ai_verified
                                   and self.settings.token and self.settings.allowed_users and self.settings.allowed_chats
                                   and not self.settings.auto_send)
-        if isinstance(self.model, CodexAdapter):
+        if self.agent:
+            conversation_ready = conversation_ready and self.agent.ready
+        elif isinstance(self.model, CodexAdapter):
             conversation_ready = conversation_ready and bool((self.model._probe or {}).get('ready'))
         atomic_json(self.store.root / 'health.json', {'checked_at': self.clock().isoformat(),
+                    'telegram_poll_at': self._telegram_poll_at,
+                    'telegram_poll_error': self._telegram_poll_error,
+                    'conversation_engine': self.settings.conversation_engine,
+                    'daily_briefing_enabled': self.settings.daily_briefing_enabled,
+                    'daily_briefing_time': self.settings.daily_briefing_time,
+                    'agent_connected': bool(self.agent and self.agent.ready),
                     'last_snapshot': self.store.get('last_snapshot'),
                     'ai': self.store.get('ai_status'), 'data_notice': getattr(self.repo, 'fallback_reason', None),
                     **self.store.health(), **data, 'conversation_ready': conversation_ready,
@@ -168,6 +183,7 @@ class Service:
 
     async def analyze_text(self, uid, user, chat, text, path, context, analysis, cancelled, request_date=None, resolved=None):
         plan = await asyncio.to_thread(self.model.plan, text, {
+            **planning_context(context),
             'snapshot_date': context['as_of_date'], 'request_date': request_date,
             'resolved_period': list(resolved) if resolved else None, 'date_from': analysis['date_from'],
             'date_to': analysis['date_to'], 'selected_product': analysis.get('focus'),
@@ -301,8 +317,19 @@ class Service:
             data_ready = False
             error = str(exc)
         ai_ready = self.settings.ai_enabled and self.settings.ai_verified
-        if ai_ready and hasattr(self.model, 'diagnose'):
+        if ai_ready and self.agent:
+            ai_ready = self.agent.ready
+        elif ai_ready and hasattr(self.model, 'diagnose'):
             ai_ready = (await asyncio.to_thread(self.model.diagnose))['ready']
+        if self.agent:
+            if context:
+                source = (f"삼전점 자료: {context['window_start']}~{context['as_of_date']} "
+                          f"({context.get('status', '품질 확인 필요')})")
+            else:
+                source = '삼전점 자료: 현재 확인이 필요합니다.'
+            return ('Codex 대화: ' + ('준비됐습니다.' if ai_ready else '연결 확인 중입니다.') + '\n'
+                    + source + '\n질문을 그대로 보내세요. 필요한 자료는 제가 조회하고 확인하겠습니다. '
+                    '진행 중인 분석은 /cancel로 중단할 수 있습니다.')
         if context and context.get('format') == 'legacy_v1':
             return ('대표님, 삼전점 비서입니다.\n일반 대화: ' + ('준비됐습니다.' if ai_ready else '연결 준비 중입니다.')
                     + f"\n기존 잠정 자료 조회: 가능 / {context['window_start']}~{context['as_of_date']}"
@@ -401,11 +428,21 @@ class Service:
                 self._session_id = session['id']
                 if new_session:
                     await self.summarize_previous(session, cancelled)
-                if await self.recall(uid, user, chat, text, cancelled):
+                    await self.send('session-rotation-v1-' + session['id'], chat,
+                                    '새 대화 세션이 시작됐습니다. 이전 대화의 요약과 선호, 분석 맥락은 이어받았습니다.',
+                                    cancelled=cancelled)
+                if not self.agent and await self.recall(uid, user, chat, text, cancelled):
                     return
             else:
                 session = self.store.memory.active(user, chat)
                 self._session_id = session['id'] if session else None
+            if self.agent and not callback and text and not text.startswith('/'):
+                if not self.settings.ai_enabled or not self.settings.ai_verified:
+                    await self.send(f'update-{uid}', chat, AI_UNAVAILABLE, cancelled=cancelled)
+                    return
+                from .agent_runtime import handle_agent
+                await handle_agent(self, uid, user, chat, text, session, cancelled)
+                return
             analysis = (self.store.analysis(session['analysis_id'], chat)
                         if session and session.get('analysis_id') else
                         self.store.context(chat, self.clock()) if session is None else None)
@@ -607,6 +644,9 @@ class Service:
             self.write_health()
 
     async def monitor_once(self):
+        if self.settings.daily_briefing_enabled:
+            from .daily_briefing import send_daily_briefing
+            await send_daily_briefing(self)
         if not self.settings.auto_send:
             try:
                 await self.current()
@@ -669,7 +709,12 @@ class Service:
             path.replace(completed / path.name)
 
     async def run(self):
-        if hasattr(self.model, 'diagnose'):
+        if self.agent:
+            await self.agent.start()
+            self.store.put('ai_status', {'stage': 'agent', 'error': None,
+                                         'checked_at': self.clock().isoformat(),
+                                         'status': 'connected'})
+        elif hasattr(self.model, 'diagnose'):
             await asyncio.to_thread(self.model.diagnose)
         try:
             await self.current()
@@ -681,8 +726,12 @@ class Service:
                 try:
                     updates = await asyncio.to_thread(self.transport.call, 'getUpdates',
                         {'offset': self.store.get('offset', 0), 'timeout': 25, 'allowed_updates': ['message', 'callback_query']})
+                    self._telegram_poll_at = self.clock().isoformat()
+                    self._telegram_poll_error = None
                     await self.ingest(updates)
                 except DeliveryError:
+                    self._telegram_poll_at = self.clock().isoformat()
+                    self._telegram_poll_error = 'telegram_temporary'
                     log.warning('텔레그램 수신 실패. 5초 뒤 다시 연결합니다')
                     await asyncio.sleep(5)
         async def worker():
@@ -701,4 +750,8 @@ class Service:
                 except Exception as exc:
                     log.error('자료 확인 실패: %s', type(exc).__name__)
                 await asyncio.sleep(self.settings.poll_seconds)
-        await asyncio.gather(poll(), worker(), monitor())
+        try:
+            await asyncio.gather(poll(), worker(), monitor())
+        finally:
+            if self.agent:
+                await self.agent.close()

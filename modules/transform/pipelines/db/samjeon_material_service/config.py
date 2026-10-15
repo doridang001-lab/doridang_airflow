@@ -19,8 +19,11 @@ class Settings:
     state_root: str = '.tmp/samjeon-service'
     snapshot_root: str = ''
     snapshot: str = ''
+    brain_root: str = ''
     enabled: bool = False
     auto_send: bool = False
+    daily_briefing_enabled: bool = False
+    daily_briefing_time: str = '09:00'
     allowed_users: tuple = ()
     allowed_chats: tuple = ()
     recipient: int | None = None
@@ -38,6 +41,8 @@ class Settings:
     notification_start: str = '09:30'
     notification_end: str = '21:00'
     poll_seconds: int = 60
+    conversation_engine: str = 'legacy'
+    agent_timeout_seconds: int = 600
 
     @classmethod
     def load(cls, filename):
@@ -45,7 +50,7 @@ class Settings:
         raw = json.loads(filename.read_text(encoding='utf-8'))
         if not isinstance(raw, dict) or set(raw) - {f.name for f in fields(cls)}:
             raise ValueError('서비스 설정 키 오류')
-        for key in ('state_root', 'snapshot_root', 'snapshot', 'font_path'):
+        for key in ('state_root', 'snapshot_root', 'snapshot', 'brain_root', 'font_path'):
             value = raw.get(key, getattr(cls(), key))
             if value:
                 p = Path(value)
@@ -61,15 +66,25 @@ class Settings:
 
     def validate(self):
         local_path(self.state_root)
-        for key in ('enabled', 'auto_send', 'ai_enabled', 'ai_verified'):
+        if not isinstance(self.brain_root, str):
+            raise ValueError('지식 폴더 경로 오류')
+        if self.conversation_engine not in ('legacy', 'appserver'):
+            raise ValueError('대화 실행 방식 오류')
+        if self.conversation_engine == 'appserver' and self.codex_backend != 'wsl':
+            raise ValueError('지속 대화는 WSL Codex를 사용합니다')
+        if type(self.agent_timeout_seconds) is not int or not 30 <= self.agent_timeout_seconds <= 1800:
+            raise ValueError('분석 시간 제한 오류')
+        for key in ('enabled', 'auto_send', 'daily_briefing_enabled', 'ai_enabled', 'ai_verified'):
             if type(getattr(self, key)) is not bool:
                 raise ValueError(f'{key}는 boolean이어야 합니다')
         if self.recipient is not None and (type(self.recipient) is not int or self.recipient not in self.allowed_chats):
             raise ValueError('자동 안내 수신자는 허용된 개인 대화여야 합니다')
         if any(type(v) is not int or v <= 0 for v in (*self.allowed_users, *self.allowed_chats)):
             raise ValueError('개인 대화·사용자 ID는 양의 정수여야 합니다')
-        if self.auto_send and self.recipient is None:
+        if (self.auto_send or self.daily_briefing_enabled) and self.recipient is None:
             raise ValueError('자동 안내 수신자를 등록하세요')
+        if self.daily_briefing_enabled and (self.conversation_engine != 'appserver' or not self.ai_enabled or not self.ai_verified):
+            raise ValueError('오전 브리핑은 검증된 Astra 대화 서비스에서만 사용합니다')
         if self.model != 'gpt-6-astra':
             raise ValueError('이 서비스의 승인 모델은 gpt-6-astra입니다')
         if self.codex_backend not in ('windows', 'wsl') or self.model_reasoning_effort != 'medium':
@@ -84,11 +99,13 @@ class Settings:
                 raise ValueError('WSL 안에 설치한 Linux Codex 절대경로가 필요합니다')
         if not re.fullmatch(r'[A-Z][A-Z0-9_]+', self.token_env):
             raise ValueError('토큰 환경변수 이름 오류')
-        for t in (self.notification_start, self.notification_end):
+        for t in (self.notification_start, self.notification_end, self.daily_briefing_time):
             if not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', t):
                 raise ValueError('알림 시각은 HH:MM이어야 합니다')
         if self.notification_start >= self.notification_end:
             raise ValueError('알림 시간 범위 오류')
+        if self.daily_briefing_time >= '12:00':
+            raise ValueError('오전 브리핑은 정오 이전 시각이어야 합니다')
         if type(self.poll_seconds) is not int or not 10 <= self.poll_seconds <= 3600:
             raise ValueError('스냅샷 확인 간격은 10~3600초입니다')
 

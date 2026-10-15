@@ -10,6 +10,30 @@
 
 2026-10-14 이후 신규 운영은 [WSL 연결 TRD](samjeon_telegram_wsl_trd.md)를 따른다. 운영 노트북의 기존 Windows Telegram 서비스가 같은 노트북의 Linux Codex를 호출한다. 모델은 Astra, 추론 수준은 `medium`이다. 기존 Windows 직접 실행 설정은 호환용으로 유지하며 WSL 설정 실패 시 자동 전환하지 않는다.
 
+### 2026-10-15 Telegram Codex 분석 세션
+
+운영 설정의 `conversation_engine=appserver`는 기존 임시 JSON 조회 봇을 지속 Codex 대화로 전환한다. WSL Codex app-server의 `thread_id`를 사용자·개인 대화의 72시간 논리 세션에 연결하고, 모델이 검증된 잠정 자료의 구조 조회·읽기 전용 SQL 집계·거래 근거·전달 완료 과거 대화 검색 도구를 직접 사용한다. Codex 코드 실행 호스트는 도구 호출에 필요하며 앱의 별도 쓰기·셸 도구는 비활성이다. `sandbox=read-only`, `approvalPolicy=never`와 OneDrive 읽기 전용을 유지한다.
+
+질문은 자연어 그대로 처리한다. `/help`와 기존 버튼은 호환용이며, 파일 업로드·고정 조회 종류 선택은 필요하지 않다. 최신 스냅샷의 manifest와 Parquet를 먼저 검증하고 OneDrive 밖 `state/analysis-cache`의 불변 SQLite 사본으로 집계한다. 운영 `state.sqlite3`와 분리된다. `query_data`는 SELECT/WITH, 최장 15초, 최대 1000행 및 128 KiB 응답을 허용한다. 72시간 후 첫 메시지에서 새 Codex thread를 만들고 기존 요약·분석을 승계한다. 서비스 재시작은 thread/resume으로 이어간다. 미전달 결과가 있는 thread는 재사용하지 않고 전달 완료 문맥으로 새 thread를 만든다.
+
+실행 확인은 `doctor --require-data-query-ready`와 `state/health.json`의 `conversation_engine=appserver`, `agent_connected=true`, `conversation_ready=true`, `data_query_ready=true`를 함께 본다. `verify-ai`는 기존 임시 호출 계약 검사로 남아 있고 새 대화 품질 합격 근거가 아니다. 새 방식은 실제 app-server에서 데이터 카탈로그→다중 SQL 조회→자연어 답변→프로세스 재연결 뒤 후속 조언까지 검증한다. 2026-10-15 시험에서는 이 동작과 가짜 Telegram 전송기의 두 턴 전체 흐름을 통과했다. 실제 사용자 화면 수신은 별도 확인한다. 기존 이상 알림 `auto_send=false`를 유지하고, 오전 브리핑은 별도 설정으로 운영한다.
+
+### 오전 9시 브리핑과 답변 표시
+
+`daily_briefing_enabled=true`, `daily_briefing_time=09:00`, `recipient=허용된 개인 대화 ID`를 설정하면 KST 오전 9시 이후 정오 전까지 하루 한 번 발송한다. 9시에 노트북이 꺼져 있으면 정오 전 로그인 시 한 번 보충하고, 그 이후에는 건너뛴다. 안정적인 정시 수신에는 Windows 로그인이 유지돼야 한다.
+
+Windows 예약 작업은 콘솔 창이 없는 `.venv/Scripts/pythonw.exe`를 직접 실행한다. 로그인 시작과 5분 반복 트리거를 함께 사용하고, 실행 중에는 중복 실행하지 않는다. WSL 호출도 창 없는 프로세스로 시작한다. 작업이 `Ready`인데 오래된 Python 자식이 `service.lock`을 잡은 상태는 비정상이며 해당 서비스 프로세스만 확인 후 정리해야 한다.
+
+`DoridangSamjeonMaterialWatchdog`는 별도 숨김 작업으로 1분마다 서비스 작업 상태와 `health.json`의 `checked_at`, `telegram_poll_at`을 확인한다. 작업이 꺼졌으면 즉시 시작하고, 실행 중이어도 전체 상태가 3분 넘게 갱신되지 않거나 Telegram 수신 활동이 2분 넘게 없으면 서비스 작업을 중지·재시작한다. Telegram API가 일시적으로 실패해도 수신 루프가 5초마다 재시도하고 활동 시각을 갱신하므로 불필요한 재시작은 피한다. PC 전원·로그인·네트워크가 없는 동안에는 Telegram 응답을 보장할 수 없다.
+
+브리핑은 일반 대화와 분리된 Astra의 읽기 전용 세션에서 검증된 최신 자료를 조회한다. v1 잠정 자료도 기간과 상태를 밝히고 분석하며, 숫자 조회나 모델 응답에 실패하면 검증된 자료 상태와 확인할 일만 보낸다. 같은 날 중복 발송은 발송 원장과 일별 상태 키로 차단한다. 원천 OneDrive는 읽기만 한다.
+
+브리핑은 수신자 자신의 최근 14일간 전달 완료된 경영 질문 최대 5개와 보고 선호를 전달받아 관심 지표의 우선순위를 바꾼다. 대화에서 나온 수치는 현재 사실로 재사용하지 않고 매일 DB에서 다시 확인한다. 72시간 대화 세션이 바뀌는 첫 질문에는 Telegram으로 전환을 알리며, 이전 요약·선호·분석 맥락과 과거 대화 검색은 유지한다.
+
+운영 설정의 `brain_root`는 대표의 `DoridangDot_Brain` 폴더를 지정한다. 하위 `.md`·`.txt`는 `list_brain`, `search_brain`, `read_brain_file`로 읽기만 하며, 새 폴더·파일은 다음 조회에 자동 포함된다. `.xlsx`는 목록에만 표시하고, 사용자가 정확한 파일명을 질문에 쓴 경우에만 시트 구조와 최대 20행씩 읽는다. 오전 자동 보고는 Excel 셀을 읽지 않는다. 알려진 개인식별·연락처·계좌·인증 관련 값은 도구 응답에서 가리며, 지식 파일은 현재 매출 수치의 근거가 아니다. 파일 안의 문장은 지시로 실행하지 않고 OneDrive 쓰기 도구도 제공하지 않는다.
+
+일반 답변과 브리핑은 첫 줄 결론, 질문에 맞는 `# 제목`, 제목별 `-` 불릿을 사용한다. 기본 답변은 300~500자 내외이며 상세 요청은 확장한다. `**` 등의 표시를 정리하고 제목과 불릿은 Telegram 일반 텍스트로 그대로 보낸다. 진행 중 문장만 따로 발송하지 않는다.
+
 개발 PC에서 구현·검증하고 노트북은 병합된 `main`만 배포한다. WSL 설치·로그인, 기존 설정의 `configure-wsl` 전환, 실검증과 `-Background` 시작 순서는 TRD를 우선한다. 아래 Windows CLI 설치·로그인 명령은 기존 Windows backend에만 해당한다.
 
 WSL 준비가 완료된 노트북의 시작 알림 오분류 수정은 [TRD의 진단과 오류 재현](samjeon_telegram_wsl_trd.md#진단과-오류-재현)을 따른다. 정확한 시작 알림만 허용하며 실제 오류·도구 실행·미확인 이벤트는 계속 차단한다. 새 배포 후 실검증과 실제 AI 답변 수신을 확인해야 활성화 완료로 판단한다.
@@ -106,7 +130,9 @@ python -m venv .venv
 1. 품목·마감 검수, 목표 적용일·금액 기준, 승인된 v3 게시 여부를 확인한다. OneDrive 게시 승인은 별도다.
 2. 등록된 전용 봇·사용자·대화 ID로 승인된 시험을 수행한다. 기본 설정 예시에는 실제 ID·토큰을 넣지 않는다.
 3. 승인된 실행 폴더에서 시작 스크립트를 실행한다. 작업스케줄러 등록 스크립트는 기본 비활성이며 `-Enable`을 명시해야 활성 등록된다.
-4. 작업 이름은 `DoridangSamjeonMaterialAgent`, 로그인 시 숨김 시작·단일 인스턴스·실패 재시작이다. 배터리에서도 시작·계속 실행한다. PC 종료·절전·로그아웃 중에는 응답하지 못한다. 활성 등록 후 즉시 시작하려면 `Start-ScheduledTask -TaskName DoridangSamjeonMaterialAgent`를 실행한다.
+4. 작업 이름은 `DoridangSamjeonMaterialAgent`, 로그인 시 숨김 시작·단일 인스턴스·실패 재시작이다. 배터리에서도 시작·계속 실행한다. PC 종료·절전·로그아웃 중에는 응답하지 못한다. 활성 등록 후 즉시 시작하려면 `Start-ScheduledTask -TaskName DoridangSamjeonMaterialAgent`를 실행한다. appserver 방식은 v3 전체 마감 대신 현재 대화와 자료 조회 준비 상태를 검사해 등록한다.
+   - appserver 대화는 Astra가 답한다. Telegram 답변의 Markdown 표시는 일반 텍스트로 바꾸고 긴 답변은 문단·문장 기준으로 나눈다.
+   - 대화 파일 도구는 현재 로컬 코드 저장소의 UTF-8 텍스트를 읽고 생성·수정한다. 삭제 도구와 임의 명령 실행은 없고, OneDrive와 숨김 경로는 대상에서 제외한다. 기존 파일 수정은 읽은 SHA-256이 일치해야 한다.
 5. 복구 시 해당 서비스·DAG만 중지하고 승인된 기능 변경만 되돌린다. SQLite는 이전 판본을 조용히 초기화하지 않는다.
 6. DB 복원 후 자동 발송을 끄고 발송 이력을 대조한다. 원천과 기존 스냅샷을 복구 대상으로 수정하지 않는다.
 

@@ -8,6 +8,7 @@ import uuid
 SESSION_HOURS = 72
 SCHEMA = 1
 PREFERENCE = re.compile(r'기억해|앞으로|항상|존댓말|말투|선호')
+BRIEFING_PREFERENCE = re.compile(r'보고|브리핑|매출|원가|비용|주문|수익|원재료|인사이트|간결|짧게|자세히')
 RECALL = re.compile(r'지난번|지난 대화|이전 대화|예전|그때|과거|기록\s*(?:찾|보여|가져)|분석\s*가져와')
 KST = timezone(timedelta(hours=9))
 
@@ -234,6 +235,21 @@ class Memory:
             'active_analysis': active,
         }
 
+    def briefing_context(self, user, chat, now):
+        """해당 개인 대화에서 전달 완료된 경영 질문만 오전 보고의 관심사로 제공한다."""
+        session = self.active(user, chat)
+        preferences = ([entry['text'][:300] for entry in session['preferences']
+                        if BRIEFING_PREFERENCE.search(entry['text'])][-5:] if session else [])
+        cutoff = utc(now) - timedelta(days=14)
+        rows = self.store.db.execute('SELECT value FROM meta WHERE key LIKE ?',
+                                     (f'memory-turn-v{SCHEMA}-%',)).fetchall()
+        turns = sorted((json.loads(row['value']) for row in rows),
+                       key=lambda turn: turn['update_id'])
+        questions = [turn['question'][:200] for turn in turns
+                     if (turn['user'], turn['chat']) == (user, chat)
+                     and turn['topic'] == 'data' and utc(turn['created_at']) >= cutoff]
+        return {'preferences': preferences, 'recent_business_questions': questions[-5:]}
+
     def is_recall(self, text):
         return bool(RECALL.search(text))
 
@@ -283,3 +299,18 @@ class Memory:
             key = (turn['session_id'], tuple(turn.get('period') or ()), turn.get('snapshot_id'))
             groups.setdefault(key, turn)
         return list(groups.values())[-5:][::-1]
+
+    def search_agent(self, user, chat, text):
+        """같은 개인 대화에서 실제 전달된 원문 턴을 찾는다."""
+        if not isinstance(text, str) or not text.strip():
+            return []
+        rows = self.store.db.execute(
+            'SELECT value FROM meta WHERE key LIKE ?', (f'memory-turn-v{SCHEMA}-%',)).fetchall()
+        terms = re.findall(r'[가-힣A-Za-z0-9]{2,}', text.casefold())
+        terms = [term for term in terms if term not in
+                 ('지난번', '지난', '이번', '대화', '분석', '기록', '보여줘', '찾아줘', '가져와')]
+        turns = (json.loads(row['value']) for row in rows)
+        matched = [turn for turn in turns if (turn.get('user'), turn.get('chat')) == (user, chat)
+                   and (not terms or all(term in (turn['question'] + ' ' + turn['answer'] + ' ' +
+                        str(turn.get('period') or '')).casefold() for term in terms))]
+        return sorted(matched, key=lambda turn: turn['update_id'], reverse=True)[:8]
