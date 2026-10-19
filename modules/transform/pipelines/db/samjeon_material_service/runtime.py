@@ -59,7 +59,7 @@ class Service:
         return self.store.memory.model_context(self._session_id)
 
     async def summarize_previous(self, session, cancelled):
-        if self.settings.assistant_profile == 'ceo_data':
+        if self.settings.lazy_data:
             return
         claimed = self.store.memory.claim_summary(session['id'])
         if not claimed or not hasattr(self.model, 'summarize'):
@@ -311,7 +311,7 @@ class Service:
         return True
 
     async def help(self):
-        if self.settings.assistant_profile == 'ceo_data':
+        if self.settings.lazy_data:
             return ('질문할 때 필요한 기간의 요약부터 확인합니다. 대기 중에는 업무 자료를 읽지 않습니다.\n'
                     '예: 이번 달 매출이 지난달 같은 기간과 비교해 어떻게 달라졌어?\n'
                     '/기억 이름=기준 · /기억목록 · /기억삭제 이름\n'
@@ -430,7 +430,7 @@ class Service:
             received_row = self.store.db.execute('SELECT created FROM updates WHERE id=?', (uid,)).fetchone()
             self._received_at = utc(received_row['created'] if received_row else self.clock())
             self._user, self._handling_uid = user, uid
-            if self.settings.assistant_profile == 'ceo_data':
+            if self.settings.lazy_data:
                 from .ceo_memory import command
                 answer = command(self.store, user, chat, text, uid)
                 if answer is not None:
@@ -443,7 +443,7 @@ class Service:
             if not callback and text and text.partition(' ')[0].split('@')[0] not in ('/start', '/help', '/status'):
                 session, new_session = self.store.memory.select(uid, user, chat, self._received_at)
                 self._session_id = session['id']
-                if new_session and self.settings.assistant_profile != 'ceo_data':
+                if new_session and not self.settings.lazy_data:
                     await self.summarize_previous(session, cancelled)
                     await self.send('session-rotation-v1-' + session['id'], chat,
                                     '새 대화 세션이 시작됐습니다. 이전 대화의 요약과 선호, 분석 맥락은 이어받았습니다.',
@@ -667,7 +667,7 @@ class Service:
             self.write_health()
 
     async def monitor_once(self):
-        if self.settings.assistant_profile == 'ceo_data':
+        if self.settings.lazy_data:
             return
         if self.settings.daily_briefing_enabled:
             from .daily_briefing import send_daily_briefing
@@ -743,7 +743,7 @@ class Service:
                                          'status': 'connected'})
         elif hasattr(self.model, 'diagnose'):
             await asyncio.to_thread(self.model.diagnose)
-        if self.settings.assistant_profile != 'ceo_data':
+        if not self.settings.lazy_data:
             try:
                 await self.current()
             except SnapshotUnavailable:
@@ -772,7 +772,7 @@ class Service:
         async def monitor():
             while True:
                 try:
-                    if self.settings.assistant_profile != 'ceo_data':
+                    if not self.settings.lazy_data:
                         await self.accept_jobs()
                     await self.monitor_once()
                     self.write_health()

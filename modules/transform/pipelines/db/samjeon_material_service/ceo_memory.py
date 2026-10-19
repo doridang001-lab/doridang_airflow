@@ -61,6 +61,8 @@ def context(store, user, chat, session, question):
     previous = session.get('previous') or session['id']
     history = store.memory.recent(session['id'], 3) or store.memory.recent(previous, 3)
     return {'remembered_rules': relevant(store, user, chat, question),
+            'inherited_preferences': [entry['text'][:300] for entry in session.get('preferences', [])[-5:]],
+            'inherited_summary': session.get('summary', '')[:1200],
             'handoff': [{'question': row['question'][:400], 'answer': row['answer'][:700],
                          'snapshot_date': row.get('snapshot_date')} for row in history],
             'notice': '이전 답변은 과거 참고 자료입니다. 현재 수치는 다시 조회하세요.'}

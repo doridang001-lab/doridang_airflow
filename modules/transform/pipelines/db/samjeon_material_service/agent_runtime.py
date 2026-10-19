@@ -18,11 +18,13 @@ async def handle_agent(service, uid, user, chat, text, session, cancelled):
     session_key = 'codex-thread-v3-' + session['id']
     request_key = 'codex-request-v1-' + str(uid)
     binding = store.get(session_key, {})
-    ceo = service.settings.assistant_profile == 'ceo_data'
+    ceo = service.settings.lazy_data
     began = time.monotonic()
     rotated = ceo and binding.get('completed_turns', 0) >= 12
     # 미전달·중단 턴이 남은 스레드를 대화 기억으로 사용하지 않는다.
-    fresh = not binding.get('thread_id') or binding.get('dirty', False) or rotated
+    toolset = 'single-bot-lazy-v1' if ceo else 'legacy'
+    changed_tools = ((ceo or 'toolset' in binding) and binding.get('toolset') != toolset)
+    fresh = not binding.get('thread_id') or binding.get('dirty', False) or rotated or changed_tools
     request_date = str(service._received_at.astimezone(ZoneInfo('Asia/Seoul')).date())
     context = {'request_date': request_date, 'timezone': 'Asia/Seoul'}
     if ceo:
@@ -30,6 +32,8 @@ async def handle_agent(service, uid, user, chat, text, session, cancelled):
         context.update(ceo_context(store, user, chat, session, text))
         if not fresh:
             context.pop('handoff', None)
+            context.pop('inherited_preferences', None)
+            context.pop('inherited_summary', None)
     elif fresh:
         context.update(service.model_context())
         previous = session.get('previous') or session['id']
@@ -60,9 +64,9 @@ async def handle_agent(service, uid, user, chat, text, session, cancelled):
                            for r in records[:3]]
             result = {'records': [{k: r.get(k) for k in
                 ('question', 'answer', 'created_at', 'snapshot_date', 'period')} for r in records]}
-        elif not ceo and name in ('list_workspace', 'read_workspace_file', 'write_workspace_file'):
+        elif name in ('list_workspace', 'read_workspace_file', 'write_workspace_file'):
             result = await asyncio.to_thread(files.call, name, arguments)
-        elif not ceo and name in ('list_brain', 'search_brain', 'read_brain_file',
+        elif name in ('list_brain', 'search_brain', 'read_brain_file',
                       'inspect_brain_workbook', 'read_brain_sheet'):
             result = await asyncio.to_thread(brain.call, name, arguments)
         else:
@@ -94,7 +98,7 @@ async def handle_agent(service, uid, user, chat, text, session, cancelled):
                 context.update(ceo_context(store, user, chat, session, text))
             context['delivery_notice'] = '이전 실행 세션을 복원하지 못해 전달 완료 대화로 재개했습니다.'
             thread_id = await agent.open_thread()
-        store.put(session_key, {'thread_id': thread_id, 'dirty': True})
+        store.put(session_key, {'thread_id': thread_id, 'dirty': True, 'toolset': toolset})
         store.put(request_key, {'status': 'running', 'thread_id': thread_id,
                                'session_id': session['id'], 'tools': []})
 
@@ -114,7 +118,7 @@ async def handle_agent(service, uid, user, chat, text, session, cancelled):
         delivered = await service.send(f'update-{uid}', chat, answer, cancelled=cancelled)
         store.put(request_key, {**store.get(request_key), 'status': 'sent' if delivered else 'undelivered'})
         if delivered and not cancelled.is_set():
-            store.put(session_key, {'thread_id': thread_id, 'dirty': False,
+            store.put(session_key, {'thread_id': thread_id, 'dirty': False, 'toolset': toolset,
                                    'completed_turns': (0 if fresh else binding.get('completed_turns', 0)) + 1})
             basis = tools.context['as_of_date'] if tools.context else None
             store.memory.record(uid, user, chat, text, answer, service._received_at,

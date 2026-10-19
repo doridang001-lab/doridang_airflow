@@ -40,7 +40,7 @@ def publish(root, manifest=True):
 def settings(tmp_path):
     root = tmp_path / 'data'
     publish(root)
-    return Settings(assistant_profile='ceo_data', ceo_data_root=str(root), state_root=str(tmp_path / 'state'),
+    return Settings(ceo_data_root=str(root), state_root=str(tmp_path / 'state'),
                     conversation_engine='appserver', codex_backend='wsl', wsl_distribution='Ubuntu',
                     wsl_user='ceo', wsl_codex_executable='/usr/local/bin/codex',
                     enabled=True, ai_enabled=True, ai_verified=True, allowed_users=(11,), allowed_chats=(22,))
@@ -188,7 +188,7 @@ def test_doctor_help_idle_no_repository_or_inference(settings, monkeypatch):
         store.close()
 
 
-def test_profile_validation_and_tools_are_separate(settings, monkeypatch):
+def test_existing_bot_config_keeps_workspace_and_brain_tools(settings, monkeypatch):
     settings.validate()
     with pytest.raises(ValueError):
         replace(settings, auto_send=True).validate()
@@ -206,7 +206,9 @@ def test_profile_validation_and_tools_are_separate(settings, monkeypatch):
     asyncio.run(agent.open_thread())
     names = {x['name'] for x in seen[0]['dynamicTools']}
     assert 'prepare_data' in names
-    assert 'write_workspace_file' not in names
+    assert 'write_workspace_file' in names
+    assert 'search_brain' in names
+    assert len(names) == len(seen[0]['dynamicTools'])
 
 
 def test_complete_conversation_rotates_and_remembers(settings, monkeypatch):
@@ -312,3 +314,101 @@ def test_unmanifested_sync_change_is_rejected(settings, monkeypatch):
         return value
     monkeypatch.setattr(Path, 'read_bytes', change)
     assert prepare(CeoTools(settings))['error'] == 'source_changed'
+
+
+def test_root_only_enables_existing_bot_and_legacy_profile_still_loads(settings, tmp_path):
+    from dataclasses import asdict
+    assert settings.assistant_profile == 'legacy' and settings.lazy_data
+    settings.validate()
+    original = replace(settings, ceo_data_root='')
+    assert not original.lazy_data
+    compatible = replace(settings, assistant_profile='ceo_data')
+    compatible.validate()
+    path = tmp_path / 'service.json'
+    path.write_text(json.dumps(asdict(settings)), encoding='utf-8')
+    loaded = Settings.load(path)
+    assert loaded.token_env == original.token_env
+    assert loaded.state_root == original.state_root
+    assert loaded.allowed_users == original.allowed_users
+    assert loaded.wsl_user == original.wsl_user
+    assert loaded.lazy_data
+
+
+def test_next_request_sees_new_month_dataset_guide_and_changed_values(settings):
+    root = Path(settings.ceo_data_root)
+    dataset = root / '삼전점'
+    (dataset / 'manifest.json').unlink()
+    first = CeoTools(settings)
+    old = prepare(first)
+    csv = dataset / '00_요약/2026_10.csv'
+    csv.write_text('날짜,메뉴코드,매출원,자료상태\n2026-10-01,001,900,정상\n', encoding='utf-8')
+    (dataset / '00_요약/2026_11.csv').write_text(csv.read_text(encoding='utf-8').replace('10-01', '11-01'), encoding='utf-8')
+    (dataset / 'AGENTS.md').write_text('# 변경된 기준\n매출은 환불 차감 후 금액입니다.', encoding='utf-8')
+    (root / '추가자료').mkdir()
+    next_request = CeoTools(settings)
+    assert '추가자료' in next_request.catalog()['datasets']
+    assert '2026_11' in next_request.catalog('삼전점')['tables'][0]['months']
+    assert '환불 차감' in str(next_request.guide('삼전점', '매출'))
+    new = prepare(next_request)
+    assert new['snapshot_id'] != old['snapshot_id']
+    alias = new['prepared'][0]['sql_table']
+    assert next_request.query(f'SELECT SUM(매출원) FROM {alias}')['rows'] == [[900]]
+
+
+def test_same_bot_transition_preserves_history_and_dispatches_existing_tools(settings, monkeypatch):
+    from test_samjeon_appserver import service
+    from test_samjeon_material_service import conversation, update, messages
+    from modules.transform.pipelines.db.samjeon_material_service.brain_files import BrainFiles
+    from modules.transform.pipelines.db.samjeon_material_service.workspace_files import WorkspaceFiles
+    svc = service(settings)
+    calls = []
+    monkeypatch.setattr(BrainFiles, 'call', lambda self, name, args: calls.append(name) or {'text': '운영 기준'})
+    monkeypatch.setattr(WorkspaceFiles, 'call', lambda self, name, args: calls.append(name) or {'text': '코드 안내'})
+    def forbidden(*args, **kwargs):
+        pytest.fail('일반 대화에서 업무 자료를 읽었습니다')
+    monkeypatch.setattr(CeoTools, 'call', forbidden)
+    try:
+        svc.store.receive([update(1, '기존 대화')], svc.clock())
+        sid, _ = svc.store.memory.select(1, 11, 22, svc.clock())
+        asyncio.run(svc.send('update-1', 22, '기존 답변'))
+        assert svc.store.memory.record(1, 11, 22, '기존 대화', '기존 답변', svc.clock(), topic='chat')
+        svc.store.update_status(1, 'done')
+        svc.store.put('codex-thread-v3-' + sid['id'], {'thread_id': 'old-thread', 'dirty': False})
+        contexts = []
+        async def turn(thread_id, text, call, cancelled, progress, context, started):
+            contexts.append(context)
+            assert (await call('search_conversation', {'query': '기존'}))['records']
+            assert (await call('search_brain', {'query': '운영'}))['text'] == '운영 기준'
+            assert (await call('read_workspace_file', {'path': 'AGENTS.md'}))['text'] == '코드 안내'
+            return {'text': '이전 대화를 이어갑니다.', 'thread_id': thread_id, 'turn_id': 't1'}
+        svc.agent.turn = turn
+        asyncio.run(conversation(svc, update(2, '운영 기준과 코드 안내를 알려줘')))
+        assert svc.agent.opened == [None]
+        assert contexts[0]['handoff'][0]['answer'] == '기존 답변'
+        assert calls == ['search_brain', 'read_workspace_file']
+        assert svc.store.get('ceo-usage-v1-2')['csv_files_read'] == 0
+        assert messages(svc)
+    finally:
+        svc.store.close()
+
+
+def test_transferred_state_keeps_offset_memories_and_deduplication(settings, tmp_path):
+    import shutil
+    from test_samjeon_appserver import service
+    from test_samjeon_material_service import conversation, update, messages
+    svc = service(settings)
+    asyncio.run(conversation(svc, update(101, '/기억 답변=세 줄로 요약')))
+    expected_offset = svc.store.get('offset')
+    svc.store.close()
+    target = tmp_path / 'notebook-state'
+    shutil.copytree(settings.state_root, target)
+    migrated = service(replace(settings, state_root=str(target)))
+    try:
+        assert migrated.store.get('offset') == expected_offset
+        assert relevant(migrated.store, 11, 22, '답변')[0]['text'] == '세 줄로 요약'
+        asyncio.run(conversation(migrated, update(101, '/기억 답변=세 줄로 요약')))
+        assert messages(migrated) == []
+        asyncio.run(conversation(migrated, update(102, '/기억목록')))
+        assert '세 줄로 요약' in messages(migrated)[0]
+    finally:
+        migrated.store.close()

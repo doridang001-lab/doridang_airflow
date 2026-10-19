@@ -11,7 +11,8 @@ if (-not (Test-Path -LiteralPath $pythonw)) { throw '창 없는 전용 Python �
 Push-Location -LiteralPath $repoRoot
 try {
     $configData = Get-Content -LiteralPath $configPath -Encoding utf8 -Raw | ConvertFrom-Json
-    $readinessFlag = if ($configData.conversation_engine -eq 'appserver') { '--require-data-query-ready' } else { '--require-ready' }
+    $lazyData = $configData.ceo_data_root -or $configData.assistant_profile -eq 'ceo_data'
+    $readinessFlag = if ($lazyData) { '--require-ready' } elseif ($configData.conversation_engine -eq 'appserver') { '--require-data-query-ready' } else { '--require-ready' }
     & $python -B -X utf8 -m modules.transform.pipelines.db.samjeon_material_service doctor --config $configPath $readinessFlag
     if ($LASTEXITCODE -ne 0) { throw '전체 실행 준비 점검을 통과해야 자동 실행 작업을 등록할 수 있습니다.' }
 } finally { Pop-Location }

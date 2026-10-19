@@ -18,11 +18,6 @@
 /scripts/register_samjeon_material_agent_task.ps1
 /scripts/update_samjeon_material_agent.ps1
 /scripts/set_samjeon_sparse.ps1
-/config/ceo_assistant.example.json
 /config/ceo_dataset_guide.example.md
 /harness/ceo_assistant.md
-/scripts/setup_ceo_assistant.ps1
-/scripts/register_ceo_assistant_task.ps1
-/scripts/watch_ceo_assistant.py
 /scripts/watch_samjeon_material_agent.py
-/scripts/update_ceo_assistant.ps1

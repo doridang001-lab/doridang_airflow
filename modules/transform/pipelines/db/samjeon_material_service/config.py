@@ -46,6 +46,11 @@ class Settings:
     conversation_engine: str = 'legacy'
     agent_timeout_seconds: int = 600
 
+    @property
+    def lazy_data(self):
+        """같은 봇에서 데이터 루트 설정만으로 선택 조회를 사용한다."""
+        return bool(self.ceo_data_root) or self.assistant_profile == 'ceo_data'
+
     @classmethod
     def load(cls, filename):
         filename = Path(filename).resolve()
@@ -70,11 +75,13 @@ class Settings:
         local_path(self.state_root)
         if self.assistant_profile not in ('legacy', 'ceo_data'):
             raise ValueError('비서 실행 모드 오류')
-        if self.assistant_profile == 'ceo_data':
+        if not isinstance(self.ceo_data_root, str):
+            raise ValueError('CEO_DB 경로는 문자열이어야 합니다')
+        if self.lazy_data:
             if not isinstance(self.ceo_data_root, str) or not self.ceo_data_root:
                 raise ValueError('CEO_DB 경로가 필요합니다')
             if self.conversation_engine != 'appserver' or self.auto_send or self.daily_briefing_enabled:
-                raise ValueError('대표님 모드는 appserver 대화 전용으로 실행합니다')
+                raise ValueError('선택 데이터 조회는 appserver 대화 전용으로 실행합니다')
             if Path(self.state_root).resolve().is_relative_to(Path(self.ceo_data_root).resolve()):
                 raise ValueError('상태 폴더는 CEO_DB 밖에 둡니다')
         if not isinstance(self.brain_root, str):

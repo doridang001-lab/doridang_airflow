@@ -8,6 +8,8 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $python = Join-Path $repoRoot '.venv\Scripts\python.exe'
 $taskName = 'DoridangSamjeonMaterialAgent'
+$watchName = 'DoridangSamjeonMaterialWatchdog'
+$tasksStopped = $false
 function Git-Checked {
     param([string[]]$Arguments)
     $output = @(& git @Arguments)
@@ -35,6 +37,8 @@ try {
         $previous = $BootstrapPreviousCommit
     }
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    $watch = Get-ScheduledTask -TaskName $watchName -ErrorAction SilentlyContinue
+    $restartWatch = $watch -and $watch.State -ne 'Disabled'
     $restart = $false
     $mode = if ($ConversationOnly) { 'conversation' } else { 'full' }
     if ($Rollback) {
@@ -43,6 +47,7 @@ try {
         $target = $record.previous_commit
         if ($target -notmatch '^[0-9a-f]{40}$') { throw '이전 커밋 기록 오류' }
         $restart = [bool]$record.restart
+        if ($record.PSObject.Properties.Name -contains 'restart_watchdog') { $restartWatch = [bool]$record.restart_watchdog }
         if ($record.PSObject.Properties.Name -contains 'mode') { $mode = $record.mode }
         if ($ConversationOnly) { $mode = 'conversation' }
         if ($mode -notin @('conversation','full')) { throw '배포 모드 기록 오류' }
@@ -54,12 +59,15 @@ try {
         $target = (Git-Checked -Arguments @('rev-parse','origin/main')) -join ''
         $restart = $task -and $task.State -ne 'Disabled'
         New-Item -ItemType Directory -Path $statePath -Force | Out-Null
-        @{previous_commit=$previous; target_commit=$target; restart=[bool]$restart; mode=$mode; status='prepared'} |
+        @{previous_commit=$previous; target_commit=$target; restart=[bool]$restart; restart_watchdog=[bool]$restartWatch; mode=$mode; status='prepared'} |
             ConvertTo-Json | Set-Content -LiteralPath $receipt -Encoding utf8
     }
-    if ($task) {
-        Disable-ScheduledTask -TaskName $taskName | Out-Null
-        Stop-ScheduledTask -TaskName $taskName
+    $tasksStopped = $true
+    foreach ($item in @($watch, $task)) {
+        if ($item) {
+            Disable-ScheduledTask -TaskName $item.TaskName | Out-Null
+            Stop-ScheduledTask -TaskName $item.TaskName
+        }
     }
     # 직접 실행한 서비스도 중지됐는지 OS 파일 잠금으로 확인한다.
     & $python -B -X utf8 -c 'import sys; from modules.transform.pipelines.db.samjeon_material_service.__main__ import instance_lock; from pathlib import Path; lock=instance_lock(Path(sys.argv[1])); lock.__enter__(); lock.__exit__(None,None,None)' $statePath
@@ -83,6 +91,10 @@ try {
             Enable-ScheduledTask -TaskName $taskName | Out-Null
             Start-ScheduledTask -TaskName $taskName
         }
+        if ($watch -and $restartWatch -and $mode -eq 'full' -and $ready) {
+            Enable-ScheduledTask -TaskName $watchName | Out-Null
+            Start-ScheduledTask -TaskName $watchName
+        }
         $record = Get-Content -LiteralPath $receipt -Encoding utf8 -Raw | ConvertFrom-Json
         $record.status = if ($Rollback) { 'rolled_back' } else { 'updated' }
         $record | ConvertTo-Json | Set-Content -LiteralPath $receipt -Encoding utf8
@@ -92,4 +104,12 @@ try {
     } catch {
         Write-Error "배포 중단. 서비스는 비활성 상태입니다. 이전 커밋: $previous. 복구: .\scripts\update_samjeon_material_agent.ps1 -Config '$resolvedConfig' -Rollback. 원인: $_"
     }
+} catch {
+    if ($tasksStopped) {
+        foreach ($name in @($watchName, $taskName)) {
+            Disable-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue | Out-Null
+            Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+        }
+    }
+    throw
 } finally { Pop-Location }
