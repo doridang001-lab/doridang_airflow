@@ -1,5 +1,11 @@
 # 송파삼전점 대화형 관리 에이전트
 
+## 월별 CSV 운영 계약 (2026-10-15 이후)
+
+- 현재 게시 루트는 `CEO_DB/송파삼전점_직영점`이다. `YYYY_MM/YYYY_MM.csv`만 일별 요약 누적본으로 게시한다. 이 목적 폴더에 상세·근거·검토·검증 CSV는 두지 않는다.
+- 서비스의 `snapshot_root`에는 이 목적 폴더를 지정한다. 기존 `samjeon_agent_DB`를 지정한 설정도 새 목적 폴더가 옆에 있으면 자동 전환한다. 아래 스냅샷·`latest.json` 설명은 이전 게시본의 호환 절차다.
+- 서비스는 월별 요약 CSV의 필수 열·날짜·값 형식을 검사하고 내용 해시로 판본을 구분한다. 일별·기간별 집계만 답하며 품목·원행 근거·상세 PDF는 미지원으로 알린다. 기본 도구 응답은 최대 100행·32 KiB다. 운영 노트북에는 변경된 서비스 코드를 배포한 뒤 실제 조회·브리핑을 확인해야 한다.
+
 ## 기존 잠정 자료 조회
 
 검증된 `samjeon-mart-v1` 조회는 [기존 자료 조회 계약과 배포 절차](samjeon_legacy_v1.md)를 따른다. 매출·구매 관측액, 품목 순위, 기간 비교, 직원식대와 구매 근거를 지원하며 PDF·고급 이상 탐지·예측은 v3 전용이다. 아래 알림·PDF·마감·전체 준비 설명은 v3에 적용한다.
@@ -14,7 +20,7 @@
 
 운영 설정의 `conversation_engine=appserver`는 기존 임시 JSON 조회 봇을 지속 Codex 대화로 전환한다. WSL Codex app-server의 `thread_id`를 사용자·개인 대화의 72시간 논리 세션에 연결하고, 모델이 검증된 잠정 자료의 구조 조회·읽기 전용 SQL 집계·거래 근거·전달 완료 과거 대화 검색 도구를 직접 사용한다. Codex 코드 실행 호스트는 도구 호출에 필요하며 앱의 별도 쓰기·셸 도구는 비활성이다. `sandbox=read-only`, `approvalPolicy=never`와 OneDrive 읽기 전용을 유지한다.
 
-질문은 자연어 그대로 처리한다. `/help`와 기존 버튼은 호환용이며, 파일 업로드·고정 조회 종류 선택은 필요하지 않다. 최신 스냅샷의 manifest와 Parquet를 먼저 검증하고 OneDrive 밖 `state/analysis-cache`의 불변 SQLite 사본으로 집계한다. 운영 `state.sqlite3`와 분리된다. `query_data`는 SELECT/WITH, 최장 15초, 최대 1000행 및 128 KiB 응답을 허용한다. 72시간 후 첫 메시지에서 새 Codex thread를 만들고 기존 요약·분석을 승계한다. 서비스 재시작은 thread/resume으로 이어간다. 미전달 결과가 있는 thread는 재사용하지 않고 전달 완료 문맥으로 새 thread를 만든다.
+질문은 자연어 그대로 처리한다. `/help`와 기존 버튼은 호환용이며, 파일 업로드·고정 조회 종류 선택은 필요하지 않다. 기존 스냅샷은 manifest와 Parquet를 검증하고, 월별 v2 자료는 먼저 일별 요약만 검증한다. OneDrive 밖 `state/analysis-cache`의 불변 SQLite 사본으로 집계하며 운영 `state.sqlite3`와 분리된다. `query_data`는 SELECT/WITH, 최장 15초, 최대 100행 및 32 KiB 응답을 허용한다. 72시간 후 첫 메시지에서 새 Codex thread를 만들고 기존 요약·분석을 승계한다. 서비스 재시작은 thread/resume으로 이어간다. 미전달 결과가 있는 thread는 재사용하지 않고 전달 완료 문맥으로 새 thread를 만든다.
 
 실행 확인은 `doctor --require-data-query-ready`와 `state/health.json`의 `conversation_engine=appserver`, `agent_connected=true`, `conversation_ready=true`, `data_query_ready=true`를 함께 본다. `verify-ai`는 기존 임시 호출 계약 검사로 남아 있고 새 대화 품질 합격 근거가 아니다. 새 방식은 실제 app-server에서 데이터 카탈로그→다중 SQL 조회→자연어 답변→프로세스 재연결 뒤 후속 조언까지 검증한다. 2026-10-15 시험에서는 이 동작과 가짜 Telegram 전송기의 두 턴 전체 흐름을 통과했다. 실제 사용자 화면 수신은 별도 확인한다. 기존 이상 알림 `auto_send=false`를 유지하고, 오전 브리핑은 별도 설정으로 운영한다.
 

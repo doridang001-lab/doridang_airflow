@@ -59,6 +59,8 @@ class Service:
         return self.store.memory.model_context(self._session_id)
 
     async def summarize_previous(self, session, cancelled):
+        if self.settings.assistant_profile == 'ceo_data':
+            return
         claimed = self.store.memory.claim_summary(session['id'])
         if not claimed or not hasattr(self.model, 'summarize'):
             return
@@ -270,7 +272,8 @@ class Service:
         self.store.put('ai_status', {'checked_at': self.clock().isoformat(),
                                     **safe_diagnostic(self.model, 'answer', error)})
         self.store.save_answer(chat, analysis, notes, rendered)
-        delivered = await self.send(f'update-{uid}', chat, rendered, buttons(analysis['id']), cancelled=cancelled)
+        delivered = await self.send(f'update-{uid}', chat, rendered,
+                                    buttons(analysis['id'], context.get('format') == 'monthly_csv_v3'), cancelled=cancelled)
         if delivered and not cancelled.is_set():
             self.store.remember_turn(chat, analysis, text, rendered, self.clock())
             self.store.memory.record(uid, user, chat, text, rendered, self._received_at,
@@ -308,6 +311,11 @@ class Service:
         return True
 
     async def help(self):
+        if self.settings.assistant_profile == 'ceo_data':
+            return ('질문할 때 필요한 기간의 요약부터 확인합니다. 대기 중에는 업무 자료를 읽지 않습니다.\n'
+                    '예: 이번 달 매출이 지난달 같은 기간과 비교해 어떻게 달라졌어?\n'
+                    '/기억 이름=기준 · /기억목록 · /기억삭제 이름\n'
+                    '자료 검증: 질문 시 수행. 노트북 종료·절전 중에는 응답할 수 없습니다.')
         context = None
         error = None
         try:
@@ -422,11 +430,20 @@ class Service:
             received_row = self.store.db.execute('SELECT created FROM updates WHERE id=?', (uid,)).fetchone()
             self._received_at = utc(received_row['created'] if received_row else self.clock())
             self._user, self._handling_uid = user, uid
+            if self.settings.assistant_profile == 'ceo_data':
+                from .ceo_memory import command
+                answer = command(self.store, user, chat, text, uid)
+                if answer is not None:
+                    await self.send(f'update-{uid}', chat, answer, cancelled=cancelled)
+                    return
+                if callback or text.startswith('/') and text.partition(' ')[0] not in ('/start', '/help', '/status'):
+                    await self.send(f'update-{uid}', chat, '분석할 내용을 자연어로 말씀해 주세요.', cancelled=cancelled)
+                    return
             session = None
             if not callback and text and text.partition(' ')[0].split('@')[0] not in ('/start', '/help', '/status'):
                 session, new_session = self.store.memory.select(uid, user, chat, self._received_at)
                 self._session_id = session['id']
-                if new_session:
+                if new_session and self.settings.assistant_profile != 'ceo_data':
                     await self.summarize_previous(session, cancelled)
                     await self.send('session-rotation-v1-' + session['id'], chat,
                                     '새 대화 세션이 시작됐습니다. 이전 대화의 요약과 선호, 분석 맥락은 이어받았습니다.',
@@ -557,12 +574,17 @@ class Service:
                 answer = '알려주신 설명을 이 분석에 기록했습니다. 이어서 설명드릴 때 함께 표시하겠습니다. 원천 금액과 품목·마감 검수 상태는 그대로 유지합니다.'
             elif request['action'] == 'help':
                 answer = await self.help()
+            elif request['action'] == 'pdf' and context.get('format') == 'monthly_csv_v3':
+                answer = '이 자료는 날짜별 집계만 제공합니다. 상세 PDF는 지원하지 않습니다.'
             elif request['action'] == 'pdf':
                 await self.pdf(uid, chat, analysis, cancelled)
                 return
             elif request['action'] == 'explain':
                 # 대화 기간이 바뀐 뒤에도 해당 기간의 조회를 사용한다.
-                if analysis.get('focus'):
+                if context.get('format') == 'monthly_csv_v3':
+                    result = await asyncio.to_thread(self.repo.query, path, 'summary', analysis['date_from'], analysis['date_to'])
+                    answer = render_query(result)
+                elif analysis.get('focus'):
                     result = await asyncio.to_thread(self.repo.query, path, 'compare', analysis['date_from'],
                                                      analysis['date_to'], product_key=analysis['focus'])
                     answer = render_query(result)
@@ -610,7 +632,8 @@ class Service:
                 if not callback and not text.startswith('/') and self.settings.ai_enabled and getattr(self.model, 'last_error', None):
                     answer = 'AI 연결을 사용할 수 없어 기본 조회로 안내합니다.\n\n' + answer
                 self.store.remember(chat, aid, self.clock() + timedelta(hours=24))
-                delivered = await self.send(f'update-{uid}', chat, answer, buttons(aid), cancelled=cancelled)
+                delivered = await self.send(f'update-{uid}', chat, answer,
+                                            buttons(aid, context.get('format') == 'monthly_csv_v3'), cancelled=cancelled)
                 if delivered and pending_note and not cancelled.is_set():
                     self.store.note(chat, aid, user, text)
                 if delivered and not callback and request and request['action'] in ('query', 'explain') and not cancelled.is_set():
@@ -644,6 +667,8 @@ class Service:
             self.write_health()
 
     async def monitor_once(self):
+        if self.settings.assistant_profile == 'ceo_data':
+            return
         if self.settings.daily_briefing_enabled:
             from .daily_briefing import send_daily_briefing
             await send_daily_briefing(self)
@@ -677,7 +702,8 @@ class Service:
         aid_record = None
         if morning and context['month_to_date']['complete'] and not self.store.get(daily_key):
             aid_record = self.analysis(chat, path, context, daily_key)
-            delivered = await self.send(daily_key, chat, briefing(context), buttons(aid_record['id']))
+            delivered = await self.send(daily_key, chat, briefing(context),
+                                        buttons(aid_record['id'], context.get('format') == 'monthly_csv_v3'))
             # 불명확한 발송도 처리 이력에 보존해 snapshot 변경으로 재전송하지 않는다.
             self.store.put(daily_key, {'attempted': True, 'delivered': delivered, 'snapshot': context['snapshot_id']})
             self.store.mark_alerts(chat, [x['key'] for x in items[:3]], aid_record['id'])
@@ -687,7 +713,8 @@ class Service:
         if selected:
             key = 'alert-' + str(chat) + '-' + hashlib.sha256('|'.join(sorted(x['key'] for x in selected)).encode()).hexdigest()[:24]
             aid_record = self.analysis(chat, path, context, key)
-            await self.send(key, chat, briefing(context, selected), buttons(aid_record['id']))
+            await self.send(key, chat, briefing(context, selected),
+                            buttons(aid_record['id'], context.get('format') == 'monthly_csv_v3'))
             self.store.mark_alerts(chat, [x['key'] for x in selected], aid_record['id'])
         self.store.put('last_snapshot', {'id': context['snapshot_id'], 'checked_at': now.isoformat(), 'status': context['status']})
 
@@ -716,10 +743,11 @@ class Service:
                                          'status': 'connected'})
         elif hasattr(self.model, 'diagnose'):
             await asyncio.to_thread(self.model.diagnose)
-        try:
-            await self.current()
-        except SnapshotUnavailable:
-            pass
+        if self.settings.assistant_profile != 'ceo_data':
+            try:
+                await self.current()
+            except SnapshotUnavailable:
+                pass
         self.write_health()
         async def poll():
             while True:
@@ -744,7 +772,8 @@ class Service:
         async def monitor():
             while True:
                 try:
-                    await self.accept_jobs()
+                    if self.settings.assistant_profile != 'ceo_data':
+                        await self.accept_jobs()
                     await self.monitor_once()
                     self.write_health()
                 except Exception as exc:

@@ -60,6 +60,16 @@ def doctor(settings):
               'font_available': Path(settings.font_path).is_file(), 'files_written': False,
               'state_db_exists': (local_path(settings.state_root) / 'state.sqlite3').is_file()}
     result.update(readiness())
+    if settings.assistant_profile == 'ceo_data':
+        configured = bool(settings.token and settings.allowed_users and settings.allowed_chats and cli['ready'])
+        ready = configured and settings.enabled and settings.ai_enabled and settings.ai_verified
+        result.update(assistant_profile='ceo_data', data_status='미조회',
+                      data_root_exists=Path(settings.ceo_data_root).is_dir(),
+                      conversation_deployable=configured, conversation_ready=ready, ready=ready,
+                      blocked_reasons=[] if ready else ['연결 설정·서비스 활성화를 확인하세요'],
+                      conversation_blocked_reasons=[] if configured else ['봇·허용 사용자·WSL 인증을 확인하세요'])
+        return result
+    summary_only = False
     health = local_path(settings.state_root) / 'health.json'
     if health.is_file():
         try:
@@ -68,6 +78,7 @@ def doctor(settings):
             result['service_health'] = {'status': '진단 파일 확인 필요'}
     try:
         _, context = Repository(settings).current()
+        summary_only = context.get('format') == 'monthly_csv_v3'
         result.update(readiness(context))
         result.update(snapshot_id=context['snapshot_id'], as_of_date=context['as_of_date'],
                       data_status=context['status'], data_complete=context.get('month_to_date', {}).get('complete', False))
@@ -78,6 +89,8 @@ def doctor(settings):
     for key, label in (('enabled', '서비스 비활성'), ('token_present', '봇 토큰 없음'),
                        ('users_registered', '사용자 미등록'), ('chat_registered', '대화 미등록'),
                        ('pdf_available', 'PDF 의존성 없음'), ('font_available', '한글 글꼴 없음')):
+        if summary_only and key in ('pdf_available', 'font_available'):
+            continue
         if not result[key]:
             blocked.append(label)
     if not result['data_ready']:
@@ -94,7 +107,8 @@ def doctor(settings):
     result.update(ready=not blocked, blocked_reasons=blocked)
     conversation_blocked = [label for key, label in (
         ('token_present', '봇 토큰 없음'), ('users_registered', '사용자 미등록'),
-        ('chat_registered', '대화 미등록'), ('pdf_available', '런타임 의존성 없음')) if not result[key]]
+        ('chat_registered', '대화 미등록'), ('pdf_available', '런타임 의존성 없음'))
+        if not result[key] and not (summary_only and key == 'pdf_available')]
     if not cli['ready']:
         conversation_blocked.append('Codex 연결 준비 필요')
     if settings.auto_send:

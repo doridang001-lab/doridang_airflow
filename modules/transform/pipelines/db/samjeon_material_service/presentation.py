@@ -55,7 +55,8 @@ def briefing(context, items=None):
     meals = context['month_to_date']
     lines.append(f"\n현장 직원식대 월 누적 관측액은 {money(meals['staff_meal_won'])}입니다." +
                  ('' if meals['staff_meal_complete'] else ' 수집·마감 확인이 남아 있습니다.'))
-    lines.append('왜 의심되는지, 어떤 품목인지 이어서 물어보세요. 상세 표와 근거는 PDF로 받으실 수 있습니다.')
+    lines.append('날짜별 매출·매입 집계와 자료 상태를 이어서 물어보세요.' if context.get('format') == 'monthly_csv_v3'
+                 else '왜 의심되는지, 어떤 품목인지 이어서 물어보세요. 상세 표와 근거는 PDF로 받으실 수 있습니다.')
     return '\n'.join(lines)
 
 
@@ -80,6 +81,8 @@ def summary(period):
 
 
 def render_query(result):
+    if result.get('unsupported'):
+        return '이 자료는 날짜별 집계만 제공합니다. 품목·개별 거래 근거와 상세 분석은 이 DB에서 확인할 수 없습니다.'
     if result.get('format') == 'legacy_v1':
         from .legacy import render
         return render(result)
@@ -204,7 +207,10 @@ def chunks(text, limit=3500):
         remaining = remaining[cut:]
 
 
-def buttons(aid):
+def buttons(aid, summary_only=False):
+    if summary_only:
+        return {'inline_keyboard': [[{'text': '집계 설명', 'callback_data': f'{aid}:why'},
+                                     {'text': '현장 직원식대', 'callback_data': f'{aid}:meal'}]]}
     return {'inline_keyboard': [[{'text': '왜 의심해?', 'callback_data': f'{aid}:why'},
                                   {'text': '증가 품목 보기', 'callback_data': f'{aid}:items'}],
                                  [{'text': '현장 직원식대', 'callback_data': f'{aid}:meal'},
