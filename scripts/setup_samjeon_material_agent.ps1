@@ -71,7 +71,7 @@ try {
     }
     & $python -B -X utf8 -m modules.transform.pipelines.db.samjeon_material_service doctor --config $configPath
     if ($LASTEXITCODE -ne 0) { throw '삼전점 서비스 점검에 실패했습니다.' }
-    Write-Output '진단의 ready와 blocked_reasons를 확인하세요. Codex 로그인, 봇 토큰·허용 ID, v3 데이터 경로를 등록한 뒤 --require-ready로 재검증합니다.'
+    Write-Output '진단의 ready와 blocked_reasons를 확인하세요. 기존 봇 토큰·허용 ID·WSL 설정은 유지하세요. CEO_DB 선택 조회는 기존 설정의 ceo_data_root에 경로를 추가하고 --require-ready로 연결을 확인합니다. 자료 본문은 질문 시 조회합니다.'
 } finally {
     Pop-Location
 }

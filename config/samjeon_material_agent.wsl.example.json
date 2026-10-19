@@ -3,6 +3,7 @@
   "snapshot_root": "",
   "snapshot": "",
   "brain_root": "",
+  "ceo_data_root": "",
   "enabled": false,
   "auto_send": false,
   "daily_briefing_enabled": false,

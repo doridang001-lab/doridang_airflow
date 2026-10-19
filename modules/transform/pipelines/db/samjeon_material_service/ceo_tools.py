@@ -1,4 +1,4 @@
-"""질문에 선택된 월별 파일만 검증·적재하는 대표님 전용 도구."""
+"""기존 봇에서 질문에 선택된 월별 파일만 검증·적재하는 도구."""
 from contextlib import closing
 from datetime import date
 import hashlib
@@ -48,7 +48,13 @@ prepare_data의 날짜 범위·선택 파일·검증 상태와 반환된 테이�
 기간·자료 상태·출처를 짧게 밝히고 내부 절대경로나 개인정보를 출력하지 마세요.
 기준을 저장하려면 /기억 이름=기준, /기억삭제 이름, /기억목록 또는 '기억해: 기준 문장'을 사용할 수 있습니다.
 remembered_rules는 현재 유효한 관련 기준입니다. 과거 대화에서 삭제·수정 전 기준을 다시 적용하지 마세요.
-기억 저장 여부는 서비스 결과로만 말하세요. 원천 파일이나 코드를 변경하는 기능은 없습니다.'''
+inherited_preferences와 inherited_summary는 기존 봇의 과거 맥락입니다. 현재 요청과 remembered_rules를 우선하세요.
+기억 저장 여부는 서비스 결과로만 말하세요. 원천 데이터와 OneDrive 파일은 수정하지 마세요.
+기존 봇의 일반 대화와 지식 조회도 지원합니다. 관련 질문에만 list_brain/search_brain/read_brain_file을 사용하세요.
+Excel은 사용자가 정확한 파일명을 명시해 분석을 요청했을 때만 inspect_brain_workbook/read_brain_sheet로 읽으세요.
+지식 자료의 개인정보와 인증 정보를 그대로 출력하지 말고 필요한 요약만 답하세요.
+사용자가 로컬 코드 수정을 요청한 경우에만 list_workspace/read_workspace_file/write_workspace_file의 허용 범위에서 수행하세요.
+파일 삭제·명령 실행·git 업데이트 도구는 없습니다. 데이터 갱신은 CEO_DB의 파일을 다음 질문에서 다시 확인하는 방식입니다.'''
 
 
 def fingerprint(value):

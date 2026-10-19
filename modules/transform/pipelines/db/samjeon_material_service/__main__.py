@@ -60,10 +60,10 @@ def doctor(settings):
               'font_available': Path(settings.font_path).is_file(), 'files_written': False,
               'state_db_exists': (local_path(settings.state_root) / 'state.sqlite3').is_file()}
     result.update(readiness())
-    if settings.assistant_profile == 'ceo_data':
+    if settings.lazy_data:
         configured = bool(settings.token and settings.allowed_users and settings.allowed_chats and cli['ready'])
         ready = configured and settings.enabled and settings.ai_enabled and settings.ai_verified
-        result.update(assistant_profile='ceo_data', data_status='미조회',
+        result.update(assistant_profile=settings.assistant_profile, lazy_data=True, data_status='미조회',
                       data_root_exists=Path(settings.ceo_data_root).is_dir(),
                       conversation_deployable=configured, conversation_ready=ready, ready=ready,
                       blocked_reasons=[] if ready else ['연결 설정·서비스 활성화를 확인하세요'],
