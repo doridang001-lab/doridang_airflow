@@ -1,6 +1,7 @@
 """자연어는 Codex 세션으로 전달하고 발송 완료 여부를 별도 기록한다."""
 import asyncio
 import json
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -17,22 +18,36 @@ async def handle_agent(service, uid, user, chat, text, session, cancelled):
     session_key = 'codex-thread-v3-' + session['id']
     request_key = 'codex-request-v1-' + str(uid)
     binding = store.get(session_key, {})
+    ceo = service.settings.assistant_profile == 'ceo_data'
+    began = time.monotonic()
+    rotated = ceo and binding.get('completed_turns', 0) >= 12
     # 미전달·중단 턴이 남은 스레드를 대화 기억으로 사용하지 않는다.
-    fresh = not binding.get('thread_id') or binding.get('dirty', False)
+    fresh = not binding.get('thread_id') or binding.get('dirty', False) or rotated
     request_date = str(service._received_at.astimezone(ZoneInfo('Asia/Seoul')).date())
     context = {'request_date': request_date, 'timezone': 'Asia/Seoul'}
-    if fresh:
+    if ceo:
+        from .ceo_memory import context as ceo_context
+        context.update(ceo_context(store, user, chat, session, text))
+        if not fresh:
+            context.pop('handoff', None)
+    elif fresh:
         context.update(service.model_context())
         previous = session.get('previous') or session['id']
         context['previous_analysis'] = store.get('codex-analysis-v1-' + previous)
         if binding.get('dirty'):
             context['delivery_notice'] = '이전 생성 결과의 전달이 완료되지 않아 전달 완료 기록만 승계했습니다.'
-    tools = AnalysisTools(service.settings, service.repo, cancelled)
+    if ceo:
+        from .ceo_tools import CeoTools
+        tools = CeoTools(service.settings, cancelled=cancelled)
+    else:
+        tools = AnalysisTools(service.settings, service.repo, cancelled)
     files = WorkspaceFiles()
     brain = BrainFiles(service.settings.brain_root, text)
     calls = []
+    output_chars = 0
 
     async def tool_call(name, arguments):
+        nonlocal output_chars
         if cancelled.is_set():
             return {'error': 'cancelled'}
         if name == 'search_conversation':
@@ -40,16 +55,20 @@ async def handle_agent(service, uid, user, chat, text, session, cancelled):
             if not isinstance(query, str) or len(query) > 1000:
                 return {'error': 'query_invalid'}
             records = store.memory.search_agent(user, chat, query)
+            if ceo:
+                records = [{**r, 'question': r.get('question', '')[:400], 'answer': r.get('answer', '')[:700]}
+                           for r in records[:3]]
             result = {'records': [{k: r.get(k) for k in
                 ('question', 'answer', 'created_at', 'snapshot_date', 'period')} for r in records]}
-        elif name in ('list_workspace', 'read_workspace_file', 'write_workspace_file'):
+        elif not ceo and name in ('list_workspace', 'read_workspace_file', 'write_workspace_file'):
             result = await asyncio.to_thread(files.call, name, arguments)
-        elif name in ('list_brain', 'search_brain', 'read_brain_file',
+        elif not ceo and name in ('list_brain', 'search_brain', 'read_brain_file',
                       'inspect_brain_workbook', 'read_brain_sheet'):
             result = await asyncio.to_thread(brain.call, name, arguments)
         else:
             result = await asyncio.to_thread(tools.call, name, arguments)
         calls.append({'tool': name, 'error': result.get('error'), 'query_id': result.get('query_id')})
+        output_chars += len(json.dumps(result, ensure_ascii=False))
         store.put(request_key, {**store.get(request_key, {}), 'tools': calls})
         return result
 
@@ -69,7 +88,10 @@ async def handle_agent(service, uid, user, chat, text, session, cancelled):
             if fresh:
                 raise
             # 사라진 스레드는 사용자에게 전달된 기록으로 재구성한다.
-            context.update(service.model_context())
+            if not ceo:
+                context.update(service.model_context())
+            else:
+                context.update(ceo_context(store, user, chat, session, text))
             context['delivery_notice'] = '이전 실행 세션을 복원하지 못해 전달 완료 대화로 재개했습니다.'
             thread_id = await agent.open_thread()
         store.put(session_key, {'thread_id': thread_id, 'dirty': True})
@@ -80,16 +102,28 @@ async def handle_agent(service, uid, user, chat, text, session, cancelled):
             store.put(request_key, {**store.get(request_key), 'turn_id': turn_id})
 
         result = await agent.turn(thread_id, text, tool_call, cancelled, None, context, started)
+        if ceo:
+            store.put('ceo-usage-v1-' + str(uid), {
+                'elapsed_seconds': round(time.monotonic() - began, 3), 'csv_files_read': tools.read_files,
+                'query_count': len(tools.trace), 'cache_hits': tools.cache_hits,
+                'context_characters': len(json.dumps(context, ensure_ascii=False)),
+                'tool_output_characters': output_chars, 'usage': result.get('usage'),
+                'usage_available': result.get('usage') is not None})
         answer = telegram_answer(redact(result['text'], service.settings.token))
         store.put(request_key, {**store.get(request_key), 'status': 'generated', 'answer': answer})
         delivered = await service.send(f'update-{uid}', chat, answer, cancelled=cancelled)
         store.put(request_key, {**store.get(request_key), 'status': 'sent' if delivered else 'undelivered'})
         if delivered and not cancelled.is_set():
-            store.put(session_key, {'thread_id': thread_id, 'dirty': False})
+            store.put(session_key, {'thread_id': thread_id, 'dirty': False,
+                                   'completed_turns': (0 if fresh else binding.get('completed_turns', 0)) + 1})
             basis = tools.context['as_of_date'] if tools.context else None
             store.memory.record(uid, user, chat, text, answer, service._received_at,
                                 topic='data' if tools.context else 'chat', snapshot_date=basis)
             if tools.context:
+                if ceo:
+                    service.data_readiness = {'data_format': 'ceo_monthly_csv', 'data_query_ready': True,
+                                              'data_ready': False, 'data_status': '선택 자료 조회 완료',
+                                              'available_date_to': basis}
                 store.put('codex-analysis-v1-' + session['id'], {
                     'snapshot_id': tools.context['snapshot_id'], 'as_of_date': basis,
                     'queries': tools.trace, 'last_question': text, 'answer': answer[:8000]})

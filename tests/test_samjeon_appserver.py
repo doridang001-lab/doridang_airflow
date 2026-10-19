@@ -65,7 +65,7 @@ def test_query_limits_and_cancel(settings):
     tool = AnalysisTools(settings, Repository(settings))
     result = tool.call('query_data', {'sql': 'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL '
         'SELECT x+1 FROM n WHERE x<2000) SELECT x FROM n'})
-    assert len(result['rows']) == 1000 and result['truncated']
+    assert len(result['rows']) == 100 and result['truncated']
     tool.cancelled.set()
     assert tool.call('data_catalog', {}) == {'error': 'cancelled'}
 

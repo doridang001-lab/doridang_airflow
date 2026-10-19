@@ -11,6 +11,9 @@ from . import legacy
 
 def checked_snapshot(path):
     try:
+        if Path(path).is_dir() and not (Path(path) / 'manifest.json').is_file():
+            manifest, context, tables = load_snapshot(path)
+            return manifest, context, tables
         manifest = json.loads((Path(path) / 'manifest.json').read_text(encoding='utf-8'))
         if not isinstance(manifest, dict):
             raise ValueError('게시 형식 오류')
@@ -53,6 +56,23 @@ class Repository:
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise SnapshotUnavailable(code='snapshot_invalid') from exc
 
+    def summary_current(self):
+        """월별 v2 자료는 일별 요약만 읽고, 그 외 판본은 기존 경로를 사용한다."""
+        from modules.transform.pipelines.db.samjeon_material_agent.monthly import load_daily_summary
+        root = Path(self.settings.snapshot or self.settings.snapshot_root or '')
+        if root.name == 'samjeon_agent_DB' and (root.parent / '송파삼전점_직영점').is_dir():
+            root = root.parent / '송파삼전점_직영점'
+        if root.is_dir() and any(root.glob('????_??/????_??.csv')):
+            try:
+                manifest, context, summary = load_daily_summary(root, public_only=True)
+                self.last_good = str(root)
+                return root, manifest, context, summary
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise SnapshotUnavailable(code='snapshot_invalid') from exc
+        source, _ = self.current()
+        manifest, context, tables = checked_snapshot(source)
+        return source, manifest, context, tables
+
     def _current(self):
         if self.settings.snapshot:
             path = Path(self.settings.snapshot).resolve()
@@ -62,6 +82,11 @@ class Repository:
             if not self.settings.snapshot_root:
                 raise SnapshotUnavailable(code='snapshot_missing')
             root = Path(self.settings.snapshot_root).resolve()
+            if root.name == 'samjeon_agent_DB' and (root.parent / '송파삼전점_직영점').is_dir():
+                root = root.parent / '송파삼전점_직영점'
+            if any(p.is_dir() and (p / f'{p.name}.csv').is_file() for p in root.glob('????_??')):
+                _, manifest, context, _ = self.summary_current()
+                return root, context
             if not (root / 'latest.json').is_file():
                 raise SnapshotUnavailable(code='snapshot_missing')
             pointer = json.loads((root / 'latest.json').read_text(encoding='utf-8'))
@@ -82,6 +107,11 @@ class Repository:
 
     def context(self, path, expected=None):
         try:
+            if Path(path).is_dir() and any(Path(path).glob('????_??/????_??.csv')):
+                _, _, context, _ = self.summary_current()
+                if expected and context['snapshot_id'] != expected:
+                    raise ValueError('대화의 스냅샷 판본이 변경됐습니다')
+                return context
             _, context, _ = checked_snapshot(Path(path))
             if expected and context['snapshot_id'] != expected:
                 raise ValueError('대화의 스냅샷 판본이 변경됐습니다')
@@ -95,6 +125,25 @@ class Repository:
         # product_keys는 검증된 서버 측 근거 화면에만 사용하는 제한된 필터다.
         ordinary = {k: v for k, v in filters.items() if k != 'product_keys'}
         validate_query(dict(intent=intent, date_from=start, date_to=end, **ordinary))
+        if Path(path).is_dir() and any(Path(path).glob('????_??/????_??.csv')):
+            from modules.transform.pipelines.db.samjeon_material_agent.monthly import summary_period
+            _, manifest, context, summary = self.summary_current()
+            start, end = start or context['as_of_date'][:7] + '-01', end or context['as_of_date']
+            if intent not in ('summary', 'staff_meal', 'status'):
+                return {'snapshot_id': manifest['snapshot_id'], 'intent': intent,
+                        'date_from': start, 'date_to': end, 'status': '미지원',
+                        'unsupported': True, 'result': {}}
+            if start < context['window_start'] or end > context['as_of_date']:
+                return {'snapshot_id': context['snapshot_id'], 'intent': intent, 'date_from': start,
+                        'date_to': end, 'status': '범위 밖', 'required_date_from': start,
+                        'required_date_to': end}
+            period = summary_period(summary, start, end)
+            result = period if intent == 'summary' else (
+                {'staff_meal_won': period['staff_meal_won'],
+                 'staff_meal_complete': period['staff_meal_complete']} if intent == 'staff_meal' else
+                {'period': period, 'quality': []})
+            return {'snapshot_id': manifest['snapshot_id'], 'intent': intent, 'date_from': start,
+                    'date_to': end, 'status': period['status'], 'result': result}
         loaded = checked_snapshot(Path(path))
         if loaded[1].get('format') == legacy.FORMAT:
             return legacy.query(loaded, intent, start, end, **filters)
@@ -105,6 +154,8 @@ class Repository:
         return checked_query(path, intent=intent, date_from=start, date_to=end, **filters)
 
     def items(self, path, question):
+        if Path(path).is_dir() and any(Path(path).glob('????_??/????_??.csv')):
+            return []
         _, _, tables = checked_snapshot(Path(path))
         frame = tables['item_daily']
         if frame.empty:
@@ -120,6 +171,8 @@ class Repository:
         return []
 
     def search_items(self, path, name):
+        if Path(path).is_dir() and any(Path(path).glob('????_??/????_??.csv')):
+            return []
         _, _, tables = checked_snapshot(Path(path))
         rows = tables['item_daily'][['product_key', 'item_name', 'spec', 'source']].drop_duplicates()
         exact = rows.loc[rows['item_name'].eq(name)]
@@ -127,6 +180,8 @@ class Repository:
         return selected.head(10).to_dict('records')
 
     def compare_item(self, path, product_key, start, end):
+        if Path(path).is_dir() and any(Path(path).glob('????_??/????_??.csv')):
+            raise ValueError('집계 전용 자료에서 품목별 비교를 지원하지 않습니다')
         loaded = checked_snapshot(Path(path))
         if loaded[1].get('format') == legacy.FORMAT:
             return legacy.query(loaded, 'compare', start, end, product_key=product_key)
@@ -153,6 +208,8 @@ class Repository:
         return check
 
     def period_context(self, path, expected, start, end):
+        if Path(path).is_dir() and any(Path(path).glob('????_??/????_??.csv')):
+            raise ValueError('집계 전용 자료에서 상세 보고서를 지원하지 않습니다')
         from modules.transform.pipelines.db.samjeon_material_agent.analytics import build_context
         manifest, context, tables = checked_snapshot(Path(path))
         if context['snapshot_id'] != expected:

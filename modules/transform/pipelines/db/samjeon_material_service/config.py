@@ -20,6 +20,8 @@ class Settings:
     snapshot_root: str = ''
     snapshot: str = ''
     brain_root: str = ''
+    assistant_profile: str = 'legacy'
+    ceo_data_root: str = ''
     enabled: bool = False
     auto_send: bool = False
     daily_briefing_enabled: bool = False
@@ -50,7 +52,7 @@ class Settings:
         raw = json.loads(filename.read_text(encoding='utf-8'))
         if not isinstance(raw, dict) or set(raw) - {f.name for f in fields(cls)}:
             raise ValueError('서비스 설정 키 오류')
-        for key in ('state_root', 'snapshot_root', 'snapshot', 'brain_root', 'font_path'):
+        for key in ('state_root', 'snapshot_root', 'snapshot', 'brain_root', 'ceo_data_root', 'font_path'):
             value = raw.get(key, getattr(cls(), key))
             if value:
                 p = Path(value)
@@ -66,6 +68,15 @@ class Settings:
 
     def validate(self):
         local_path(self.state_root)
+        if self.assistant_profile not in ('legacy', 'ceo_data'):
+            raise ValueError('비서 실행 모드 오류')
+        if self.assistant_profile == 'ceo_data':
+            if not isinstance(self.ceo_data_root, str) or not self.ceo_data_root:
+                raise ValueError('CEO_DB 경로가 필요합니다')
+            if self.conversation_engine != 'appserver' or self.auto_send or self.daily_briefing_enabled:
+                raise ValueError('대표님 모드는 appserver 대화 전용으로 실행합니다')
+            if Path(self.state_root).resolve().is_relative_to(Path(self.ceo_data_root).resolve()):
+                raise ValueError('상태 폴더는 CEO_DB 밖에 둡니다')
         if not isinstance(self.brain_root, str):
             raise ValueError('지식 폴더 경로 오류')
         if self.conversation_engine not in ('legacy', 'appserver'):

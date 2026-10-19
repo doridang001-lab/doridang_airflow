@@ -9,14 +9,19 @@ import pandas as pd
 
 from modules.transform.pipelines.db.samjeon_material_agent.analytics import build_context, period_result
 from modules.transform.pipelines.db.samjeon_material_agent.contracts import SCHEMA_VERSION, digest, validate_context
-from modules.transform.pipelines.db.samjeon_material_agent.contracts import OUTPUT_NAMES, OUTPUT_TABLES
+from modules.transform.pipelines.db.samjeon_material_agent.mart import OUTPUT_NAMES, OUTPUT_TABLES
 from modules.transform.pipelines.db.samjeon_material_agent.settings import validate_settings
+from modules.transform.pipelines.db.samjeon_material_agent.monthly import load_monthly, csv_evidence, summary_period
 
 INTENTS = {"summary", "compare", "anomalies", "forecast", "staff_meal", "evidence", "status"}
 
 
 def load_snapshot(directory: Path) -> tuple[dict, dict, dict]:
     directory = Path(directory)
+    if directory.is_dir() and not (directory / "manifest.json").is_file():
+        month = directory.name
+        is_month = (directory / f"{month}.csv").is_file()
+        return load_monthly(directory.parent if is_month else directory)
     manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("이 스냅샷은 v3 조회 계약이 아닙니다. v3 로컬 재계산이 필요합니다")
@@ -54,8 +59,22 @@ def query_snapshot(directory: Path, *, intent: str = "summary", date_from: str |
         required_start = min(required_start, last.replace(day=1))
     identity = {"snapshot_id": manifest["snapshot_id"], "schema_version": SCHEMA_VERSION,
                 "intent": intent, "date_from": start, "date_to": end}
+    if manifest.get("format") == "monthly_csv_v3":
+        if start < manifest["window_start"] or end > manifest["as_of_date"]:
+            return {**identity, "status": "범위 밖", "reason": "해당 기간의 월별 CSV가 필요",
+                    "required_date_from": start, "required_date_to": end}
+        if intent not in {"summary", "status", "staff_meal"}:
+            raise ValueError("집계 전용 자료에서 지원하지 않는 조회입니다")
+        period = summary_period(tables["daily_summary"], start, end)
+        result = period if intent == "summary" else (
+            {"staff_meal_won": period["staff_meal_won"],
+             "staff_meal_complete": period["staff_meal_complete"]} if intent == "staff_meal" else
+            {"period": period, "quality": tables["daily_summary"].loc[
+                tables["daily_summary"]["날짜"].between(start, end),
+                ["날짜", "자료상태", "매출원천상태", "푸드가이드상태", "물류담상태", "확인필요"]].to_dict("records")})
+        return {**identity, "status": period["status"], "result": result}
     if str(required_start) < manifest["window_start"] or end > manifest["as_of_date"]:
-        return {**identity, "status": "범위 밖", "reason": "해당 기간의 별도 스냅샷 계산 필요",
+        return {**identity, "status": "범위 밖", "reason": "해당 기간의 월별 CSV가 필요",
                 "required_date_from": str(required_start), "required_date_to": end}
     settings = validate_settings(context["settings"])
     period = period_result(start, end, tables, settings)
@@ -90,4 +109,5 @@ def query_snapshot(directory: Path, *, intent: str = "summary", date_from: str |
         result = ({"seven_day": calculated["seven_day"], "staff_meal_seven_day": calculated["staff_meal_seven_day"],
                    "top_increase_items": calculated["top_increase_items"]} if intent == "compare" else
                   calculated["alerts"] if intent == "anomalies" else calculated["forecast"])
-    return {**identity, "status": result_status, "result": result}
+    return {**identity, "status": result_status,
+            "result": csv_evidence(result) if str(manifest.get("format", "")).startswith("monthly_csv_") else result}

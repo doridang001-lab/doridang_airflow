@@ -152,14 +152,17 @@ class AppServer:
 
     async def open_thread(self, thread_id=None, *, analysis_only=False):
         await self.start()
+        ceo = self.settings.assistant_profile == 'ceo_data'
+        if ceo:
+            from .ceo_tools import INSTRUCTIONS as ceo_instructions, TOOLS as ceo_tools
         common = {'model': self.settings.model, 'cwd': self.work, 'approvalPolicy': 'never',
                   'sandbox': 'read-only',
-                  'developerInstructions': DAILY_INSTRUCTIONS if analysis_only else INSTRUCTIONS}
+                  'developerInstructions': ceo_instructions if ceo else DAILY_INSTRUCTIONS if analysis_only else INSTRUCTIONS}
         if thread_id:
             result = await self.rpc('thread/resume', {**common, 'threadId': thread_id, 'excludeTurns': True})
         else:
             result = await self.rpc('thread/start', {**common, 'ephemeral': analysis_only,
-                                                     'dynamicTools': TOOLS[:3] + BRAIN_TOOLS[1:3] if analysis_only
+                                                     'dynamicTools': ceo_tools if ceo else TOOLS[:3] + BRAIN_TOOLS[1:3] if analysis_only
                                                      else TOOLS + FILE_TOOLS + BRAIN_TOOLS})
         return result['thread']['id']
 
@@ -178,6 +181,7 @@ class AppServer:
                 on_started(turn_id)
             deadline = time.monotonic() + self.settings.agent_timeout_seconds
             answers, interrupt_at = {}, None
+            usage = None
             while True:
                 if (cancelled.is_set() or time.monotonic() >= deadline) and interrupt_at is None:
                     cancelled.set()
@@ -191,6 +195,8 @@ class AppServer:
                 except asyncio.TimeoutError:
                     continue
                 method, params = message.get('method'), message.get('params', {})
+                if method == 'thread/tokenUsage/updated' and params.get('threadId') == thread_id:
+                    usage = params.get('tokenUsage')
                 self.last_event_types.append((method, params.get('item', {}).get('type'),
                                               params.get('turn', {}).get('status')))
                 self.last_event_types = self.last_event_types[-30:]
@@ -234,7 +240,7 @@ class AppServer:
                     answer = '\n\n'.join(answers.values()).strip()
                     if not answer:
                         raise AppServerError('empty_answer')
-                    return {'text': answer, 'thread_id': thread_id, 'turn_id': turn_id}
+                    return {'text': answer, 'thread_id': thread_id, 'turn_id': turn_id, 'usage': usage}
 
     async def close(self):
         self.ready = False

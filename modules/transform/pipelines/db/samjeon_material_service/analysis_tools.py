@@ -2,6 +2,7 @@
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 import sqlite3
 import threading
@@ -22,10 +23,10 @@ def spec(name, description, properties, required=()):
 TOOLS = [
     spec('data_catalog', '현재 연결된 검증 자료의 테이블·컬럼·기간·품질을 확인한다. SQL 작성 전에 확인한다.', {}),
     spec('query_data', '현재 판본을 읽기 전용 SQLite SQL로 조회·집계·비교·계산한다. SELECT/WITH, JOIN, 윈도 함수, '
-         'sqrt/pow/log와 stdev 집계가 가능하다. 최대 1000행. 숫자 날짜는 데이터에서 확인하며 구매액은 사용원가가 아니다.',
+         'sqrt/pow/log와 stdev 집계가 가능하다. 최대 100행. 숫자 날짜는 데이터에서 확인하며 구매액은 사용원가가 아니다.',
          {'sql': {'type': 'string'}, 'parameters': {'type': 'array', 'items': {
              'type': ['string', 'number', 'null', 'boolean']}}}, ('sql',)),
-    spec('get_evidence', 'purchase_lines에서 evidence_id로 구매 원행을 확인한다.',
+    spec('get_evidence', '거래 근거가 게시된 이전 자료에서만 evidence_id로 구매 원행을 확인한다. 집계 전용 자료에서는 지원하지 않는다.',
          {'evidence_ids': {'type': 'array', 'items': {'type': 'string'}, 'maxItems': 50}}, ('evidence_ids',)),
     spec('search_conversation', '같은 사용자와 대화의 전달 완료 과거 기록을 검색한다. 검색어 또는 날짜·품목을 사용한다.',
          {'query': {'type': 'string'}}, ('query',)),
@@ -56,20 +57,32 @@ class AnalysisTools:
         self.context = None
         self.catalog = None
         self.trace = []
+        self._detail_tables = None
+        self._detail_path = None
+        self._summary_table = None
+        self._source = None
 
     def prepare(self):
         if self.path:
             return
-        source, _ = self.repository.current()
-        manifest, context, tables = checked_snapshot(source)
+        source, manifest, context, tables = self.repository.summary_current()
+        self._source = source
         fingerprint = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
         root = local_path(self.settings.state_root) / 'analysis-cache'
         root.mkdir(parents=True, exist_ok=True)
         target = root / (fingerprint + '.sqlite3')
         # 게시 파일의 경로·개인 환경 정보는 분석 DB에도 복사하지 않는다.
-        clean = {name: table.drop(columns=[c for c in table.columns
+        clean = ({name: table.drop(columns=[c for c in table.columns
                     if c in ('source_file', 'source_path') or c.endswith('_path')], errors='ignore')
-                 for name, table in tables.items()}
+                 for name, table in tables.items()} if isinstance(tables, dict) else {})
+        if context.get('format') in ('monthly_csv_v2', 'monthly_csv_v3'):
+            from modules.transform.pipelines.db.samjeon_material_agent.monthly import TABLE_FILES
+            if context.get('format') == 'monthly_csv_v2':
+                self._detail_tables = {name: None for name in TABLE_FILES}
+            summary = tables
+            self._summary_table = summary
+            clean = {'daily_summary': summary}
+            target = root / (fingerprint + '-summary.sqlite3')
         if not target.exists():
             temporary = root / (uuid.uuid4().hex + '.tmp.sqlite3')
             try:
@@ -95,6 +108,37 @@ class AnalysisTools:
                             'quality_daily': '원천·날짜별 품질. 행 부재를 정상 또는 0으로 해석하지 않는다.',
                             'category': '미분류를 원재료로 추정하지 않는다.',
                             'dates': '날짜 문자열은 YYYY-MM-DD. 보유 기간은 월 전체 완료를 뜻하지 않는다.'}}
+        if self._detail_tables is not None:
+            self.catalog['detail_tables'] = list(self._detail_tables)
+            self.catalog['detail_note'] = '기본 조회는 daily_summary. 품목·근거 분석이 필요할 때만 상세 테이블을 SQL에서 지정한다.'
+
+    def _ensure_detail(self):
+        if self._detail_tables is None or self._detail_path is not None:
+            return
+        manifest, _, tables = checked_snapshot(self._source)
+        if manifest['snapshot_id'] != self.context['snapshot_id']:
+            raise SnapshotUnavailable(code='snapshot_invalid')
+        self._detail_tables = {name: table.drop(columns=[c for c in table.columns
+                        if c in ('source_file', 'source_path') or c.endswith('_path')], errors='ignore')
+                        for name, table in tables.items()}
+        target = self.path.with_name(self.path.stem.replace('-summary', '-detail') + '.sqlite3')
+        if not target.exists():
+            temporary = target.with_name(uuid.uuid4().hex + '.tmp.sqlite3')
+            try:
+                with closing(sqlite3.connect(temporary)) as db:
+                    self._summary_table.to_sql('daily_summary', db, index=False)
+                    for name, table in self._detail_tables.items():
+                        if self.cancelled.is_set():
+                            raise InterruptedError('cancelled')
+                        table.to_sql(name, db, index=False)
+                    db.execute('CREATE INDEX evidence_lookup ON purchase_lines(evidence_id)')
+                    db.commit()
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
+        self._detail_path = target
+        self.catalog['tables'].update({name: {'columns': list(table.columns), 'rows': len(table)}
+                                       for name, table in self._detail_tables.items()})
 
     def query(self, sql, parameters=()):
         if not isinstance(sql, str) or len(sql) > 20000:
@@ -102,8 +146,12 @@ class AnalysisTools:
         if not isinstance(parameters, (list, tuple)) or len(parameters) > 1000:
             raise ValueError('parameters_invalid')
         self.prepare()
+        if self._detail_tables is not None and any(re.search(r'(?<![\w])' + re.escape(name) + r'(?![\w])', sql, re.I)
+                                                   for name in self._detail_tables):
+            self._ensure_detail()
         deadline = time.monotonic() + 15
-        with closing(sqlite3.connect(self.path.as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
+        database = self._detail_path or self.path
+        with closing(sqlite3.connect(database.as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
             db.execute('PRAGMA query_only=ON')
             db.enable_load_extension(False)
             db.create_aggregate('stdev', 1, Stdev)
@@ -130,7 +178,7 @@ class AnalysisTools:
             for row in cursor:
                 values = [v.hex() if isinstance(v, bytes) else v for v in row]
                 size += len(json.dumps(values, ensure_ascii=False).encode())
-                if len(rows) == 1000 or size > 128000:
+                if len(rows) == 100 or size > 32000:
                     truncated = True
                     break
                 rows.append(values)
@@ -154,6 +202,9 @@ class AnalysisTools:
             if name == 'query_data':
                 return self.query(arguments.get('sql'), arguments.get('parameters', []))
             if name == 'get_evidence':
+                self.prepare()
+                if self.context.get('format') == 'monthly_csv_v3':
+                    return {'error': 'unsupported_detail', 'message': '집계 전용 자료에는 개별 거래 근거가 없습니다.'}
                 ids = arguments.get('evidence_ids')
                 if not isinstance(ids, list) or not 1 <= len(ids) <= 50 or not all(isinstance(i, str) for i in ids):
                     return {'error': 'evidence_ids_invalid'}
