@@ -61,6 +61,9 @@ async def send_daily_briefing(service):
                 return await asyncio.to_thread(tools.call, name, arguments)
             if name in ('search_brain', 'read_brain_file'):
                 return await asyncio.to_thread(brain.call, name, arguments)
+            if name == 'read_assistant_knowledge':
+                from .assistant_packages import knowledge
+                return knowledge(settings, arguments.get('query'))
             return {'error': 'tool_not_allowed'}
 
         thread_id = await service.agent.open_thread(analysis_only=True)
@@ -70,10 +73,15 @@ async def send_daily_briefing(service):
                   '전일 자료가 없어도 확인 가능한 잠정 관측값을 분석하세요. '
                   '최근 경영 질문과 보고 선호가 있으면 관련 지표의 우선순위와 설명 깊이에 반영하세요. '
                   '대화에서 나온 추정이나 숫자를 현재 사실로 취급하지 말고 오늘 자료로 다시 검증하세요.')
+        from .assistant_packages import context as package_context
+        from .learning import Learning
+        model_context = {'request_date': str(now.date()), 'timezone': 'Asia/Seoul',
+                         'briefing': True, 'as_of_date': context['as_of_date'], 'conversation_focus': memory}
+        model_context.update(package_context(settings))
+        if chat in settings.allowed_users and chat in settings.allowed_chats:
+            model_context.update(Learning(service.store, settings, chat, chat).context(prompt))
         result = await service.agent.turn(thread_id, prompt, tool_call, threading.Event(), None,
-                                          {'request_date': str(now.date()), 'timezone': 'Asia/Seoul',
-                                           'briefing': True, 'as_of_date': context['as_of_date'],
-                                           'conversation_focus': memory}, lambda _: None)
+                                          model_context, lambda _: None)
         if not tools.trace:
             raise ValueError('briefing_without_data_query')
         answer = telegram_answer(redact(result['text'], settings.token))

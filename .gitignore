@@ -155,3 +155,6 @@ airflow_tmp/
 .tmp/
 __pycache__/
 .pytest_cache/
+
+# 배포용 기본 비서 정의는 운영 JSON 데이터와 달리 소스에 포함한다.
+!modules/transform/pipelines/db/samjeon_material_service/assistant_seed.json

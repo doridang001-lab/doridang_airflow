@@ -324,6 +324,8 @@ class Service:
                     '예: 이번 달 매출이 지난달 같은 기간과 비교해 어떻게 달라졌어?\n'
                     '보고 예약: 매일 오전 9시에 KPI 보고 보내줘 / 보고 예약 확인해줘 / 보고 예약 해제해줘\n'
                     '/기억 이름=기준 · /기억목록 · /기억삭제 이름\n'
+                    '학습: /학습목록 · /학습보기 ID · /학습확정 ID 판본 · /학습삭제 ID 판본\n'
+                    '대표 공유 검토: /학습공유 ID 판본 (실제 배포는 하지 않습니다)\n'
                     '자료 검증: 질문 시 수행. 노트북 종료·절전 중에는 응답할 수 없습니다.')
         context = None
         error = None
@@ -346,7 +348,8 @@ class Service:
                 source = '삼전점 자료: 현재 확인이 필요합니다.'
             return ('Codex 대화: ' + ('준비됐습니다.' if ai_ready else '연결 확인 중입니다.') + '\n'
                     + source + '\n질문을 그대로 보내세요. 필요한 자료는 제가 조회하고 확인하겠습니다. '
-                    '진행 중인 분석은 /cancel로 중단할 수 있습니다.')
+                    '진행 중인 분석은 /cancel로 중단할 수 있습니다.\n'
+                    '학습: /학습목록 · /학습보기 ID · /학습확정 ID 판본 · /학습삭제 ID 판본')
         if context and context.get('format') == 'legacy_v1':
             return ('대표님, 삼전점 비서입니다.\n일반 대화: ' + ('준비됐습니다.' if ai_ready else '연결 준비 중입니다.')
                     + f"\n기존 잠정 자료 조회: 가능 / {context['window_start']}~{context['as_of_date']}"
@@ -434,6 +437,12 @@ class Service:
         self.store.update_status(uid, 'processing')
         try:
             text = redact(message.get('text', '').strip(), self.settings.token)
+            if not callback:
+                from .learning import Learning
+                learning_answer = Learning(self.store, self.settings, user, chat).command(text)
+                if learning_answer is not None:
+                    await self.send(f'update-{uid}', chat, learning_answer, cancelled=cancelled)
+                    return
             if len(text) > 4000:
                 raise ValueError('질문을 4,000자 이내로 나눠 보내주세요')
             received_row = self.store.db.execute('SELECT created FROM updates WHERE id=?', (uid,)).fetchone()
@@ -441,7 +450,7 @@ class Service:
             self._user, self._handling_uid = user, uid
             if self.settings.lazy_data:
                 from .ceo_memory import command
-                answer = command(self.store, user, chat, text, uid)
+                answer = command(self.store, user, chat, text, uid, self.settings)
                 if answer is not None:
                     await self.send(f'update-{uid}', chat, answer, cancelled=cancelled)
                     return

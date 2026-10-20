@@ -206,7 +206,8 @@ def test_existing_bot_config_keeps_workspace_and_brain_tools(settings, monkeypat
     asyncio.run(agent.open_thread())
     names = {x['name'] for x in seen[0]['dynamicTools']}
     assert 'prepare_data' in names
-    assert 'write_workspace_file' in names
+    assert 'write_workspace_file' not in names
+    assert {'propose_learning', 'list_learning'} <= names
     assert 'search_brain' in names
     assert len(names) == len(seen[0]['dynamicTools'])
 

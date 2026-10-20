@@ -445,7 +445,8 @@ def test_new_thread_receives_non_deleting_file_tools(settings):
         async def rpc(method, params):
             assert method == 'thread/start'
             names = {tool['name'] for tool in params['dynamicTools']}
-            assert {'list_workspace', 'read_workspace_file', 'write_workspace_file'} <= names
+            assert {'list_workspace', 'read_workspace_file', 'propose_learning', 'list_learning'} <= names
+            assert 'write_workspace_file' not in names
             assert {'list_brain', 'search_brain', 'read_brain_file'} <= names
             assert {'inspect_brain_workbook', 'read_brain_sheet'} <= names
             assert not any('delete' in name for name in names)
@@ -465,7 +466,7 @@ def test_daily_thread_gets_only_read_only_data_tools(settings):
             assert params['ephemeral'] is True
             assert {tool['name'] for tool in params['dynamicTools']} == {
                 'data_catalog', 'query_data', 'get_evidence',
-                'search_brain', 'read_brain_file'}
+                'search_brain', 'read_brain_file', 'read_assistant_knowledge'}
             return {'thread': {'id': 'daily-thread'}}
         agent.rpc = rpc
         assert await agent.open_thread(analysis_only=True) == 'daily-thread'

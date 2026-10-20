@@ -45,6 +45,9 @@ class Settings:
     poll_seconds: int = 60
     conversation_engine: str = 'legacy'
     agent_timeout_seconds: int = 600
+    assistant_id: str = 'samjeon'
+    assistant_package: str = ''
+    package_owner_user: int | None = None
 
     @property
     def lazy_data(self):
@@ -57,7 +60,7 @@ class Settings:
         raw = json.loads(filename.read_text(encoding='utf-8'))
         if not isinstance(raw, dict) or set(raw) - {f.name for f in fields(cls)}:
             raise ValueError('서비스 설정 키 오류')
-        for key in ('state_root', 'snapshot_root', 'snapshot', 'brain_root', 'ceo_data_root', 'font_path'):
+        for key in ('state_root', 'snapshot_root', 'snapshot', 'brain_root', 'ceo_data_root', 'font_path', 'assistant_package'):
             value = raw.get(key, getattr(cls(), key))
             if value:
                 p = Path(value)
@@ -73,6 +76,16 @@ class Settings:
 
     def validate(self):
         local_path(self.state_root)
+        if not isinstance(self.assistant_id, str) or not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', self.assistant_id):
+            raise ValueError('비서 식별자 오류')
+        if not isinstance(self.assistant_package, str):
+            raise ValueError('비서 패키지 경로 오류')
+        if self.package_owner_user is not None and (type(self.package_owner_user) is not int
+                or self.package_owner_user not in self.allowed_users):
+            raise ValueError('패키지 대표는 허용된 사용자여야 합니다')
+        if self.assistant_package:
+            from .assistant_packages import selected
+            selected(self)
         if self.assistant_profile not in ('legacy', 'ceo_data'):
             raise ValueError('비서 실행 모드 오류')
         if not isinstance(self.ceo_data_root, str):

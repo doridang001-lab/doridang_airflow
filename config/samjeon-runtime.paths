@@ -20,4 +20,5 @@
 /scripts/set_samjeon_sparse.ps1
 /config/ceo_dataset_guide.example.md
 /harness/ceo_assistant.md
+/harness/samjeon_assistant_packages.md
 /scripts/watch_samjeon_material_agent.py
