@@ -59,6 +59,10 @@ def doctor(settings):
               'ai_live_verified': settings.ai_verified, 'pdf_available': find_spec('reportlab') is not None,
               'font_available': Path(settings.font_path).is_file(), 'files_written': False,
               'state_db_exists': (local_path(settings.state_root) / 'state.sqlite3').is_file()}
+    from .assistant_packages import selected, validate
+    package = selected(settings)
+    result['assistant_package'] = validate(package, settings) if package else {'configured': False}
+    result['package_owner_configured'] = settings.package_owner_user is not None
     result.update(readiness())
     if settings.lazy_data:
         configured = bool(settings.token and settings.allowed_users and settings.allowed_chats and cli['ready'])
@@ -122,6 +126,8 @@ def doctor(settings):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest='command', required=True)
+    from .package_cli import add_commands
+    add_commands(subs)
     wsl = subs.add_parser('configure-wsl')
     wsl.add_argument('--config', type=Path, required=True)
     wsl.add_argument('--distribution', required=True)
@@ -139,6 +145,9 @@ def main(argv=None):
         if name == 'report':
             cmd.add_argument('--snapshot', type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.command == 'package':
+        from .package_cli import run
+        return run(args)
     if args.command == 'configure-wsl':
         from .wsl_config import configure
         return configure(args.config, args.distribution, args.user, args.codex_executable, args.dry_run)

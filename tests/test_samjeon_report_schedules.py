@@ -218,7 +218,7 @@ def test_analysis_thread_excludes_mutation_and_memory_tools(settings,monkeypatch
     monkeypatch.setattr(agent,'rpc',rpc)
     asyncio.run(agent.open_thread(analysis_only=True))
     names={x['name'] for x in seen[0]['dynamicTools']}
-    assert names=={'data_catalog','read_guide','prepare_data','query_data','search_brain','read_brain_file'}
+    assert names=={'data_catalog','read_guide','prepare_data','query_data','search_brain','read_brain_file','read_assistant_knowledge'}
 
 
 def test_one_off_revision_does_not_change_future_reports(settings):

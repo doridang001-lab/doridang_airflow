@@ -123,6 +123,16 @@ def test_runtime_sparse_clone_imports_without_other_repository_files(tmp_path):
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)['files_written'] is False
     assert git('status', '--porcelain', cwd=clone).stdout == ''
+    exported = tmp_path / 'portable-assistant.json'
+    package_result = subprocess.run([sys.executable, '-B', '-X', 'utf8', '-m',
+        'modules.transform.pipelines.db.samjeon_material_service', 'package', 'export',
+        '--id', 'portable', '--version', '1.0.0', '--output', str(exported)],
+        cwd=clone, env=env, capture_output=True, encoding='utf-8')
+    assert package_result.returncode == 0, package_result.stderr
+    assert json.loads(package_result.stdout)['valid']
+    assert exported.is_file()
+    assert (clone / 'modules/transform/pipelines/db/samjeon_material_service/prompts/learning.md').is_file()
+    assert git('status', '--porcelain', cwd=clone).stdout == ''
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='PowerShell 작업 스케줄러 설정')

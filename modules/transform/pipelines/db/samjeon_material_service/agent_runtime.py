@@ -2,14 +2,17 @@
 import asyncio
 import json
 import time
-from datetime import datetime
+import hashlib
 from zoneinfo import ZoneInfo
 
 from .analysis_tools import AnalysisTools
 from .appserver import AppServerError
 from .codex_adapter import redact
 from .presentation import telegram_answer
+from .learning import Learning
 from .workspace_files import WorkspaceFiles
+from .tool_registry import ActorContext, ToolRegistry
+from . import assistant_packages
 from .brain_files import BrainFiles
 
 
@@ -19,17 +22,24 @@ async def handle_agent(service, uid, user, chat, text, session, cancelled):
     request_key = 'codex-request-v1-' + str(uid)
     binding = store.get(session_key, {})
     ceo = service.settings.lazy_data
+    learning = Learning(store, service.settings, user, chat)
     began = time.monotonic()
     rotated = ceo and binding.get('completed_turns', 0) >= 12
     # 미전달·중단 턴이 남은 스레드를 대화 기억으로 사용하지 않는다.
-    toolset = 'single-bot-lazy-schedules-v2' if ceo else 'legacy'
+    toolset = ('assistant-learning-v1-' + str(ceo) + '-' + assistant_packages.fingerprint(service.settings)
+               + '-' + hashlib.sha256(json.dumps(learning.list(), ensure_ascii=False, sort_keys=True).encode()).hexdigest())
     changed_tools = ((ceo or 'toolset' in binding) and binding.get('toolset') != toolset)
     fresh = not binding.get('thread_id') or binding.get('dirty', False) or rotated or changed_tools
     request_date = str(service._received_at.astimezone(ZoneInfo('Asia/Seoul')).date())
     context = {'request_date': request_date, 'timezone': 'Asia/Seoul'}
+    context.update(learning.context(text))
+    context.update(assistant_packages.context(service.settings))
     if ceo:
         from .ceo_memory import context as ceo_context
         context.update(ceo_context(store, user, chat, session, text))
+        managed_names = {r['name'] for r in learning.list()}
+        context['remembered_rules'] = [r for r in context['remembered_rules'] if r['name'] not in managed_names]
+        context['remembered_rules'] += [{'name': r['name'], 'text': r['content']} for r in context['active_learning']]
         if not fresh:
             context.pop('handoff', None)
             context.pop('inherited_preferences', None)
@@ -45,13 +55,13 @@ async def handle_agent(service, uid, user, chat, text, session, cancelled):
         tools = CeoTools(service.settings, cancelled=cancelled)
     else:
         tools = AnalysisTools(service.settings, service.repo, cancelled)
-    files = WorkspaceFiles()
     brain = BrainFiles(service.settings.brain_root, text)
+    files = WorkspaceFiles()
     calls = []
     output_chars = 0
     schedule_result = None
 
-    async def tool_call(name, arguments):
+    async def dispatch(name, arguments):
         nonlocal output_chars, schedule_result
         if cancelled.is_set():
             return {'error': 'cancelled'}
@@ -71,7 +81,17 @@ async def handle_agent(service, uid, user, chat, text, session, cancelled):
                            for r in records[:3]]
             result = {'records': [{k: r.get(k) for k in
                 ('question', 'answer', 'created_at', 'snapshot_date', 'period')} for r in records]}
-        elif name in ('list_workspace', 'read_workspace_file', 'write_workspace_file'):
+        elif name == 'list_learning':
+            offset = arguments.get('offset', 0)
+            if type(offset) is not int or not 0 <= offset <= 100:
+                return {'error': 'offset_invalid'}
+            items = learning.list()
+            result = {'items': items[offset:offset + 10], 'next_offset': offset + 10 if offset + 10 < len(items) else None}
+        elif name == 'propose_learning':
+            result = learning.propose(arguments, uid, text)
+        elif name == 'read_assistant_knowledge':
+            result = assistant_packages.knowledge(service.settings, arguments.get('query'))
+        elif name in ('list_workspace', 'read_workspace_file'):
             result = await asyncio.to_thread(files.call, name, arguments)
         elif name in ('list_brain', 'search_brain', 'read_brain_file',
                       'inspect_brain_workbook', 'read_brain_sheet'):
@@ -82,6 +102,10 @@ async def handle_agent(service, uid, user, chat, text, session, cancelled):
         output_chars += len(json.dumps(result, ensure_ascii=False))
         store.put(request_key, {**store.get(request_key, {}), 'tools': calls})
         return result
+
+    registry = ToolRegistry(service.settings, ActorContext(user, chat, service.settings.assistant_id,
+        service.settings.ceo_data_root or service.settings.snapshot_root or service.settings.snapshot), dispatch)
+    tool_call = registry.call
 
     async def typing():
         while True:

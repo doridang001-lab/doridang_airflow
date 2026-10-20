@@ -6,7 +6,7 @@ def records(store, user, chat):
     return store.get(f'ceo-rules-v1-{user}-{chat}', {})
 
 
-def command(store, user, chat, text, uid):
+def command(store, user, chat, text, uid, settings=None):
     key = f'ceo-rules-v1-{user}-{chat}'
     rules = records(store, user, chat)
     def invalidate():
@@ -21,6 +21,12 @@ def command(store, user, chat, text, uid):
         name = text.partition(' ')[2].strip()
         rules.pop(name, None)
         store.put(key, rules)
+        if settings:
+            from .learning import Learning
+            manager = Learning(store, settings, user, chat)
+            for row in manager.list():
+                if row['name'] == name:
+                    manager.command(f"/학습삭제 {row['id']} {row['revision']}")
         invalidate()
         return f'기준을 삭제했습니다: {name[:80]}'
     match = re.match(r'^(?:/기억\s+|기억해:\s*)([^=\n]{1,80})=(.{1,1000})$', text, re.S)
@@ -30,7 +36,7 @@ def command(store, user, chat, text, uid):
             value = next(v for v in natural.groups() if v).strip(' .\n')
             if any(word in value for word in ('아까 말한', '이것', '그것', '이거', '그거')):
                 return '기억할 기준을 한 문장으로 적어 주세요. 예: 기억해: 매출은 같은 기간으로 비교'
-            return command(store, user, chat, '/기억 ' + value[:40].replace('=', ' ') + '=' + value, uid)
+            return command(store, user, chat, '/기억 ' + value[:40].replace('=', ' ') + '=' + value, uid, settings)
     if match:
         name, value = (part.strip() for part in match.groups())
         if not name or not value:
@@ -38,6 +44,14 @@ def command(store, user, chat, text, uid):
         if len(rules) >= 100 and name not in rules:
             return '기준은 최대 100개입니다. 사용하지 않는 기준을 먼저 삭제해 주세요.'
         rules[name] = {'text': value, 'update_id': uid}
+        if settings:
+            from .learning import Learning
+            manager = Learning(store, settings, user, chat)
+            previous = next((r for r in manager.list() if r['name'] == name), None)
+            saved = manager.propose({'name': name, 'kind': 'rule', 'content': value,
+                'expected_revision': previous['revision'] if previous else 0}, uid, text)
+            if saved.get('saved'):
+                manager.command(saved['confirm_command'])
         store.put(key, rules)
         invalidate()
         return f'확정 기준을 기억했습니다: {name} = {value}'
