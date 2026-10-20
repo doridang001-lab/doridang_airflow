@@ -54,6 +54,7 @@ class Service:
         self._user = None
         self._telegram_poll_at = None
         self._telegram_poll_error = None
+        self._report_task = None
 
     def model_context(self):
         return self.store.memory.model_context(self._session_id)
@@ -135,7 +136,14 @@ class Service:
             conversation_ready = conversation_ready and self.agent.ready
         elif isinstance(self.model, CodexAdapter):
             conversation_ready = conversation_ready and bool((self.model._probe or {}).get('ready'))
+        schedules = []
+        if self.settings.lazy_data:
+            from .report_schedules import Schedules, next_run
+            schedules = [{'enabled': s.get('enabled'), 'time': s.get('time'),
+                          'next_run': next_run(s, self.clock())}
+                         for s in Schedules(self.store, self.settings).all()]
         atomic_json(self.store.root / 'health.json', {'checked_at': self.clock().isoformat(),
+                    'scheduled_reports': schedules,
                     'telegram_poll_at': self._telegram_poll_at,
                     'telegram_poll_error': self._telegram_poll_error,
                     'conversation_engine': self.settings.conversation_engine,
@@ -314,6 +322,7 @@ class Service:
         if self.settings.lazy_data:
             return ('질문할 때 필요한 기간의 요약부터 확인합니다. 대기 중에는 업무 자료를 읽지 않습니다.\n'
                     '예: 이번 달 매출이 지난달 같은 기간과 비교해 어떻게 달라졌어?\n'
+                    '보고 예약: 매일 오전 9시에 KPI 보고 보내줘 / 보고 예약 확인해줘 / 보고 예약 해제해줘\n'
                     '/기억 이름=기준 · /기억목록 · /기억삭제 이름\n'
                     '자료 검증: 질문 시 수행. 노트북 종료·절전 중에는 응답할 수 없습니다.')
         context = None
@@ -667,6 +676,14 @@ class Service:
             self.write_health()
 
     async def monitor_once(self):
+        if self.settings.lazy_data and (self._report_task is None or self._report_task.done()):
+            from .report_schedules import run_due_reports
+            if self._report_task is not None:
+                try:
+                    self._report_task.result()
+                except (Exception, asyncio.CancelledError):
+                    log.warning('예약 보고 작업 중단')
+            self._report_task = asyncio.create_task(run_due_reports(self))
         if self.settings.lazy_data:
             return
         if self.settings.daily_briefing_enabled:
@@ -736,6 +753,9 @@ class Service:
             path.replace(completed / path.name)
 
     async def run(self):
+        if self.settings.lazy_data:
+            from .report_schedules import Schedules
+            Schedules(self.store, self.settings).recover(self.clock())
         if self.agent:
             await self.agent.start()
             self.store.put('ai_status', {'stage': 'agent', 'error': None,
@@ -782,5 +802,8 @@ class Service:
         try:
             await asyncio.gather(poll(), worker(), monitor())
         finally:
+            if self._report_task is not None:
+                self._report_task.cancel()
+                await asyncio.gather(self._report_task, return_exceptions=True)
             if self.agent:
                 await self.agent.close()
