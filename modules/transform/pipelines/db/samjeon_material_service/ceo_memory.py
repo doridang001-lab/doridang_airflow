@@ -60,7 +60,10 @@ def relevant(store, user, chat, question):
 def context(store, user, chat, session, question):
     previous = session.get('previous') or session['id']
     history = store.memory.recent(session['id'], 3) or store.memory.recent(previous, 3)
+    last_report = (store.get(f'last-scheduled-report-v1-{user}-{chat}')
+                   if re.search(r'보고|리포트|브리핑|이거|이것|이\s*내용', question) else None)
     return {'remembered_rules': relevant(store, user, chat, question),
+            'latest_scheduled_report': last_report,
             'inherited_preferences': [entry['text'][:300] for entry in session.get('preferences', [])[-5:]],
             'inherited_summary': session.get('summary', '')[:1200],
             'handoff': [{'question': row['question'][:400], 'answer': row['answer'][:700],

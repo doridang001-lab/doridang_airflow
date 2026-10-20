@@ -155,6 +155,8 @@ class AppServer:
         ceo = self.settings.lazy_data
         if ceo:
             from .ceo_tools import INSTRUCTIONS as ceo_instructions, TOOLS as ceo_tools
+            from .report_schedules import INSTRUCTIONS as schedule_instructions, TOOLS as schedule_tools
+            ceo_instructions += DAILY_INSTRUCTIONS if analysis_only else schedule_instructions
         common = {'model': self.settings.model, 'cwd': self.work, 'approvalPolicy': 'never',
                   'sandbox': 'read-only',
                   'developerInstructions': ceo_instructions if ceo else DAILY_INSTRUCTIONS if analysis_only else INSTRUCTIONS}
@@ -162,7 +164,7 @@ class AppServer:
             result = await self.rpc('thread/resume', {**common, 'threadId': thread_id, 'excludeTurns': True})
         else:
             result = await self.rpc('thread/start', {**common, 'ephemeral': analysis_only,
-                                                     'dynamicTools': (ceo_tools if analysis_only else ceo_tools + FILE_TOOLS + BRAIN_TOOLS) if ceo else TOOLS[:3] + BRAIN_TOOLS[1:3] if analysis_only
+                                                     'dynamicTools': (ceo_tools[:4] + BRAIN_TOOLS[1:3] if analysis_only else ceo_tools + FILE_TOOLS + BRAIN_TOOLS + schedule_tools) if ceo else TOOLS[:3] + BRAIN_TOOLS[1:3] if analysis_only
                                                      else TOOLS + FILE_TOOLS + BRAIN_TOOLS})
         return result['thread']['id']
 

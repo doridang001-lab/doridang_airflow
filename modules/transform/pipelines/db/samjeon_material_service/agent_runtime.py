@@ -22,7 +22,7 @@ async def handle_agent(service, uid, user, chat, text, session, cancelled):
     began = time.monotonic()
     rotated = ceo and binding.get('completed_turns', 0) >= 12
     # 미전달·중단 턴이 남은 스레드를 대화 기억으로 사용하지 않는다.
-    toolset = 'single-bot-lazy-v1' if ceo else 'legacy'
+    toolset = 'single-bot-lazy-schedules-v2' if ceo else 'legacy'
     changed_tools = ((ceo or 'toolset' in binding) and binding.get('toolset') != toolset)
     fresh = not binding.get('thread_id') or binding.get('dirty', False) or rotated or changed_tools
     request_date = str(service._received_at.astimezone(ZoneInfo('Asia/Seoul')).date())
@@ -49,12 +49,19 @@ async def handle_agent(service, uid, user, chat, text, session, cancelled):
     brain = BrainFiles(service.settings.brain_root, text)
     calls = []
     output_chars = 0
+    schedule_result = None
 
     async def tool_call(name, arguments):
-        nonlocal output_chars
+        nonlocal output_chars, schedule_result
         if cancelled.is_set():
             return {'error': 'cancelled'}
-        if name == 'search_conversation':
+        if name in ('get_report_schedule', 'set_report_schedule', 'cancel_report_schedule') and ceo:
+            from .report_schedules import Schedules
+            result = Schedules(store, service.settings).call(name, arguments, user=user, chat=chat,
+                request_id=uid, text=text, now=service.clock())
+            if result.get('saved'):
+                schedule_result = result
+        elif name == 'search_conversation':
             query = arguments.get('query', '') if isinstance(arguments, dict) else ''
             if not isinstance(query, str) or len(query) > 1000:
                 return {'error': 'query_invalid'}
@@ -114,6 +121,10 @@ async def handle_agent(service, uid, user, chat, text, session, cancelled):
                 'tool_output_characters': output_chars, 'usage': result.get('usage'),
                 'usage_available': result.get('usage') is not None})
         answer = telegram_answer(redact(result['text'], service.settings.token))
+        if schedule_result:
+            answer = ('매일 보고 예약을 해제했습니다.' if not schedule_result['enabled'] else
+                      f"매일 한국시간 {schedule_result['time']} 보고를 예약했습니다.\n"
+                      f"다음 실행: {schedule_result['next_run']}\n보고 내용: {schedule_result['prompt']}")
         store.put(request_key, {**store.get(request_key), 'status': 'generated', 'answer': answer})
         delivered = await service.send(f'update-{uid}', chat, answer, cancelled=cancelled)
         store.put(request_key, {**store.get(request_key), 'status': 'sent' if delivered else 'undelivered'})
